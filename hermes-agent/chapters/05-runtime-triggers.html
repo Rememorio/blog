@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>运行时触发点：自进化是怎么挂进主循环的 | Hermes Agent 源码阅读</title>
+    <meta name="theme-color" content="#f6f4ef" />
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../" aria-label="Hermes Agent 源码阅读首页">
+        <span class="brand-mark">H</span>
+        <span>Hermes Agent Notes</span>
+      </a>
+      <nav aria-label="页面导航">
+        <a href="../#chapters">章节</a>
+        <a href="../#sources">源码</a>
+        <a href="https://github.com/NousResearch/hermes-agent/tree/3edd09a46">源码版本</a>
+      </nav>
+    </header>
+
+    <main class="page-shell chapter-shell">
+      <aside class="toc chapter-toc" aria-label="章节目录">
+        <strong>本章目录</strong>
+        <a class="toc-level-2" href="#第一层-系统提示先划边界">第一层：系统提示先划边界</a>
+<a class="toc-level-2" href="#第二层-memory-按用户-turn-触发">第二层：memory 按用户 turn 触发</a>
+<a class="toc-level-2" href="#第三层-skills-按工具迭代触发">第三层：skills 按工具迭代触发</a>
+<a class="toc-level-2" href="#第四层-回答结束后才开后台-review">第四层：回答结束后才开后台 review</a>
+<a class="toc-level-2" href="#第五层-review-fork-继承运行时-但限制工具">第五层：review fork 继承运行时，但限制工具</a>
+<a class="toc-level-2" href="#第六层-为什么要继承-cached-system-prompt">第六层：为什么要继承 cached system prompt</a>
+<a class="toc-level-2" href="#第七层-写入后不会立刻改当前模型视图">第七层：写入后不会立刻改当前模型视图</a>
+<a class="toc-level-2" href="#失败时怎么办">失败时怎么办</a>
+<a class="toc-level-2" href="#这一篇怎么收束">这一篇怎么收束</a>
+      </aside>
+      <article class="article markdown-body">
+        <nav class="chapter-links" aria-label="章节导航">
+          <a href="./04-session-search.html" rel="prev">上一章</a>
+          <a href="../#chapters">全部章节</a>
+          <a href="./06-summary-and-questions.html" rel="next">下一章</a>
+        </nav>
+        <h1 id="运行时触发点-自进化是怎么挂进主循环的">运行时触发点：自进化是怎么挂进主循环的</h1>
+<p>前面几篇分别看了 memory、skills、session_search。</p>
+<p>但这些模块如果只是孤零零存在，还不能构成自进化。真正的问题是：它们在 Hermes 的一轮运行里，究竟什么时候出现？</p>
+<p>这一篇沿着一次 <code>run_conversation</code> 的生命周期，把自进化链路串起来。</p>
+<h2 id="第一层-系统提示先划边界">第一层：系统提示先划边界</h2>
+<p>自进化不是后台 review 才开始的。它从 system prompt 的行为边界就开始了。</p>
+<p><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/prompt_builder.py"><code>agent/prompt_builder.py</code></a> 里有三段很关键的 guidance：</p>
+<ul>
+<li><code>MEMORY_GUIDANCE</code></li>
+<li><code>SESSION_SEARCH_GUIDANCE</code></li>
+<li><code>SKILLS_GUIDANCE</code></li>
+</ul>
+<p>这三段告诉模型：</p>
+<ul>
+<li>持久事实用 memory。</li>
+<li>过去会话用 session_search 找。</li>
+<li>复杂任务、棘手错误、可复用流程用 skill 保存。</li>
+</ul>
+<p>它们的作用不是让模型“多写点东西”，而是让模型先学会分类。</p>
+<p>如果没有这层边界，模型很容易把任务进度写进 memory，或者把一次性日志写成 skill。Hermes 的自进化从一开始就不是“保存一切”，而是“保存对的东西”。</p>
+<h2 id="第二层-memory-按用户-turn-触发">第二层：memory 按用户 turn 触发</h2>
+<p>用户每发一轮消息，<a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/turn_context.py"><code>agent/turn_context.py</code></a> 会推进 <code>_turns_since_memory</code>。</p>
+<p>逻辑很直接：</p>
+<ol>
+<li>memory 开启。</li>
+<li>memory 工具可用。</li>
+<li>当前 agent 有 memory store。</li>
+<li>用户 turn 计数达到 <code>_memory_nudge_interval</code>。</li>
+<li>设置 <code>should_review_memory = True</code>，并把计数归零。</li>
+</ol>
+<p>默认 interval 是 10，初始化在 <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/agent_init.py"><code>agent/agent_init.py</code></a>。</p>
+<p>注意，这里只是“标记需要复盘”，不是立刻写 memory。真正写入会等到本轮任务结束后。</p>
+<p>这样设计有两个原因：</p>
+<ul>
+<li>当前用户任务优先，不能被复盘打断。</li>
+<li>是否值得保存，要看完整轮次的最终结果。</li>
+</ul>
+<h2 id="第三层-skills-按工具迭代触发">第三层：skills 按工具迭代触发</h2>
+<p>Skill 的触发不是按用户 turn，而是按工具迭代。</p>
+<p>原因很自然：skill 关注的是“怎么做事”。如果一轮任务用了很多工具、经历了多次修复、产生了复杂操作路径，那么它更可能值得沉淀成可复用流程。</p>
+<p>在 <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/conversation_loop.py"><code>agent/conversation_loop.py</code></a> 里，每次进入工具循环，Hermes 会推进 <code>_iters_since_skill</code>。如果中途真的调用了 <code>skill_manage</code>，这个计数会被重置，避免重复提醒。</p>
+<p>本轮结束时，<a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/turn_finalizer.py"><code>agent/turn_finalizer.py</code></a> 会检查 <code>_iters_since_skill &gt;= _skill_nudge_interval</code>。满足条件就设置 <code>_should_review_skills = True</code>，并把计数归零。</p>
+<p>这让 Hermes 的 skill review 更贴近“复杂工作”而不是“聊天轮数”。</p>
+<h2 id="第四层-回答结束后才开后台-review">第四层：回答结束后才开后台 review</h2>
+<p>最终触发点仍然在 <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/turn_finalizer.py"><code>agent/turn_finalizer.py</code></a>。</p>
+<p>条件是：</p>
+<ul>
+<li>有 <code>final_response</code>。</li>
+<li>没有 interrupted。</li>
+<li>memory 或 skills 至少有一个需要 review。</li>
+</ul>
+<p>满足后，Hermes 调用：</p>
+<pre><code class="language-text">agent._spawn_background_review(
+  messages_snapshot=list(messages),
+  review_memory=_should_review_memory,
+  review_skills=_should_review_skills,
+)</code></pre>
+<p>这一步说明 Hermes 把自进化设计成 side path，而不是 main path。</p>
+<p>用户得到回答之后，后台再看这轮是否有东西值得保存。它失败了，也不会让主任务失败；它成功了，会给用户一个简短的 self-improvement review 摘要。</p>
+<h2 id="第五层-review-fork-继承运行时-但限制工具">第五层：review fork 继承运行时，但限制工具</h2>
+<p><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/background_review.py"><code>agent/background_review.py</code></a> 会创建一个新的 <code>AIAgent</code>。</p>
+<p>它继承父 agent 的：</p>
+<ul>
+<li>model</li>
+<li>provider</li>
+<li>api mode</li>
+<li>base_url</li>
+<li>api_key</li>
+<li>credential pool</li>
+<li>platform</li>
+<li>session id</li>
+<li>cached system prompt</li>
+</ul>
+<p>同时，它会做几件限制：</p>
+<ul>
+<li><code>max_iterations=16</code></li>
+<li><code>quiet_mode=True</code></li>
+<li><code>skip_memory=True</code></li>
+<li><code>_memory_nudge_interval = 0</code></li>
+<li><code>_skill_nudge_interval = 0</code></li>
+<li><code>compression_enabled = False</code></li>
+<li>只允许 memory 和 skills 工具</li>
+</ul>
+<p>这几条限制非常关键。</p>
+<p><code>skip_memory=True</code> 是为了避免 review prompt 被外部 memory provider 吞进去，污染用户真实记忆空间。</p>
+<p><code>compression_enabled = False</code> 是为了避免 review fork 和前台 session 同时操作压缩 lineage，产生兄弟 child session。</p>
+<p>工具 whitelist 是为了确保后台复盘只做经验保存，不会跑命令、改文件、触发别的外部副作用。</p>
+<h2 id="第六层-为什么要继承-cached-system-prompt">第六层：为什么要继承 cached system prompt</h2>
+<p>background review 继承父 agent 的 <code>_cached_system_prompt</code>。</p>
+<p>这不是为了省几行初始化代码，而是为了保护 prompt cache。</p>
+<p>如果 review fork 重新生成 system prompt，里面可能有新时间、新 session id、新工具集、新 skills snapshot。哪怕语义差不多，字节级前缀也会变化，缓存命中就会下降。</p>
+<p>Hermes 选择继承父 agent 的 cached system prompt，让 review fork 尽量命中同一稳定前缀。</p>
+<p>这说明 Hermes 的自进化不是“额外跑一个模型就完了”。它还要考虑成本、缓存、前缀稳定性、运行时一致性。</p>
+<h2 id="第七层-写入后不会立刻改当前模型视图">第七层：写入后不会立刻改当前模型视图</h2>
+<p>即使 background review 成功写入 memory，当前 session 的 system prompt snapshot 也不会立刻改变。</p>
+<p>这和 memory 篇讲的一样：写入会落盘，但当前 session 的稳定前缀不动。</p>
+<p>Skill 写入也会清理 skills system prompt cache，让后续需要重新构造技能摘要时能看到更新。但它不会把新 skill 全文硬塞进当前模型上下文。</p>
+<p>所以完整链路是：</p>
+<div class="mermaid">sequenceDiagram
+  participant U as User
+  participant A as Main Agent
+  participant R as Review Fork
+  participant M as Memory
+  participant S as Skills
+
+  U-&gt;&gt;A: 发起任务
+  A-&gt;&gt;A: 主循环调用模型和工具
+  A-&gt;&gt;U: 返回最终回答
+  A-&gt;&gt;A: turn_finalizer 检查触发条件
+  A--&gt;&gt;R: fork 后台 review
+  R-&gt;&gt;R: 读取本轮消息快照
+  R-&gt;&gt;M: 必要时写入稳定事实
+  R-&gt;&gt;S: 必要时创建或修改 skill
+  R--&gt;&gt;A: 返回简短复盘摘要</div>
+<p>主路径和复盘路径分开，是 Hermes 运行时设计的核心。</p>
+<h2 id="失败时怎么办">失败时怎么办</h2>
+<p>background review 是 best-effort。</p>
+<p>如果失败，Hermes 会记录 warning，并通过 auxiliary failure 机制报告，但不会让用户刚完成的任务回滚。</p>
+<p>这个取舍很合理。因为自进化是增益能力，不应该反过来破坏任务完成。一个可靠的 agent 必须先完成当前任务，再考虑是否学习。</p>
+<h2 id="这一篇怎么收束">这一篇怎么收束</h2>
+<p>可以这样表达：</p>
+<p>Hermes 的自进化挂在主循环之外，但由主循环触发。system prompt 先给模型 memory、session_search、skills 的分类边界。每个用户 turn 会推进 memory nudge counter，每次工具迭代会推进 skill nudge counter。任务结束后，turn_finalizer 判断本轮是否需要 review；如果需要，就 fork 一个后台 AIAgent，继承父 agent 的运行时和 cached system prompt，但禁用递归 nudge、禁用 compression，并用工具 whitelist 限制它只能调用 memory 和 skill 管理工具。这样自进化不会抢当前任务上下文，也不会破坏 prompt cache，同时把经验写入长期载体。</p>
+<p>这段话能把宏观卖点落到具体源码：</p>
+<ul>
+<li>分类边界：<code>prompt_builder.py</code></li>
+<li>memory 计数：<code>turn_context.py</code></li>
+<li>skill 计数：<code>conversation_loop.py</code></li>
+<li>触发后台 review：<code>turn_finalizer.py</code></li>
+<li>review fork：<code>background_review.py</code></li>
+<li>memory / skills 写入：<code>memory_tool.py</code>、<code>skill_manager_tool.py</code></li>
+</ul>
+<p>下一篇把这些内容收成一张总结地图：先讲清主线，再逐层展开到源码细节，并给出后续值得继续追问的问题。</p>
+        <nav class="chapter-links chapter-links-bottom" aria-label="章节导航">
+          <a href="./04-session-search.html" rel="prev">上一章</a>
+          <a href="../#chapters">全部章节</a>
+          <a href="./06-summary-and-questions.html" rel="next">下一章</a>
+        </nav>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>Hermes Agent 源码阅读笔记。</p>
+      <a href="../">返回首页</a>
+    </footer>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral" });
+    </script>
+  </body>
+</html>

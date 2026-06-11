@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>自进化闭环：Hermes 为什么不只是工具调用器 | Hermes Agent 源码阅读</title>
+    <meta name="theme-color" content="#f6f4ef" />
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../" aria-label="Hermes Agent 源码阅读首页">
+        <span class="brand-mark">H</span>
+        <span>Hermes Agent Notes</span>
+      </a>
+      <nav aria-label="页面导航">
+        <a href="../#chapters">章节</a>
+        <a href="../#sources">源码</a>
+        <a href="https://github.com/NousResearch/hermes-agent/tree/3edd09a46">源码版本</a>
+      </nav>
+    </header>
+
+    <main class="page-shell chapter-shell">
+      <aside class="toc chapter-toc" aria-label="章节目录">
+        <strong>本章目录</strong>
+        <a class="toc-level-2" href="#先区分两种能力">先区分两种能力</a>
+<a class="toc-level-2" href="#一次任务结束后发生什么">一次任务结束后发生什么</a>
+<a class="toc-level-2" href="#为什么要后台复盘">为什么要后台复盘</a>
+<a class="toc-level-2" href="#复盘到底写到哪里">复盘到底写到哪里</a>
+<a class="toc-level-2" href="#为什么不是每轮都写">为什么不是每轮都写</a>
+<a class="toc-level-2" href="#自进化也需要治理">自进化也需要治理</a>
+<a class="toc-level-2" href="#这一篇怎么收束">这一篇怎么收束</a>
+      </aside>
+      <article class="article markdown-body">
+        <nav class="chapter-links" aria-label="章节导航">
+          <a href="./00-series-map.html" rel="prev">上一章</a>
+          <a href="../#chapters">全部章节</a>
+          <a href="./02-memory.html" rel="next">下一章</a>
+        </nav>
+        <h1 id="自进化闭环-hermes-为什么不只是工具调用器">自进化闭环：Hermes 为什么不只是工具调用器</h1>
+<p>很多 Agent 项目都会说自己能用工具。它能读文件、跑命令、查网页、调用 API，于是看起来已经很强。</p>
+<p>但这只能说明它“这一轮能做事”。真正困难的问题是：这次做事留下的经验，下一次还在不在？</p>
+<p>如果下一次还要用户重新解释偏好、重新提醒坑点、重新描述工作流，那么它只是一个强一点的会话界面。Hermes 想做的是另一件事：把经验分门别类地留下来，让下一次会话一开始就站在更高的位置上。</p>
+<h2 id="先区分两种能力">先区分两种能力</h2>
+<p>Agent 的能力大致可以分成两类。</p>
+<p>第一类是即时能力：模型会推理，工具能执行，网关能收消息，终端能跑命令。这类能力解决的是“现在怎么完成任务”。</p>
+<p>第二类是成长能力：这次任务里学到的偏好、方法、坑点、上下文，能否在未来被正确取回。这类能力解决的是“下次怎样少走弯路”。</p>
+<p>Hermes 的亮点在第二类。</p>
+<p>它的 README 直接把自己定位成 self-improving agent，并把闭环拆成几个动作：从经验创建 skills，在使用中改进 skills，主动持久化知识，搜索过去的会话，跨会话理解用户。这不是一个营销句式，源码里确实有对应链路。</p>
+<h2 id="一次任务结束后发生什么">一次任务结束后发生什么</h2>
+<p>先不要急着看 memory 或 skills 的实现。先看一轮任务的生命周期。</p>
+<p>在主循环里，模型正常完成用户任务。过程中会产生很多痕迹：用户消息、模型回复、工具调用、工具结果、错误、重试、最后的回答。这些会进入 session transcript。</p>
+<p>任务结束后，Hermes 不会立刻把全部历史塞进下次 prompt。它会先判断：这轮是否到了复盘时机。</p>
+<p>触发点有两个：</p>
+<ul>
+<li>memory 复盘按用户轮次计数，默认每 10 个用户 turn 检查一次。</li>
+<li>skills 复盘按工具迭代计数，默认每 10 次工具循环检查一次。</li>
+</ul>
+<p>初始化位置在 <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/agent_init.py"><code>agent/agent_init.py</code></a>，默认值分别是 <code>_memory_nudge_interval = 10</code> 和 <code>_skill_nudge_interval = 10</code>。用户每发一轮消息，<a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/turn_context.py"><code>agent/turn_context.py</code></a> 会推进 memory 计数。模型每进入一次工具循环，<a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/conversation_loop.py"><code>agent/conversation_loop.py</code></a> 会推进 skill 计数。</p>
+<p>真正启动复盘的地方在 <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/turn_finalizer.py"><code>agent/turn_finalizer.py</code></a>：只有当本轮有最终回答、没有被中断，并且 memory 或 skills 的触发条件满足时，Hermes 才会调用 <code>_spawn_background_review()</code>。</p>
+<p>这一步很关键。自进化不是在用户等回答的时候抢上下文，而是在回答交付之后后台进行。</p>
+<h2 id="为什么要后台复盘">为什么要后台复盘</h2>
+<p>如果把“要不要保存经验”放进主任务里，模型就会同时做两件事：</p>
+<ol>
+<li>完成用户眼前的任务。</li>
+<li>判断自己是否应该写 memory 或 skill。</li>
+</ol>
+<p>这很容易污染任务路径。比如用户只是想让它修一个 bug，模型却花大量 token 总结经验；或者为了写 skill，它提前改变了回答节奏。</p>
+<p>Hermes 的做法是把复盘放到后台 review fork 里。<a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/background_review.py"><code>agent/background_review.py</code></a> 会创建一个新的 <code>AIAgent</code>，继承父 agent 的 provider、model、base_url、api_key、credential pool、session_id、cached system prompt，然后把当前消息快照交给这个 review agent。</p>
+<p>这个 fork 只允许做两类事：</p>
+<ul>
+<li>调用 memory 工具。</li>
+<li>调用 skills 管理工具。</li>
+</ul>
+<p>其他工具会被 whitelist 拦住。也就是说，后台复盘不是另一个可以随便操作系统的 agent，它只是一个负责判断“哪些经验值得留下”的旁路流程。</p>
+<h2 id="复盘到底写到哪里">复盘到底写到哪里</h2>
+<p>复盘之后有三个去处。</p>
+<p>第一个是 memory。它适合保存稳定事实，比如用户偏好、环境约定、项目习惯。对应工具是 <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/tools/memory_tool.py"><code>tools/memory_tool.py</code></a>。</p>
+<p>第二个是 skills。它适合保存“怎么做一类任务”的流程，比如某类调试方法、某个平台接入步骤、某种审查清单。对应工具是 <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/tools/skill_manager_tool.py"><code>tools/skill_manager_tool.py</code></a>。</p>
+<p>第三个是 transcript。它不是主动写出来的“经验”，而是完整过程本来就会落盘。以后如果需要查过去发生过什么，可以走 <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/tools/session_search_tool.py"><code>tools/session_search_tool.py</code></a>。</p>
+<p>这三个去处的边界非常重要：</p>
+<div class="mermaid">flowchart TD
+  A["这次任务里的信息"] --&gt; B{"未来还稳定吗？"}
+  B --&gt;|"稳定事实"| C["Memory"]
+  B --&gt;|"可复用方法"| D["Skills"]
+  B --&gt;|"只属于某次任务"| E["Transcript + Session Search"]</div>
+<p>比如：</p>
+<ul>
+<li>“用户偏好简洁回答”是 memory。</li>
+<li>“修复某类 provider 鉴权问题的步骤”是 skill。</li>
+<li>“今天这个 PR 的编号、commit SHA、临时日志”是 transcript。</li>
+</ul>
+<p>如果都塞进 memory，memory 会污染未来每一轮。如果都塞进 skill，技能库会变成大量一次性碎片。如果都只留在 transcript，下一次又很难主动变好。</p>
+<p>Hermes 的自进化，首先就是这个分类能力。</p>
+<h2 id="为什么不是每轮都写">为什么不是每轮都写</h2>
+<p>一个看似自然的方案是：每轮结束都让模型总结一下，然后写 memory 或 skill。</p>
+<p>Hermes 没这么做，原因很实际。</p>
+<p>第一，写得太勤会让噪声增加。大多数会话没有产生可复用经验，强行写只会产生“今天做了什么”这类很快过期的内容。</p>
+<p>第二，写入会影响长期行为。memory 会进入后续模型视图，skill 会影响未来同类任务。如果一次错误复盘被持久化，后面可能反复放大。</p>
+<p>第三，主会话要保护 prompt cache。Hermes 的 memory 文件在 session start 时形成 frozen snapshot，中途写入磁盘但不改写当前 system prompt。这样经验能落盘，当前会话的稳定前缀也不被打破。</p>
+<p>所以 Hermes 选择的是“周期性触发 + 后台判断 + 受控写入”。</p>
+<h2 id="自进化也需要治理">自进化也需要治理</h2>
+<p>只要 agent 能自己写长期资产，就会有风险：它可能记错事实，可能把一次临时失败写成永久规则，可能把技能库写成一堆狭窄碎片。</p>
+<p>Hermes 对这个问题不是靠一句“模型会判断”，而是加了几层治理。</p>
+<p>第一层是 write approval。<a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/tools/write_approval.py"><code>tools/write_approval.py</code></a> 支持对 memory 和 skills 的写入做审批。开启后，后台写入会先进入 pending 目录，用户可以通过 <code>/memory pending</code> 或 <code>/skills pending</code> 审核。</p>
+<p>第二层是 skill provenance。只有后台 review 创建的 skill 才会被标为 agent-created。这样 curator 知道哪些技能可以自动维护，哪些是用户手写或外部安装的资产。</p>
+<p>第三层是 curator。<a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/curator.py"><code>agent/curator.py</code></a> 会周期性整理 agent-created skills，把长期不用的技能标为 stale 或归档，把过窄的技能合并到更大的 umbrella skill 里。它不会自动删除，只做可恢复的归档。</p>
+<p>这三层说明 Hermes 对自进化的态度很清醒：成长不是越写越多，而是有边界地留下、复用和整理。</p>
+<h2 id="这一篇怎么收束">这一篇怎么收束</h2>
+<p>如果要从宏观到微观介绍 Hermes，可以这样说：</p>
+<p>Hermes Agent 的核心亮点是闭环学习。它不是只在当前上下文里完成任务，而是把任务经验分成三类长期资产：稳定事实进入 memory，可复用流程进入 skills，完整历史进入 SQLite transcript 并通过 session_search 检索。运行时通过 turn 和 tool-iteration 计数触发后台 review，review fork 继承父 agent 的运行时和 cached system prompt，但只允许调用 memory 和 skill 管理工具。写入可以走 approval gate，技能库还有 curator 做 stale、archive、consolidation，避免自进化变成无限膨胀。</p>
+<p>这段话里有三层：</p>
+<ul>
+<li>宏观：Hermes 是 self-improving agent，不只是工具调用器。</li>
+<li>中观：memory / skills / session_search 分别承担不同类型的长期经验。</li>
+<li>微观：触发点在 <code>turn_context</code>、<code>conversation_loop</code>、<code>turn_finalizer</code>，后台逻辑在 <code>background_review</code>，治理在 <code>write_approval</code> 和 <code>curator</code>。</li>
+</ul>
+<p>下一篇进入 memory。因为在自进化系统里，最容易出问题的不是“忘了记”，而是“记错了、记多了、记成了未来每轮都要执行的自我约束”。</p>
+        <nav class="chapter-links chapter-links-bottom" aria-label="章节导航">
+          <a href="./00-series-map.html" rel="prev">上一章</a>
+          <a href="../#chapters">全部章节</a>
+          <a href="./02-memory.html" rel="next">下一章</a>
+        </nav>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>Hermes Agent 源码阅读笔记。</p>
+      <a href="../">返回首页</a>
+    </footer>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral" });
+    </script>
+  </body>
+</html>

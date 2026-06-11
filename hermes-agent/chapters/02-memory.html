@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Memory：事实为什么要短、稳、慢注入 | Hermes Agent 源码阅读</title>
+    <meta name="theme-color" content="#f6f4ef" />
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../" aria-label="Hermes Agent 源码阅读首页">
+        <span class="brand-mark">H</span>
+        <span>Hermes Agent Notes</span>
+      </a>
+      <nav aria-label="页面导航">
+        <a href="../#chapters">章节</a>
+        <a href="../#sources">源码</a>
+        <a href="https://github.com/NousResearch/hermes-agent/tree/3edd09a46">源码版本</a>
+      </nav>
+    </header>
+
+    <main class="page-shell chapter-shell">
+      <aside class="toc chapter-toc" aria-label="章节目录">
+        <strong>本章目录</strong>
+        <a class="toc-level-2" href="#先看边界-memory-不负责保存历史">先看边界：memory 不负责保存历史</a>
+<a class="toc-level-2" href="#两个文件-一个记环境-一个记用户">两个文件：一个记环境，一个记用户</a>
+<a class="toc-level-2" href="#最关键的设计-frozen-snapshot">最关键的设计：frozen snapshot</a>
+<a class="toc-level-2" href="#为什么要扫描和阻断">为什么要扫描和阻断</a>
+<a class="toc-level-2" href="#为什么写入前要重新读磁盘">为什么写入前要重新读磁盘</a>
+<a class="toc-level-2" href="#写入审批-自进化不能默认全信">写入审批：自进化不能默认全信</a>
+<a class="toc-level-2" href="#memory-和-skills-的分界">Memory 和 Skills 的分界</a>
+<a class="toc-level-2" href="#用源码串起来">用源码串起来</a>
+<a class="toc-level-2" href="#这一篇怎么收束">这一篇怎么收束</a>
+      </aside>
+      <article class="article markdown-body">
+        <nav class="chapter-links" aria-label="章节导航">
+          <a href="./01-learning-loop.html" rel="prev">上一章</a>
+          <a href="../#chapters">全部章节</a>
+          <a href="./03-skills.html" rel="next">下一章</a>
+        </nav>
+        <h1 id="memory-事实为什么要短-稳-慢注入">Memory：事实为什么要短、稳、慢注入</h1>
+<p>自进化的第一步，通常会被理解成“让 Agent 记住东西”。</p>
+<p>但真正难的不是记住，而是决定什么值得记、以什么形态记、什么时候进入模型视图。</p>
+<p>Hermes 的 memory 设计很克制。它不是一个无限增长的知识库，而是两个有大小上限的 Markdown 文件：<code>MEMORY.md</code> 和 <code>USER.md</code>。源码在 <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/tools/memory_tool.py"><code>tools/memory_tool.py</code></a>。</p>
+<h2 id="先看边界-memory-不负责保存历史">先看边界：memory 不负责保存历史</h2>
+<p>Hermes 对 memory 的定位很明确：保存未来仍然稳定的事实。</p>
+<p>适合进入 memory 的内容包括：</p>
+<ul>
+<li>用户偏好，比如回答风格、常用语言、工作习惯。</li>
+<li>环境约定，比如项目使用的测试命令、固定目录结构。</li>
+<li>工具坑点，比如某个 provider 的配置方式、某个平台的限制。</li>
+<li>长期仍然有价值的事实。</li>
+</ul>
+<p>不适合进入 memory 的内容包括：</p>
+<ul>
+<li>某个任务做到哪一步。</li>
+<li>某个 PR 的编号。</li>
+<li>某次修复的 commit SHA。</li>
+<li>今天的临时日志。</li>
+<li>一周后就可能过期的状态。</li>
+</ul>
+<p>这些信息不是没价值，而是不应该进入每一轮模型视图。它们应该留在 transcript 里，未来通过 session_search 找回来。</p>
+<p>这就是 Hermes 的第一层边界：memory 不是历史仓库，而是稳定事实层。</p>
+<h2 id="两个文件-一个记环境-一个记用户">两个文件：一个记环境，一个记用户</h2>
+<p><code>MemoryStore</code> 里有两份状态：</p>
+<ul>
+<li><code>MEMORY.md</code>：agent 对环境、项目、工具、约定的长期观察。</li>
+<li><code>USER.md</code>：agent 对用户偏好、身份、沟通方式的长期理解。</li>
+</ul>
+<p>这两个文件都在 profile-scoped 的 memories 目录里。它们不是数据库表，而是带分隔符的 Markdown 条目。每条 entry 用 <code>§</code> 分隔。</p>
+<p>为什么不用普通追加日志？</p>
+<p>因为 memory 会进入 system prompt。它不是给人看的历史记录，而是给模型下一次决策用的“长期事实”。如果这里变成日志，模型每轮都会读到大量过期信息。</p>
+<p>所以 Hermes 给 memory 加了字符上限。默认 <code>MEMORY.md</code> 大约 2200 chars，<code>USER.md</code> 大约 1375 chars。这个限制看起来小，但正是它逼着 memory 保持高密度。</p>
+<h2 id="最关键的设计-frozen-snapshot">最关键的设计：frozen snapshot</h2>
+<p>Memory 最值得看的不是 <code>add</code>、<code>replace</code>、<code>remove</code>，而是它进入 prompt 的方式。</p>
+<p><code>MemoryStore.load_from_disk()</code> 会做两件事：</p>
+<ol>
+<li>从磁盘读取 <code>MEMORY.md</code> 和 <code>USER.md</code>。</li>
+<li>构造 <code>_system_prompt_snapshot</code>。</li>
+</ol>
+<p>这个 snapshot 是冻结的。当前 session 中，memory 工具继续写磁盘，但不会立刻改写这一轮 session 的 system prompt。</p>
+<p>这听起来反直觉：既然记住了，为什么不马上让模型读到？</p>
+<p>原因是 prompt cache。</p>
+<p>长期会话里，system prompt 是最重要的稳定前缀。如果每次 memory 写入都改 system prompt，那么同一个会话的模型视图会不断抖动，缓存命中率会下降，甚至可能让模型在一轮任务中突然被新的长期事实影响。</p>
+<p>Hermes 的取舍是：</p>
+<ul>
+<li>写入要立刻落盘，避免丢。</li>
+<li>当前 session 的模型前缀不变，保护缓存和行为稳定。</li>
+<li>下一次 session start 再刷新 memory snapshot。</li>
+</ul>
+<p>也就是说，memory 的写入是即时持久化，但进入模型视图是慢半拍的。</p>
+<h2 id="为什么要扫描和阻断">为什么要扫描和阻断</h2>
+<p>Memory 会进入 system prompt，所以它比普通文件危险。</p>
+<p>如果 memory 里出现 prompt injection、外泄诱导、伪造系统规则，下一次 session 一启动，模型就会把它当成高优先级上下文读进去。</p>
+<p>Hermes 因此在两个时刻做扫描：</p>
+<ul>
+<li>写入前，<code>add</code> / <code>replace</code> 会调用 <code>_scan_memory_content()</code>。</li>
+<li>加载 snapshot 时，<code>_sanitize_entries_for_snapshot()</code> 会把命中的条目替换成 <code>[BLOCKED: ...]</code> 占位。</li>
+</ul>
+<p>这里的细节很重要：被阻断的原文不会从 live state 里静默消失。用户仍然可以通过 <code>memory(action=read)</code> 看到并删除它。这样既避免 prompt 被污染，也避免安全问题被藏起来。</p>
+<h2 id="为什么写入前要重新读磁盘">为什么写入前要重新读磁盘</h2>
+<p>Memory 文件可能不只被一个 agent 写。</p>
+<p>可能有另一个 session 正在写，也可能用户手动改过，也可能其他工具改过。Hermes 在写入前会拿文件锁，并重新从磁盘读最新内容。</p>
+<p>如果发现文件不能按 memory 工具的格式 round-trip，或者某个条目大到超过整个 store 的字符上限，<code>MemoryStore</code> 会认为出现 external drift。它会先备份 <code>.bak.&lt;ts&gt;</code>，然后拒绝本次写入。</p>
+<p>这不是吹毛求疵。因为 memory 工具最终会把 entries 重新序列化。如果磁盘上混入了自由格式内容，直接写回可能把用户手动追加的内容覆盖掉。拒绝写入，是为了避免 silent data loss。</p>
+<h2 id="写入审批-自进化不能默认全信">写入审批：自进化不能默认全信</h2>
+<p>Hermes 允许 memory 自主写入，但也提供 write approval。</p>
+<p>逻辑在 <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/tools/write_approval.py"><code>tools/write_approval.py</code></a>。开启 <code>memory.write_approval</code> 后：</p>
+<ul>
+<li>前台 CLI 的小 memory 写入可以 inline 审核。</li>
+<li>gateway 或 background review 里的写入会进入 pending store。</li>
+<li>用户再通过 <code>/memory pending</code>、<code>/memory approve</code>、<code>/memory reject</code> 处理。</li>
+</ul>
+<p>这个设计说明 Hermes 并不把“自进化”理解成 agent 想写什么就写什么。尤其是后台 review，它运行时用户可能不在现场，必须能先暂存再审核。</p>
+<h2 id="memory-和-skills-的分界">Memory 和 Skills 的分界</h2>
+<p>Memory 的 schema 里有一句很关键的意思：如果学到的是一种新方法，应该保存成 skill，而不是 memory。</p>
+<p>可以用这个判断：</p>
+<ul>
+<li>这是一条事实吗？进 memory。</li>
+<li>这是一套步骤吗？进 skill。</li>
+<li>这是某次任务的过程吗？留 transcript。</li>
+</ul>
+<p>例如：</p>
+<ul>
+<li>“用户更喜欢直接给结论，再补少量原因”是 memory。</li>
+<li>“做前端视觉 QA 时先跑 Playwright 截图，再检查 mobile viewport”是 skill。</li>
+<li>“这次第 3 个截图里按钮溢出了”是 transcript。</li>
+</ul>
+<p>这个分界决定了 Hermes 的长期经验不会全部混在一个桶里。</p>
+<h2 id="用源码串起来">用源码串起来</h2>
+<p>Memory 的主路径可以这样读：</p>
+<div class="mermaid">flowchart TD
+  A["agent 初始化"] --&gt; B["读取 memory 配置"]
+  B --&gt; C["MemoryStore.load_from_disk"]
+  C --&gt; D["生成 frozen snapshot"]
+  D --&gt; E["system prompt 注入"]
+  F["memory 工具写入"] --&gt; G["扫描内容"]
+  G --&gt; H["文件锁 + 重新读磁盘"]
+  H --&gt; I["add / replace / remove"]
+  I --&gt; J["原子写回 MEMORY.md / USER.md"]
+  J -. "当前 session 不改 snapshot" .-&gt; D</div>
+<p>对应源码入口：</p>
+<ul>
+<li>初始化配置：<a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/agent_init.py"><code>agent/agent_init.py</code></a></li>
+<li>存储与工具：<a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/tools/memory_tool.py"><code>tools/memory_tool.py</code></a></li>
+<li>写入审批：<a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/tools/write_approval.py"><code>tools/write_approval.py</code></a></li>
+<li>后台复盘写入：<a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46/agent/background_review.py"><code>agent/background_review.py</code></a></li>
+</ul>
+<h2 id="这一篇怎么收束">这一篇怎么收束</h2>
+<p>可以这样表达：</p>
+<p>Hermes 的 memory 是 bounded curated memory，不是无限历史。它分成 <code>MEMORY.md</code> 和 <code>USER.md</code>，分别保存环境事实和用户画像。启动 session 时，Hermes 从磁盘读取并构造 frozen snapshot 注入 system prompt；中途 memory 工具写入只更新磁盘，不改当前 snapshot，从而保护 prompt cache 和同一会话的行为稳定。写入前会做 threat scan、字符预算、文件锁、external drift 检测，也可以启用 write approval。临时任务状态不进 memory，而是留在 transcript 里通过 session_search 回忆。</p>
+<p>这段话的重点不是“能记住”，而是“知道什么该记、怎么安全地记、什么时候进入模型视图”。</p>
+<p>下一篇看 skills。Memory 解决“事实怎么留下来”，skills 解决“方法怎么变成下次可复用的能力”。</p>
+        <nav class="chapter-links chapter-links-bottom" aria-label="章节导航">
+          <a href="./01-learning-loop.html" rel="prev">上一章</a>
+          <a href="../#chapters">全部章节</a>
+          <a href="./03-skills.html" rel="next">下一章</a>
+        </nav>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>Hermes Agent 源码阅读笔记。</p>
+      <a href="../">返回首页</a>
+    </footer>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral" });
+    </script>
+  </body>
+</html>
