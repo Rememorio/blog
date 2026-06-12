@@ -388,59 +388,146 @@
 
             <h2>六、自改进必须在交付之后发生</h2>
             <p>
-              现在可以谈“self-improving”了。很多人会把它想成模型边回答边反思，或者每轮结束都自动把对话总结成经验。
-              这两个想法都危险：前者会拖慢前台任务，后者会把一次性状态硬化成长期知识。Hermes 的做法更克制：先交付，再学习；
-              学习时还要用更窄的工具面。
+              前面讲完回合、状态账本和工具边界之后，才适合谈“self-improving”。否则这个词很容易被误解成：
+              模型一边回答一边反思自己，或者每轮结束都把整段对话总结成长期经验。听起来很聪明，实际会带来两个问题。
+              第一，当前任务还没交付，模型就开始分心判断“这件事值不值得记住”；第二，中间试错、临时路径和一次性日志可能被写成长期事实。
             </p>
 
             <figure class="figure">
               <img
                 src="./assets/self-improvement.png"
-                alt="Hermes 后台自改进路径图，展示 Task、Turn、Finalize、Answer 之后才进入 Review fork、Memory/Skill patch 和 Curator"
+                alt="Hermes 自改进流程图，展示 Answer、Finalizer、Nudge、Review fork、Write stores 和 Curator 的后置关系"
               />
               <figcaption>
-                前台回答先完成；review fork 和 curator 是后置维护路径，不应该抢当前任务的注意力。
+                先把当前回答交出去，再让受限的后台分支判断有没有东西值得沉淀。
               </figcaption>
             </figure>
 
-            <h3>6.1 Background review：同一套 runtime，窄工具面</h3>
             <p>
-              finalizer 在组装 result、执行 post hook、同步外部 memory 后，才判断是否触发 memory/skill review。源码在
+              可以从一个很普通的场景理解：你让 agent 修一个测试失败。它在过程中发现了项目的固定命令、你的提交偏好，
+              还试过几条最后没用上的路径。哪些应该留下？测试日志本身应该进 SessionDB；“以后这个项目先跑某个脚本”可能适合变成 skill；
+              “用户不希望自动改生成文件”可能适合进 Memory；那些走错的临时路径，则不该变成任何长期状态。
+            </p>
+
+            <p>
+              Hermes 的答案不是“每轮自动总结”，而是一条交付后的受控写账流程：当前 turn 先产出最终回答；
+              finalizer 只在满足条件时安排后台 review；review fork 只能使用 memory 和 skills 相关工具；
+              写入落到对应 store；之后的任务再通过正常的 memory 快照、skills 索引或检索路径看到这些变化。当前已经交付的回答不被改写，
+              主会话 transcript 也不会被后台 review 当场重写。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>步骤</th>
+                    <th>发生了什么</th>
+                    <th>为什么这样安排</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>1. 先交付</td>
+                    <td>前台回合完成工具调用和最终回答。</td>
+                    <td>用户要的是当前任务结果，不是等待模型自我总结。</td>
+                  </tr>
+                  <tr>
+                    <td>2. 再判断</td>
+                    <td>finalizer 看本轮是否有 final response、是否被 interrupt、memory/skill nudge 是否到点。</td>
+                    <td>避免每轮都跑后台学习，也避免失败或中断回合留下错误经验。</td>
+                  </tr>
+                  <tr>
+                    <td>3. 开后台分支</td>
+                    <td>background review 拿本轮 messages snapshot，fork 一个同配置的 <code>AIAgent</code> 回看刚才发生的事。</td>
+                    <td>它能看到本轮用户消息、assistant 回复、工具调用和工具结果，但不抢前台任务的上下文。</td>
+                  </tr>
+                  <tr>
+                    <td>4. 限制能写哪里</td>
+                    <td>review fork 只能调用 memory 和 skill 管理工具，外部 memory provider 也被跳过。</td>
+                    <td>自改进只允许写长期账本，不能变成另一个能随意操作环境的 agent。</td>
+                  </tr>
+                  <tr>
+                    <td>5. 以后再生效</td>
+                    <td>写入成功后，后续 turn 通过正常的 Memory / Skills 读取路径使用它。</td>
+                    <td>学习结果影响未来任务，而不是反过来篡改已经交付的这一轮。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以读 Hermes 的自进化，不要先问“模型有没有反思能力”，而要问四个更具体的问题：谁触发这次学习？它能看什么？
+              它能写到哪里？写完什么时候才会影响下一轮？源码里的 background review 和 curator，正好分别回答“单轮之后学什么”
+              和“长期技能库怎么整理”。
+            </p>
+
+            <h3>6.1 Finalizer：只在回答完成后排 review</h3>
+            <p>
+              先看触发点。finalizer 在组装 result、执行 post hook、同步外部 memory 后，才判断是否触发 memory/skill review。源码在
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_finalizer.py#L375-L401">review 触发</a>
               里能看到：只有有 final response、未被 interrupt、且 memory 或 skill nudge 触发时，才调用 <code>_spawn_background_review</code>。
+              这里的 nudge 不是模型突然想到“我该学习了”，而是 runtime 的节流信号：memory nudge 按用户回合数累计，skill nudge 按工具调用迭代数累计。
+              对应计数可以看
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_context.py#L184-L217"><code>turn_context.py</code></a>
+              和
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L516-L521"><code>conversation_loop.py</code></a>。
             </p>
 
+            <p>
+              如果前台 agent 已经主动用了 <code>memory</code> 或 <code>skill_manage</code>，对应计数会被重置；见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/tool_executor.py#L263-L273">工具执行前的计数重置</a>。
+              所以后台 review 不是固定税，而是“这段时间没有显式沉淀，且现在安全结束了，再检查一次”。finalizer 不让 review 参与“当前答案怎么写”，
+              只让它在答案完成后判断“这轮结果是否暴露了可复用信息”。
+              因此它不会因为后台学习而延迟用户看到回答，也不会让 review 中途改变前台 agent 的决策路线。
+            </p>
+
+            <h3>6.2 Review fork：同一套 runtime，窄工具面</h3>
             <p>
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L1-L17"><code>background_review.py</code> 的模块说明</a>
-              说得很清楚：fork 一个 agent 回看本轮对话，判断是否保存或更新 memory/skill；写入直接落到 store，主会话和 prompt cache 不被触碰。
-              真正构造 review agent 的逻辑在
+              把这个分支的职责写得很直接：它拿刚完成的 conversation snapshot，fork 一个 agent 回看本轮对话，判断是否应该保存或更新 memory / skill；
+              写入直接落到对应 store，主会话和 prompt cache 不被触碰。真正构造 review agent 的逻辑在
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L327-L416"><code>_run_review_in_thread</code></a>。
+              这里的 snapshot 不是只有最终答案，还包括本轮 history 里的工具调用和工具结果，所以 review 能区分“最后采用的做法”和“中途试过但失败的路径”。
             </p>
 
             <p>
-              这里有两个保护边界。第一，review fork 继承父 agent 的 provider、model、credential 等运行条件，但 <code>skip_memory=True</code>，
-              避免外部 memory provider 被 review harness 污染。第二，它设置 tool whitelist，只允许 memory 和 skills 相关工具；见
+              这个 fork 不是一个“第二个前台助手”。它继承父 agent 的 provider、model、credential、toolset 配置和 cached system prompt，
+              这样判断语境和请求形状尽量一致；但它用 <code>skip_memory=True</code> 避免外部 memory provider 把 review prompt 当成用户真实对话吸收进去。
+              同时，它把工具面收窄到 memory 和 skills，非白名单工具会在 runtime 被拒绝；见
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L470-L495">白名单和 run_conversation 调用</a>。
-              这让“学习”变成受控副作用，而不是另一个能随意操作世界的前台 agent。
+              这让“学习”变成受控副作用：它可以写账，但不能继续执行用户任务。
             </p>
 
-            <h3>6.2 Curator：不是每轮反思，而是空闲维护</h3>
             <p>
-              如果 background review 解决的是“这一轮之后是否有东西要沉淀”，curator 解决的是“长期技能库是否需要整理”。
+              写入之后也不是马上反向改写当前回合。Memory 写入会落盘，但当前 system prompt 里的 memory snapshot 仍然是本轮开始时的快照；
+              skill 变更会影响后续 skills 索引的构造或失效路径。换句话说，后台 review 的结果服务于下一次任务，不会把已经交付的答案重新加工一遍。
+            </p>
+
+            <p>
+              Review 完成后还会扫描自己的 tool 结果；只有真的创建或更新了 memory / skill，才向前台汇报一个很短的 self-improvement summary。
+              相关汇总逻辑在
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L516-L537">action summary</a>。
+              这也是一个产品细节：用户看到的是“沉淀了什么”，不是另一个冗长的后台推理过程。
+            </p>
+
+            <h3>6.3 Curator：不是每轮反思，而是长期整理</h3>
+            <p>
+              Background review 解决的是“这一轮之后是否有东西要沉淀”。但如果 agent 长期运行，skills 会越来越多：有的被频繁使用，
+              有的过期了，有的其实可以合并。这时需要的不是再看某一轮对话，而是整理整个技能库。Hermes 里的 curator 就是这个角色。
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L1-L20"><code>curator.py</code> 的文件说明</a>
               写明它会周期性 review agent-created skills，做 lifecycle 状态迁移，必要时 fork 一个 AIAgent 去 pin、archive、consolidate 或 patch 技能。
             </p>
 
             <p>
-              这不是“每轮都整理一次技能”。<code>should_run_now</code> 会检查 enabled、paused 和 interval gate；首次观察只播种 last_run_at，不立即运行，见
+              Curator 不是“每轮都整理一次技能”。<code>should_run_now</code> 会检查 enabled、paused 和 interval gate；首次观察只播种 last_run_at，不立即运行，见
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L198-L248"><code>should_run_now</code></a>。
               自动状态迁移会把长期未活跃技能标记 stale 或 archived，pinned 不动，见
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L255-L310"><code>apply_automatic_transitions</code></a>。
             </p>
 
             <p>
-              这一步再次体现 Hermes 的克制：短期任务由前台 turn 解决，单轮知识沉淀由 background review 解决，技能库长期卫生由 curator 解决。
-              三者都叫“改进”，但不共享同一个触发时机。
+              到这里，自进化的流程就完整了：短期任务由前台 turn 解决；单轮之后的偏好和流程沉淀由 background review 解决；
+              多轮累积后的技能库膨胀、过期和合并问题由 curator 解决。三者都叫“改进”，但触发时机、可见上下文和可写范围都不同。
             </p>
 
             <h2>七、多入口共享核心，但不能共享所有权限</h2>
