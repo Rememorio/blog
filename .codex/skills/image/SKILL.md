@@ -167,6 +167,25 @@ runtime responsibility. If the article already uses JSON examples for exact
 fields, the figure should show ownership, order, and consequence rather than
 duplicating the whole payload.
 
+For side paths such as background review, maintenance jobs, curator passes,
+subagents, asynchronous forks, or delayed writes, make sequence semantics
+unambiguous:
+
+- draw the foreground path as the main lane;
+- draw per-turn background work as a separate lane entered only after the
+  trigger point;
+- draw periodic or idle maintenance as another lane with its own schedule or
+  idle gate;
+- do not use a direct arrow when the relationship is accumulation, later
+  visibility, or shared storage rather than immediate execution;
+- use dotted or muted connectors only for loose dependencies, and label them
+  with short phrases such as `after answer`, `future turns`, or
+  `skills accumulate`.
+
+If a figure is meant to correct a misconception, design the layout so the wrong
+interpretation is hard to read from the arrows. For example, a periodic
+curator should not appear as the next step after every single-turn patch.
+
 Figures should expose the reason for a mechanism, not just its plumbing. When a
 diagram depicts a runtime choice, make the protected invariant visually clear:
 stable prefix, lossy projection, durable recovery point, ownership boundary, or
@@ -206,6 +225,10 @@ For source-code diagrams, keep visible labels short:
   callouts. Never place Chinese explanation text in a monospace-only font that
   can render missing-glyph boxes.
 - Maximum visible labels per figure: `10`; maximum words per label: `4`.
+- When a diagram is likely to be reused across language editions, prefer short
+  English labels and move localized explanation into alt text, captions, and
+  surrounding prose. Do not regenerate a figure solely to translate labels if
+  the existing labels are readable and language-neutral.
 
 Prompt pattern:
 
@@ -241,6 +264,11 @@ Use deterministic composition when accuracy requires it:
   bottom-right mark.
 - Export one final PNG for publication.
 - Keep source files near the article only when they are useful for regeneration.
+
+When using deterministic text overlays, fit labels by changing the wording and
+layout before shrinking text aggressively. Prefer shorter labels, wider boxes,
+separate lanes, or fewer callouts over tiny typography. After overlaying text,
+inspect the final raster at full size, not only as a contact sheet.
 
 Mandatory brand overlay protocol:
 
@@ -308,7 +336,11 @@ Inspect every generated figure before publishing:
 - No missing-glyph boxes, clipped words, accidental line breaks inside code
   identifiers, or forced wraps such as splitting `observation` across lines.
 - Labels do not escape boxes.
-- Arrows do not cross in confusing ways.
+- Labels, arrows, lane captions, and brand marks do not overlap.
+- Arrows do not cross in confusing ways, point to the wrong node, or imply a
+  sequence that the article says is only periodic, optional, or delayed.
+- Separate foreground, background, and maintenance paths visually when their
+  triggers and permissions differ.
 - The figure matches the article's source claims.
 - The Rememorio mark is one deterministic composited raster treatment,
   proportionally scaled and placed in the bottom-right. No image-model
@@ -325,6 +357,12 @@ Inspect every generated figure before publishing:
   decorative that it obscures the real mechanism.
 
 Regenerate or post-process if any item fails.
+
+For figures that use hand-drawn or script-like fonts, perform an extra
+readability pass. If the font makes letters ambiguous, pushes text into header
+bands, or creates awkward baselines, switch to a clearer hand-drawn font or
+reduce the label. A hand-drawn feel is secondary to legibility and correct
+mechanism flow.
 
 For article batches, create a temporary contact sheet of new figures beside the
 Wine-style reference images and inspect the set as one family. The batch should

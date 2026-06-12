@@ -79,6 +79,23 @@ what problem appears
 -> cache/context consequence
 ```
 
+For lifecycle sections that explain background work, forks, compaction,
+self-evolution, maintenance jobs, or any other side path, make the flow
+complete enough for a new reader to replay:
+
+- why the foreground path cannot do this work inline;
+- who triggers the side path and which gate or counter must fire;
+- what input snapshot the side path sees;
+- what it is allowed to read, write, or call;
+- what it is explicitly not allowed to touch;
+- whether it may do nothing;
+- where successful output is stored;
+- when later turns can observe the result.
+
+If a section still feels abstract, add a compact step table before diving into
+source names. The table should explain the product-level event first, then link
+the source mechanism that implements it.
+
 For multi-mechanism sections, do not leave the reader with only a taxonomy.
 Convert mechanism lists into pressure-and-invariant tables when useful:
 
@@ -127,6 +144,12 @@ but too detailed for the main flow, use an HTML `details` block with a precise
 `summary`. Good candidates for `details`: feature gates, version drift,
 visible-source limits, edge-case recovery, provider caveats, or "how this
 differs from a nearby concept" notes.
+
+When a reader-comprehension problem is raised, do a reader-review pass before
+rewriting. The review should list what a reasonable target reader still cannot
+answer, which terms arrive too early, and what sequence would make the section
+natural. If the user explicitly authorizes a subagent or outside reader, use it
+only for this bounded feedback; keep the final rewrite owned by the main pass.
 
 Protocol-shaped examples are mandatory when prose alone leaves too much
 ambiguity. For API/runtime articles, include small before/after request or
@@ -442,6 +465,24 @@ Keep the article's prose in the target publication language. For current
 Rememorio source-reading articles, Chinese prose is the default unless the
 article package already has a separate English source.
 
+For bilingual standalone articles in this static blog, prefer sibling language
+pages over in-page machine translation:
+
+- use `<article>/cn/` for Chinese and `<article>/en/` for English;
+- keep `<article>/` as a thin language gateway when both editions exist;
+- preserve old root anchors by redirecting root URLs with a hash to the Chinese
+  page while keeping the hash;
+- add `canonical` and `alternate hreflang` links for `zh-CN`, `en`, and
+  `x-default`;
+- add visible language switches in each edition's header;
+- update the blog index with explicit entries or labels for each public
+  language entry point.
+
+Write each language as a finished article in that language. Do not mechanically
+translate sentence by sentence when the target language needs different
+rhythm, transitions, or terminology. Keep the evidence, figures, source links,
+and claims aligned across editions.
+
 Figures may use concise English labels, source identifiers, and product terms
 even inside a Chinese article. This keeps diagrams legible, reduces generated
 text errors, and makes later English localization cheaper. Explain the meaning
@@ -452,6 +493,12 @@ carried by short English terms such as `model view`, `snapshot`, `fork`, or
 `ledger`. If a future English version is added, keep heading slugs, asset
 filenames, source links, and figure concepts stable so the translation can share
 the same evidence and visual package.
+
+When adding a new language edition, reuse existing figures when their labels
+are already concise, source-accurate, and language-neutral. Localize alt text,
+captions, headings, navigation, metadata, and surrounding prose. Regenerate a
+figure only when the visual claim, label semantics, or target-language
+readability actually changes.
 
 ## Terminology And Link Semantics
 
@@ -476,6 +523,15 @@ The linked target must be at the same abstraction level as the linked words.
   terms such as `runtime`, `provider contract`, `owner`, `projection`, or
   `ledger`. Use the English term directly when it is clearer and already
   carries the engineering meaning.
+- Keep reader-facing terminology consistent across title, guiding questions,
+  headings, alt text, captions, and conclusion. If the article chooses a local
+  Chinese term such as `自进化`, use it consistently for the concept; reserve
+  source literals such as `self-improvement review` for code, logs, or exact
+  product text.
+- Avoid stiff imported abstractions when a more natural Chinese phrase carries
+  the same meaning. Prefer plain reader-facing wording in headings and
+  transitions; keep specialized terms for places where the source or protocol
+  actually requires them.
 - When a category has competing vendor names, use the smallest stable category
   term in prose and link concrete product names to official docs. Do not
   foreground minor naming differences unless naming, taxonomy, or API surface is
@@ -582,6 +638,16 @@ For any article change:
 6. Verify desktop and mobile widths for overflow, cramped figures, and broken
    code/table scrolling.
 7. Keep the README public index current for new public entry points.
+
+For language-structure changes, also verify:
+
+- root gateway page, each language page, and the blog index all link to the
+  intended targets;
+- `hreflang`, canonical URLs, page titles, descriptions, Open Graph metadata,
+  and header language switches are present and language-correct;
+- old anchor links either still resolve or redirect to the new language page
+  with the hash preserved;
+- relative asset paths are correct from each language subdirectory.
 
 Before committing public article changes, run the smallest relevant validation
 that covers the edit:
