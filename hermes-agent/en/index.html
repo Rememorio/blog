@@ -1,0 +1,781 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hermes Agent: the Runtime Loop Behind a Self-Evolving Agent</title>
+    <meta
+      name="description"
+      content="A source-grounded walkthrough of how Hermes Agent organizes turns, model views, long-term state, background learning, and multi-surface runtime boundaries."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Hermes Agent: the Runtime Loop Behind a Self-Evolving Agent" />
+    <meta
+      property="og:description"
+      content="Start from the pressure of long-running agents, then follow Hermes Agent through turns, ledgers, tools, background review, curator, gateway, cron, and delegation."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/hermes-banner.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/hermes-agent/en/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/hermes-agent/cn/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/hermes-agent/en/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/hermes-agent/" />
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav aria-label="Page navigation">
+        <a href="../../">Home</a>
+        <a href="../cn/" lang="zh-CN">中文</a>
+        <a href="#sources">Sources</a>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Source Notes</p>
+            <h1>Hermes Agent: the Runtime Loop Behind a Self-Evolving Agent</h1>
+            <p class="lead">
+              The hard part of an agent is not the first answer. It is staying coherent after dozens of tool calls,
+              failed retries, history searches, memory updates, and background maintenance passes. Hermes Agent is
+              useful to read because its source lays that runtime loop out in the open.
+            </p>
+            <div class="meta-line">
+              <span>Source snapshot: NousResearch/hermes-agent</span>
+              <span>Topic: agent runtime</span>
+              <span>Scope: visible public source paths</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/hermes-banner.png"
+                alt="Overview of the Hermes Agent runtime loop, with AIAgent core, entry surfaces, state ledgers, and background learning"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Start with an ordinary coding session. You ask an agent to change a repository. It reads the README and
+              project rules, searches the code, edits files, and runs tests. A test fails, so it inspects the log, adds
+              an edge case, and runs again. In the middle you say, "For this project, do not edit generated files
+              directly." Later you ask it to find the failed command from earlier.
+            </p>
+
+            <p>
+              For a short chat, the easy answer is to append every message to history and send the whole history back to
+              the model. A long-running agent runs into pressure quickly: history expands, tool output overwhelms the
+              task, user preferences get mixed with one-off failures, and different entry surfaces begin to disagree.
+              The CLI remembers one thing, the gateway remembers another, and a cron job cannot ask the user a follow-up.
+            </p>
+
+            <p>
+              Hermes Agent describes itself in the
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/README.md#L18-L29">README feature map</a>
+              as a self-improving agent with a terminal UI, gateway, closed-loop learning, cron, delegation, and
+              trajectory tooling. Those names look broad, but they orbit one simpler question: how should an agent keep
+              the current task, durable history, long-term knowledge, and background learning in their proper places?
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                This article uses the public README, configuration, and visible source snapshot only. Direct claims come
+                from fixed source links. Design intent is inferred only where call chains, data shapes, or source
+                comments support it. README is the map; source is the mechanism. For example, the visible
+                <code>session_search</code> tool uses SQLite/FTS5 and returns real message windows. It does not call an
+                LLM inside that tool path.
+              </p>
+            </div>
+
+            <p>Read the article with five questions in mind:</p>
+
+            <ol>
+              <li>When a user message enters the system, what must Hermes preserve first?</li>
+              <li>Why is the model-visible view not the same thing as raw transcript history?</li>
+              <li>Why are memory, session search, and skills three ledgers instead of one memory bucket?</li>
+              <li>Why must background self-evolution happen after delivery, with a narrow tool surface?</li>
+              <li>How can CLI, gateway, cron, and delegation share one agent core while narrowing their own risks?</li>
+            </ol>
+
+            <p>
+              Once those questions connect, "self-evolving" stops sounding like a vague slogan. It becomes a state
+              discipline: deliver the current task first, write reusable material into the right ledger afterward, and
+              let future turns retrieve it according to source, lifetime, and risk.
+            </p>
+
+            <h2>1. Separate the surfaces first: an agent is not just chat history</h2>
+            <p>
+              The easiest mistake is to treat conversation history as the only source of truth. In Hermes, the UI view,
+              the durable transcript, the request payload sent to the model, and the background review's candidate
+              write-set are different surfaces.
+            </p>
+
+            <p>
+              A practical way to read the system is to split it into four lines: entry surfaces receive tasks, foreground
+              turns organize models and tools, durable storage preserves evidence, and long-term ledgers hold stable
+              preferences or reusable procedures. <code>AIAgent</code> sits in the middle because every entry surface
+              eventually has to return to the same turn lifecycle.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Surface</th>
+                    <th>Reader view</th>
+                    <th>Typical failure</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Entry surface</td>
+                    <td>CLI, TUI, gateway, cron, or a subagent starts a task.</td>
+                    <td>Each entry builds context differently and behavior diverges.</td>
+                  </tr>
+                  <tr>
+                    <td>Model view</td>
+                    <td>The actual messages, system prompt, tool schemas, and temporary context sent this turn.</td>
+                    <td>Transient recall leaks into stable prompt and breaks cache discipline.</td>
+                  </tr>
+                  <tr>
+                    <td>Real transcript</td>
+                    <td>Durable user messages, assistant messages, tool calls, and tool results.</td>
+                    <td>Summaries replace raw evidence, making later recovery brittle.</td>
+                  </tr>
+                  <tr>
+                    <td>Long-term ledgers</td>
+                    <td>Memory, SessionDB, and Skills hold different kinds of future-use state.</td>
+                    <td>Preferences, evidence, and procedures collapse into one vague memory.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>2. A turn has to survive before it can be clever</h2>
+            <p>
+              The foreground turn is the unit that keeps work recoverable. Hermes builds a clean user message, tracks
+              counters, prepares context, runs model/tool iterations, persists messages, finalizes the result, and only
+              then schedules background review. The entry point is visible in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L371-L461"><code>run_conversation</code></a>,
+              with per-turn state shaped by
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_context.py#L64-L130"><code>TurnContext</code></a>.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../assets/turn-loop.png"
+                alt="One Hermes foreground turn from user input through context, prompt, model, tools, finalization, persistence, sync, and review"
+              />
+              <figcaption>
+                A turn is not one model call. It is the recoverable lifecycle that surrounds model calls and tool calls.
+              </figcaption>
+            </figure>
+
+            <h3>2.1 The model view is not the raw transcript</h3>
+            <p>
+              The request the model sees is a projection. Hermes can prepend a system prompt, load project context,
+              attach memory snapshots, restore summaries, add tool schemas, and include current-turn recall. The raw
+              transcript remains the durable evidence, but the model view is assembled for the current decision.
+            </p>
+
+            <p>
+              This distinction matters because lossy transformations are useful only when they have an owner. A summary
+              can help fit the prompt, but it cannot replace the transcript for audit. A memory snapshot can guide the
+              model, but it should not become an unbounded log. A retrieved tool result can help one turn, but it should
+              not silently become a stable rule.
+            </p>
+
+            <h3>2.2 The end of a turn is a distribution point</h3>
+            <p>
+              Turn finalization is where Hermes decides what to return, what to persist, what to sync, and whether a
+              background review may run. The relevant hook lives in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_finalizer.py#L375-L401">the finalizer review trigger</a>.
+              That placement explains a lot of the design: current task delivery is foreground work; learning from the
+              turn is a post-delivery side effect.
+            </p>
+
+            <h2>3. The system prompt is not a junk drawer</h2>
+            <p>
+              If every useful fact gets pushed into the system prompt, the prompt becomes noisy and unstable. Hermes
+              builds the prompt in layers. Stable identity and tool guidance come first; project context and skill
+              indexes follow; volatile memory snapshots, user profile, provider blocks, dates, and session identifiers
+              come later. The visible source spans
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/system_prompt.py#L62-L79">the high-level structure</a>,
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/system_prompt.py#L85-L133">identity and tool guidance</a>,
+              and
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/system_prompt.py#L320-L401">context and volatile assembly</a>.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Layer</th>
+                    <th>What belongs there</th>
+                    <th>Invariant</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>stable</td>
+                    <td>Identity, tool instructions, skills index, platform notes, environment guidance.</td>
+                    <td>Keep the leading rules steady so repeated turns can reuse a stable prefix.</td>
+                  </tr>
+                  <tr>
+                    <td>context</td>
+                    <td>Caller system messages and project context files.</td>
+                    <td>Project facts have a source and do not merge with long-term memory.</td>
+                  </tr>
+                  <tr>
+                    <td>volatile</td>
+                    <td>Memory snapshot, user profile, provider block, date, session id.</td>
+                    <td>Dynamic state is visible, but not randomly rebuilt into the stable layer.</td>
+                  </tr>
+                  <tr>
+                    <td>turn-only</td>
+                    <td>External memory prefetch and plugin pre-LLM context.</td>
+                    <td>Current recall helps current reasoning without polluting transcript or stable prompt.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The takeaway is simple: important information does not automatically belong in the system prompt. Stable
+              rules can sit near the front; current-turn recall needs a current-turn lifetime.
+            </p>
+
+            <h2>4. Long-term state needs more than one ledger</h2>
+            <p>
+              Return to the opening scenario. "Do not edit generated files" is a preference. A failed test log is past
+              evidence. A repeatable release process is procedural knowledge. All three are things an agent may need
+              later, but they should not live in the same place.
+            </p>
+
+            <p>
+              Hermes splits durable state into Memory, SessionDB, and Skills. The split is not cosmetic. It prevents a
+              test log from becoming a user preference, a preference from being buried in transcript, and a one-off task
+              state from becoming a reusable procedure.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../assets/state-ledgers.png"
+                alt="Three Hermes state ledgers: Memory for facts, SessionDB for messages, and Skills for procedures"
+              />
+              <figcaption>
+                Memory, SessionDB, and Skills have different lifetimes: small facts, real evidence, and reusable process.
+              </figcaption>
+            </figure>
+
+            <h3>4.1 Memory holds small stable facts</h3>
+            <p>
+              Memory is for small facts that are likely to remain true: user preferences, environmental facts, and stable
+              constraints. The
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/memory_tool.py#L3-L24"><code>memory_tool.py</code> module note</a>
+              says the built-in memory uses <code>MEMORY.md</code> and <code>USER.md</code>, loaded as a frozen snapshot
+              at session start. Writes land on disk, but they do not immediately rewrite the current system prompt.
+            </p>
+
+            <p>
+              Writes are guarded. <code>MemoryStore.add</code> checks empty content, scans for leakage patterns, uses file
+              locks, reloads from disk, deduplicates, and enforces a character budget; <code>replace</code> rejects
+              ambiguous multi-match edits. The source paths are
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/memory_tool.py#L297-L347"><code>add</code></a>
+              and
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/memory_tool.py#L349-L390"><code>replace</code></a>.
+            </p>
+
+            <h3>4.2 SessionDB preserves real history</h3>
+            <p>
+              If you need the original failed command, that is not a long-term preference. It is evidence. Hermes'
+              <code>session_search</code> tool searches SQLite session history with FTS5 and returns real message windows;
+              the tool boundary is described in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/session_search_tool.py#L3-L29"><code>session_search_tool.py</code></a>.
+            </p>
+
+            <p>
+              Discovery calls <code>db.search_messages</code>, deduplicates by session lineage, and returns anchored
+              windows near each hit. The code is in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/session_search_tool.py#L393-L491"><code>_discover</code></a>.
+              The lower-level <code>SessionDB</code> schema creates FTS5 and trigram tables so message content, tool names,
+              and tool calls can be indexed; see
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/hermes_state.py#L527-L589"><code>hermes_state.py</code></a>.
+            </p>
+
+            <h3>4.3 Skills turn repeatable workflows into procedural memory</h3>
+            <p>
+              A skill is not just a note that says "remember this." It is a reusable procedure with a name, description,
+              file body, optional references, and lifecycle metadata. The prompt builder assembles the skills prompt from
+              available skill metadata in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/prompt_builder.py#L1101-L1125"><code>prompt_builder.py</code></a>.
+              Creating or patching a skill goes through
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/skill_manager_tool.py#L894-L984"><code>skill_manage</code></a>.
+            </p>
+
+            <p>
+              This is the right home for class-level process. A command sequence that works for one release should not
+              become a memory sentence. It needs procedure text, support files when useful, and patch semantics when the
+              workflow improves later.
+            </p>
+
+            <h2>5. Tool calls are not the model's private business</h2>
+            <p>
+              Tool calling can look like "the model asks for a tool and the tool runs." Hermes puts more runtime around
+              that moment. The executor separates concurrent and sequential paths; the concurrent path preserves original
+              tool-call order while appending results, and the sequential path handles stricter interaction cases. The
+              relevant code starts around
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/tool_executor.py#L243-L360"><code>execute_tool_calls_concurrent</code></a>
+              and
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/tool_executor.py#L770-L920">the sequential path</a>.
+            </p>
+
+            <p>
+              The more important boundary is runtime-owned dispatch. <code>session_search</code> needs SessionDB,
+              <code>memory</code> needs the built-in memory store and external-provider sync, and
+              <code>delegate_task</code> needs the agent's delegation dispatcher. That dispatch is visible in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/tool_executor.py#L964-L1125"><code>tool_executor.py</code></a>.
+            </p>
+
+            <p>
+              The model may request a tool, but the state boundary, audit trail, permission shape, and recovery semantics
+              belong to the runtime. Without that split, a temporary observation could become long-term memory, a search
+              could guess at past history instead of reading evidence, and delegated work could contaminate the parent
+              context.
+            </p>
+
+            <h2>6. Self-evolution must happen after delivery</h2>
+            <p>
+              After turns, ledgers, and tool ownership are clear, "self-evolving" becomes concrete. It should not mean
+              that the model reflects while answering, or that every turn is summarized into long-term knowledge. Both
+              designs are risky: the foreground task is delayed, and temporary trial paths can harden into future rules.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../assets/self-improvement.png"
+                alt="Hermes self-evolution flow: Answer, Finalizer, Nudge, Review fork, Write stores, and Curator"
+              />
+              <figcaption>
+                The answer is delivered first. A restricted background branch decides later whether anything deserves to be written down.
+              </figcaption>
+            </figure>
+
+            <p>
+              Use the coding-session example again. The agent finds a fixed project command, learns your commit
+              preference, and also tries several paths that turn out to be wrong. The test log belongs in SessionDB. A
+              repeatable project command may become a skill. A stable preference may become memory. The failed detours
+              should usually remain transcript only.
+            </p>
+
+            <p>
+              Hermes implements self-evolution as a controlled write after delivery. The foreground turn produces the
+              final answer. The finalizer checks whether review is allowed. A background review fork may look at the
+              completed turn snapshot. That fork can only call memory and skill-management tools. Successful writes land
+              in their stores, and later turns use them through the normal Memory and Skills paths. The already-delivered
+              answer is not rewritten.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Step</th>
+                    <th>What happens</th>
+                    <th>Why this shape matters</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>1. Deliver first</td>
+                    <td>The foreground turn finishes tool calls and returns a final answer.</td>
+                    <td>The user is waiting for the task result, not for self-summary.</td>
+                  </tr>
+                  <tr>
+                    <td>2. Check after</td>
+                    <td>The finalizer checks final response, interrupt status, and memory/skill nudge gates.</td>
+                    <td>Failed or interrupted turns do not become long-term lessons by accident.</td>
+                  </tr>
+                  <tr>
+                    <td>3. Fork review</td>
+                    <td>Background review receives the completed messages snapshot and forks a configured <code>AIAgent</code>.</td>
+                    <td>It can inspect user messages, assistant output, tool calls, and tool results without taking over the foreground turn.</td>
+                  </tr>
+                  <tr>
+                    <td>4. Narrow writes</td>
+                    <td>The review fork can only use memory and skill tools; external memory providers are skipped.</td>
+                    <td>Self-evolution can write ledgers, but it cannot become another environment-acting agent.</td>
+                  </tr>
+                  <tr>
+                    <td>5. Affect future turns</td>
+                    <td>Successful writes are read later through normal Memory or Skills paths.</td>
+                    <td>Learning changes future work, not the answer already delivered.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>6.1 Finalizer schedules review only after the answer</h3>
+            <p>
+              The trigger point is explicit. The finalizer assembles the result, runs post hooks, syncs external memory,
+              and only then checks whether memory or skill review should run. The code shows that review is spawned only
+              when there is a final response, the turn was not interrupted, and a memory or skill nudge gate fired; see
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_finalizer.py#L375-L401">the review trigger</a>.
+            </p>
+
+            <p>
+              The nudge is not the model deciding to learn. It is a runtime throttle. Memory nudge is counted by user
+              turns, visible in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_context.py#L184-L217"><code>turn_context.py</code></a>.
+              Skill nudge is counted by tool-call iterations, visible in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L516-L521"><code>conversation_loop.py</code></a>.
+              If the foreground agent already uses <code>memory</code> or <code>skill_manage</code>, the corresponding
+              counter resets in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/tool_executor.py#L263-L273">tool execution bookkeeping</a>.
+            </p>
+
+            <h3>6.2 Review fork reuses runtime, but narrows tools</h3>
+            <p>
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L1-L17"><code>background_review.py</code></a>
+              describes the job: replay a conversation snapshot in a forked agent and ask whether any memory or skill
+              should be saved or updated. Writes go straight to the memory and skill stores; the main conversation and
+              prompt cache are not touched.
+            </p>
+
+            <p>
+              The fork inherits the parent's provider, model, credentials, toolset configuration, and cached system
+              prompt, so it judges the turn under the same runtime conditions. But it runs with <code>skip_memory=True</code>
+              so external memory providers do not ingest the review harness as if it were user conversation. It also sets
+              a runtime whitelist to memory and skill tools; non-whitelisted tools are denied. The construction and
+              whitelist live in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L327-L416"><code>_run_review_in_thread</code></a>
+              and
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L470-L495">the whitelisted run call</a>.
+            </p>
+
+            <p>
+              After review finishes, Hermes scans the fork's tool results. Only successful memory or skill actions are
+              surfaced as a compact self-improvement summary; see
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L516-L537">the action summary code</a>.
+            </p>
+
+            <h3>6.3 Curator is long-term maintenance, not per-turn reflection</h3>
+            <p>
+              Background review answers "did this turn reveal something worth saving?" Curator answers a different
+              question: "is the skill library still healthy after many turns?" Some skills are active, some are stale,
+              some overlap, and some need patching or archiving.
+            </p>
+
+            <p>
+              The curator module says it periodically reviews agent-created skills, applies lifecycle transitions, and
+              may fork an AIAgent to pin, archive, consolidate, or patch skills. Its invariants are listed in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L1-L20"><code>curator.py</code></a>.
+              It is not a per-turn cleanup pass. <code>should_run_now</code> checks enabled, paused, and interval gates;
+              first observation seeds <code>last_run_at</code> rather than mutating immediately. See
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L198-L248"><code>should_run_now</code></a>
+              and
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L255-L310"><code>apply_automatic_transitions</code></a>.
+            </p>
+
+            <h2>7. Multiple entry surfaces share the core, but not every permission</h2>
+            <p>
+              Hermes is not only a CLI. The source also includes gateway, cron, and delegation paths. If each entry
+              surface owned its own agent loop, state discipline would fragment. Hermes instead routes them toward the
+              same core while narrowing each surface's permissions.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../assets/runtime-surfaces.png"
+                alt="Multiple Hermes runtime surfaces: CLI/TUI, Gateway, Cron, Subagents, and Curator connect to AIAgent core and state stores"
+              />
+              <figcaption>
+                Entry surfaces share the core runtime, but each one trims context and tools to fit its risk profile.
+              </figcaption>
+            </figure>
+
+            <h3>7.1 Gateway turns platform context into prompt boundaries</h3>
+            <p>
+              Gateway has to carry platform details such as channel, user, thread, attachments, and response routing.
+              <code>SessionContext</code> stores per-session state for that surface; see
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/gateway/session.py#L160-L250"><code>gateway/session.py</code></a>.
+              Gateway should not become a separate agent. It should translate platform context into the boundaries the
+              core runtime already understands.
+            </p>
+
+            <h3>7.2 Cron narrows tools because no one is there to answer</h3>
+            <p>
+              Cron is non-interactive. It cannot rely on clarification, chat repair, or a human watching every tool
+              prompt. The scheduler defines a narrower default toolset in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/cron/scheduler.py#L61-L81"><code>cron/scheduler.py</code></a>,
+              excluding interaction-heavy tools such as <code>clarify</code> and <code>send_message</code>. That is not a
+              convenience choice. It is the runtime acknowledging that non-interactive work needs a smaller permission
+              surface.
+            </p>
+
+            <h3>7.3 Delegation isolates exploration and returns a summary</h3>
+            <p>
+              Delegation solves a different context pressure: the parent agent should not absorb every exploratory
+              detail. <code>delegate_task</code> states that child agents have isolated context, restricted toolsets, and
+              their own terminal sessions. The parent blocks until completion, but it receives the delegation call and
+              summary result, not the child's full intermediate reasoning and tool stream; see
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/delegate_tool.py#L3-L17"><code>delegate_tool.py</code></a>.
+            </p>
+
+            <p>
+              Child agents are also restricted by default. <code>DELEGATE_BLOCKED_TOOLS</code> blocks tools such as
+              <code>delegate_task</code>, <code>clarify</code>, <code>memory</code>, <code>send_message</code>, and
+              <code>execute_code</code>; see
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/delegate_tool.py#L44-L53"><code>DELEGATE_BLOCKED_TOOLS</code></a>.
+              The subagent construction also uses <code>skip_context_files=True</code>, <code>skip_memory=True</code>, and
+              an independent iteration budget; see
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/delegate_tool.py#L932-L1012">role and toolset calculation</a>
+              and
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/delegate_tool.py#L1140-L1171">AIAgent construction</a>.
+            </p>
+
+            <h2>8. Return to the practical question: where should information live?</h2>
+            <p>
+              The opening scenario now has a concrete answer. A user preference, a failed command, a long tool output, a
+              reusable process, and a temporary task state are not all "memory." Hermes first classifies the information,
+              then decides which ledger owns it and when the model should see it again.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../assets/decision-map.png"
+                alt="Hermes decision map for placing facts, past turns, workflows, and task state into Memory, SessionDB, Skill, or Transcript"
+              />
+              <figcaption>
+                Decide by lifetime and future use before choosing Memory, SessionDB, Skill, or transcript only.
+              </figcaption>
+            </figure>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Information</th>
+                    <th>Home</th>
+                    <th>Reason</th>
+                    <th>If misplaced</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Long-term user preference or small environment fact</td>
+                    <td>Memory</td>
+                    <td>Small, stable, auditable, and suitable for a session snapshot.</td>
+                    <td>If left only in transcript, it may be hard to find later.</td>
+                  </tr>
+                  <tr>
+                    <td>Past tool output or full conversation evidence</td>
+                    <td>SessionDB / session_search</td>
+                    <td>The real message window matters more than a summary.</td>
+                    <td>If written to memory, one-time evidence becomes a fake rule.</td>
+                  </tr>
+                  <tr>
+                    <td>Reusable method for future tasks</td>
+                    <td>Skills</td>
+                    <td>Procedural memory needs an index, body, and patch semantics.</td>
+                    <td>If written as memory, the model gets a conclusion but not a process.</td>
+                  </tr>
+                  <tr>
+                    <td>Current task progress, temporary failures, exploration</td>
+                    <td>Transcript only</td>
+                    <td>Useful for recovery, but not stable enough to harden.</td>
+                    <td>If saved too early, future tasks inherit false constraints.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>8.1 Four common misreadings</h3>
+            <p>
+              First, memory is not the home for all history. Memory has budgets, scans, frozen snapshots, and manual
+              semantics. Session search is the path for real past evidence.
+            </p>
+
+            <p>
+              Second, skills are not "one experience note per task." The skill system emphasizes class-level workflows,
+              patching existing skills, and support files.
+            </p>
+
+            <p>
+              Third, background review is not part of the main answer. The finalizer placement shows it happens after
+              final response. Gateway also queues review summaries after delivery.
+            </p>
+
+            <p>
+              Fourth, cron is not ordinary chat automation. Cron narrows interactive tools, assembles prompt context
+              differently, and supports a no-agent script path. Non-interactive entry surfaces need stricter defaults.
+            </p>
+
+            <h2>9. Conclusion: self-evolution is state discipline, not the word "reflection"</h2>
+            <p>
+              The value in Hermes Agent's source is not the number of feature names attached to "self-evolving." It is
+              the way the runtime separates the state boundaries that long-running agents usually blur: current turn,
+              model view, durable transcript, small facts, searchable history, procedural skills, background review,
+              idle curator, and entry-surface policy.
+            </p>
+
+            <p>
+              A reader new to Hermes only needs to keep one sentence: an agent's long-term capability is not remembering
+              everything, but knowing when each kind of information should appear, in which view, and whether it should
+              be written down after the turn ends.
+            </p>
+
+            <pre><code class="language-text">Facts should be small and auditable.
+Evidence stays in transcript.
+Workflows become skills.
+Current-turn recall does not pollute stable prompt.
+Background learning happens after response delivery.</code></pre>
+
+            <p>
+              That is the reusable lesson: do not keep stretching one giant prompt. Assign every state an owner, a
+              lifetime, and a recovery path. The hard part of a long-running agent is the boundary between those
+              lifetimes.
+            </p>
+
+            <h2 id="sources">Source References</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/NousResearch/hermes-agent/tree/3edd09a46f721c19e47ab39aad08ce8d3e61ee20">Fixed source snapshot: NousResearch/hermes-agent</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/README.md#L18-L29">README feature map</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/pyproject.toml#L8-L20">pyproject package metadata</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L371-L461">run_conversation entry</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_context.py#L64-L130">TurnContext definition</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/system_prompt.py#L62-L79">system prompt layers</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/tool_executor.py#L964-L1125">runtime-owned tool dispatch</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_finalizer.py#L375-L401">finalizer review trigger</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/memory_tool.py#L3-L24">Memory tool note</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/session_search_tool.py#L3-L29">Session search tool note</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/hermes_state.py#L527-L589">SessionDB FTS5 schema</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/prompt_builder.py#L1101-L1125">skills prompt construction</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/skill_manager_tool.py#L894-L984">skill_manage</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L327-L416">background review fork</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L1-L20">curator invariants</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/gateway/session.py#L160-L250">gateway SessionContext</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/cron/scheduler.py#L61-L81">cron toolset boundary</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/tools/delegate_tool.py#L3-L17">delegation architecture note</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
