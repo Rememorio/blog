@@ -14,13 +14,13 @@ pipeline.
 
 Codex Source Notes is a bilingual source-reading series on
 [openai/codex](https://github.com/openai/codex). It starts by following one
-ordinary user turn through the governed runtime, then drills into context,
+ordinary user request through the runtime path, then drills into context,
 tools, permissions, client projection, and recovery as separate mechanisms.
 
 - Language gateway:
   [rememorio.github.io/blog/codex/](https://rememorio.github.io/blog/codex/)
 - Chinese overview:
-  [Codex 源码阅读（一）：从一次 turn 看懂受控运行时](https://rememorio.github.io/blog/codex/zh/overview/)
+  [Codex 源码阅读（一）：先跟一次请求走完整条运行主线](https://rememorio.github.io/blog/codex/zh/overview/)
 - English overview:
   [Codex Source Notes I: Follow One Turn Through the Governed Runtime](https://rememorio.github.io/blog/codex/en/overview/)
 - Chinese context management:
@@ -50,16 +50,16 @@ background review, curator, gateway, cron, and delegation.
 ├── index.html                  # Blog home page
 ├── codex/
 │   ├── index.html              # Language gateway
-│   ├── cn/index.html           # Chinese series index
-│   ├── cn/overview/            # Chinese series overview article
-│   ├── cn/context-management/  # Chinese context-management article
+│   ├── zh/index.html           # Chinese series index
+│   ├── zh/overview/            # Chinese series overview article
+│   ├── zh/context-management/  # Chinese context-management article
 │   ├── en/index.html           # English series index
 │   ├── en/overview/            # English series overview article
 │   ├── en/context-management/  # English context-management article
 │   └── assets/*.png            # Final raster figures
 ├── hermes-agent/
 │   ├── index.html              # Language gateway
-│   ├── cn/index.html           # Chinese edition
+│   ├── zh/index.html           # Chinese edition
 │   ├── en/index.html           # English edition
 │   ├── styles.css              # Shared article styling
 │   └── assets/*.png            # Final raster figures
