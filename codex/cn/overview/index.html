@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex 源码阅读（一）：从一次 turn 看懂受控运行时</title>
+    <meta
+      name="description"
+      content="Codex 源码阅读系列总览：沿一次用户请求拆解 openai/codex 的入口、typed protocol、session、turn、context、model stream、tool authority 和 evidence projection。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex 源码阅读（一）：从一次 turn 看懂受控运行时" />
+    <meta
+      property="og:description"
+      content="不从文件树开始，而是跟一条普通请求走完 Codex 的受控 agent runtime。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/codex-turn-runtime-overview.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/cn/overview/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/cn/overview/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/overview/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav aria-label="页面导航">
+        <a href="../../../">首页</a>
+        <a href="../">Codex 系列</a>
+        <a href="../../en/overview/" lang="en">English</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex 源码阅读 · 第一篇</p>
+            <h1>从一次 turn 看懂 Codex：它不是聊天壳，而是受控运行时</h1>
+            <p class="lead">
+              读 Codex 源码，最容易走偏的方式是从目录树开始。更稳的办法是拿一条普通请求，
+              追问它离开 UI 以后由谁接住、谁拥有上下文、谁能批准副作用、最后哪些证据会留下来。
+            </p>
+            <div class="meta-line">
+              <span>项目：openai/codex</span>
+              <span>主题：series overview</span>
+              <span>范围：公开源码与官方文档</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/codex-turn-runtime-overview.png"
+                alt="Codex turn runtime 总览图，展示 client、Submission、Session、Turn、Context、Model、Tool Gate、Events 和 Evidence 的关系"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先想一个非常日常的请求：你让 Codex 在当前仓库修一个 bug，必要时跑测试。
+              如果它只是“聊天界面加模型”，实现上把这句话发给模型、把回复流回来就够了。
+              但真正的 coding agent 不能这么简单。它可能要读文件、改文件、跑命令、处理测试输出、遵守
+              <code>AGENTS.md</code>、等待审批、在 sandbox 里重试、把工具结果送回模型，还要让 UI 看到可靠的进度。
+            </p>
+
+            <p>
+              所以源码阅读的第一步，不是问“哪个目录最重要”，而是问：
+              <strong>一条用户请求进入系统后，下一步由哪个 owner 做决定？</strong>
+              owner 在这里不是权限头衔，而是负责某个状态和边界的运行时组件。请求每换一次 owner，
+              我们就换一个源码视角。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这篇总览的核心判断是：Codex 不是一个 UI 壳，也不是模型直接操控文件系统。
+                它更像一个 <strong>受控 agent runtime</strong>：入口只接收意图，protocol 负责类型化，
+                session/turn 拥有运行状态，tool gate 才能把模型请求变成副作用，event/rollout 留下可展示和可恢复的证据。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文把官方文档当作产品层契约，把 openai/codex 的公开源码当作机制证据。
+                源码链接固定到同一个公开快照。像“受控运行时”“owner”“projection”这类词，是从可见类型、
+                函数和调用边界归纳出的工程读法，不是对 OpenAI 私有服务拓扑的断言。
+              </p>
+            </div>
+
+            <p>
+              这篇的阅读契约也很具体：读完以后，你应该能把一次普通 turn 复述成一条链路，
+              而不是一堆目录名。我们只追五个问题：
+            </p>
+            <ol>
+              <li>为什么入口代码不是架构本身？</li>
+              <li>用户意图离开入口后，由什么 typed carrier 承载？</li>
+              <li>哪一个对象真正拥有 turn 的上下文、取消、模型流和工具循环？</li>
+              <li>为什么模型输出不能直接等同于文件修改或命令执行？</li>
+              <li>客户端看到的进度，为什么只是运行时证据的一种 projection？</li>
+            </ol>
+
+            <h2>一、先跟一条请求走，而不是先逛目录</h2>
+            <p>
+              Codex 的仓库足够大，任何入口都能让人觉得自己摸到了核心。你可以从 CLI 读到命令解析，
+              从 TUI 读到状态渲染，从 app-server 读到多客户端协议，从 tools 读到 shell 和 patch，
+              从 sandbox 读到权限隔离。问题是，这些都是真的，但都不是单独的全貌。
+            </p>
+
+            <p>
+              更好的路线是从“修一个 bug”这条请求出发。每一步只问当前 owner 已经做完什么，
+              它把什么 typed fact 交给下一个 owner。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>turn 阶段</th>
+                    <th>阅读问题</th>
+                    <th>先看哪里</th>
+                    <th>后续文章</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>入口</td>
+                    <td>哪个产品面接收请求，它拒绝在本地决定什么？</td>
+                    <td>CLI、TUI、app-server、MCP server、remote-control。</td>
+                    <td>入口与多客户端。</td>
+                  </tr>
+                  <tr>
+                    <td>typed carrier</td>
+                    <td>意图被包装成哪个 operation，输出又以哪个 event 返回？</td>
+                    <td><code>Submission</code>、<code>Op</code>、<code>Event</code>、<code>EventMsg</code>。</td>
+                    <td>protocol 与事件流。</td>
+                  </tr>
+                  <tr>
+                    <td>session / turn</td>
+                    <td>谁拥有上下文、取消、pending input、模型流和工具循环？</td>
+                    <td><code>Codex</code> facade、<code>Session</code>、<code>run_turn</code>。</td>
+                    <td>session 与 turn loop。</td>
+                  </tr>
+                  <tr>
+                    <td>context / model</td>
+                    <td>哪本账被保存，哪一份 view 被送进模型？</td>
+                    <td><code>ContextManager</code>、<code>TurnContext</code>、<code>for_prompt()</code>。</td>
+                    <td>上下文管理。</td>
+                  </tr>
+                  <tr>
+                    <td>tool authority</td>
+                    <td>模型请求行动时，谁能审批、拒绝、sandbox、重试和记录输出？</td>
+                    <td><code>ToolRouter</code>、<code>ToolOrchestrator</code>、exec、apply_patch、hooks。</td>
+                    <td>工具、权限与 sandbox。</td>
+                  </tr>
+                  <tr>
+                    <td>projection / evidence</td>
+                    <td>UI 看到的内容和持久证据如何分开？</td>
+                    <td>events、turn items、rollout、app-server 映射、TUI rendering。</td>
+                    <td>客户端投影与恢复。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这张表不是目录，而是一个读源码时的换挡规则：当 owner 变了，文件就该换；
+              当 owner 没变，继续读当前层。这样不容易把“我最先看懂的文件”误当成系统中心。
+            </p>
+
+            <h2>二、入口只接收意图，protocol 才是第一道边界</h2>
+            <p>
+              Codex 暴露很多入口，这是产品事实；但源码里的第一道架构边界不是某一个入口，
+              而是入口把请求变成 typed operation 的那一刻。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2525-L2535"><code>SessionSource</code></a>
+              已经把 <code>Cli</code>、<code>VSCode</code>、<code>Exec</code>、<code>Mcp</code>、<code>SubAgent</code>
+              等来源放在同一个会话来源枚举里。这个枚举的意义不是“入口很多”这么简单，
+              而是告诉我们：入口是来源标签，后面还要进入共享 runtime。
+            </p>
+
+            <h3>2.1 <code>Submission</code> / <code>Op</code> 把意图变成 typed data</h3>
+            <p>
+              在 protocol 层，
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L154-L165"><code>Submission</code></a>
+              不是一段聊天文本。它有 <code>id</code>、<code>op</code>、可选的客户端消息 id 和 trace。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L477-L540"><code>Op</code></a>
+              也不是单一的 prompt 字段：它可以表示用户输入、thread settings、approval、interrupt、realtime conversation、
+              tool refresh 等不同操作。
+            </p>
+
+            <p>
+              这就把用户请求从 UI 句子提升成了 runtime work item。比如“修 bug”可能同时带着当前 cwd、
+              thread settings、额外上下文、输出 schema 或审批策略。源码阅读到这里就不能再说“用户发了一句话”，
+              更准确的是：入口提交了一个带 id 的 typed operation。
+            </p>
+
+            <h3>2.2 <code>Codex</code> facade 是 queue pair，不是 UI 组件</h3>
+            <p>
+              typed operation 进入 core 后，会落到高层
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L382-L390"><code>Codex</code></a>
+              facade。这个结构持有 <code>tx_sub</code>、<code>rx_event</code>、agent status 和 session。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L693-L742"><code>submit()</code></a>
+              给 operation 生成 submission id 并送入队列；
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L767-L774"><code>next_event()</code></a>
+              从事件队列取回运行时输出。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这就是 Codex 的第一条不变量：<strong>客户端提交 operation，运行时返回 event。</strong>
+                只要抓住这个 queue pair，就不会把某个 UI 的状态管理误读成 agent runtime 的真相。
+              </p>
+            </div>
+
+            <h2>三、turn 才是 agent runtime 的控制单元</h2>
+            <p>
+              进入 session 之后，真正把上下文、模型、工具和取消揉在一起的，是 turn。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L123-L144"><code>run_turn</code></a>
+              的注释说得很朴素：每次 sampling request 里，模型要么返回 function calls，要么返回 assistant message；
+              如果是 function call，runtime 执行工具并把 output 放进下一次 sampling；如果只是 assistant message，
+              就记录历史并认为 turn 完成。
+            </p>
+
+            <p>
+              这段代码的关键不是“它循环调用模型”，而是循环前后的 owner 边界。turn 开始先跑 pre-sampling compact，
+              再记录上下文更新、构建 skills/plugins 注入项、跑 session start hooks、记录输入、设置上一轮配置，
+              进入循环后才从 history 投影出 <code>for_prompt()</code> 的模型输入。
+            </p>
+
+            <pre><code class="language-text">one user turn, shape-level:
+  submit typed Op
+  -> session accepts Submission
+  -> run_turn owns this request
+  -> update context / skills / hooks
+  -> project history into model input
+  -> stream model response
+  -> execute requested tools through authority gates
+  -> emit events and durable evidence</code></pre>
+
+            <p>
+              turn 的上下文也不是一条消息。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L57-L108"><code>TurnContext</code></a>
+              持有模型、cwd、权限、approval policy、sandbox、技能上下文、输出 schema、环境信息、网络策略和 session source。
+              它像本轮运行的结构化快照。第二篇会专门讲它怎样进入 context ledger，这里只先记住一点：
+              <strong>turn 是运行单元，不是聊天轮次的别名。</strong>
+            </p>
+
+            <h2>四、模型输出只是请求，tool gate 才能给权限</h2>
+            <p>
+              现在看最容易误读的一步：模型让 Codex “执行命令”或“修改文件”。
+              严格说，模型并没有直接获得执行权。它只能在 model-visible tool specs 允许的范围内提出 tool call。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L999-L1017"><code>build_prompt()</code></a>
+              把投影后的 input、<code>router.model_visible_specs()</code>、parallel tool call 能力、base instructions、
+              personality 和 output schema 合成 <code>Prompt</code>。工具 schema 在这里是模型可见能力，不是执行结果。
+            </p>
+
+            <p>
+              这份 schema 来自
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L1128-L1226"><code>built_tools()</code></a>
+              和
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/router.rs#L34-L61"><code>ToolRouter</code></a>：
+              MCP tools、plugins、apps、dynamic tools 和 extension executors 会被合并成一套 turn-scoped router。
+              当模型真的返回 tool call 时，
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/router.rs#L147-L223">router dispatch</a>
+              才把调用交给注册的工具执行器。
+            </p>
+
+            <p>
+              更关键的是执行前还有 authority 层。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L1-L7"><code>ToolOrchestrator</code> 文件头</a>
+              直接把顺序写出来：approval、select sandbox、attempt、sandbox denial 后升级重试。
+              在具体实现里，
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L137-L265">orchestrator</a>
+              会先根据 approval policy、filesystem sandbox policy 和工具自己的 requirement 做审批判断，
+              再选择初始 sandbox，并把 workspace roots、网络策略和平台 sandbox 参数一起带到 attempt。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                所以“模型改了文件”只是用户视角的简写。源码视角应该说：
+                <strong>模型提出 tool call，runtime 经过 router、approval、hooks、sandbox 和具体 handler 才可能产生副作用。</strong>
+              </p>
+            </div>
+
+            <h2>五、客户端看到的是 projection，不是唯一事实源</h2>
+            <p>
+              runtime 运行时会不断发事件。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1149-L1164"><code>Event</code> 和 <code>EventMsg</code></a>
+              把输出也类型化：warning、context compacted、thread rolled back、turn started、turn complete、
+              agent message delta、tool call、token count、hook lifecycle 等都不是一段无结构日志。
+              客户端可以把它们渲染成聊天气泡、进度条、diff、审批弹窗或状态文本，但这些 UI 形态只是 projection。
+            </p>
+
+            <p>
+              还有另一种更耐久的证据：
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2890"><code>RolloutItem</code></a>
+              会保存 session metadata、response items、compacted records、turn context 和 event messages。
+              这就是为什么后面讲 resume、rollback、compact 时不能只看 UI 上还显示了什么。
+              UI 是当前投影，rollout 才是恢复和审计时要回放的证据层之一。
+            </p>
+
+            <h2>六、这个系列会怎么拆</h2>
+            <p>
+              总览篇只负责建立路线。后面的文章会沿同一条 turn 链路，一次只拆一个 owner。
+              这样读起来不会变成“源码百科”，也不会把所有概念一次性塞满。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>篇章</th>
+                    <th>核心问题</th>
+                    <th>主线 owner</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>一、总览</td>
+                    <td>一次用户 turn 如何穿过入口、protocol、runtime、tool gate 和 evidence？</td>
+                    <td><code>Submission</code>、<code>Codex</code>、<code>run_turn</code>、<code>ToolOrchestrator</code>。</td>
+                    <td>本文。</td>
+                  </tr>
+                  <tr>
+                    <td>二、上下文管理</td>
+                    <td>为什么 context 不是聊天记录，而是可投影、可压缩、可恢复的 ledger？</td>
+                    <td><code>ContextManager</code>、<code>TurnContext</code>、<code>for_prompt()</code>、compaction。</td>
+                    <td><a href="../context-management/">已发布</a>。</td>
+                  </tr>
+                  <tr>
+                    <td>三、protocol 与事件流</td>
+                    <td>客户端和 runtime 如何用 typed request/event 维持同一套事实？</td>
+                    <td><code>Op</code>、<code>EventMsg</code>、app-server protocol、generated schema。</td>
+                    <td>计划。</td>
+                  </tr>
+                  <tr>
+                    <td>四、工具系统</td>
+                    <td>工具 schema 如何进入模型，tool call 又怎样被分发、并行和归档？</td>
+                    <td><code>ToolRouter</code>、registry、MCP、dynamic tools、extension tools。</td>
+                    <td>计划。</td>
+                  </tr>
+                  <tr>
+                    <td>五、权限与 sandbox</td>
+                    <td>模型请求副作用时，审批、hooks、sandbox、exec policy 分别拦在哪里？</td>
+                    <td><code>ToolOrchestrator</code>、exec policy、hooks、sandboxing、apply_patch。</td>
+                    <td>计划。</td>
+                  </tr>
+                  <tr>
+                    <td>六、客户端投影</td>
+                    <td>TUI、app-server 和持久记录如何展示同一套运行时证据？</td>
+                    <td>event mapping、turn items、rollout、thread status。</td>
+                    <td>计划。</td>
+                  </tr>
+                  <tr>
+                    <td>七、扩展与多 agent</td>
+                    <td>skills、plugins、MCP、subagents 怎样作为 turn-scoped 注入，而不是另起一套混乱循环？</td>
+                    <td>skills manager、plugins manager、MCP exposure、multi-agent session source。</td>
+                    <td>计划。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>七、几个常见误读</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>误读</th>
+                    <th>更准确的读法</th>
+                    <th>为什么重要</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>CLI 是 Codex 的架构中心。</td>
+                    <td>CLI 是入口之一；进入 runtime 后靠 <code>Submission</code> 和 <code>Event</code> 交接。</td>
+                    <td>否则会把参数解析误当成 session/turn 语义。</td>
+                  </tr>
+                  <tr>
+                    <td>turn 就是聊天里的一问一答。</td>
+                    <td>turn 是控制单元，里面可能有多次 sampling、工具调用、pending input 和 compact。</td>
+                    <td>否则看不懂为什么一次用户请求里会有多个模型请求。</td>
+                  </tr>
+                  <tr>
+                    <td>模型直接运行命令。</td>
+                    <td>模型只提出 tool call，执行权在 router、approval、hooks、sandbox 和 handler。</td>
+                    <td>否则会漏掉最关键的安全和可审计边界。</td>
+                  </tr>
+                  <tr>
+                    <td>UI 看到的历史就是 runtime truth。</td>
+                    <td>UI 是 event 和状态的 projection；恢复还要看 rollout、history 和 turn context。</td>
+                    <td>否则 resume、rollback、compact 都会被误读成显示层行为。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>八、可以带走的规则</h2>
+            <p>
+              如果以后读别的 agent 系统，也可以先拿这套问题去试：
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>阅读动作</th>
+                    <th>先问什么</th>
+                    <th>保护什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>读入口</td>
+                    <td>它把意图交给哪个 typed carrier？</td>
+                    <td>不把 UI 文本误读成 runtime work。</td>
+                  </tr>
+                  <tr>
+                    <td>读 runtime</td>
+                    <td>谁拥有上下文、取消、状态变更和完成条件？</td>
+                    <td>找到真正的控制点，而不是停在调用模型的那一行。</td>
+                  </tr>
+                  <tr>
+                    <td>读工具</td>
+                    <td>模型输出到副作用之间有哪些 gate？</td>
+                    <td>把能力暴露、审批、sandbox、执行和证据分开。</td>
+                  </tr>
+                  <tr>
+                    <td>读客户端</td>
+                    <td>屏幕上看到的内容来自哪些 event 和持久记录？</td>
+                    <td>区分展示层、恢复层和模型可见层。</td>
+                  </tr>
+                  <tr>
+                    <td>读系列文章</td>
+                    <td>这一篇正在解释哪一个 owner？</td>
+                    <td>避免所有概念同时展开，保持循序渐进。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              下一篇就从这条链路里的 <strong>context owner</strong> 开始。
+              Codex 的上下文不是简单聊天记录，而是一个能投影给模型、能被 compact 重写、能从 rollout 恢复的运行时账本。
+              只有先看完这张总览图，第二篇里的 <code>ContextManager</code>、<code>TurnContext</code> 和
+              <code>for_prompt()</code> 才不会变成孤立名词。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex 固定源码快照</a></li>
+              <li><a href="https://developers.openai.com/codex">Codex 官方文档总览</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L154-L165">Submission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L477-L540">Op</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1149-L1164">Event / EventMsg</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2525-L2535">SessionSource</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L382-L390">Codex facade</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L693-L742">submit / submit_with_id</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L767-L774">next_event</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L123-L230">run_turn 主线</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L57-L108">TurnContext</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L999-L1017">build_prompt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L1128-L1226">built_tools</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/router.rs#L34-L61">ToolRouter</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L1-L7">ToolOrchestrator 顺序</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2890">RolloutItem</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
