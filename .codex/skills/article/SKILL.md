@@ -45,17 +45,21 @@ private notes, or hidden prompt context to understand the argument.
 Preferred flow:
 
 1. Start with the practical problem and why it matters.
-2. Define the mental model before naming internal mechanisms.
-3. Introduce provider or platform contracts before source-code consequences.
-4. Walk source mechanisms in execution order.
-5. Use examples at every boundary where readers are likely to confuse concepts.
-6. End with a comparison table or distilled operational rules.
+2. Translate the first necessary terms into reader-facing language before using
+   dense product, protocol, or source identifiers.
+3. Define the mental model before naming internal mechanisms.
+4. Introduce provider or platform contracts before source-code consequences.
+5. Walk source mechanisms in execution order.
+6. Use examples at every boundary where readers are likely to confuse concepts.
+7. Surface common misreadings near the mechanism that creates them, then end
+   with a comparison table or distilled operational rules.
 
 For source-comparison articles, the default long-form arc is:
 
 ```text
 practical pressure
 -> central thesis
+-> minimal vocabulary or reading contract
 -> 3 to 5 guiding questions
 -> mental model
 -> provider/platform contract
@@ -78,6 +82,13 @@ what problem appears
 -> what breaks without this mechanism
 -> cache/context consequence
 ```
+
+Use source names only after the reader has a concrete hook for the concept.
+When a mechanism depends on overloaded terms such as `history`, `prompt`,
+`context`, `baseline`, `projection`, or `replacement`, define the local usage
+before the first dense source paragraph. A compact "terms used in this article"
+table is better than repeated parenthetical glosses when several terms will
+carry the argument.
 
 For lifecycle sections that explain background work, forks, compaction,
 self-evolution, maintenance jobs, or any other side path, make the flow
@@ -146,10 +157,14 @@ visible-source limits, edge-case recovery, provider caveats, or "how this
 differs from a nearby concept" notes.
 
 When a reader-comprehension problem is raised, do a reader-review pass before
-rewriting. The review should list what a reasonable target reader still cannot
-answer, which terms arrive too early, and what sequence would make the section
-natural. If the user explicitly authorizes a subagent or outside reader, use it
-only for this bounded feedback; keep the final rewrite owned by the main pass.
+rewriting. The review should read like a target-reader audit, not a copy-edit:
+list what a reasonable reader still cannot answer, which terms arrive too
+early, which transitions feel abrupt, where an example or contrast is missing,
+and what sequence would make the section natural. If the user explicitly
+authorizes a subagent or outside reader, use it only for this bounded feedback.
+The subagent should not edit files; it should return prioritized reading
+obstacles and concrete rewrite suggestions. Keep the final rewrite owned by the
+main pass, so the article remains one coherent voice.
 
 Protocol-shaped examples are mandatory when prose alone leaves too much
 ambiguity. For API/runtime articles, include small before/after request or
@@ -176,6 +191,13 @@ transcript. It must not reveal the user's requests, editing plan, model
 instructions, review process, local machine details, or any private rationale.
 Remove phrases that imply the page was created by prompting an assistant. The
 reader should only see the subject, evidence, argument, figures, and links.
+
+Use visual emphasis as part of the article's argument. A long source article
+should not read as undifferentiated exposition: core invariants, misconception
+corrections, and design tradeoffs can be given quiet emphasis with `strong`, a
+small note/callout, or a compact comparison table. Keep this restrained and
+reader-facing. Do not turn every paragraph into a card, and do not use emphasis
+for decorative excitement or process notes.
 
 For multi-page technical notes or batch article passes, add a compact reading
 contract before changing deep prose:
@@ -252,9 +274,11 @@ implementation aids, and must be replaced by final raster assets before
 publication.
 
 If exact labels, arrows, or source-code identifiers must be corrected after
-generation, do it only as part of the image workflow's deterministic
-post-processing step, and still export a single final raster image. Do not let
-post-processing become an excuse to rebuild the figure as HTML or SVG.
+generation, follow the image workflow: simplify labels, regenerate or use a
+built-in edit first, and use deterministic post-processing only for small
+exactness fixes that still look integrated. Always export a single final raster
+image. Do not let post-processing become an excuse to rebuild the figure as
+HTML or SVG.
 
 ## Heading Hierarchy
 
@@ -328,8 +352,8 @@ For incremental edits, run the same check at smaller scope:
 1. Identify the paragraph, section, or source claim being changed.
 2. Locate any figure whose labels, arrows, ordering, boundary, or caption now
    touches that claim.
-3. Decide whether the existing figure remains accurate, needs a deterministic
-   label/overlay fix, or needs a fresh figure regeneration.
+3. Decide whether the existing figure remains accurate, needs a small
+   exactness fix, needs a built-in edit, or needs a fresh figure regeneration.
 4. If a figure is added or touched, save the final PNG under the article assets
    directory and update the published image reference.
 5. Preserve image rhythm; do not add decorative images just because a change was
@@ -656,8 +680,11 @@ that covers the edit:
 - Search for private leakage: local absolute paths, local file URLs, temporary
   paths, unfinished editorial markers, hidden process language, private request
   text, or private rationale.
-- Check generated TOC, table `data-label` behavior, and mobile body
-  `scrollWidth`.
+- Check generated TOC, table `data-label` behavior, mobile body `scrollWidth`,
+  and whether heading hierarchy still reads as a useful route map.
+- When emphasis blocks, notes, or highlighted sentences were added, verify that
+  they clarify invariants or misreadings and do not create a stack of generic
+  callouts.
 - If links were added or changed, sample-check official docs and representative
   GitHub line anchors.
 - Run repository content/build checks when the touched files participate in a

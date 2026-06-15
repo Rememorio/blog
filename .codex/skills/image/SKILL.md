@@ -1,12 +1,12 @@
 ---
 name: image
-description: "Generate and maintain Rememorio hand-drawn technical article images with image2/imagegen."
+description: "Generate and maintain Rememorio hand-drawn technical article images with imagegen."
 argument-hint: "[article-or-figure topic]"
 ---
 
-# Rememorio Image2 Hand-Drawn Figures
+# Rememorio Imagegen Hand-Drawn Figures
 
-Use this skill for every image2/imagegen asset created for this repository.
+Use this skill for every imagegen asset created for this repository.
 The goal is a consistent Rememorio visual language for technical notes and
 articles: precise enough for source-code explanation, warm enough for long-form
 reading.
@@ -34,25 +34,31 @@ to keep, fix, or replace; the Wine & Chord reference is the comparative bar.
 If an image generation tool accepts reference images, use the most relevant
 `1` to `3` Wine-style references by role. If the tool does not accept reference
 images, explicitly translate the selected references' style and layout roles
-into the prompt and deterministic post-processing choices.
+into the prompt and later quality checks.
 
-Adapt the visual system to Rememorio by keeping a restrained bottom-right
-`Rememorio` wordmark treatment and the article's source-accurate labels.
+Adapt the visual system to Rememorio by keeping a restrained, integrated
+bottom-right `Rememorio` source-notes treatment and the article's
+source-accurate labels.
 
 ## Non-Negotiables
 
 - The page must reference final raster images, usually PNG. Do not leave source
   diagrams as HTML, Mermaid, or SVG-only illustrations in published articles.
-- Every final figure must carry one deterministic `Rememorio` raster brand
-  treatment. Do not rely on the image model to redraw or reinterpret the logo.
+- Use the installed system `imagegen` skill's built-in image generation path by
+  default. Do not use local CLI/API workflows unless the user explicitly asks
+  for CLI, API, model, or local-key control.
+- Every final figure must carry one integrated `Rememorio` source-notes brand
+  treatment generated as part of the same visual language as the figure. Do not
+  use a pasted-looking logo, generic badge, clover/leaf icon, unrelated mascot,
+  or competing generated mark.
 - Every final generated figure must be saved under the relevant article's
   local `assets/` directory before publication. Published article markup should
   use the correct page-relative path for that static page.
 - Do not include production notes, prompts, private instructions, model names,
   or process explanations inside public images.
 - Do not let generated text invent source facts. If exact identifiers, arrows,
-  or labels matter, compose them deterministically into the final raster image
-  after generating the hand-drawn base.
+  or labels matter, first simplify the label set and regenerate or edit the
+  whole figure so text, arrows, and brand remain visually unified.
 - A figure must faithfully teach the mechanism it represents. It may be lively
   and metaphorical, but the node order, ownership boundary, data flow, and
   failure/recovery path must match the article's verified claims.
@@ -96,27 +102,25 @@ Line and shape:
 
 Brand mark treatment:
 
-- The preferred Rememorio pictorial source is the repository-root
-  `Eyjafjalla.png` image. Use the full character image as the brand signature
-  whenever space permits, and compose it deterministically with a small clean
-  `Rememorio` wordmark instead of asking the image model to redraw it.
-- Use a restrained wordmark: dark ink, warm brown, or muted rose tones that fit
-  the figure. Do not use the old yellow/green route-line wordmark treatment as
-  the default.
-- Do not crop the character into a head-only avatar by default. If the full
-  character would be too small inside a dense technical figure, keep the figure
-  brand treatment quieter rather than switching to a large avatar badge.
-- The final published figure should composite exactly one Rememorio brand
-  treatment into the image after generation or deterministic drawing.
-- Keep it legible but secondary: roughly `10%` to `18%` of image width, with at
-  least `3%` canvas padding from the right and bottom edges.
-- During image generation, ask for a clean bottom-right paper area reserved for
-  the brand treatment. After generation, overlay the selected PNG composition
-  deterministically. If the model generated any competing logo or text there,
-  cover it with matching paper texture before compositing the brand treatment.
-- Do not use a generic badge, alternate logo, image-model imitation, or
-  unrelated icon. Legacy brand PNGs in this skill directory are only fallback
-  assets when the article explicitly calls for them.
+- Generate the Rememorio treatment as part of the whole figure by default,
+  usually as a small bottom-right paper note or source-notes card that includes
+  a tiny Eyjafjalla-like character and the word `Rememorio`.
+- The repository-root `Eyjafjalla.png` image may be used as a visual reference
+  for the character's broad look, but the final figure should feel like one
+  unified hand-drawn illustration, not a base diagram with a later pasted
+  sticker.
+- Keep the brand legible but secondary: roughly `10%` to `18%` of image width,
+  with at least `3%` canvas padding from the right and bottom edges.
+- Ask for the brand area to be naturally integrated into the paper texture,
+  line weight, shadows, and palette of the figure. The note should look drawn
+  with the same hand as the diagram.
+- Do not use a generic badge, alternate logo, image-model imitation of an
+  unrelated mark, clover/leaf icon, route-line logo, or large avatar badge.
+- Deterministic compositing with the exact `Eyjafjalla.png` asset is an
+  exception, not the default. Use it only when the user explicitly requires
+  pixel-level brand fidelity or asks to use the exact source image. Before
+  choosing that path, note that it can look less integrated than a whole-image
+  generation.
 
 ## Reference Image Roles
 
@@ -217,13 +221,15 @@ For source-code diagrams, keep visible labels short:
   Chinese articles. This improves generation reliability and preserves a clean
   path to later English localization.
 - Avoid long Chinese sentences inside generated images.
-- If Chinese labels are required, add them with deterministic post-processing
-  and export a single PNG.
-- Use font roles deliberately during deterministic post-processing: reserve
-  monospace fonts for short code identifiers, function names, flags, and schema
-  fields; use a CJK-capable sans font for Chinese prose labels, captions, and
-  callouts. Never place Chinese explanation text in a monospace-only font that
-  can render missing-glyph boxes.
+- If Chinese labels are required, keep them short and prefer whole-image
+  generation or a built-in edit pass so the lettering stays integrated with the
+  figure. Use deterministic text only for small exactness fixes that cannot be
+  resolved cleanly through regeneration.
+- When deterministic text is truly necessary, use font roles deliberately:
+  reserve monospace fonts for short code identifiers, function names, flags,
+  and schema fields; use a CJK-capable sans font for Chinese prose labels,
+  captions, and callouts. Never place Chinese explanation text in a
+  monospace-only font that can render missing-glyph boxes.
 - Maximum visible labels per figure: `10`; maximum words per label: `4`.
 - When a diagram is likely to be reused across language editions, prefer short
   English labels and move localized explanation into alt text, captions, and
@@ -241,51 +247,56 @@ Palette: deep navy, Rememorio blue, muted forest green, slate gray, small
 amber highlights.
 Subject: [one precise source-level idea].
 Composition: [nodes and arrows in exact order].
-Leave a clean warm-paper safe area in the bottom-right for the Rememorio
-wordmark/avatar treatment that will be composited after generation.
+Integrate a small bottom-right Rememorio source-notes paper card into the same
+hand-drawn style, with a tiny Eyjafjalla-like character and the exact word
+`Rememorio`.
 No process notes, no prompt references, no meta text.
 Use only these short English labels: [label list].
+Avoid generic logos, clovers, leaves, pasted stickers, competing badges, and
+any brand mark that looks detached from the illustration.
 Keep arrows clean and non-crossing; leave generous margins.
 Professional editorial diagram, not cartoonish, not glossy 3D.
 ```
 
-If exact labels matter, ask the image model for the unlabeled or lightly labeled
-base, then overlay final text with deterministic composition. Keep final labels
-aligned with article prose and source links.
+If exact labels matter, simplify the label list first and iterate with a
+targeted whole-image generation or built-in edit. Use deterministic overlays
+only for small exactness fixes where the result still looks like a single
+finished raster image.
 
 ## Post-Processing
 
-Use deterministic composition when accuracy requires it:
+Use post-processing sparingly. The preferred final figure is one coherent image
+whose text, arrows, and Rememorio treatment were generated or edited together.
+Local processing is appropriate for format conversion, downscaling, light
+cropping, or a small exactness correction that does not make the figure look
+assembled from layers.
 
-- Keep the generated or hand-drawn base as the background or illustration layer.
-- Overlay exact labels, node titles, arrows, or callouts with a script or design
-  renderer.
-- Always overlay one selected Rememorio brand treatment as the final
-  bottom-right mark.
-- Export one final PNG for publication.
-- Keep source files near the article only when they are useful for regeneration.
+- Keep the generated figure as the primary visual source.
+- Prefer regenerating or built-in editing when labels, arrows, or the brand
+  treatment drift.
+- Use deterministic labels, arrows, or callouts only when exact source
+  identifiers require it and the correction remains visually integrated.
+- Use deterministic brand compositing only when the user explicitly requires
+  the exact source image or pixel-level brand fidelity.
+- Export one final PNG for publication and keep source files near the article
+  only when they are useful for regeneration.
 
 When using deterministic text overlays, fit labels by changing the wording and
 layout before shrinking text aggressively. Prefer shorter labels, wider boxes,
 separate lanes, or fewer callouts over tiny typography. After overlaying text,
 inspect the final raster at full size, not only as a contact sheet.
 
-Mandatory brand overlay protocol:
+Integrated brand protocol:
 
-1. Generate the figure body with a clean bottom-right warm-paper safe area.
-2. Build or select one Rememorio brand treatment based on the figure brief,
-   article voice, and visual fit. Prefer a deterministic composition from the
-   full `Eyjafjalla.png` character plus a small clean wordmark. Record the
-   source asset and placement choice so later revisions can reproduce the same
-   final figure.
-3. Load the selected brand treatment and scale it proportionally to `10%` to
-   `18%` of canvas width.
-4. Place it in the bottom-right safe area with at least `3%` right and bottom
-   padding.
-5. If the selected brand treatment background differs from the target paper,
-   softly key out the light paper background or blend it into a small
-   matching-paper patch. Do not distort the avatar or wordmark.
-6. Save the composited result as the only image referenced by the article.
+1. Include the Rememorio treatment in the figure brief before generation.
+2. Place it as a small bottom-right source-notes card, roughly `10%` to `18%`
+   of canvas width, with at least `3%` right and bottom padding.
+3. Keep the character, wordmark, card paper, line weight, shadows, and palette
+   consistent with the rest of the figure.
+4. If the brand area looks like a pasted sticker, generic icon, clover/leaf
+   badge, unrelated mascot, or detached logo, regenerate or use a built-in edit
+   for the whole figure area rather than layering a patch on top.
+5. Save the final integrated image as the only PNG referenced by the article.
 
 Recommended final asset layout:
 
@@ -299,8 +310,8 @@ references.
 
 Static blog publication protocol:
 
-1. Finish the image generation or deterministic drawing pass, label fixes, and
-   selected `Rememorio` brand overlay first.
+1. Finish the built-in image generation or edit pass, label fixes, and
+   integrated `Rememorio` treatment first.
 2. Save the final PNG locally under the article's assets directory so the source
    package remains reproducible.
 3. Reference the final PNG with the correct page-relative path: usually
@@ -342,10 +353,10 @@ Inspect every generated figure before publishing:
 - Separate foreground, background, and maintenance paths visually when their
   triggers and permissions differ.
 - The figure matches the article's source claims.
-- The Rememorio mark is one deterministic composited raster treatment,
-  proportionally scaled and placed in the bottom-right. No image-model
-  imitation, alternate badge, generic icon, distorted crop, recolor, or
-  competing generated logo is visible.
+- The Rememorio treatment is integrated into the bottom-right of the figure and
+  looks drawn with the same paper, line weight, palette, and shadows. No pasted
+  sticker, alternate badge, generic icon, clover/leaf mark, distorted crop,
+  recolor, or competing generated logo is visible.
 - The published article references the correct local relative URL for each
   generated figure, and the referenced PNG exists in the repository.
 - No private instruction, prompt, unfinished editorial marker, or process note
@@ -356,7 +367,9 @@ Inspect every generated figure before publishing:
 - The figure is vivid enough to explain the concept visually, but not so
   decorative that it obscures the real mechanism.
 
-Regenerate or post-process if any item fails.
+If any item fails, prefer regeneration or a built-in edit that keeps the whole
+figure visually unified. Use local post-processing only for small exactness or
+format fixes.
 
 For figures that use hand-drawn or script-like fonts, perform an extra
 readability pass. If the font makes letters ambiguous, pushes text into header
