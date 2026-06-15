@@ -10,6 +10,13 @@ pipeline.
 
 ## Published Articles
 
+- Language gateway:
+  [rememorio.github.io/blog](https://rememorio.github.io/blog/)
+- Chinese home:
+  [rememorio.github.io/blog/zh/](https://rememorio.github.io/blog/zh/)
+- English home:
+  [rememorio.github.io/blog/en/](https://rememorio.github.io/blog/en/)
+
 ### Codex Source Notes
 
 Codex Source Notes is a bilingual source-reading series on
@@ -47,7 +54,9 @@ background review, curator, gateway, cron, and delegation.
 
 ```text
 .
-├── index.html                  # Blog home page
+├── index.html                  # Site language gateway
+├── zh/index.html               # Chinese blog home page
+├── en/index.html               # English blog home page
 ├── codex/
 │   ├── index.html              # Language gateway
 │   ├── zh/index.html           # Chinese series index
@@ -81,6 +90,8 @@ python3 -m http.server 4173
 Then open:
 
 - `http://127.0.0.1:4173/`
+- `http://127.0.0.1:4173/zh/`
+- `http://127.0.0.1:4173/en/`
 - `http://127.0.0.1:4173/codex/`
 - `http://127.0.0.1:4173/codex/zh/overview/`
 - `http://127.0.0.1:4173/codex/en/overview/`
