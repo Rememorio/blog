@@ -10,6 +10,21 @@ pipeline.
 
 ## Published Articles
 
+### Codex Source Notes
+
+Codex Source Notes is a bilingual source-reading series on
+[openai/codex](https://github.com/openai/codex). The first article explains how
+Codex manages context as a runtime ledger: durable history, turn context,
+model-visible prompt projection, context diffs, compaction replacement, and
+rollout recovery.
+
+- Language gateway:
+  [rememorio.github.io/blog/codex/](https://rememorio.github.io/blog/codex/)
+- Chinese:
+  [Codex 源码阅读（一）：上下文不是聊天记录，而是运行时账本](https://rememorio.github.io/blog/codex/cn/context-management/)
+- English:
+  [Codex Source Notes I: Context Is a Runtime Ledger, Not Chat History](https://rememorio.github.io/blog/codex/en/context-management/)
+
 ### Hermes Agent
 
 Hermes Agent is a source-grounded walkthrough of
@@ -30,6 +45,13 @@ background review, curator, gateway, cron, and delegation.
 ```text
 .
 ├── index.html                  # Blog home page
+├── codex/
+│   ├── index.html              # Language gateway
+│   ├── cn/index.html           # Chinese series index
+│   ├── cn/context-management/  # Chinese context-management article
+│   ├── en/index.html           # English series index
+│   ├── en/context-management/  # English context-management article
+│   └── assets/*.png            # Final raster figures
 ├── hermes-agent/
 │   ├── index.html              # Language gateway
 │   ├── cn/index.html           # Chinese edition
@@ -54,6 +76,9 @@ python3 -m http.server 4173
 Then open:
 
 - `http://127.0.0.1:4173/`
+- `http://127.0.0.1:4173/codex/`
+- `http://127.0.0.1:4173/codex/cn/context-management/`
+- `http://127.0.0.1:4173/codex/en/context-management/`
 - `http://127.0.0.1:4173/hermes-agent/`
 
 Use a local server rather than opening files directly when checking relative

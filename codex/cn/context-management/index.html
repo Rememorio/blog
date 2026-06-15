@@ -1,0 +1,931 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex 源码阅读（一）：上下文不是聊天记录，而是运行时账本</title>
+    <meta
+      name="description"
+      content="沿 openai/codex 源码拆解 Codex 的上下文管理机制：ContextManager、TurnContext、for_prompt、reference_context_item、auto compaction 与 rollout 恢复。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex 源码阅读（一）：上下文不是聊天记录，而是运行时账本" />
+    <meta
+      property="og:description"
+      content="从实际上下文压力出发，逐步读懂 Codex 如何把 durable history 投影成 model-visible prompt，并在压缩后恢复运行。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/context-ledger-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/cn/context-management/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/cn/context-management/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/context-management/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav aria-label="页面导航">
+        <a href="../../../">首页</a>
+        <a href="../">Codex 系列</a>
+        <a href="../../en/context-management/" lang="en">English</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex 源码阅读 · 第一篇</p>
+            <h1>上下文不是聊天记录，而是运行时账本</h1>
+            <p class="lead">
+              很多 coding agent 的失败，看起来像“模型忘了”。Codex 源码里的答案更具体：
+              运行时维护的是一套可投影、可压缩、可恢复的上下文账本，而不是把聊天记录原封不动塞进 context window。
+            </p>
+            <div class="meta-line">
+              <span>项目：openai/codex</span>
+              <span>主题：context management</span>
+              <span>范围：公开源码与官方文档</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/context-ledger-cover.png"
+                alt="Codex 上下文账本总览图，展示从持久 history 到模型请求和压缩恢复的路径"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先从一个日常场景开始。你让 Codex 在一个仓库里修 bug。它读了 <code>AGENTS.md</code>，
+              搜了几个文件，跑了一次测试，测试失败后又看日志。中途你补了一句“别改生成文件”，
+              它又因为上下文接近窗口上限触发了一次 compact。第二天你恢复这个 thread，希望它还知道昨天做了什么。
+            </p>
+
+            <p>
+              如果把这件事理解成“消息数组越来越长”，很快就解释不通了。仓库规则、当前工作目录、sandbox 权限、
+              技能列表、工具 schema、工具输出、图片、推理 token、用户临时补充、压缩摘要、恢复基线，都不是同一种东西。
+              有些必须持久保存，有些只该在本轮给模型看，有些可以被截断，有些一旦丢掉就必须全量重注入。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                先不看源码，先把三个词翻译成人话：
+                <strong>thread</strong> 是一次可以恢复的工作会话；
+                <strong>context window</strong> 是本次模型请求能容纳的上下文上限；
+                <strong>compact</strong> 不是“删掉前文”，而是把旧账改写成一个可继续工作的摘要恢复点。
+              </p>
+            </div>
+
+            <p>
+              官方文档先给出外部契约：Codex 的 thread 是一次会话，包含 prompt、模型输出和工具调用；
+              agent 工作时会继续从文件内容、工具输出和已完成工作中收集上下文；所有信息都必须放进模型的
+              context window，长任务可能自动 compact。源码要回答的是下一层问题：这些东西在运行时到底放在哪里，
+              什么时候进入模型，什么时候被摘要替换，恢复时又靠什么对齐？
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文把官方文档当作产品层契约，把 openai/codex 的公开源码当作机制证据。源码链接固定到同一公开快照。
+                当源码只暴露 remote compaction 的选择边界，而不暴露服务端摘要实现时，本文只描述可见生命周期，
+                不推断服务端内部算法。
+              </p>
+            </div>
+
+            <p>
+              这篇的阅读契约很简单：先分清 <strong>哪本账负责保存状态</strong>，
+              再分清 <strong>哪一部分会被投影给模型</strong>。只要这两件事清楚了，
+              后面的 diff、projection、compact 和 resume 都会落到同一条主线上。
+            </p>
+
+            <p>所以这篇只追五个问题：</p>
+            <ol>
+              <li>Codex 持久保存的 history，为什么不能直接等同于模型看到的 prompt？</li>
+              <li>每一轮开始前，哪些上下文会全量注入，哪些只发 diff？</li>
+              <li><code>for_prompt()</code> 这一步到底规整和过滤了什么？</li>
+              <li>compact 发生时，Codex 替换的是哪本账，留下的恢复点是什么？</li>
+              <li>rollback、resume 和模型切换为什么会影响下一轮上下文注入？</li>
+            </ol>
+
+            <h2>一、先把四个表面分开</h2>
+            <p>
+              读 Codex 上下文源码，第一步不是找一个叫“记忆模块”的地方。
+              真正需要先分开的，是同一个工作会话里四种不同的表面：
+              session 级状态、turn 级快照、durable history，以及本次请求真正发给模型的 view。
+              它们看起来都叫“上下文”，但 owner 和生命周期完全不同。
+            </p>
+
+            <p>
+              回到开头修 bug 的例子：仓库规则和权限基线属于 session 和 turn；
+              你临时补的“别改生成文件”会进入当前 turn 的输入和 history；
+              测试日志、工具输出、模型回复属于 durable history；
+              而模型下一次实际看到的，是运行时从这些记录里整理出来的一份请求视图。
+              <strong>混在一起讲，就会把“保存过”误读成“这次一定发给模型”。</strong>
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/state/session.rs#L23-L42"><code>SessionState</code></a>
+              是 session 级账本，持有 <code>history: ContextManager</code>、<code>additional_context</code>、
+              <code>previous_turn_settings</code> 和 <code>auto_compact_window</code>。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L55-L108"><code>TurnContext</code></a>
+              则是单轮快照：模型、cwd、日期、时区、开发者指令、用户指令、协作模式、权限、技能上下文、输出 schema 等都在这里。
+              它不是一条聊天消息，而是本轮运行环境的结构化描述。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>表面</th>
+                    <th>源码 owner</th>
+                    <th>模型是否直接看到</th>
+                    <th>保护的不变量</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>session 状态</td>
+                    <td><code>SessionState</code></td>
+                    <td>不会整体进入模型</td>
+                    <td>跨 turn 保存 history、权限基线、压缩窗口和恢复状态。</td>
+                  </tr>
+                  <tr>
+                    <td>turn 快照</td>
+                    <td><code>TurnContext</code></td>
+                    <td>部分转成上下文消息或 request 字段</td>
+                    <td>让本轮的模型、cwd、sandbox、日期、技能等配置有一个一致来源。</td>
+                  </tr>
+                  <tr>
+                    <td>durable history</td>
+                    <td><code>ContextManager.items</code></td>
+                    <td>经过投影后才进入模型</td>
+                    <td>保留可恢复的 API 消息、工具调用和压缩替换记录。</td>
+                  </tr>
+                  <tr>
+                    <td>model-visible prompt</td>
+                    <td><code>for_prompt()</code> + <code>Prompt</code></td>
+                    <td>是本次请求</td>
+                    <td>只给模型合法、适配当前模型能力、带工具 schema 的请求视图。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L32-L50"><code>ContextManager</code></a>
+              的注释说它是 thread history 的 transcript，但同一个结构里还有 <code>history_version</code>、
+              <code>token_info</code> 和 <code>reference_context_item</code>。最后这个字段很关键：
+              它是下一轮做 settings diff 的基线。
+            </p>
+
+            <p>
+              可以把它想成“上一轮环境的对照表”。如果上一轮权限是 <code>workspace-write</code>，
+              这一轮变成 <code>read-only</code>，有可信基线时只需要告诉模型“权限变了”；
+              如果基线丢了，Codex 就不再猜差异，而是全量重发当前环境。
+              <strong>baseline 不可信，就全量重注入。</strong> 这是后面 rollback、compact 和模型切换共同遵守的底线。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这就是本文的核心模型：Codex 的上下文不是一段不断变长的聊天记录，
+                而是一个 <strong>durable ledger</strong>。每一轮请求前，运行时从账本里取一个快照，
+                把它投影成当前模型能接受的 prompt；当账本太大时，再用 replacement history 写入新的恢复点。
+              </p>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>后文叫法</th>
+                    <th>它指什么</th>
+                    <th>不要误读成</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>durable history / ledger</td>
+                    <td>本地可恢复、可重放的历史账本。</td>
+                    <td>模型每次完整看到的聊天记录。</td>
+                  </tr>
+                  <tr>
+                    <td>model-visible view / prompt</td>
+                    <td>本轮请求真正交给模型的投影视图。</td>
+                    <td>内存里保存的全部状态。</td>
+                  </tr>
+                  <tr>
+                    <td>baseline / 基线</td>
+                    <td>上一轮上下文快照，用来判断这轮只需发哪些 diff。</td>
+                    <td>永远可信、永远能复用的缓存。</td>
+                  </tr>
+                  <tr>
+                    <td>replacement history</td>
+                    <td>compact 之后安装的新 history。</td>
+                    <td>贴在旧 history 旁边的一条摘要备注。</td>
+                  </tr>
+                  <tr>
+                    <td>projection / 投影</td>
+                    <td>从 durable history 生成 model-visible view 的过滤和规整过程。</td>
+                    <td>简单复制消息数组。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>二、一轮 turn 不是从用户消息直接进模型</h2>
+            <p>
+              现在看一轮 turn。<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L137-L184"><code>run_turn</code></a>
+              进入后，第一件事不是记录新用户消息，而是先检查旧账是否已经太大。
+              compact 的内部细节放到第四节；这里只需要抓住一个顺序：
+              <strong>压缩检查发生在本轮新消息入账之前。</strong>
+              源码旁边的备注说明：当前 pre-turn compaction 发生在 context updates 和新用户消息被记录之前，
+              未来应该估算即将进入的上下文 diff 或全量重注入是否会把 thread 推过阈值。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/turn-context-pipeline.png"
+                alt="Codex turn pipeline 图，展示一轮请求从压缩检查、上下文更新、输入记录到模型请求和后续循环的路径"
+              />
+              <figcaption>
+                一轮 turn 的关键顺序：先检查是否需要压缩，再写入上下文更新、技能和输入，最后才构造本次模型请求。
+              </figcaption>
+            </figure>
+
+            <p>
+              之后 <code>run_turn</code> 调
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L3118-L3162"><code>record_context_updates_and_set_reference_context_item</code></a>，
+              再构造 skills 和 plugins 注入项，运行 hooks，记录用户输入和注入项。真正进入模型请求前，
+              代码取的是 <code>sess.clone_history().await.for_prompt(...)</code>。
+              也就是说，进入模型的是一个从 durable history 克隆出来的请求视图。
+            </p>
+
+            <pre><code class="language-text">turn starts
+  -> maybe compact old history
+  -> inject full context or settings diff
+  -> load skills/plugins chosen for this turn
+  -> record user input and additional context
+  -> clone history
+  -> for_prompt(input_modalities)
+  -> build Prompt with tools and base instructions
+  -> stream model response</code></pre>
+
+            <p>
+              这里还有一个容易忽略的细节。
+              用户可能在模型工具调用中途补一句话，模型也可能因为工具结果回来而继续上一次回答；
+              这两种输入如果插到同一个位置，模型看到的接续关系就会变。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L197-L203">源码注释</a>
+              说明 <code>ModelClientSession</code> 是 turn-scoped，并且 pending input 不是任何时候都立刻 drain 到 history：
+              turn 开头要先让 fresh input 被采样；auto-compact 之后也要先让模型或工具 continuation 接上。
+              这不是 UI 细节，而是上下文顺序不变量。
+            </p>
+
+            <h3>2.1 初始上下文是运行时合成的，不是用户消息</h3>
+            <p>
+              full initial context 由
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2814-L3048"><code>build_initial_context</code></a>
+              合成。它把运行时环境整理成 developer 或 contextual user message。
+              这些信息不是一条用户聊天消息，而是本轮请求必须携带的边界条件。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>来源</th>
+                    <th>进入请求时的形态</th>
+                    <th>为什么不能当普通用户消息</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>模型、权限、cwd、日期、时区</td>
+                    <td>developer 或 contextual user message，以及 request 字段。</td>
+                    <td>它们定义本轮运行边界，优先级高于用户临时描述。</td>
+                  </tr>
+                  <tr>
+                    <td>开发者指令、协作模式、personality、用户指令</td>
+                    <td>合成进 initial context 的结构化文本。</td>
+                    <td>恢复或切换模型时需要重新建立同一套行为基线。</td>
+                  </tr>
+                  <tr>
+                    <td>skills、plugins、apps instructions、token budget context</td>
+                    <td>按本轮可用能力和预算生成 model-visible context items。</td>
+                    <td>它们由运行时选择，不是用户在对话里随手说的话。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这些信息来自运行时配置和环境，不是用户在 chat 里说的一句话。把它们当普通用户消息会让优先级和恢复语义都变乱。
+              Codex 的做法是把它们合成成 model-visible context items，并在当前 turn 的
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L345-L367"><code>TurnContextItem</code></a>
+              里保存结构化基线。
+            </p>
+
+            <h3>2.2 稳态 turn 只发 diff，但 diff 有边界</h3>
+            <p>
+              <code>record_context_updates_and_set_reference_context_item</code> 的分支很直接：
+              如果 <code>reference_context_item</code> 缺失，就全量调用 <code>build_initial_context</code>；
+              否则只调 <code>build_settings_update_items</code> 生成 diff。
+              diff 当前覆盖环境变化、模型切换、权限变化、协作模式变化、realtime 和 personality。
+            </p>
+
+            <pre><code class="language-text">if reference_context_item is None:
+    history += build_initial_context(turn_context)
+else:
+    history += build_settings_update_items(previous, turn_context)
+
+persist TurnContextItem for this real user turn
+reference_context_item = current TurnContextItem</code></pre>
+
+            <p>
+              这一步保护的是 token 和语义稳定性：稳定配置不必每轮重复塞入 prompt，变化的配置又必须显式告诉模型。
+              但
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/updates.rs#L209-L243"><code>build_settings_update_items</code></a>
+              里也有一个重要备注：它还没有覆盖 <code>build_initial_context</code> 可能发出的所有 model-visible item。
+              这说明实现没有假装 diff 是万能的。只要基线不可靠，后续路径就会清掉 <code>reference_context_item</code>，
+              让下一轮回到全量重注入。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这一节要打掉的误读是：<strong>初始上下文不是每轮重复发，也不是永远只发 diff。</strong>
+                Codex 先看有没有可信 baseline；有就省 token 发变化，没有就牺牲 token 换语义正确。
+              </p>
+            </div>
+
+            <h2>三、history 到 prompt 中间有一次 projection</h2>
+            <p>
+              当 <code>run_turn</code> 准备采样请求时，它不会把 <code>ContextManager.items</code> 原封不动发出去。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L107-L114"><code>for_prompt()</code></a>
+              会先 normalize history，再返回当前模型可用的 <code>ResponseItem</code> 列表。
+              这里的 projection 指的就是这次转换：<strong>账本要完整，报表要合法。</strong>
+              <code>ResponseItem</code> 可以理解成模型请求里的消息、工具调用和工具输出单元。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/prompt-projection-boundary.png"
+                alt="Codex prompt projection 图，展示持久 history 经过过滤和规整后变成模型可见请求"
+              />
+              <figcaption>
+                durable history 是恢复和审计视角，model view 是本次请求视角；两者中间有规整、过滤和能力适配。
+              </figcaption>
+            </figure>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L323-L335"><code>normalize_history</code></a>
+              目前明确做三件事：确保每个 function/custom call 有对应 output，移除没有对应 call 的 orphan output，
+              以及当模型不支持图片输入时，从消息和工具输出里 strip image content。
+              orphan output 就是只剩工具输出、找不到对应工具调用的半截记录；strip image content 则是把当前模型不能接收的图片内容从请求视图里拿掉。
+              这解释了为什么“history 里有图片”不等于“这次请求一定把图片发给模型”。
+            </p>
+
+            <pre><code class="language-text">durable history, shape-level:
+  user text
+  function_call(call_id=A)
+  function_call_output(call_id=A)
+  orphan function_call_output(call_id=old)
+  user image
+
+model-visible view for a text-only model:
+  user text
+  function_call(call_id=A)
+  function_call_output(call_id=A)
+  user text with image content stripped</code></pre>
+
+            <p>
+              同一层还有本地截断。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L338-L360"><code>process_item</code></a>
+              会按 truncation policy 处理 function output payload，避免单个工具输出把 history 撑爆。
+              而真正构造请求的
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L1000-L1017"><code>build_prompt</code></a>
+              还会把工具 specs、parallel tool calls 支持、base instructions、personality 和 output schema 放进
+              <code>Prompt</code>。工具 schema 不是聊天消息，但它们仍然是模型可见请求的一部分。
+            </p>
+
+            <h3>3.1 token 账也是混合账</h3>
+            <p>
+              Codex 的 token 判断也不是单纯读服务端最后一次 usage。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L249-L314"><code>get_total_token_usage</code></a>
+              会在 last token usage 之外，加上最近一次模型生成之后本地追加的 items；如果服务端没有把历史 reasoning tokens 算入，
+              客户端还会估算非最后一段 reasoning item。这个数不是 tokenizer 精确计数，
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L130-L155">估算函数</a>
+              自己也说是 byte-based heuristic 和 coarse lower bound。
+            </p>
+
+            <p>
+              用一个形状级数字例子会更直观：服务端上次记下约 80k input tokens；
+              之后本地又追加了 8k 的工具输出和上下文更新；客户端再粗略估出 5k 历史 reasoning；
+              如果当前 auto-compact scope 是 <code>BodyAfterPrefix</code>，还要从 active 账里减去 20k 左右的 prefix baseline。
+              触发 compact 的不是某一个“权威数字”，而是这些账合成后和 scope limit、完整 context window limit 的关系。
+            </p>
+
+            <p>
+              这会影响 compact 触发。<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L733-L780"><code>auto_compact_token_status</code></a>
+              同时看 active context tokens、auto-compact scope tokens、scope limit 和完整 context window limit。
+              当 scope 是 <code>BodyAfterPrefix</code> 时，它会从 active tokens 里减去当前 auto-compact window 的 prefill baseline。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/state/auto_compact_window.rs#L14-L23"><code>AutoCompactWindow</code></a>
+              保存的就是这个窗口基线，且服务端观测到的 input tokens 会替换恢复时的估算值。
+            </p>
+
+            <h2>四、compact 不是删除历史，而是安装 replacement history</h2>
+            <p>
+              上下文窗口接近上限时，最容易被误解的词是 compact。它听起来像“把前文总结一下”，
+              但 Codex 源码里更像一次可恢复的 history rewrite：生成摘要、选择保留的近期用户消息、
+              写入 replacement history、更新 auto-compact window，再决定下一轮 initial context 的基线怎样处理。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                本节最重要的一句话是：<strong>compact 改写的是 history，不是在旧 history 旁边贴一条摘要。</strong>
+                如果摘要不能成为恢复时可重放的新账本，它就只是省了一点 token，却没有解决长 thread 的继续工作问题。
+              </p>
+            </div>
+
+            <figure class="figure">
+              <img
+                src="../../assets/compaction-replacement.png"
+                alt="Codex compaction replacement 图，展示旧 history 被摘要任务替换成新 history 并写入恢复账本"
+              />
+              <figcaption>
+                compact 的结果不是一句摘要旁挂在旧 history 上，而是一段新的 replacement history，并带着不同的初始上下文注入策略。
+              </figcaption>
+            </figure>
+
+            <h3>4.1 触发点先分 pre-turn 和 mid-turn</h3>
+            <p>
+              先不要看 enum 名字，先看 compact 发生在一轮 turn 的哪个位置。
+              同样是“压缩旧账”，发生在用户新消息入账前，和发生在模型已经工作到一半时，恢复策略是不一样的。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>触发位置</th>
+                    <th>用户新消息是否已入账</th>
+                    <th>initial context 放哪里</th>
+                    <th>为什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>pre-turn / 手动 compact</td>
+                    <td>还没有进入这轮 history。</td>
+                    <td>不立刻注入，清空 baseline，下一轮全量重注入。</td>
+                    <td>旧账已经要被替换，新 turn 还没开始，最稳的是让下一轮重新建立环境基线。</td>
+                  </tr>
+                  <tr>
+                    <td>mid-turn compact</td>
+                    <td>模型已经采样过，可能还要继续。</td>
+                    <td>插到最后一个真实用户消息之前。</td>
+                    <td>模型要把 summary 当作最后的接续点，initial context 不能盖到 summary 后面。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              pre-turn 路径在
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L783-L803"><code>run_pre_sampling_compact</code></a>：
+              先处理上一个模型的 inline compaction，再检查 token status。如果已经到阈值，就调用
+              <code>run_auto_compact(..., InitialContextInjection::DoNotInject, ...)</code>。
+              还有两个额外原因会在 pre-turn 触发：compaction compatibility hash 变化，或者切换到更小 context window 的模型。
+            </p>
+
+            <p>
+              mid-turn 路径发生在模型已经采样过、但还需要 follow-up 的时候。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L252-L320">采样后的状态收集</a>
+              会同时看模型是否需要继续、pending input 是否存在、token limit 是否达到。
+              如果需要继续且 token limit reached，就用
+              <code>InitialContextInjection::BeforeLastUserMessage</code> 做 compact，然后继续循环。
+            </p>
+
+            <p>
+              这个 enum 的注释直接给出了设计理由。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L53-L66"><code>InitialContextInjection</code></a>
+              说明 pre-turn 和手动 compact 用 <code>DoNotInject</code>，会清空 <code>reference_context_item</code>，
+              下一次普通 turn 再全量重注入。mid-turn compact 则必须把 initial context 插到最后一个真实用户消息之前，
+              因为模型被训练成在 mid-turn compaction 后看到 summary 作为 history 里的最后一项。
+            </p>
+
+            <h3>4.2 摘要是一个 handoff summary，不是随意短句</h3>
+            <p>
+              local inline compaction 的入口是
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L72-L96"><code>run_inline_auto_compact_task</code></a>。
+              它把 <code>turn_context.compact_prompt()</code> 合成为一个用户输入。默认 prompt 来自
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/prompts/templates/compact/prompt.md#L1-L8">compact prompt 模板</a>：
+              要为另一个将继续任务的 LLM 写 handoff summary，包含当前进度、关键决策、约束、剩余步骤和关键数据。
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L196-L330"><code>run_compact_task_inner_impl</code></a>
+              的可见流程可以拆成六步。这样看会比一个长句更接近真实运行时的手感：
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>步骤</th>
+                    <th>发生了什么</th>
+                    <th>保护的边界</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>1</td>
+                    <td>克隆当前 history。</td>
+                    <td>compact 请求可以读旧账，但不先破坏主会话。</td>
+                  </tr>
+                  <tr>
+                    <td>2</td>
+                    <td>把 compact prompt 追加到这次请求的本地 history。</td>
+                    <td>摘要任务有明确目标，不是随意压缩。</td>
+                  </tr>
+                  <tr>
+                    <td>3</td>
+                    <td>调用模型直到 completed，并取最后一个 assistant message 作为 summary suffix。</td>
+                    <td>只把最终 handoff summary 装进新账。</td>
+                  </tr>
+                  <tr>
+                    <td>4</td>
+                    <td>收集近期真实用户消息，和 summary 一起构造 replacement history。</td>
+                    <td>保留最近用户意图，同时承认旧中间过程已经有损。</td>
+                  </tr>
+                  <tr>
+                    <td>5</td>
+                    <td>推进 auto-compact window id。</td>
+                    <td>后续 token 判断知道自己已经换过窗口。</td>
+                  </tr>
+                  <tr>
+                    <td>6</td>
+                    <td>调用 <code>replace_compacted_history</code> 安装新 history，并重新估算 token usage。</td>
+                    <td>内存状态和后续恢复记录对齐。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <pre><code class="language-text">old history:
+  initial context
+  user A
+  model/tool work
+  user B
+  model/tool work
+
+replacement history, shape-level:
+  recent real user messages, capped
+  user message: SUMMARY_PREFIX + handoff summary</code></pre>
+
+            <p>
+              构造 replacement history 的
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L523-L587"><code>build_compacted_history</code></a>
+              会从后往前保留真实用户消息，最多约 20,000 tokens，然后把 summary 作为 user message 放到最后。
+              如果是 mid-turn compact，<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L466-L521"><code>insert_initial_context_before_last_real_user_or_summary</code></a>
+              会把当前 canonical initial context 插到模型期望的边界：优先放在最后一个真实用户消息前；没有真实用户消息时，
+              放在 summary 或 compaction item 前，保证 compaction item 仍然留在最后。
+            </p>
+
+            <h3>4.3 replacement 还要写入 rollout</h3>
+            <p>
+              这里先给 <code>rollout</code> 一个位置：它是恢复 thread 时可以重放的持久事件记录，
+              不等于当前内存里的 <code>history</code>。
+              compact 不只改内存。<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2732-L2753"><code>replace_compacted_history</code></a>
+              会替换 <code>SessionState.history</code>，持久化 <code>RolloutItem::Compacted</code>，
+              如果这次 compact 重新建立了 <code>reference_context_item</code>，还会持久化一个 <code>RolloutItem::TurnContext</code>。
+              之后它排队一个 session start hook，并由调用方重算 token usage。
+            </p>
+
+            <p>
+              这一步把 compact 从“临时省 token”升级成“可恢复的历史重写”。后面 resume 或 fork 需要重建 thread 时，
+              它看到的不是旧 history 加一条备注，而是带 <code>replacement_history</code> 的 compacted 记录。
+              Codex 还会在 compact 完成后发出 warning：长 thread 和多次 compaction 会让模型准确性下降，能新开 thread 时应该保持任务小而聚焦。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                所以“compact 只是摘要一下”这个说法不够准确。
+                更准确的说法是：<strong>compact 生成 handoff summary，并把它安装成可恢复的 replacement history。</strong>
+              </p>
+            </div>
+
+            <h2>五、rollback 和 resume 会主动打断错误基线</h2>
+            <p>
+              如果只有向前追加，<code>reference_context_item</code> 很好维护。难点在 rollback、resume、compact 和新窗口之后。
+              这些路径都可能让历史里剩下的上下文片段和当前基线不再匹配。Codex 的策略不是继续拿旧基线 diff，
+              而是在不确定时清空基线，让下一轮全量重注入。
+            </p>
+
+            <h3>5.1 rollback 为什么要清 baseline</h3>
+            <p>
+              想象你让 Codex 回滚最近两轮。用户消息可以删，模型回复和工具输出可以删，
+              但 turn 边界附近还可能粘着一段 context update：比如当时注入的 cwd、权限、开发者指令片段。
+              如果这些片段的一部分被剪掉，旧 baseline 还继续说“我知道上一轮环境是什么”，下一轮 diff 就会建立在一段已经不存在的历史上。
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L208-L247"><code>drop_last_n_user_turns</code></a>
+              做 rollback 时，会从切点往前修剪紧贴 turn 边界的 context update items。
+              如果被修剪的是一个混合的 <code>build_initial_context</code> developer bundle，里面既有可回滚的 contextual fragments，
+              又有持久 developer text，<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L376-L420">trim 逻辑</a>
+              会清空 <code>reference_context_item</code>。原因很朴素：幸存 history 已经不包含建立旧基线的完整 bundle，
+              后面不能再基于它发 diff。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                rollback 的关键不是“删掉几条消息”，而是：<strong>一旦建立 baseline 的 bundle 不完整，
+                下一轮就不能再沿着旧 baseline 发 diff。</strong>
+              </p>
+            </div>
+
+            <h3>5.2 resume 和新窗口如何重建 baseline</h3>
+            <p>
+              resume 面对的是另一个问题：内存已经没了，thread 要从持久记录里重新站起来。
+              这时 Codex 不能只恢复聊天记录，还要恢复 previous settings、reference context 和 compact window id；
+              否则恢复后的第一轮就不知道自己应该继续 diff，还是重新注入完整环境。
+            </p>
+
+            <p>
+              resume 路径也同样把 history、previous settings、reference context 和 window id 作为一组恢复。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L1310-L1350"><code>apply_rollout_reconstruction</code></a>
+              从 rollout 重建这些状态；如果当前 auto-compact scope 是 <code>BodyAfterPrefix</code>，
+              它还会估算 prefix tokens，作为恢复后的 compaction window baseline。
+            </p>
+
+            <p>
+              还有一种更像显式“新窗口”的路径：
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L3080-L3110"><code>maybe_start_new_context_window</code></a>
+              在收到请求后推进 window id，用当前 <code>build_initial_context</code> 直接替换 history，
+              持久化一个空 message 的 <code>CompactedItem</code> 和新的 <code>TurnContextItem</code>。
+              这条路径强调的不是摘要，而是从新的 prefix baseline 重新开始。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                到这里，四个核心不变量已经闭合：
+                <strong>history 不是 prompt</strong>，
+                <strong>baseline 不可信就全量重注入</strong>，
+                <strong>compact 安装 replacement history</strong>，
+                <strong>rollback/resume 会主动打断错误基线</strong>。
+              </p>
+            </div>
+
+            <h2>六、几个常见误读</h2>
+            <p>
+              读完这条链路，可以把常见误读压成一张表。它比“上下文管理很复杂”更有用，因为每一行都对应一个实际会出错的地方。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>误读</th>
+                    <th>源码里实际发生的事</th>
+                    <th>如果按误读实现会怎样</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>history 就是 prompt</td>
+                    <td><code>ContextManager</code> 保存 durable items，<code>for_prompt()</code> 再投影出请求视图。</td>
+                    <td>orphan outputs、unsupported images 或错误 call/output 对会直接污染请求。</td>
+                  </tr>
+                  <tr>
+                    <td>初始上下文每轮都重复发</td>
+                    <td>有 baseline 时只发 settings diff；baseline 缺失或不可靠时才全量重注入。</td>
+                    <td>token 浪费，或者更糟，沿着已经失效的基线发错误 diff。</td>
+                  </tr>
+                  <tr>
+                    <td>compact 只是摘要一下</td>
+                    <td>compact 生成 handoff summary，并安装 replacement history，写入 rollout。</td>
+                    <td>恢复时无法知道摘要替换了哪段 history，也无法重建上下文基线。</td>
+                  </tr>
+                  <tr>
+                    <td>token 账完全来自服务端</td>
+                    <td>Codex 会把服务端 usage、本地新增 items、reasoning 估算和 window baseline 合并判断。</td>
+                    <td>本地追加的大工具输出或上下文 diff 可能把请求推过窗口却没被提前发现。</td>
+                  </tr>
+                  <tr>
+                    <td>rollback 只删用户消息</td>
+                    <td>Codex 还会修剪紧贴边界的 context updates，并在必要时清空 baseline。</td>
+                    <td>下一轮可能基于已经不存在的 initial context bundle 继续发 diff。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>七、可以带走的运行时规则</h2>
+            <p>
+              这篇源码阅读最后可以收成几条更一般的 agent runtime 规则。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>状态类型</th>
+                    <th>应该放在哪里</th>
+                    <th>进入模型前要做什么</th>
+                    <th>保护的不变量</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>真实对话和工具证据</td>
+                    <td>durable history / rollout</td>
+                    <td>按模型能力投影，保持 call/output 成对。</td>
+                    <td>恢复和审计时有证据链。</td>
+                  </tr>
+                  <tr>
+                    <td>运行环境和权限</td>
+                    <td>turn context + reference baseline</td>
+                    <td>首次全量注入，后续只发可信 diff。</td>
+                    <td>模型知道当前边界，且不会被旧配置误导。</td>
+                  </tr>
+                  <tr>
+                    <td>工具能力</td>
+                    <td>tool router / prompt request</td>
+                    <td>通过 model-visible specs 暴露，不伪装成聊天历史。</td>
+                    <td>工具 schema 与 runtime 执行面一致。</td>
+                  </tr>
+                  <tr>
+                    <td>长线程压缩结果</td>
+                    <td>replacement history + compacted rollout item</td>
+                    <td>把摘要作为恢复用 handoff，必要时插回 initial context。</td>
+                    <td>长任务可继续，但承认压缩是有损的。</td>
+                  </tr>
+                  <tr>
+                    <td>token 窗口状态</td>
+                    <td>token_info + auto_compact_window</td>
+                    <td>用服务端 usage 和本地估算共同判断。</td>
+                    <td>避免只看一侧账导致过窗。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这也是为什么 Codex 的上下文管理值得单独写成系列第一篇。工具调用、权限系统、多 agent、
+              skills 和插件，后面都会回到同一个问题：运行时必须先决定哪本账有权保存状态，
+              再决定哪一部分应该被投影给模型。没有这层上下文纪律，agent 越强，越容易把自己之前做过的事搅成一团。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex 固定源码快照</a></li>
+              <li><a href="https://developers.openai.com/codex">Codex 官方文档总览</a></li>
+              <li><a href="https://developers.openai.com/codex/guides/agents-md">AGENTS.md 官方文档</a></li>
+              <li><a href="https://developers.openai.com/codex/skills">Codex skills 官方文档</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/state/session.rs#L23-L42">SessionState 字段</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L55-L108">TurnContext 定义</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L32-L50">ContextManager 字段</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L137-L184">run_turn 入口顺序</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2814-L3048">build_initial_context</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L3118-L3162">record_context_updates_and_set_reference_context_item</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L323-L335">normalize_history</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L733-L780">auto_compact_token_status</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L196-L330">run_compact_task_inner_impl</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/prompts/templates/compact/prompt.md#L1-L8">默认 compact prompt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2732-L2753">replace_compacted_history</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L208-L247">drop_last_n_user_turns</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

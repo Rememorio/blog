@@ -1,0 +1,739 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes I: Context Is a Runtime Ledger, Not Chat History</title>
+    <meta
+      name="description"
+      content="A source-guided walkthrough of Codex context management: ContextManager, TurnContext, for_prompt, reference_context_item, auto compaction, and rollout recovery."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes I: Context Is a Runtime Ledger, Not Chat History" />
+    <meta
+      property="og:description"
+      content="How openai/codex projects durable thread history into model-visible prompts, then compacts and recovers long-running threads."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/context-ledger-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/context-management/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/cn/context-management/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/context-management/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav aria-label="Page navigation">
+        <a href="../../../">Home</a>
+        <a href="../">Codex series</a>
+        <a href="../../cn/context-management/" lang="zh-CN">中文</a>
+        <a href="#sources">Sources</a>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part I</p>
+            <h1>Context Is a Runtime Ledger, Not Chat History</h1>
+            <p class="lead">
+              When a coding agent fails, the symptom often sounds like memory loss.
+              The Codex source shows a more precise mechanism: context is a
+              ledger that can be projected, compacted, and reconstructed.
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: context management</span>
+              <span>Scope: public source and official docs</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/context-ledger-cover.png"
+                alt="Overview of the Codex context ledger from durable history to model request and compaction recovery"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Start with a normal Codex session. You ask it to fix a bug in a
+              repository. It reads <code>AGENTS.md</code>, searches source files,
+              runs a test, inspects the failure, and edits the patch. Halfway
+              through, you add a constraint: do not touch generated files. Later
+              the thread approaches the context limit and compacts. The next
+              morning, you resume the thread and expect the agent to continue
+              from the right place.
+            </p>
+
+            <p>
+              A plain "append every message to a chat history" model cannot
+              explain this workflow. Repository instructions, working directory,
+              sandbox policy, skill metadata, tool schemas, tool outputs,
+              images, reasoning tokens, pending user input, compaction summaries,
+              and resume baselines have different owners. Some must be durable.
+              Some are only model-visible for one request. Some may be truncated.
+              Some must be re-injected from scratch if the baseline becomes
+              unreliable.
+            </p>
+
+            <p>
+              The official Codex docs provide the product contract: a thread is
+              a session made from prompts, model outputs, and tool calls; as the
+              agent works, it gathers context from files, tool output, and its
+              running record; everything must fit in the model's context window,
+              and long threads may be compacted. The source answers the next
+              question: where does that information live, when does it become
+              model-visible, and what gets installed after compaction?
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                This article treats official documentation as the product-level
+                contract and the public openai/codex source as the implementation
+                evidence. Source links point to one fixed public snapshot. Where
+                the source exposes only the remote-compaction selection boundary,
+                this article describes the visible lifecycle and does not infer
+                the server-side summarization algorithm.
+              </p>
+            </div>
+
+            <p>The article follows five questions:</p>
+            <ol>
+              <li>Why is durable history not the same thing as the prompt?</li>
+              <li>When does Codex inject full initial context, and when does it emit only a diff?</li>
+              <li>What does <code>for_prompt()</code> normalize or filter?</li>
+              <li>During compaction, which ledger is replaced and what recovery record remains?</li>
+              <li>Why do rollback, resume, and model switches affect the next context injection?</li>
+            </ol>
+
+            <h2>1. Separate The Four Surfaces</h2>
+            <p>
+              The first step is to stop looking for one memory object. Codex has
+              at least four relevant surfaces: session-scoped state, per-turn
+              configuration, durable history, and the model-visible request view.
+              They are not interchangeable.
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/state/session.rs#L23-L42"><code>SessionState</code></a>
+              owns session-level state such as <code>history: ContextManager</code>,
+              <code>additional_context</code>, <code>previous_turn_settings</code>,
+              and <code>auto_compact_window</code>. A
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L55-L108"><code>TurnContext</code></a>
+              is the per-turn snapshot: model, cwd, date, timezone, developer
+              instructions, user instructions, collaboration mode, permissions,
+              skill context, final output schema, and more. It is not a user
+              message. It is the structured runtime environment for one turn.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Surface</th>
+                    <th>Source owner</th>
+                    <th>Model-visible?</th>
+                    <th>Invariant protected</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Session state</td>
+                    <td><code>SessionState</code></td>
+                    <td>Not as a whole</td>
+                    <td>Keep history, permission baselines, compaction windows, and recovery state across turns.</td>
+                  </tr>
+                  <tr>
+                    <td>Turn snapshot</td>
+                    <td><code>TurnContext</code></td>
+                    <td>Partly, through context messages and request fields</td>
+                    <td>Give one turn a coherent source of model, cwd, sandbox, date, and skills.</td>
+                  </tr>
+                  <tr>
+                    <td>Durable history</td>
+                    <td><code>ContextManager.items</code></td>
+                    <td>Only after projection</td>
+                    <td>Retain recoverable API messages, tool calls, outputs, and compaction records.</td>
+                  </tr>
+                  <tr>
+                    <td>Model-visible prompt</td>
+                    <td><code>for_prompt()</code> + <code>Prompt</code></td>
+                    <td>Yes</td>
+                    <td>Send a legal request view adapted to the current model and tools.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L32-L50"><code>ContextManager</code></a>
+              comment calls it a transcript of thread history, but the struct
+              also carries <code>history_version</code>, <code>token_info</code>,
+              and <code>reference_context_item</code>. That last field is the
+              baseline used to generate model-visible settings updates. If it is
+              missing, the next regular turn falls back to full context
+              reinjection instead of diffing against stale state.
+            </p>
+
+            <h2>2. A Turn Does Not Jump Straight From User Input To Model</h2>
+            <p>
+              In <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L137-L184"><code>run_turn</code></a>,
+              the first step is not to record the new user message. Codex first
+              runs pre-sampling compaction. A nearby source note says this happens
+              before context updates and the new user message are recorded, and
+              that pending incoming items should eventually be estimated before
+              deciding whether the thread crosses the compaction threshold.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/turn-context-pipeline.png"
+                alt="Codex turn pipeline showing one request moving through compaction checks, context updates, input capture, model request, and the follow-up loop"
+              />
+              <figcaption>
+                A turn checks compaction first, writes context updates and inputs,
+                then projects history into a model request.
+              </figcaption>
+            </figure>
+
+            <p>
+              After that, <code>run_turn</code> records context updates, builds
+              skill and plugin injections, runs hooks, records user input, and
+              stores injection items. Only then does it prepare
+              <code>sampling_request_input</code> by cloning history and calling
+              <code>for_prompt()</code>. The request is a view derived from the
+              ledger, not the ledger itself.
+            </p>
+
+            <pre><code class="language-text">turn starts
+  -> maybe compact old history
+  -> inject full context or settings diff
+  -> load skills/plugins chosen for this turn
+  -> record user input and additional context
+  -> clone history
+  -> for_prompt(input_modalities)
+  -> build Prompt with tools and base instructions
+  -> stream model response</code></pre>
+
+            <p>
+              The turn loop also treats pending input carefully. A
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L197-L203">source comment</a>
+              says the turn-scoped <code>ModelClientSession</code> is reused
+              across retries, while pending input is deliberately not drained at
+              the very start of a turn or immediately after auto-compaction.
+              That ordering preserves continuation semantics. If a steer is
+              inserted in the wrong place, the model may resume the wrong work.
+            </p>
+
+            <h3>2.1 Initial Context Is Synthesized Runtime State</h3>
+            <p>
+              Full initial context comes from
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2814-L3048"><code>build_initial_context</code></a>.
+              It collects model-switch guidance, permission instructions,
+              developer instructions, collaboration mode, realtime state,
+              personality, apps instructions, available skills, plugins,
+              extension fragments, token budget context, environment context,
+              and user instructions. These become developer or contextual user
+              messages. They are not the user chat message.
+            </p>
+
+            <p>
+              The structured baseline is stored as a
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L345-L367"><code>TurnContextItem</code></a>.
+              That lets Codex later decide whether a new turn can emit only a
+              settings diff or must re-inject the full context bundle.
+            </p>
+
+            <h3>2.2 Steady-State Turns Emit Diffs, With Clear Limits</h3>
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L3118-L3162"><code>record_context_updates_and_set_reference_context_item</code></a>
+              is the normal runtime path. If the reference context item is
+              missing, it calls <code>build_initial_context</code>. Otherwise it
+              calls <code>build_settings_update_items</code> and appends only the
+              visible settings changes. It still persists a <code>TurnContext</code>
+              item for every real user turn, even when no visible diff is needed.
+            </p>
+
+            <pre><code class="language-text">if reference_context_item is None:
+    history += build_initial_context(turn_context)
+else:
+    history += build_settings_update_items(previous, turn_context)
+
+persist TurnContextItem for this real user turn
+reference_context_item = current TurnContextItem</code></pre>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/updates.rs#L209-L243"><code>build_settings_update_items</code></a>
+              currently covers environment changes, model switches, permission
+              changes, collaboration mode, realtime state, and personality. A
+              source note in that function states that it still does not cover every
+              model-visible item emitted by <code>build_initial_context</code>.
+              That limitation matters: when the baseline cannot be trusted,
+              Codex clears <code>reference_context_item</code> so the next turn
+              reinjects full context rather than sending a bogus diff.
+            </p>
+
+            <h2>3. History Becomes Prompt Through Projection</h2>
+            <p>
+              Before sampling, Codex does not send raw
+              <code>ContextManager.items</code>. It calls
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L107-L114"><code>for_prompt()</code></a>,
+              which normalizes history and returns the items suitable for the
+              current model request. Think of this as generating a report from
+              the ledger: the ledger stays durable, the report must be valid.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/prompt-projection-boundary.png"
+                alt="Codex prompt projection showing durable history filtered and normalized into the model-visible request"
+              />
+              <figcaption>
+                Durable history is the recovery surface. The model view is the
+                request surface, after normalization and capability filtering.
+              </figcaption>
+            </figure>
+
+            <p>
+              The current
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L323-L335"><code>normalize_history</code></a>
+              implementation enforces three invariants: every function or
+              custom call must have a corresponding output; every output must
+              have a corresponding call; and when images are unsupported, image
+              content is stripped from messages and tool outputs. Therefore
+              "the history contains an image" does not mean "this request sends
+              that image to the model."
+            </p>
+
+            <pre><code class="language-text">durable history, shape-level:
+  user text
+  function_call(call_id=A)
+  function_call_output(call_id=A)
+  orphan function_call_output(call_id=old)
+  user image
+
+model-visible view for a text-only model:
+  user text
+  function_call(call_id=A)
+  function_call_output(call_id=A)
+  user text with image content stripped</code></pre>
+
+            <p>
+              The same layer also truncates large tool outputs. The
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L338-L360"><code>process_item</code></a>
+              path applies a truncation policy to function output payloads.
+              Then <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L1000-L1017"><code>build_prompt</code></a>
+              adds model-visible tool specs, parallel tool call support, base
+              instructions, personality, and output schema. Tools are not
+              stored as normal chat messages, but their schemas still enter the
+              model-visible request.
+            </p>
+
+            <h3>3.1 Token Accounting Is A Mixed Ledger</h3>
+            <p>
+              Token accounting is also not just the server's last usage value.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L249-L314"><code>get_total_token_usage</code></a>
+              adds the latest server usage, local items appended after the last
+              model-generated item, and, when the server has not included them,
+              estimated non-last reasoning tokens. The local estimate is coarse:
+              the estimator is byte-based, not tokenizer-accurate.
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L733-L780"><code>auto_compact_token_status</code></a>
+              uses that active context count together with the configured
+              auto-compact scope, a scope limit, and the full context window
+              limit. In <code>BodyAfterPrefix</code> mode, it subtracts a
+              prefill baseline held by
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/state/auto_compact_window.rs#L14-L23"><code>AutoCompactWindow</code></a>.
+              Server-observed input tokens replace an estimated baseline when
+              they become available.
+            </p>
+
+            <h2>4. Compaction Installs Replacement History</h2>
+            <p>
+              Compaction is easy to under-describe as "make a summary." In
+              Codex, the visible mechanism is a recoverable history rewrite:
+              generate a handoff summary, preserve recent real user messages,
+              install replacement history, advance the auto-compact window, and
+              decide how initial context should be represented after the rewrite.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/compaction-replacement.png"
+                alt="Codex compaction replacement showing old history summarized into replacement history and written to the recovery ledger"
+              />
+              <figcaption>
+                The compacted result is replacement history, not a summary
+                dangling beside the old transcript.
+              </figcaption>
+            </figure>
+
+            <h3>4.1 Pre-Turn And Mid-Turn Compaction Differ</h3>
+            <p>
+              The pre-turn path is
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L783-L803"><code>run_pre_sampling_compact</code></a>.
+              It checks whether compaction is required before the new user turn
+              is sampled. There are also pre-turn compactions for compaction
+              compatibility hash changes and model downshifts to smaller context
+              windows.
+            </p>
+
+            <p>
+              The mid-turn path happens after sampling when the model still
+              needs a follow-up or pending input exists. The post-sampling state
+              collection checks token status and, if the context limit has been
+              reached while follow-up work is needed, runs auto-compaction with
+              <code>InitialContextInjection::BeforeLastUserMessage</code>.
+            </p>
+
+            <p>
+              The enum comment in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L53-L66"><code>InitialContextInjection</code></a>
+              explains the split. Pre-turn and manual compactions use
+              <code>DoNotInject</code>, replace history with a summary, and
+              clear <code>reference_context_item</code>; the next regular turn
+              will fully reinject initial context. Mid-turn compaction injects
+              initial context into replacement history just above the last real
+              user message, preserving the model's expected continuation shape.
+            </p>
+
+            <h3>4.2 The Summary Prompt Is A Handoff Contract</h3>
+            <p>
+              Local inline compaction starts in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L72-L96"><code>run_inline_auto_compact_task</code></a>.
+              It turns <code>turn_context.compact_prompt()</code> into user
+              input. The default
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/prompts/templates/compact/prompt.md#L1-L8">compact prompt</a>
+              asks the model to create a handoff summary for another LLM that
+              will resume the task: current progress, key decisions, constraints,
+              remaining steps, and critical references.
+            </p>
+
+            <p>
+              In
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L196-L330"><code>run_compact_task_inner_impl</code></a>,
+              Codex clones history, appends the compact prompt to that compact
+              request, runs the model to completion, extracts the last assistant
+              message as the summary suffix, collects real user messages, builds
+              replacement history, advances the auto-compact window id, installs
+              the compacted history, and recomputes token usage.
+            </p>
+
+            <pre><code class="language-text">old history:
+  initial context
+  user A
+  model/tool work
+  user B
+  model/tool work
+
+replacement history, shape-level:
+  recent real user messages, capped
+  user message: SUMMARY_PREFIX + handoff summary</code></pre>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L523-L587"><code>build_compacted_history</code></a>
+              retains recent real user messages, capped by a 20,000-token
+              approximate budget, then appends the summary as a user message.
+              When mid-turn compaction needs initial context, the
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L466-L521">insertion helper</a>
+              places canonical initial context before the last real user message
+              when possible, or before the summary or compaction item as a
+              fallback so the compacted item remains last.
+            </p>
+
+            <h3>4.3 Replacement Is Persisted To Rollout</h3>
+            <p>
+              Compaction changes durable state too.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2732-L2753"><code>replace_compacted_history</code></a>
+              replaces in-memory history, persists <code>RolloutItem::Compacted</code>,
+              optionally persists a <code>RolloutItem::TurnContext</code> when a
+              new baseline was established, and queues a session-start hook for
+              the compacted state. That makes compaction part of resume and fork
+              semantics, not just a temporary token-saving step.
+            </p>
+
+            <h2>5. Rollback And Resume Break Bad Baselines</h2>
+            <p>
+              The difficult part is not appending a new turn. It is keeping the
+              baseline valid after rollback, resume, fork, and compaction.
+              Codex does not keep diffing against a baseline it can no longer
+              reconstruct. When the surviving history no longer contains the
+              bundle that established the baseline, Codex clears the baseline.
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L208-L247"><code>drop_last_n_user_turns</code></a>
+              trims user turns and also walks backward to remove contextual
+              update items near the rollback boundary. If it trims a mixed
+              <code>build_initial_context</code> developer bundle, the
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L376-L420">trim logic</a>
+              clears <code>reference_context_item</code>. The next real turn
+              must fully reinject context because steady-state diffs would be
+              based on a bundle that no longer exists in history.
+            </p>
+
+            <p>
+              Resume reconstruction treats history, previous settings, reference
+              context, and window id as a single recovery group.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L1310-L1350"><code>apply_rollout_reconstruction</code></a>
+              installs the reconstructed history and baseline. In
+              <code>BodyAfterPrefix</code> mode, it also estimates prefix tokens
+              for the recovered compaction window.
+            </p>
+
+            <p>
+              A separate path,
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L3080-L3110"><code>maybe_start_new_context_window</code></a>,
+              advances the window id and replaces history with current initial
+              context. It persists an empty-message compacted item plus a fresh
+              <code>TurnContextItem</code>. This is a new prefix baseline, not a
+              semantic summary of old work.
+            </p>
+
+            <h2>6. Common Misreadings</h2>
+            <p>
+              The mechanism becomes easier to reuse once the common shortcuts are
+              made explicit.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Misreading</th>
+                    <th>What the source shows</th>
+                    <th>What breaks if implemented literally</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>History is the prompt</td>
+                    <td><code>ContextManager</code> stores durable items; <code>for_prompt()</code> derives a request view.</td>
+                    <td>Orphan outputs, unsupported images, or bad call/output pairs can poison the request.</td>
+                  </tr>
+                  <tr>
+                    <td>Initial context is repeated every turn</td>
+                    <td>A valid baseline allows settings diffs; missing or unreliable baselines trigger full reinjection.</td>
+                    <td>Either waste tokens or, worse, diff against stale runtime state.</td>
+                  </tr>
+                  <tr>
+                    <td>Compaction is just a summary</td>
+                    <td>Compaction creates a handoff summary and installs replacement history in rollout.</td>
+                    <td>Resume cannot know which history was replaced or how to restore the baseline.</td>
+                  </tr>
+                  <tr>
+                    <td>Token usage is only server usage</td>
+                    <td>Codex combines server usage, local appended items, reasoning estimates, and window baselines.</td>
+                    <td>Large local additions can push a request over the window without being noticed early.</td>
+                  </tr>
+                  <tr>
+                    <td>Rollback just deletes user messages</td>
+                    <td>Rollback also trims nearby context updates and may clear the reference baseline.</td>
+                    <td>The next turn can send diffs based on an initial context bundle that no longer survives.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>7. Runtime Rules To Carry Forward</h2>
+            <p>
+              The Codex implementation suggests a small set of general rules for
+              coding-agent runtimes.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>State type</th>
+                    <th>Where it belongs</th>
+                    <th>Before model visibility</th>
+                    <th>Invariant protected</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Conversation and tool evidence</td>
+                    <td>Durable history / rollout</td>
+                    <td>Project by model capability and preserve valid call/output pairs.</td>
+                    <td>Recovery and auditability keep an evidence chain.</td>
+                  </tr>
+                  <tr>
+                    <td>Runtime environment and permissions</td>
+                    <td>Turn context plus reference baseline</td>
+                    <td>Inject fully first, then emit trusted diffs.</td>
+                    <td>The model sees current boundaries without stale configuration.</td>
+                  </tr>
+                  <tr>
+                    <td>Tool capability</td>
+                    <td>Tool router / prompt request</td>
+                    <td>Expose as model-visible specs, not as normal chat text.</td>
+                    <td>Tool schemas match the runtime execution surface.</td>
+                  </tr>
+                  <tr>
+                    <td>Long-thread compaction</td>
+                    <td>Replacement history plus compacted rollout item</td>
+                    <td>Install a handoff summary and reinsert initial context when needed.</td>
+                    <td>Long work can continue while acknowledging compaction is lossy.</td>
+                  </tr>
+                  <tr>
+                    <td>Context-window accounting</td>
+                    <td><code>token_info</code> plus <code>auto_compact_window</code></td>
+                    <td>Combine server usage with local estimates.</td>
+                    <td>Neither side of the token ledger is trusted alone.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              That is why context management is a natural first article in a
+              Codex source-reading series. Tool calling, permissions, multi-agent
+              work, skills, and plugins all come back to the same discipline:
+              decide which ledger owns a piece of state, then decide which
+              projection of that state the model is allowed to see.
+            </p>
+
+            <h2 id="sources">Sources</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex fixed source snapshot</a></li>
+              <li><a href="https://developers.openai.com/codex">Codex docs overview</a></li>
+              <li><a href="https://developers.openai.com/codex/guides/agents-md">AGENTS.md docs</a></li>
+              <li><a href="https://developers.openai.com/codex/skills">Codex skills docs</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/state/session.rs#L23-L42">SessionState fields</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L55-L108">TurnContext definition</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L32-L50">ContextManager fields</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L137-L184">run_turn order</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2814-L3048">build_initial_context</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L3118-L3162">record_context_updates_and_set_reference_context_item</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L323-L335">normalize_history</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L733-L780">auto_compact_token_status</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L196-L330">run_compact_task_inner_impl</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/prompts/templates/compact/prompt.md#L1-L8">Default compact prompt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2732-L2753">replace_compacted_history</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L208-L247">drop_last_n_user_turns</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
