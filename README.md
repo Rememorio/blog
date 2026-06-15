@@ -20,11 +20,11 @@ tools, permissions, client projection, and recovery as separate mechanisms.
 - Language gateway:
   [rememorio.github.io/blog/codex/](https://rememorio.github.io/blog/codex/)
 - Chinese overview:
-  [Codex 源码阅读（一）：从一次 turn 看懂受控运行时](https://rememorio.github.io/blog/codex/cn/overview/)
+  [Codex 源码阅读（一）：从一次 turn 看懂受控运行时](https://rememorio.github.io/blog/codex/zh/overview/)
 - English overview:
   [Codex Source Notes I: Follow One Turn Through the Governed Runtime](https://rememorio.github.io/blog/codex/en/overview/)
 - Chinese context management:
-  [Codex 源码阅读（二）：上下文不是聊天记录，而是运行时账本](https://rememorio.github.io/blog/codex/cn/context-management/)
+  [Codex 源码阅读（二）：上下文不是聊天记录，而是运行时账本](https://rememorio.github.io/blog/codex/zh/context-management/)
 - English context management:
   [Codex Source Notes II: Context Is a Runtime Ledger, Not Chat History](https://rememorio.github.io/blog/codex/en/context-management/)
 
@@ -39,7 +39,7 @@ background review, curator, gateway, cron, and delegation.
 - Language gateway:
   [rememorio.github.io/blog/hermes-agent/](https://rememorio.github.io/blog/hermes-agent/)
 - Chinese:
-  [Hermes Agent: 自进化 Agent 的运行闭环](https://rememorio.github.io/blog/hermes-agent/cn/)
+  [Hermes Agent: 自进化 Agent 的运行闭环](https://rememorio.github.io/blog/hermes-agent/zh/)
 - English:
   [Hermes Agent: the Runtime Loop Behind a Self-Evolving Agent](https://rememorio.github.io/blog/hermes-agent/en/)
 
@@ -82,9 +82,9 @@ Then open:
 
 - `http://127.0.0.1:4173/`
 - `http://127.0.0.1:4173/codex/`
-- `http://127.0.0.1:4173/codex/cn/overview/`
+- `http://127.0.0.1:4173/codex/zh/overview/`
 - `http://127.0.0.1:4173/codex/en/overview/`
-- `http://127.0.0.1:4173/codex/cn/context-management/`
+- `http://127.0.0.1:4173/codex/zh/context-management/`
 - `http://127.0.0.1:4173/codex/en/context-management/`
 - `http://127.0.0.1:4173/hermes-agent/`
 
@@ -106,7 +106,7 @@ article in this repository:
 
 For bilingual articles, use sibling pages:
 
-- `<article>/cn/`
+- `<article>/zh/`
 - `<article>/en/`
 - `<article>/` as a language gateway
 
