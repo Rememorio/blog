@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex 源码阅读（七）：扩展与多 agent，额外能力怎样进入一次 turn</title>
+    <meta
+      name="description"
+      content="沿 openai/codex 源码拆解 Codex 的扩展与多 agent 机制：skills、plugins、MCP tool exposure、tool_search、dynamic tools、subagents 和 AgentControl。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex 源码阅读（七）：扩展与多 agent，额外能力怎样进入一次 turn" />
+    <meta
+      property="og:description"
+      content="从一次 turn 的能力入口出发，读懂 Codex 怎样把 skills、plugins、MCP 工具和 subagents 接进同一条运行主线。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/extension-runtime-boundaries.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/zh/extensions-agents/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/extensions-agents/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/extensions-agents/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(45, 95, 139, 0.32);
+        background: rgba(45, 95, 139, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Codex 系列</a>
+        <a href="../client-projection/">上一篇：客户端</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/extensions-agents/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex 源码阅读 · 第七篇</p>
+            <h1>扩展与多 agent，额外能力怎样进入一次 turn</h1>
+            <p class="lead">
+              前面几篇已经把一次 Codex 请求的主线走完：上下文怎样整理，工具怎样暴露，权限怎样收口，
+              客户端怎样看到同一套事实。现在问题换成另一种：当用户点名一个 skill、安装一个 plugin、
+              启用一批 MCP 工具，或者让子 agent 并行工作时，这些额外能力怎样进入这一次 turn？
+            </p>
+            <div class="meta-line">
+              <span>项目：openai/codex</span>
+              <span>主题：extensions / multi-agent</span>
+              <span>范围：公开源码</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/extension-runtime-boundaries.png"
+                alt="Codex turn capability map，展示 skills、plugins、MCP tools 和 subagents 四种入口进入 TurnContext 并流向事件"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先想一个具体场景：你让 Codex 写一篇文章，并点名使用 <code>$article</code> 和
+              <code>$image</code>；同时本地装着 Browser、GitHub、Documents 这些 plugin；
+              这轮可能还会出现几十个 MCP 工具，甚至需要开一个 subagent 专门审稿。
+              如果把这些都理解成“给模型多塞一些东西”，源码很快会读乱。
+            </p>
+
+            <p>
+              Codex 的处理方式更像一个分拣台。<strong>有的能力进入 prompt，有的能力进入工具列表，
+              有的能力只提供安装或发现入口，有的能力直接变成一条新的线程。</strong>
+              它们最终都服务同一轮工作，但进入 runtime 的形状完全不同。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这篇可以抓住一句话：<strong>扩展会以不同形状投到这一次 turn 里，继续受 turn runtime 管理。</strong>
+                <code>skills</code> 进入上下文，<code>plugins</code> 提供能力根目录和包边界，
+                <code>MCP</code> 进入工具暴露计划，<code>subagents</code> 进入线程控制面。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文只描述 openai/codex 公开源码里可验证的 skill 发现与注入、plugin manifest 与
+                load outcome、MCP tool exposure、tool_search、dynamic tools、multi-agent tool surface
+                和 <code>AgentControl</code> 行为。文中提到 app、plugin、subagent 时，指这些公开代码里的运行时结构。
+              </p>
+            </div>
+
+            <p>第七篇按六个问题拆：</p>
+            <ol>
+              <li>为什么要先区分“上下文能力”“工具能力”和“线程能力”？</li>
+              <li><code>TurnContext</code> 里哪些字段承接扩展输入？</li>
+              <li>skill 从“可用目录”到“完整 SKILL.md 注入”经历了什么？</li>
+              <li>plugin 作为能力包，怎样同时贡献 skills、MCP、apps 和 hooks？</li>
+              <li>MCP 工具什么时候直接给模型，什么时候交给 <code>tool_search</code>？</li>
+              <li>subagent 为什么是线程控制面，而不是普通工具输出？</li>
+            </ol>
+
+            <h2>一、先把四种能力形状分开</h2>
+            <p>
+              读扩展代码最容易卡住的地方，是几个词都会被泛泛地叫成“能力”。但在 Codex 里，
+              它们落到模型面前的形状不一样，也由不同 owner 管。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>能力形状</th>
+                    <th>用户看到的入口</th>
+                    <th>进入 runtime 的方式</th>
+                    <th>源码里要跟的 owner</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>工作方法</td>
+                    <td><code>$article</code>、<code>$image</code>、显式 skill 选择。</td>
+                    <td>先展示 skill catalog；被点名后读取完整 <code>SKILL.md</code>，作为 contextual user fragment 注入。</td>
+                    <td><code>SkillsManager</code>、<code>build_skill_injections</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>能力包</td>
+                    <td>Browser、GitHub、Documents 这类 plugin。</td>
+                    <td>manifest 声明 skills、MCP servers、apps、hooks；加载后产出 effective roots 和 capability summaries。</td>
+                    <td><code>PluginManifest</code>、<code>PluginLoadOutcome</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>可调用工具</td>
+                    <td>MCP server、app connector、dynamic tool。</td>
+                    <td>转换成 model-visible tool spec；数量或配置触发时变成 deferred tools，由 <code>tool_search</code> 再发现。</td>
+                    <td><code>build_mcp_tool_exposure</code>、<code>ToolSearchHandler</code>、<code>ToolRouter</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>并行工作单元</td>
+                    <td><code>spawn_agent</code>、<code>send_message</code>、<code>wait_agent</code>。</td>
+                    <td>创建或恢复子线程，复制本轮运行配置和权限边界，通过 inter-agent communication 回到父线程。</td>
+                    <td><code>AgentControl</code>、multi-agent handlers、<code>SessionSource::SubAgent</code>。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这张表先放在脑子里，后面看源码就不会混：skill 解决“这件事该怎么做”，plugin 解决“这些能力属于哪个包”，
+              MCP 解决“模型能调用什么”，subagent 解决“是否需要另一条上下文和执行轨道”。
+            </p>
+
+            <h2>二、TurnContext 先把入口留出来</h2>
+            <p>
+              第二篇讲 <code>TurnContext</code> 时，我们重点看上下文、权限和 token budget。第七篇要注意另一组字段：
+              <code>dynamic_tools</code>、<code>extension_data</code>、<code>turn_skills</code>、
+              <code>multi_agent_version</code>、<code>parent_thread_id</code> 和 <code>session_source</code>。
+              它们让一次 turn 有地方承接外部能力。
+            </p>
+
+            <p>
+              <code>make_turn_context</code> 会把当前 turn 的配置、模型信息、权限 profile、动态工具、
+              extension data 和 skills outcome 放进同一个结构里。这里有两个细节很关键。
+              第一，<code>HostLoadedSkills</code> 被插入 <code>extension_data</code>，让 host extension
+              也能看到已加载的 skill 集合。第二，<code>dynamic_tools</code> 来自 session configuration，
+              后面工具规划阶段会把它们追加到工具 surface。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                所以扩展入口并不是散落在各处临时读取。Codex 会在 turn 开始时先形成一个能力快照：
+                当前配置允许什么、已加载哪些 skill、有哪些 extension data、是否启用多 agent、
+                本轮权限边界是什么。后续注入和工具规划都围绕这份快照展开。
+              </p>
+            </div>
+
+            <h2>三、skills：先给目录，再按需展开全文</h2>
+            <p>
+              skill 的第一层很轻：Codex 会把可用 skill 的列表和使用规则放进 developer 上下文。
+              <code>AvailableSkillsInstructions</code> 只渲染 catalog 级别的信息，告诉模型有哪些 skill、
+              什么时候应该使用、怎么读取附加说明。
+            </p>
+
+            <p>
+              真正重的部分发生在用户点名之后。<code>build_skills_and_plugins</code> 从本轮 user input
+              里收集显式 skill mention，然后调用 <code>build_skill_injections</code>。这个函数会按 skill metadata
+              找到对应的文件系统，读取完整 <code>SKILL.md</code>，再把内容包装成
+              <code>SkillInstructions</code>。换句话说，完整技能说明是本轮被需要时才进入 prompt。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>阶段</th>
+                    <th>放进模型上下文的内容</th>
+                    <th>为什么这样做</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>可用列表</td>
+                    <td>skill name、description、path、触发规则。</td>
+                    <td>让模型知道“可以选什么”，但不把所有长说明一次塞进上下文。</td>
+                  </tr>
+                  <tr>
+                    <td>显式点名</td>
+                    <td>完整 <code>SKILL.md</code> 内容。</td>
+                    <td>用户或结构化输入已经确认需要它，这时才值得付出上下文成本。</td>
+                  </tr>
+                  <tr>
+                    <td>注入形状</td>
+                    <td><code>ContextualUserFragment</code> 里的 <code>SkillInstructions</code>。</td>
+                    <td>skill 是工作方法和约束，进入的是上下文层，不是工具调用层。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这也解释了为什么一个 skill 写得好不好，会直接影响文章或图的质量。runtime 只负责把它放到正确位置，
+              至于模型读到后如何执行，取决于 skill 里面是否把工作流、边界、验收方式写清楚。
+            </p>
+
+            <h2>四、plugins：把一组能力打成包</h2>
+            <p>
+              plugin 解决的是另一个问题：一组能力往往不是单独一个 <code>SKILL.md</code>。例如 Browser plugin
+              可能同时带 skill、脚本、MCP server、app connector；GitHub plugin 可能同时提供 PR triage、
+              CI 排查和发布流程。源码里 <code>PluginManifest</code> 的 <code>paths</code> 字段把这些入口分开声明：
+              <code>skills</code>、<code>mcp_servers</code>、<code>apps</code>、<code>hooks</code>。
+            </p>
+
+            <p>
+              加载后，<code>PluginLoadOutcome</code> 会给出几类 effective 结果：
+              skill roots、plugin skill roots、MCP servers、apps、hook sources 和 capability summaries。
+              capability summary 只保留对模型有用的短描述；真正能被调用的能力，仍然要走它各自的通道。
+            </p>
+
+            <div class="note">
+              <p>
+                这里有个很容易忽略的边界：plugin 自己不是一个万能工具。源码给模型的 plugin 使用说明里明确强调，
+                plugin 是 skills、MCP servers 和 apps 的本地 bundle。要解决任务，仍然使用它贡献出来的
+                skill、MCP 工具或 app tool。
+              </p>
+            </div>
+
+            <p>
+              <code>build_skills_and_plugins</code> 会先从当前配置加载 plugins，再解析显式 plugin mention。
+              如果用户点名某个 plugin，Codex 会拿到当前可用的 MCP/app inventory，用
+              <code>build_plugin_injections</code> 生成本轮 guidance。这样模型知道“这个包现在有哪些可用能力”，
+              但调用时还是回到具体工具或 skill。
+            </p>
+
+            <h2>五、MCP 与 tool_search：工具太多时先发现，再展开</h2>
+            <p>
+              第四篇已经讲过普通工具调用路径。第七篇要补上 MCP 工具进入模型前的一层选择：
+              <code>build_mcp_tool_exposure</code> 会先筛出 model-visible 的 MCP tools，
+              再根据配置和数量决定直接暴露，还是作为 deferred tools 交给搜索工具。
+            </p>
+
+            <p>
+              代码里有一个很具体的阈值：<code>DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD</code> 是 100。
+              如果启用了 search tool，并且配置要求始终 defer，或者待暴露工具数量达到阈值，
+              Codex 就不把这一大批工具全塞到 direct tool list；它会提供 <code>tool_search</code>，
+              让模型按 query 找到本轮真正需要的工具规格。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>工具来源</th>
+                    <th>进入模型前的处理</th>
+                    <th>运行时保护</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>普通 MCP tool</td>
+                    <td>筛 model-visible，数量合适时直接进入 tool spec。</td>
+                    <td>调用时仍走 <code>McpHandler</code> 和 MCP approval metadata。</td>
+                  </tr>
+                  <tr>
+                    <td>大量 MCP tool</td>
+                    <td>作为 deferred tool 建索引，先通过 <code>tool_search</code> 返回匹配工具。</td>
+                    <td>减少上下文噪音，调用路径没有绕开工具审批。</td>
+                  </tr>
+                  <tr>
+                    <td>app connector tool</td>
+                    <td>需要 connector 在本轮允许并启用，才会进入可见集合。</td>
+                    <td>tool metadata 里保留 connector 和 plugin 相关信息。</td>
+                  </tr>
+                  <tr>
+                    <td>dynamic tool</td>
+                    <td>从 <code>TurnContext.dynamic_tools</code> 追加到工具规划。</td>
+                    <td>仍然变成标准 handler，由 <code>ToolRouter</code> 分发。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这一层的价值很实际：工具多起来以后，问题不只是“能不能调用”，还有“模型面前应该先出现多少”。
+              direct exposure 适合少量稳定工具；deferred exposure 适合大工具库；tool_search 像一个按需打开的目录。
+            </p>
+
+            <h2>六、subagents：需要另一条线程时，才开并行轨道</h2>
+            <p>
+              多 agent 的入口看上去也像工具：<code>spawn_agent</code>、<code>send_message</code>、
+              <code>followup_task</code>、<code>wait_agent</code>、<code>list_agents</code> 都是在工具规划里暴露的。
+              但它们执行后的结果不止是一段工具返回值；运行时会创建一条由 <code>AgentControl</code> 管理的子线程。
+            </p>
+
+            <p>
+              <code>handle_spawn_agent</code> 会解析 <code>task_name</code>、<code>agent_type</code>、
+              <code>model</code>、<code>reasoning_effort</code>、<code>fork_turns</code> 等参数。
+              之后它会从父 turn 构建子 agent 配置：复制必要的 runtime 字段，应用模型或 role 覆盖，
+              再把本轮权限 profile、sandbox、cwd、environment selection 等运行时边界带过去。
+            </p>
+
+            <p>
+              真正生成子线程时，<code>AgentControl.spawn_agent_with_metadata</code> 会使用
+              <code>SessionSource::SubAgent</code> 和 <code>ThreadSpawn</code> metadata。
+              如果选择 fork history，它会先读取父线程的历史，再按 <code>fork_turns</code> 决定继承全部、
+              最近 N 轮，或者不继承历史。子 agent 结束后，completion watcher 会把结果作为
+              <code>InterAgentCommunication</code> 或用户消息送回父线程。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                subagent 的重点在于多一条受控线程。它有自己的 context、status、
+                history 和 completion notification；但它的权限与环境来自父 turn 的运行时配置，
+                不会变成脱离主线程监管的后台过程。
+              </p>
+            </div>
+
+            <h2>七、把四条入口接回同一条主线</h2>
+            <p>
+              到这里可以把第七篇合回前六篇的路线图：用户输入进入 turn；<code>TurnContext</code> 固定本轮快照；
+              skill 和 plugin guidance 先形成上下文注入；MCP、dynamic tools 和 collaboration tools
+              进入工具规划；工具执行、agent 活动和普通模型输出再继续变成事件，交给客户端投影。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>你在使用时看到</th>
+                    <th>源码里可以这样定位</th>
+                    <th>接到前文哪一层</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>“用 $article 写一篇”</td>
+                    <td>先看 <code>collect_explicit_skill_mentions</code>，再看 <code>SkillInstructions</code> 注入。</td>
+                    <td>第二篇的上下文管理。</td>
+                  </tr>
+                  <tr>
+                    <td>“启用 Browser / GitHub plugin”</td>
+                    <td>先看 manifest 和 load outcome，再看它贡献的 skill roots、MCP、apps。</td>
+                    <td>本篇的 plugin 包边界，第四篇的工具系统。</td>
+                  </tr>
+                  <tr>
+                    <td>“工具很多，先搜索工具”</td>
+                    <td>看 <code>build_mcp_tool_exposure</code> 和 <code>ToolSearchHandler</code>。</td>
+                    <td>第四篇的 tool spec 与 tool router。</td>
+                  </tr>
+                  <tr>
+                    <td>“开一个 subagent 审稿”</td>
+                    <td>看 multi-agent handlers、<code>AgentControl</code>、<code>SessionSource::SubAgent</code>。</td>
+                    <td>第三篇的事件流，第六篇的客户端投影。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这样看，Codex 的扩展机制并不是给 runtime 外面套一层万能插件系统。它更像给一次 turn
+              增加几种受控入口：能写进 prompt 的写进 prompt，能变成工具的变成工具，
+              需要独立上下文的开成子线程，所有结果继续回到事件和记录。
+            </p>
+
+            <h2>八、读完第七篇，回头看一次完整请求</h2>
+            <p>
+              如果把前七篇连起来，一次普通请求已经可以这样读：入口把用户意图变成 typed operation；
+              session 建立 turn；context manager 整理模型能看到的材料；tool spec 和 tool router
+              决定模型能调用什么；permission 和 sandbox 管住副作用；event stream 把运行事实投给客户端；
+              extensions 和 multi-agent 则回答“额外能力怎样加入这条主线”。
+            </p>
+
+            <p>
+              后面继续往下挖，可以顺着 hooks 和生命周期走：用户 prompt 提交前后、工具调用前后、
+              turn 停止时，Codex 还允许哪些代码在边界处补充上下文或拦截副作用。到那一层，
+              plugin 里的 <code>hooks</code> 就会从 manifest 字段变成真正的执行路径。
+            </p>
+
+            <h2 id="sources">参考源码</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex 固定源码快照</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L55-L108">TurnContext 字段：dynamic tools、extension data、turn skills、multi-agent runtime</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L458-L580">make_turn_context 构建本轮能力快照</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L458-L612">build_skills_and_plugins 组装 skill、plugin 和 extension 注入</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context/available_skills_instructions.rs#L8-L49">AvailableSkillsInstructions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2921-L2942">session prompt 中加入 available skills</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/manager.rs#L103-L140">SkillsManager 根据配置计算 skill roots</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/injection.rs#L58-L124">build_skill_injections 读取完整 SKILL.md</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/injection.rs#L146-L214">collect_explicit_skill_mentions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/skill_instructions.rs#L5-L40">SkillInstructions contextual fragment</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/manifest.rs#L8-L24">PluginManifest paths：skills、MCP、apps、hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/load_outcome.rs#L13-L88">LoadedPlugin 与 PluginLoadOutcome</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/load_outcome.rs#L108-L184">effective skill roots、MCP servers、apps、hooks 和 capability summaries</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context/available_plugins_instructions.rs#L24-L68">AvailablePluginsInstructions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/plugins/injection.rs#L14-L58">build_plugin_injections</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/extensions.rs#L45-L95">app-server 注册 extension registry</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/mcp_tool_exposure.rs#L12-L52">build_mcp_tool_exposure 与 deferred threshold</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/tool_search.rs#L23-L139">ToolSearchHandler</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/spec_plan.rs#L630-L820">工具规划：MCP resources、plugin install、collaboration tools、MCP handlers、dynamic tools</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/mcp_tool_call.rs#L957-L1065">MCP tool approval metadata 与 request metadata</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs#L39-L133">handle_spawn_agent 构建子 agent</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs#L185-L233">SpawnAgentArgs 与 fork_turns</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_common.rs#L197-L278">build_agent_spawn_config 与 runtime overrides</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/agent/control.rs#L84-L190">AgentControl 控制面与 inter-agent communication</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/agent/control.rs#L396-L515">subagent completion watcher 与 ThreadSpawn metadata</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          links.push({ link, heading });
+        });
+
+        toc.appendChild(list);
+
+        const activate = () => {
+          let current = links[0];
+          for (const item of links) {
+            if (item.heading.getBoundingClientRect().top <= 120) current = item;
+            else break;
+          }
+          links.forEach((item) => item.link.classList.toggle("active", item === current));
+        };
+
+        activate();
+        document.addEventListener("scroll", activate, { passive: true });
+      })();
+    </script>
+  </body>
+</html>

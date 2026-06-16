@@ -22,7 +22,8 @@ pipeline.
 Codex Source Notes is a bilingual source-reading series on
 [openai/codex](https://github.com/openai/codex). It starts by following one
 ordinary user request through the runtime path, then drills into context,
-tools, permissions, client projection, and recovery as separate mechanisms.
+tools, permissions, client projection, extensions, and recovery as separate
+mechanisms.
 
 - Language gateway:
   [rememorio.github.io/blog/codex/](https://rememorio.github.io/blog/codex/)
@@ -50,6 +51,10 @@ tools, permissions, client projection, and recovery as separate mechanisms.
   [Codex 源码阅读（六）：客户端投影，同一套事实怎样变成可见状态](https://rememorio.github.io/blog/codex/zh/client-projection/)
 - English client projection:
   [Codex Source Notes VI: Client Projection](https://rememorio.github.io/blog/codex/en/client-projection/)
+- Chinese extensions and multi-agent:
+  [Codex 源码阅读（七）：扩展与多 agent，额外能力怎样进入一次 turn](https://rememorio.github.io/blog/codex/zh/extensions-agents/)
+- English extensions and multi-agent:
+  [Codex Source Notes VII: Extensions and Multi-Agent](https://rememorio.github.io/blog/codex/en/extensions-agents/)
 
 ### Hermes Agent
 
@@ -82,6 +87,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/tools/               # Chinese tools-runtime article
 │   ├── zh/permissions-sandbox/ # Chinese permission/sandbox article
 │   ├── zh/client-projection/   # Chinese client-projection article
+│   ├── zh/extensions-agents/   # Chinese extensions/multi-agent article
 │   ├── en/index.html           # English series index
 │   ├── en/overview/            # English series overview article
 │   ├── en/context-management/  # English context-management article
@@ -89,6 +95,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── en/tools/               # English tools-runtime article
 │   ├── en/permissions-sandbox/ # English permission/sandbox article
 │   ├── en/client-projection/   # English client-projection article
+│   ├── en/extensions-agents/   # English extensions/multi-agent article
 │   └── assets/*.png            # Final raster figures
 ├── hermes-agent/
 │   ├── index.html              # Language gateway
@@ -129,6 +136,8 @@ Then open:
 - `http://127.0.0.1:4173/codex/en/permissions-sandbox/`
 - `http://127.0.0.1:4173/codex/zh/client-projection/`
 - `http://127.0.0.1:4173/codex/en/client-projection/`
+- `http://127.0.0.1:4173/codex/zh/extensions-agents/`
+- `http://127.0.0.1:4173/codex/en/extensions-agents/`
 - `http://127.0.0.1:4173/hermes-agent/`
 
 Use a local server rather than opening files directly when checking relative

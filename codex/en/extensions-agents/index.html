@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes VII: Extensions and Multi-Agent</title>
+    <meta
+      name="description"
+      content="A source-guided walkthrough of how Codex brings skills, plugins, MCP tool exposure, tool_search, dynamic tools, subagents, and AgentControl into one turn."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes VII: Extensions and Multi-Agent" />
+    <meta
+      property="og:description"
+      content="Read how skills, plugins, MCP tools, dynamic tools, and subagents enter the same Codex turn runtime."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/extension-runtime-boundaries.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/extensions-agents/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/extensions-agents/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/extensions-agents/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(45, 95, 139, 0.32);
+        background: rgba(45, 95, 139, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Codex series</a>
+        <a href="../client-projection/">Previous: clients</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/extensions-agents/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part VII</p>
+            <h1>Extensions and Multi-Agent: How Extra Capability Enters One Turn</h1>
+            <p class="lead">
+              The first six parts followed one Codex request through context, tools,
+              permissions, events, client projection, and recovery. This part asks
+              a different question: when a user names a skill, installs a plugin,
+              enables MCP tools, or asks a subagent to help, how does that extra
+              capability join the current turn?
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: extensions / multi-agent</span>
+              <span>Scope: public source</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/extension-runtime-boundaries.png"
+                alt="Codex turn capability map showing skills, plugins, MCP tools, and subagents entering TurnContext and flowing to events"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Start with a familiar workflow. You ask Codex to write an article,
+              explicitly invoke <code>$article</code> and <code>$image</code>,
+              keep Browser and GitHub plugins enabled, expose a large MCP tool
+              set, and maybe spawn a subagent to review the draft. All of that is
+              "capability" in everyday language, but the source does not treat it
+              as one blob.
+            </p>
+
+            <p>
+              Codex separates the shapes. <strong>Some capability becomes prompt
+              context, some becomes tool specs, some becomes a package boundary,
+              and some becomes another thread.</strong> Those paths still serve
+              the same user turn, but they are owned and projected differently.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The useful reading model is simple: <strong>extensions enter the
+                current turn as bounded runtime inputs.</strong> <code>skills</code>
+                enter context, <code>plugins</code> provide package boundaries and
+                roots, <code>MCP</code> enters tool exposure, and <code>subagents</code>
+                enter the thread control plane.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                This article only describes behavior visible in the public
+                openai/codex source: skill discovery and injection, plugin
+                manifests and load outcomes, MCP tool exposure, tool_search,
+                dynamic tools, the multi-agent tool surface, and <code>AgentControl</code>.
+                References to apps, plugins, and subagents mean those public
+                runtime structures.
+              </p>
+            </div>
+
+            <p>This part follows six questions:</p>
+            <ol>
+              <li>Why separate context capability, tool capability, and thread capability?</li>
+              <li>Which <code>TurnContext</code> fields receive extension inputs?</li>
+              <li>How does a skill move from catalog entry to full <code>SKILL.md</code> injection?</li>
+              <li>How does a plugin package skills, MCP servers, apps, and hooks?</li>
+              <li>When are MCP tools exposed directly, and when are they deferred to <code>tool_search</code>?</li>
+              <li>Why is a subagent a child thread rather than an ordinary tool result?</li>
+            </ol>
+
+            <h2>1. Four Capability Shapes</h2>
+            <p>
+              The hardest part of this area is vocabulary. The UI may call many
+              things "capabilities", but the runtime needs sharper boundaries.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Shape</th>
+                    <th>User-facing entry</th>
+                    <th>Runtime entry</th>
+                    <th>Owner to follow</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Working method</td>
+                    <td><code>$article</code>, <code>$image</code>, or a structured skill selection.</td>
+                    <td>The catalog is visible first; full <code>SKILL.md</code> content is injected only when selected.</td>
+                    <td><code>SkillsManager</code>, <code>build_skill_injections</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>Capability bundle</td>
+                    <td>Browser, GitHub, Documents, and other plugins.</td>
+                    <td>The manifest declares skills, MCP servers, apps, and hooks; loading produces effective roots and summaries.</td>
+                    <td><code>PluginManifest</code>, <code>PluginLoadOutcome</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>Callable tool</td>
+                    <td>MCP server, app connector, or dynamic tool.</td>
+                    <td>Converted into model-visible tool specs; large tool sets can be deferred behind <code>tool_search</code>.</td>
+                    <td><code>build_mcp_tool_exposure</code>, <code>ToolSearchHandler</code>, <code>ToolRouter</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>Parallel work unit</td>
+                    <td><code>spawn_agent</code>, <code>send_message</code>, <code>wait_agent</code>.</td>
+                    <td>Creates or resumes a child thread with copied runtime boundaries and inter-agent communication.</td>
+                    <td><code>AgentControl</code>, multi-agent handlers, <code>SessionSource::SubAgent</code>.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Keep this table close while reading the code. A skill answers
+              "how should this work be done?", a plugin answers "which package
+              owns these abilities?", MCP answers "what can the model call?",
+              and a subagent answers "does this need a separate context track?".
+            </p>
+
+            <h2>2. TurnContext Holds the Inputs</h2>
+            <p>
+              Earlier parts focused on <code>TurnContext</code> as the place where
+              context, permissions, and token policy meet. For extensions, the
+              relevant fields are <code>dynamic_tools</code>, <code>extension_data</code>,
+              <code>turn_skills</code>, <code>multi_agent_version</code>,
+              <code>parent_thread_id</code>, and <code>session_source</code>.
+            </p>
+
+            <p>
+              <code>make_turn_context</code> assembles the turn's config, model
+              information, permission profile, dynamic tools, extension data, and
+              loaded skills into one structure. Two details matter here:
+              <code>HostLoadedSkills</code> is inserted into <code>extension_data</code>
+              for host extensions, and <code>dynamic_tools</code> is carried from
+              session configuration into the later tool plan.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                Codex forms a turn capability snapshot before the model request:
+                current config, loaded skills, extension data, multi-agent mode,
+                and permission boundaries. Injection and tool planning both
+                build on that snapshot.
+              </p>
+            </div>
+
+            <h2>3. Skills: Catalog First, Full Text on Demand</h2>
+            <p>
+              Skill exposure has a light first layer. Codex renders available
+              skill names, descriptions, paths, and usage rules into developer
+              context through <code>AvailableSkillsInstructions</code>. That tells
+              the model what can be selected without paying the cost of loading
+              every long skill body.
+            </p>
+
+            <p>
+              The heavier layer appears after an explicit mention. <code>build_skills_and_plugins</code>
+              collects skill mentions from the current user input, then calls
+              <code>build_skill_injections</code>. That function resolves the
+              skill metadata, reads the full <code>SKILL.md</code>, and wraps the
+              contents as <code>SkillInstructions</code>. The full working method
+              enters context only when the turn needs it.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Stage</th>
+                    <th>Model-visible content</th>
+                    <th>Why it is shaped this way</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Catalog</td>
+                    <td>Skill name, description, path, and trigger guidance.</td>
+                    <td>The model can choose without loading every long instruction file.</td>
+                  </tr>
+                  <tr>
+                    <td>Explicit mention</td>
+                    <td>Full <code>SKILL.md</code> contents.</td>
+                    <td>The user or structured input has confirmed that the skill is relevant.</td>
+                  </tr>
+                  <tr>
+                    <td>Injection shape</td>
+                    <td><code>SkillInstructions</code> as a contextual user fragment.</td>
+                    <td>A skill is a work method and constraint, so it enters context rather than the tool list.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              That is why skill quality matters so much. The runtime can put the
+              file in the right place, but the file itself still needs to encode
+              workflow, boundaries, and verification criteria clearly.
+            </p>
+
+            <h2>4. Plugins Package Several Kinds of Capability</h2>
+            <p>
+              Plugins solve a broader packaging problem. A plugin may contribute
+              skills, scripts, MCP servers, app connectors, and hooks. In the
+              source, <code>PluginManifest.paths</code> names those components as
+              separate resources: <code>skills</code>, <code>mcp_servers</code>,
+              <code>apps</code>, and <code>hooks</code>.
+            </p>
+
+            <p>
+              After loading, <code>PluginLoadOutcome</code> exposes effective
+              skill roots, plugin skill roots, MCP servers, apps, hook sources,
+              and capability summaries. A summary is a compact model-facing
+              description. The actual capability still enters through its own
+              path: skill context, MCP tool, app tool, or hook.
+            </p>
+
+            <div class="note">
+              <p>
+                The plugin instructions make this boundary explicit: a plugin is
+                a local bundle of skills, MCP servers, and apps. Solving work
+                still means using the underlying skill, MCP tool, or app tool.
+              </p>
+            </div>
+
+            <p>
+              <code>build_skills_and_plugins</code> loads plugins from the current
+              config, resolves explicit plugin mentions, and, when needed, loads
+              raw MCP/app inventory for the turn. <code>build_plugin_injections</code>
+              then turns a plugin mention into guidance about the package's
+              currently usable abilities.
+            </p>
+
+            <h2>5. MCP and tool_search: Discover Before Loading Everything</h2>
+            <p>
+              Part IV covered the ordinary tool-call path. The extension layer
+              adds an exposure decision before the model sees MCP tools.
+              <code>build_mcp_tool_exposure</code> filters model-visible MCP tools
+              and then decides whether to expose them directly or defer them.
+            </p>
+
+            <p>
+              The threshold is concrete: <code>DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD</code>
+              is 100. If search is enabled and the configuration requests
+              always-defer, or the tool set reaches that threshold, Codex does
+              not place the whole set in the direct tool list. It exposes
+              <code>tool_search</code>, and the model retrieves relevant specs by
+              query.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Tool source</th>
+                    <th>Before model exposure</th>
+                    <th>Runtime boundary</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Regular MCP tool</td>
+                    <td>Filtered for model visibility and exposed directly when the set is small enough.</td>
+                    <td>Calls still go through <code>McpHandler</code> and approval metadata.</td>
+                  </tr>
+                  <tr>
+                    <td>Large MCP set</td>
+                    <td>Indexed as deferred tools and retrieved through <code>tool_search</code>.</td>
+                    <td>The search step reduces context noise without bypassing the call path.</td>
+                  </tr>
+                  <tr>
+                    <td>App connector tool</td>
+                    <td>Visible only when the connector is allowed and enabled for this turn.</td>
+                    <td>Tool metadata keeps connector and plugin information.</td>
+                  </tr>
+                  <tr>
+                    <td>Dynamic tool</td>
+                    <td>Added from <code>TurnContext.dynamic_tools</code> during tool planning.</td>
+                    <td>Still becomes a normal handler routed by <code>ToolRouter</code>.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The practical point is scale. Once tool libraries become large,
+              the key question is not just whether the model can call them; it
+              is how many specs should be placed in front of the model before it
+              knows what it needs.
+            </p>
+
+            <h2>6. Subagents Add a Controlled Thread</h2>
+            <p>
+              Multi-agent operations are exposed through tools:
+              <code>spawn_agent</code>, <code>send_message</code>,
+              <code>followup_task</code>, <code>wait_agent</code>, and
+              <code>list_agents</code>. Their effect is different from a normal
+              function result. A spawned agent becomes a child thread managed by
+              <code>AgentControl</code>.
+            </p>
+
+            <p>
+              <code>handle_spawn_agent</code> parses <code>task_name</code>,
+              <code>agent_type</code>, model options, reasoning effort,
+              service tier, and <code>fork_turns</code>. It then builds a child
+              config from the parent turn, applies allowed model or role
+              overrides, and copies runtime boundaries such as approval policy,
+              sandbox, cwd, permission profile, and environments.
+            </p>
+
+            <p>
+              The spawn path uses <code>SessionSource::SubAgent</code> and
+              <code>ThreadSpawn</code> metadata. When history is forked, it reads
+              parent history and keeps all turns, the last N turns, or none,
+              depending on <code>fork_turns</code>. Completion is reported back
+              to the parent through <code>InterAgentCommunication</code> in the
+              v2 path, or by injecting a parent-thread message for older paths.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                A subagent is a controlled thread, not just a function call. It
+                has its own context, status, history, and completion notification,
+                while still inheriting the parent's runtime boundaries.
+              </p>
+            </div>
+
+            <h2>7. Rejoin the Main Turn</h2>
+            <p>
+              The four paths now connect back to the series map. User input
+              enters a turn; <code>TurnContext</code> fixes the current snapshot;
+              skill and plugin guidance become contextual injection; MCP,
+              dynamic tools, and collaboration tools enter the tool plan; tool
+              calls, agent activity, and model output continue into events and
+              client projection.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>What you see</th>
+                    <th>Where to read</th>
+                    <th>Series connection</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>"Use $article for this post"</td>
+                    <td><code>collect_explicit_skill_mentions</code>, then <code>SkillInstructions</code>.</td>
+                    <td>Part II: context management.</td>
+                  </tr>
+                  <tr>
+                    <td>"Enable Browser or GitHub plugin"</td>
+                    <td>Manifest and load outcome, then contributed skill roots, MCP servers, and apps.</td>
+                    <td>This part's plugin boundary, plus Part IV tools.</td>
+                  </tr>
+                  <tr>
+                    <td>"Search the tool catalog first"</td>
+                    <td><code>build_mcp_tool_exposure</code> and <code>ToolSearchHandler</code>.</td>
+                    <td>Part IV: tool specs and routing.</td>
+                  </tr>
+                  <tr>
+                    <td>"Spawn a reviewer subagent"</td>
+                    <td>Multi-agent handlers, <code>AgentControl</code>, and <code>SessionSource::SubAgent</code>.</td>
+                    <td>Part III events and Part VI client projection.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Seen this way, Codex extensions are not an external plugin layer
+              bolted around the runtime. They are bounded inputs to the same
+              turn: context when the model needs a working method, tool specs
+              when it needs callable capability, and child threads when the work
+              needs a separate context track.
+            </p>
+
+            <h2>8. The Series Map After Part VII</h2>
+            <p>
+              With seven parts in place, a single request can be read end to
+              end: entry converts user intent into typed operations; session
+              creates a turn; context management prepares model-visible material;
+              tool specs and routers define callable surface; permission and
+              sandboxing gate side effects; events project runtime facts to
+              clients; extensions and multi-agent explain how extra capability
+              joins that same path.
+            </p>
+
+            <p>
+              The natural next layer is hooks and lifecycle. Before or after a
+              user prompt, before or after a tool call, and when a turn stops,
+              Codex allows more code to add context or intercept side effects.
+              At that point, the <code>hooks</code> entry in a plugin manifest
+              becomes an execution path.
+            </p>
+
+            <h2 id="sources">Source References</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">Pinned openai/codex source snapshot</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L55-L108">TurnContext fields for dynamic tools, extension data, turn skills, and multi-agent runtime</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L458-L580">make_turn_context builds the turn capability snapshot</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L458-L612">build_skills_and_plugins assembles skill, plugin, and extension injection</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context/available_skills_instructions.rs#L8-L49">AvailableSkillsInstructions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2921-L2942">Available skills added to session prompt sections</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/manager.rs#L103-L140">SkillsManager computes skill roots from config</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/injection.rs#L58-L124">build_skill_injections reads full SKILL.md contents</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/injection.rs#L146-L214">collect_explicit_skill_mentions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/skill_instructions.rs#L5-L40">SkillInstructions contextual fragment</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/manifest.rs#L8-L24">PluginManifest paths for skills, MCP, apps, and hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/load_outcome.rs#L13-L88">LoadedPlugin and PluginLoadOutcome</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/load_outcome.rs#L108-L184">Effective skill roots, MCP servers, apps, hooks, and summaries</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context/available_plugins_instructions.rs#L24-L68">AvailablePluginsInstructions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/plugins/injection.rs#L14-L58">build_plugin_injections</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/extensions.rs#L45-L95">app-server extension registry</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/mcp_tool_exposure.rs#L12-L52">build_mcp_tool_exposure and deferred threshold</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/tool_search.rs#L23-L139">ToolSearchHandler</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/spec_plan.rs#L630-L820">Tool planning for MCP resources, plugin install tools, collaboration tools, MCP handlers, and dynamic tools</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/mcp_tool_call.rs#L957-L1065">MCP tool approval metadata and request metadata</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs#L39-L133">handle_spawn_agent builds child agents</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs#L185-L233">SpawnAgentArgs and fork_turns</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_common.rs#L197-L278">build_agent_spawn_config and runtime overrides</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/agent/control.rs#L84-L190">AgentControl and inter-agent communication</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/agent/control.rs#L396-L515">Subagent completion watcher and ThreadSpawn metadata</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          links.push({ link, heading });
+        });
+
+        toc.appendChild(list);
+
+        const activate = () => {
+          let current = links[0];
+          for (const item of links) {
+            if (item.heading.getBoundingClientRect().top <= 120) current = item;
+            else break;
+          }
+          links.forEach((item) => item.link.classList.toggle("active", item === current));
+        };
+
+        activate();
+        document.addEventListener("scroll", activate, { passive: true });
+      })();
+    </script>
+  </body>
+</html>
