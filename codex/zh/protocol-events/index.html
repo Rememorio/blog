@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex 源码阅读（三）：protocol 与事件流，客户端怎样共享同一套事实</title>
+    <meta
+      name="description"
+      content="沿 openai/codex 源码拆解 Codex 的 protocol 与事件流：TurnStartParams、Submission、Op、EventMsg、app-server v2 投影和 rollout 恢复。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex 源码阅读（三）：protocol 与事件流，客户端怎样共享同一套事实" />
+    <meta
+      property="og:description"
+      content="从一次 turn 的外部可见状态出发，读懂 Codex 如何用有类型的 request、event 和 v2 notification 让多个客户端对齐同一套运行时事实。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/protocol-event-stream.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/zh/protocol-events/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/protocol-events/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/protocol-events/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Codex 系列</a>
+        <a href="../context-management/">上一篇：上下文</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/protocol-events/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex 源码阅读 · 第三篇</p>
+            <h1>protocol 与事件流，客户端怎样共享同一套事实</h1>
+            <p class="lead">
+              第二篇讲清了 turn 内部怎样整理上下文。现在把视角挪到 turn 外面：
+              当 Codex 在后台跑模型、等审批、执行命令、更新 diff 时，客户端为什么能持续看到同一件事？
+              答案藏在一条很朴素的链路里：客户端提交有类型的任务单，运行时发出有类型的事件，
+              app-server 再把这些事件投影成客户端能消费的视图。
+            </p>
+            <div class="meta-line">
+              <span>项目：openai/codex</span>
+              <span>主题：protocol and events</span>
+              <span>范围：公开源码</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/protocol-event-stream.png"
+                alt="Codex protocol 与事件流总览图，展示 client、TurnStart、Submission、Op、Session、EventMsg、v2 view、rollout 和 resume 的关系"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先想一个日常画面。你在一个客户端里发起任务，Codex 开始处理；另一个客户端连进来，
+              应该能看到当前 turn 已经开始、模型正在输出、某条命令在等审批、当前 diff 变成了什么。
+              过一会儿你关掉页面再回来，历史里还要能重建这轮发生过的关键事实。
+            </p>
+
+            <p>
+              如果只盯着界面，会很容易把这些现象看成一堆 UI 状态：聊天消息、进度条、审批弹窗、diff 面板、token 数字。
+              源码里的边界更清楚：先有 <strong>core 的运行时事实</strong>，再有 <strong>客户端视图</strong>。
+              这一篇就沿这条边界读。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                先把三个词翻译成人话：
+                <strong>Submission</strong> 是交给运行时的任务单；
+                <strong>EventMsg</strong> 是运行时吐出的事实；
+                <strong>ServerNotification</strong> 是 app-server 给客户端看的投影视图。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文把 OpenAI 的 App Server 文章当作产品层契约，把 openai/codex 公开源码里能看到的协议类型、
+                事件类型和映射函数当作机制证据。源码链接固定到同一个公开快照。文中把“任务单”“事实”“投影”当作阅读辅助词，
+                对应的是源码里的 <code>Submission</code>、<code>EventMsg</code>、app-server v2 notification 等结构。
+              </p>
+            </div>
+
+            <p>这一篇只追五个问题：</p>
+            <ol>
+              <li>客户端发起 turn 时，除了文本，还带了哪些运行边界？</li>
+              <li>core 层为什么把交互收成一对队列：提交任务、接收事件？</li>
+              <li><code>EventMsg</code> 里哪些是生命周期，哪些是内容、工具、审批、用量和 diff？</li>
+              <li>app-server v2 为什么要把 core event 再翻译成 turn、item、delta 和 request？</li>
+              <li>恢复历史时，为什么能够从 rollout 重新拼出 turn？</li>
+            </ol>
+
+            <h2>一、先从客户端看到的现象说起</h2>
+            <p>
+              读 protocol 最容易掉进枚举清单。更自然的入口，是先列出客户端要解决的问题。
+              一个 Codex turn 运行时，客户端至少要处理这些变化：
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>客户端看到</th>
+                    <th>源码里要追问</th>
+                    <th>对应边界</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>turn 开始、完成、被中断。</td>
+                    <td>谁给这轮分配 id，谁宣布生命周期变化？</td>
+                    <td><code>Submission.id</code> 与 <code>EventMsg::TurnStarted</code> / <code>TurnComplete</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>assistant 文本一边生成一边显示。</td>
+                    <td>流式内容是完整消息，还是增量事件？</td>
+                    <td><code>AgentMessage</code> 与 <code>AgentMessageContentDelta</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>命令、patch、MCP、动态工具进入进度列表。</td>
+                    <td>工具执行是 UI 自己猜的，还是运行时发出的结构化事实？</td>
+                    <td><code>ItemStarted</code> / <code>ItemCompleted</code> 与工具类事件。</td>
+                  </tr>
+                  <tr>
+                    <td>命令或文件修改请求审批。</td>
+                    <td>审批是普通通知，还是需要客户端回填决定？</td>
+                    <td><code>ExecApprovalRequest</code> / <code>ApplyPatchApprovalRequest</code> 与后续 <code>Op::*Approval</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>刷新后还能看到历史 turn。</td>
+                    <td>页面状态从哪里重建？</td>
+                    <td><code>RolloutItem</code> 与 <code>ThreadHistoryBuilder</code>。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这张表能帮我们避开一个误读：protocol 不是“给前端写几个接口”这么简单。
+              它同时承担三件事：<strong>接住用户意图</strong>、<strong>维持运行时事实</strong>、
+              <strong>让不同客户端用自己的视图消费这些事实</strong>。
+            </p>
+
+            <h2>二、输入侧：客户端先交一张有类型的任务单</h2>
+            <p>
+              app-server v2 的客户端请求不是散装 JSON。源码通过宏生成
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L177-L210"><code>ClientRequest</code></a>，
+              每个 request 都有固定的 <code>params</code> 和 <code>response</code> 类型。其中
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L787-L792"><code>turn/start</code></a>
+              对应 <code>TurnStartParams</code>。
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L125"><code>TurnStartParams</code></a>
+              里最直观的是 <code>thread_id</code> 和 <code>input</code>，但它还带着很多“本轮怎么运行”的边界：
+              client metadata、additional context、environment、cwd、workspace roots、approval policy、
+              sandbox policy、permissions、model 和 service tier。也就是说，发起 turn 的请求不是一句话，
+              更像是一张带运行约束的任务单。
+            </p>
+
+            <p>
+              进入 app-server 的 <code>turn_start_inner</code> 后，这张任务单会被整理成 core 能理解的
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L505-L518"><code>Op::UserInput</code></a>。
+              源码先把 v2 input 转成 core input，解析 cwd 和环境选择，再把 approval、sandbox、permissions、
+              model 等字段收进 thread settings overrides；随后创建 <code>Op::UserInput</code>，
+              调用
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L427-L479"><code>submit_user_input_with_client_user_message_id</code></a>。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这一段最关键的细节是：<strong><code>turn/start</code> 返回的 <code>turn_id</code>，
+                其实来自 core submission id。</strong>
+                源码注释直接写着“提交用户输入，并把 submission id 作为 turn_id 返回”。
+                这让后续事件可以用同一个 id 回到这轮任务上。
+              </p>
+            </div>
+
+            <p>
+              同一层还有一个很实用的设计：
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L520-L527"><code>Op::ThreadSettings</code></a>
+              不启动 turn，但走同一条 submission queue。源码注释说得很直接：这样 app-server 可以保留
+              thread settings mutation 和 turn start 之间的调用顺序。读到这里，就能理解为什么 settings
+              不是在旁边随手改全局变量，而是被放进同一条有序队列。
+            </p>
+
+            <h2>三、core 边界：Codex 是一对队列</h2>
+            <p>
+              app-server 把请求整理成 <code>Op</code> 之后，真正进入 core 的边界非常小。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L380-L390"><code>Codex</code></a>
+              结构体的注释说它是一个 queue pair：发送 submission，接收 event。结构体里对应两根管道：
+              <code>tx_sub: Sender&lt;Submission&gt;</code> 和 <code>rx_event: Receiver&lt;Event&gt;</code>。
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L693-L742"><code>submit</code></a>
+              会生成一个 UUID，把 <code>Op</code> 包成
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L154-L165"><code>Submission</code></a>，
+              再送进 <code>tx_sub</code>。<code>Submission</code> 自己只有几件事：唯一 id、payload op、
+              可选的 client user message id、可选 trace。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L767-L774"><code>next_event</code></a>
+              则从 <code>rx_event</code> 取出下一条 <code>Event</code>。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>core 类型</th>
+                    <th>人话职责</th>
+                    <th>为什么重要</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>Op</code></td>
+                    <td>用户或客户端想让运行时做什么。</td>
+                    <td>输入不再只是文本，还包括中断、审批回复、compact、rollback、review 等操作。</td>
+                  </tr>
+                  <tr>
+                    <td><code>Submission</code></td>
+                    <td>带 id 的任务单。</td>
+                    <td>给后续事件提供关联 id，也让 trace 和 client message id 有位置可放。</td>
+                  </tr>
+                  <tr>
+                    <td><code>Event</code></td>
+                    <td>带 id 的运行时事实。</td>
+                    <td>事件里的 id 指回对应 submission，让客户端知道这条事实属于哪一轮。</td>
+                  </tr>
+                  <tr>
+                    <td><code>EventMsg</code></td>
+                    <td>事实的具体类型。</td>
+                    <td>把生命周期、文本、工具、审批、diff、token、compact、rollback 分成可匹配的类型。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这个边界小，但后面的设计都靠它对齐：
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1149-L1156"><code>Event</code></a>
+              也带一个 id，注释写的是“与 submission id 关联”。这就是客户端看到“第几轮 turn 在更新”的基础。
+            </p>
+
+            <h2>四、输出侧：EventMsg 是运行时事实清单</h2>
+            <p>
+              接下来读
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1158-L1325"><code>EventMsg</code></a>。
+              它不是一个小枚举，而是一份很长的运行时事实清单，并且用 <code>#[serde(tag = "type", rename_all = "snake_case")]</code>
+              固定 wire shape。也就是说，事件不是靠字符串约定偷偷传，而是以 tagged enum 的形式进入序列化边界。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>事件类别</th>
+                    <th>代表类型</th>
+                    <th>说明</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>turn 生命周期</td>
+                    <td><code>TurnStarted</code>、<code>TurnComplete</code>、<code>TurnAborted</code></td>
+                    <td>告诉客户端这一轮什么时候开始、结束或中断。</td>
+                  </tr>
+                  <tr>
+                    <td>模型内容</td>
+                    <td><code>UserMessage</code>、<code>AgentMessage</code>、<code>AgentReasoning</code>、各种 delta</td>
+                    <td>既能保存完整消息，也能发送流式增量。</td>
+                  </tr>
+                  <tr>
+                    <td>工具与文件变化</td>
+                    <td><code>ExecCommand*</code>、<code>PatchApply*</code>、<code>ItemStarted</code>、<code>ItemCompleted</code></td>
+                    <td>把命令、patch、工具调用放进结构化生命周期，而不是只输出日志文本。</td>
+                  </tr>
+                  <tr>
+                    <td>审批与交互</td>
+                    <td><code>ExecApprovalRequest</code>、<code>ApplyPatchApprovalRequest</code>、<code>RequestUserInput</code></td>
+                    <td>运行时暂停在需要人或客户端决定的位置，后续再由对应 <code>Op</code> 回填。</td>
+                  </tr>
+                  <tr>
+                    <td>状态补充</td>
+                    <td><code>TokenCount</code>、<code>TurnDiff</code>、<code>ContextCompacted</code>、<code>ThreadRolledBack</code></td>
+                    <td>让客户端显示用量、diff、压缩和回滚状态，也给恢复链路留下可用信息。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这里要注意一件事：<code>EventMsg</code> 的粒度比最终 UI 更底层。
+              比如 <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L3355-L3358"><code>TurnDiffEvent</code></a>
+              只关心统一 diff 文本；<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2020-L2024"><code>TokenCountEvent</code></a>
+              只携带 token usage 和 rate limit 快照。客户端要怎样排版、折叠、突出显示，留给投影层处理。
+            </p>
+
+            <h2>五、app-server v2：把运行时事实翻译成客户端视图</h2>
+            <p>
+              到 app-server 这一层，协议开始面向多客户端。OpenAI 的
+              <a href="https://openai.com/index/unlocking-the-codex-harness/">App Server 文章</a>
+              把这一层描述为 client 和 Codex harness 之间的 JSON-RPC 边界：它接住客户端请求，
+              转成 core operations，再把 harness event stream 翻译成客户端稳定消费的通知。
+              源码里，这件事首先表现为用宏生成
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1318-L1338"><code>ServerNotification</code></a>，
+              并显式列出 wire method：<code>turn/started</code>、<code>turn/completed</code>、
+              <code>item/started</code>、<code>item/completed</code>、<code>turn/diff/updated</code>、
+              <code>thread/tokenUsage/updated</code> 等。
+            </p>
+
+            <p>
+              v2 视图里最重要的两个容器是 <code>Turn</code> 和 <code>ThreadItem</code>。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L25-L33"><code>TurnStatus</code></a>
+              只暴露客户端关心的状态：completed、interrupted、failed、in progress。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/item.rs#L209-L250"><code>ThreadItem</code></a>
+              则把用户消息、assistant 消息、plan、reasoning、工具调用等整理成客户端列表项。
+            </p>
+
+            <p>
+              真正的翻译发生在两处。第一处是
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L136-L198"><code>apply_bespoke_event_handling</code></a>：
+              它拿到 core <code>Event { id, msg }</code> 后，按 <code>EventMsg</code> 分支处理。
+              <code>TurnStarted</code> 会变成 <code>TurnStartedNotification</code>，
+              <code>TurnComplete</code> 会收尾并发送完成通知；审批请求会变成需要客户端响应的 server request；
+              token 和 diff 则各自走专门处理函数。
+            </p>
+
+            <p>
+              第二处是
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L35"><code>item_event_to_server_notification</code></a>。
+              这个 helper 只覆盖“单个 core event 到单个 v2 notification”的无状态投影，
+              例如 assistant 文本 delta、plan delta、reasoning delta、item started/completed、
+              exec output delta 等。需要检查状态、清理 pending request 或抑制 legacy event 的场景，
+              仍然留在 bespoke handler 里。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>core 事件</th>
+                    <th>v2 输出</th>
+                    <th>读源码时的判断</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>EventMsg::TurnStarted</code></td>
+                    <td><code>TurnStartedNotification</code></td>
+                    <td>打开一个客户端可见的 turn snapshot。</td>
+                  </tr>
+                  <tr>
+                    <td><code>AgentMessageContentDelta</code></td>
+                    <td><code>AgentMessageDeltaNotification</code></td>
+                    <td>流式文本增量直接投影给客户端。</td>
+                  </tr>
+                  <tr>
+                    <td><code>ItemStarted</code> / <code>ItemCompleted</code></td>
+                    <td><code>ItemStartedNotification</code> / <code>ItemCompletedNotification</code></td>
+                    <td>核心工具事实进入 v2 的列表项生命周期。</td>
+                  </tr>
+                  <tr>
+                    <td><code>ExecApprovalRequest</code> / <code>ApplyPatchApprovalRequest</code></td>
+                    <td>server request</td>
+                    <td>这类事件需要客户端返回决定，不能只当普通 notification 展示。</td>
+                  </tr>
+                  <tr>
+                    <td><code>TokenCount</code></td>
+                    <td><code>ThreadTokenUsageUpdatedNotification</code></td>
+                    <td>usage 从 core 事件转成 thread 级客户端状态。</td>
+                  </tr>
+                  <tr>
+                    <td><code>TurnDiff</code></td>
+                    <td><code>TurnDiffUpdatedNotification</code></td>
+                    <td>统一 diff 作为 turn 级视图更新发给客户端。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这一层还有很多“克制”的细节。例如
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L901-L904"><code>ContextCompacted</code></a>
+              在 v2 里被压下，因为 v2 客户端会收到 canonical 的 context compaction item；
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1081-L1093"><code>PatchApplyBegin/End</code> 和部分 exec legacy item</a>
+              也会为了避免重复渲染而被抑制。也就是说，投影层不是“有事件就全发”，它会维护客户端视图的一致性。
+            </p>
+
+            <h2>六、rollout 与恢复：保存能重建的事实</h2>
+            <p>
+              到这里，实时客户端已经能持续看到 turn 状态。但刷新、恢复、fork 又从哪里来？
+              答案在 rollout。protocol 里
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2890"><code>RolloutItem</code></a>
+              可以保存 <code>SessionMeta</code>、<code>ResponseItem</code>、<code>Compacted</code>、
+              <code>TurnContext</code> 和 <code>EventMsg</code>。它保存的不是屏幕长什么样，而是足够重建历史的材料。
+            </p>
+
+            <p>
+              这也是为什么
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2368-L2440"><code>InitialHistory</code></a>
+              提供 <code>get_event_msgs()</code>：恢复和 fork 时，可以从 rollout 里筛出 <code>RolloutItem::EventMsg</code>。
+              core 层的
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L1222-L1285"><code>record_initial_history</code></a>
+              会应用 rollout reconstruction，并从最后持久化的 <code>TokenCount</code> 事件种下 usage 状态，
+              让 UI 在恢复后能立刻看到 token 快照。
+            </p>
+
+            <p>
+              app-server 还有一层专门的历史 reducer：
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L74-L84"><code>build_turns_from_rollout_items</code></a>
+              会把持久化的 <code>RolloutItem</code> 转成一组 <code>Turn</code>。内部的
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L166-L245"><code>ThreadHistoryBuilder</code></a>
+              逐条处理 <code>EventMsg</code>、compacted item、response item 和 turn context；
+              遇到 <code>TurnStarted</code> 会打开新 turn，遇到 <code>TurnComplete</code> 会关闭它。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                所以恢复历史时，app-server 不是在“复原某个前端页面”，而是在
+                <strong>用持久化的运行时事实重新归约出 turn 和 item</strong>。
+                这能解释为什么第三篇要放在上下文管理之后：上下文负责让下一次模型调用继续工作，
+                protocol/event 负责让人和客户端知道运行时发生过什么。
+              </p>
+            </div>
+
+            <h2>七、带走一张判断表</h2>
+            <p>
+              读 Codex protocol 时，可以用下面这张表快速定位自己看到的类型属于哪一层。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>看到的类型</th>
+                    <th>先问什么</th>
+                    <th>常见误读</th>
+                    <th>更稳的读法</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>TurnStartParams</code></td>
+                    <td>客户端这次 turn 带了哪些边界？</td>
+                    <td>只看成用户消息。</td>
+                    <td>把 input、cwd、approval、sandbox、model、metadata 一起看。</td>
+                  </tr>
+                  <tr>
+                    <td><code>Op</code></td>
+                    <td>这是哪种运行时操作？</td>
+                    <td>只追 <code>UserInput</code>。</td>
+                    <td>把 interrupt、approval response、compact、rollback、review 都纳入同一输入面。</td>
+                  </tr>
+                  <tr>
+                    <td><code>EventMsg</code></td>
+                    <td>这条事实由运行时哪一步发出？</td>
+                    <td>直接等同于 UI 组件。</td>
+                    <td>先判定它是生命周期、内容、工具、审批、diff、token 还是恢复相关事件。</td>
+                  </tr>
+                  <tr>
+                    <td><code>ServerNotification</code></td>
+                    <td>这是哪个客户端视图需要的投影？</td>
+                    <td>以为 core event 会原样发给所有客户端。</td>
+                    <td>看 bespoke handler 和 event mapping 是否做了转换、抑制或拆分。</td>
+                  </tr>
+                  <tr>
+                    <td><code>RolloutItem</code></td>
+                    <td>这条记录能帮助恢复什么？</td>
+                    <td>当成屏幕快照。</td>
+                    <td>把它读成可重放、可归约的历史材料。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              到这里，前三篇的顺序就串起来了：第一篇先给出一次请求的路线；
+              第二篇进入 turn 内部，看模型请求前如何整理上下文；第三篇回到 turn 外部，
+              看运行时事实如何被客户端观察、确认和恢复。下一篇自然会进入工具系统：
+              <strong>模型提出 tool call 之后，Codex 怎样把它路由到具体工具、处理并发、归档结果，并把副作用关进权限边界里？</strong>
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex 固定源码快照</a></li>
+              <li><a href="https://openai.com/index/unlocking-the-codex-harness/">OpenAI：Unlocking the Codex harness: how we built the App Server</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L177-L210">ClientRequest 宏生成</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L787-L792">turn/start request 定义</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L125">TurnStartParams</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L427-L479">turn_start_inner 转成 Op::UserInput</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L154-L165">Submission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L477-L635">Op</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L380-L390">Codex queue pair</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L693-L742">submit / submit_with_id</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L767-L774">next_event</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1149-L1325">Event / EventMsg</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1318-L1338">ServerNotification 宏生成</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L136-L198">apply_bespoke_event_handling</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L35">item_event_to_server_notification</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L511-L565">审批请求映射</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1607-L1633">TokenCount 映射</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1278-L1291">TurnDiff 映射</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2890">RolloutItem</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L74-L84">build_turns_from_rollout_items</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L166-L245">ThreadHistoryBuilder</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

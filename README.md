@@ -34,6 +34,10 @@ tools, permissions, client projection, and recovery as separate mechanisms.
   [Codex 源码阅读（二）：上下文不是聊天记录，而是运行时账本](https://rememorio.github.io/blog/codex/zh/context-management/)
 - English context management:
   [Codex Source Notes II: Context Is a Runtime Ledger, Not Chat History](https://rememorio.github.io/blog/codex/en/context-management/)
+- Chinese protocol and events:
+  [Codex 源码阅读（三）：protocol 与事件流，客户端怎样共享同一套事实](https://rememorio.github.io/blog/codex/zh/protocol-events/)
+- English protocol and events:
+  [Codex Source Notes III: Protocol and Event Stream](https://rememorio.github.io/blog/codex/en/protocol-events/)
 
 ### Hermes Agent
 
@@ -62,9 +66,11 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/index.html           # Chinese series index
 │   ├── zh/overview/            # Chinese series overview article
 │   ├── zh/context-management/  # Chinese context-management article
+│   ├── zh/protocol-events/     # Chinese protocol/event-stream article
 │   ├── en/index.html           # English series index
 │   ├── en/overview/            # English series overview article
 │   ├── en/context-management/  # English context-management article
+│   ├── en/protocol-events/     # English protocol/event-stream article
 │   └── assets/*.png            # Final raster figures
 ├── hermes-agent/
 │   ├── index.html              # Language gateway

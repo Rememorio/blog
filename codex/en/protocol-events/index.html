@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes III: Protocol and Event Stream</title>
+    <meta
+      name="description"
+      content="A source-guided walkthrough of Codex protocol and event stream: TurnStartParams, Submission, Op, EventMsg, app-server v2 projection, and rollout recovery."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes III: Protocol and Event Stream" />
+    <meta
+      property="og:description"
+      content="How Codex turns client requests into typed submissions, emits runtime facts, projects them into v2 client views, and rebuilds history from rollout."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/protocol-event-stream.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/protocol-events/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/protocol-events/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/protocol-events/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Codex series</a>
+        <a href="../context-management/">Previous: context</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/protocol-events/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part III</p>
+            <h1>Protocol and Event Stream</h1>
+            <p class="lead">
+              Part II stayed inside a turn and explained how Codex prepares model-visible context.
+              This part steps outside the turn: when Codex is streaming text, waiting on approval,
+              running commands, updating a diff, or being resumed later, how do clients stay aligned
+              on the same runtime facts?
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: protocol and events</span>
+              <span>Scope: public source</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/protocol-event-stream.png"
+                alt="Overview of Codex protocol and event stream from client to TurnStart, Submission, Op, Session, EventMsg, v2 view, rollout, and resume"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Start from a normal product scene. One client starts a task. Another client joins later
+              and should see the current turn, streamed assistant output, a pending command approval,
+              the latest diff, and token usage. If the page reloads, history should still reconstruct
+              the important parts of the turn.
+            </p>
+
+            <p>
+              The source boundary is cleaner than the UI surface. There is a layer of
+              <strong>runtime facts</strong>, and there are <strong>client projections</strong> built
+              from those facts. The core protocol accepts typed submissions and emits typed events;
+              app-server v2 turns those events into the shapes clients actually consume.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                In plain terms:
+                <strong>Submission</strong> is the work order sent to the runtime;
+                <strong>EventMsg</strong> is a runtime fact emitted by the runtime;
+                <strong>ServerNotification</strong> is app-server's v2 client-facing projection.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                This article treats OpenAI's App Server article as the product-level
+                contract, and the public openai/codex source as implementation
+                evidence for protocol types, event types, app-server mapping code,
+                and rollout reconstruction. Source links are pinned to one public snapshot.
+              </p>
+            </div>
+
+            <p>This part follows five questions:</p>
+            <ol>
+              <li>What boundaries does a client send when it starts a turn?</li>
+              <li>Why does core reduce interaction to one submission queue and one event queue?</li>
+              <li>Which <code>EventMsg</code> variants describe lifecycle, content, tools, approvals, usage, and diff?</li>
+              <li>Why does app-server v2 translate core events instead of forwarding them verbatim?</li>
+              <li>How can rollout be reduced back into turns after resume?</li>
+            </ol>
+
+            <h2>1. Start From What Clients Need To See</h2>
+            <p>
+              Protocols are hard to read when they begin as enum lists. The easier route is to ask
+              what client-visible state must remain coherent while a Codex turn is running.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Client Sees</th>
+                    <th>Source Question</th>
+                    <th>Boundary</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>A turn starts, completes, or is interrupted.</td>
+                    <td>Who assigns the id and announces lifecycle changes?</td>
+                    <td><code>Submission.id</code> plus <code>TurnStarted</code> / <code>TurnComplete</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>Assistant text streams into the UI.</td>
+                    <td>Is this a full message or an incremental event?</td>
+                    <td><code>AgentMessage</code> and <code>AgentMessageContentDelta</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>Commands, patches, MCP, and dynamic tools appear as progress items.</td>
+                    <td>Does the UI infer tool progress, or does runtime emit structured facts?</td>
+                    <td><code>ItemStarted</code> / <code>ItemCompleted</code> and tool events.</td>
+                  </tr>
+                  <tr>
+                    <td>A command or file change asks for approval.</td>
+                    <td>Is this just a notification, or does it require a client response?</td>
+                    <td><code>ExecApprovalRequest</code> / <code>ApplyPatchApprovalRequest</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>History is visible after reload or resume.</td>
+                    <td>What rebuilds the page state?</td>
+                    <td><code>RolloutItem</code> and <code>ThreadHistoryBuilder</code>.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              That is the shape of the problem: accept intent, preserve runtime facts, and let
+              different clients consume those facts through their own view.
+            </p>
+
+            <h2>2. Input Side: A Typed Work Order</h2>
+            <p>
+              app-server v2 requests are not loose JSON blobs. The protocol macro generates
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L177-L210"><code>ClientRequest</code></a>,
+              where each request has fixed <code>params</code> and <code>response</code> types.
+              The
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L787-L792"><code>turn/start</code></a>
+              request uses <code>TurnStartParams</code>.
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L125"><code>TurnStartParams</code></a>
+              includes the obvious <code>thread_id</code> and <code>input</code>, but it also carries
+              runtime boundaries: client metadata, additional context, environment selection, cwd,
+              workspace roots, approval policy, sandbox policy, permissions, model, and service tier.
+              Starting a turn is therefore more like submitting a typed work order than sending chat text.
+            </p>
+
+            <p>
+              In <code>turn_start_inner</code>, app-server maps v2 input into core input, resolves cwd
+              and environment selections, builds thread-settings overrides, creates
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L505-L518"><code>Op::UserInput</code></a>,
+              and submits it through
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L427-L479"><code>submit_user_input_with_client_user_message_id</code></a>.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The important line: <strong><code>turn/start</code> returns the core submission id
+                as <code>turn_id</code></strong>. That gives later events a stable id to point back
+                to the turn.
+              </p>
+            </div>
+
+            <p>
+              The same ordering idea appears in <code>Op::ThreadSettings</code>. It does not start a
+              turn, but it uses the same submission queue so app-server can preserve caller order
+              between settings mutations and turn starts.
+            </p>
+
+            <h2>3. Core Boundary: A Queue Pair</h2>
+            <p>
+              Once app-server has an <code>Op</code>, the core boundary becomes very small. The
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L380-L390"><code>Codex</code></a>
+              struct is documented as a queue pair: send submissions, receive events. Its fields
+              are the two channels: <code>tx_sub: Sender&lt;Submission&gt;</code> and
+              <code>rx_event: Receiver&lt;Event&gt;</code>.
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L693-L742"><code>submit</code></a>
+              generates a UUID, wraps the <code>Op</code> in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L154-L165"><code>Submission</code></a>,
+              and sends it to <code>tx_sub</code>. <code>next_event</code> reads the next
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1149-L1156"><code>Event</code></a>
+              from <code>rx_event</code>. The event id is documented as correlated with the
+              submission id.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Core Type</th>
+                    <th>Role</th>
+                    <th>Why It Matters</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>Op</code></td>
+                    <td>What the runtime is being asked to do.</td>
+                    <td>Includes user input, interrupt, approvals, compact, rollback, review, and more.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Submission</code></td>
+                    <td>A work order with an id.</td>
+                    <td>Gives later events a correlation id and carries trace/client message metadata.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Event</code></td>
+                    <td>A runtime fact with an id.</td>
+                    <td>Lets clients attach a fact back to the turn submission.</td>
+                  </tr>
+                  <tr>
+                    <td><code>EventMsg</code></td>
+                    <td>The concrete kind of fact.</td>
+                    <td>Separates lifecycle, content, tools, approvals, diff, token usage, compaction, and rollback.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>4. Output Side: EventMsg Is the Fact List</h2>
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1158-L1325"><code>EventMsg</code></a>
+              is a long tagged enum with <code>#[serde(tag = "type", rename_all = "snake_case")]</code>.
+              That wire shape matters: runtime facts are structured variants, not informal strings.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Category</th>
+                    <th>Representative Variants</th>
+                    <th>Meaning</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Turn lifecycle</td>
+                    <td><code>TurnStarted</code>, <code>TurnComplete</code>, <code>TurnAborted</code></td>
+                    <td>Announce when a turn starts, finishes, or is interrupted.</td>
+                  </tr>
+                  <tr>
+                    <td>Model content</td>
+                    <td><code>UserMessage</code>, <code>AgentMessage</code>, <code>AgentReasoning</code>, deltas</td>
+                    <td>Carry full persisted messages and streaming increments.</td>
+                  </tr>
+                  <tr>
+                    <td>Tools and file changes</td>
+                    <td><code>ExecCommand*</code>, <code>PatchApply*</code>, <code>ItemStarted</code>, <code>ItemCompleted</code></td>
+                    <td>Represent command, patch, and tool lifecycles structurally.</td>
+                  </tr>
+                  <tr>
+                    <td>Approval and interaction</td>
+                    <td><code>ExecApprovalRequest</code>, <code>ApplyPatchApprovalRequest</code>, <code>RequestUserInput</code></td>
+                    <td>Pause where a human or client decision is needed.</td>
+                  </tr>
+                  <tr>
+                    <td>State updates</td>
+                    <td><code>TokenCount</code>, <code>TurnDiff</code>, <code>ContextCompacted</code>, <code>ThreadRolledBack</code></td>
+                    <td>Update usage, diff, compaction, and rollback state.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The key distinction is that <code>EventMsg</code> is lower-level than the final UI.
+              A <code>TurnDiffEvent</code> carries the unified diff. A <code>TokenCountEvent</code>
+              carries token usage and rate-limit snapshots. Layout, grouping, folding, and emphasis
+              belong to the projection layer.
+            </p>
+
+            <h2>5. app-server v2 Projects Facts Into Client Views</h2>
+            <p>
+              At app-server, the protocol becomes a multi-client surface. OpenAI's
+              <a href="https://openai.com/index/unlocking-the-codex-harness/">App Server article</a>
+              frames this layer as the JSON-RPC boundary between clients and the
+              Codex harness: it accepts client requests, turns them into core
+              operations, and projects the harness event stream into stable
+              client notifications. In source, app-server v2 defines those
+              notifications through
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1318-L1338"><code>ServerNotification</code></a>.
+              The method list includes <code>turn/started</code>, <code>turn/completed</code>,
+              <code>item/started</code>, <code>item/completed</code>,
+              <code>turn/diff/updated</code>, and <code>thread/tokenUsage/updated</code>.
+            </p>
+
+            <p>
+              The v2 view is built around <code>Turn</code> and <code>ThreadItem</code>. A turn
+              exposes status such as completed, interrupted, failed, and in progress. A
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/item.rs#L209-L250"><code>ThreadItem</code></a>
+              turns user messages, assistant messages, plans, reasoning, and tool calls into
+              client list items.
+            </p>
+
+            <p>
+              The main translation point is
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L136-L198"><code>apply_bespoke_event_handling</code></a>.
+              It receives core <code>Event { id, msg }</code>, matches on <code>EventMsg</code>,
+              and emits v2 notifications or server requests. Turn lifecycle events become turn
+              notifications; approval requests become server requests that need a client response;
+              token usage and diff have dedicated handlers.
+            </p>
+
+            <p>
+              Stateless one-to-one item projections live in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L35"><code>item_event_to_server_notification</code></a>.
+              That helper covers assistant message deltas, plan deltas, reasoning deltas,
+              item started/completed, exec output deltas, and similar direct mappings. Anything that
+              needs state checks, pending request cleanup, or legacy-event suppression stays in the
+              bespoke handler.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Core Event</th>
+                    <th>v2 Output</th>
+                    <th>Reading Rule</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>TurnStarted</code></td>
+                    <td><code>TurnStartedNotification</code></td>
+                    <td>Open a client-visible turn snapshot.</td>
+                  </tr>
+                  <tr>
+                    <td><code>AgentMessageContentDelta</code></td>
+                    <td><code>AgentMessageDeltaNotification</code></td>
+                    <td>Project streaming assistant text.</td>
+                  </tr>
+                  <tr>
+                    <td><code>ItemStarted</code> / <code>ItemCompleted</code></td>
+                    <td><code>ItemStartedNotification</code> / <code>ItemCompletedNotification</code></td>
+                    <td>Expose tool and item lifecycle to clients.</td>
+                  </tr>
+                  <tr>
+                    <td><code>ExecApprovalRequest</code> / <code>ApplyPatchApprovalRequest</code></td>
+                    <td>server request</td>
+                    <td>Ask the client for a decision, then feed the answer back as another <code>Op</code>.</td>
+                  </tr>
+                  <tr>
+                    <td><code>TokenCount</code></td>
+                    <td><code>ThreadTokenUsageUpdatedNotification</code></td>
+                    <td>Convert runtime usage into thread-level client state.</td>
+                  </tr>
+                  <tr>
+                    <td><code>TurnDiff</code></td>
+                    <td><code>TurnDiffUpdatedNotification</code></td>
+                    <td>Expose the latest aggregated unified diff for the turn.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The projection layer also suppresses or redirects events when that keeps the v2 view
+              coherent. For example, legacy <code>ContextCompacted</code> and some patch/exec events
+              are not blindly forwarded because v2 clients receive canonical items elsewhere.
+            </p>
+
+            <h2>6. Rollout Rebuilds Turns From Facts</h2>
+            <p>
+              Realtime notifications explain what connected clients see. Reload and resume require a
+              durable source. Protocol
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2890"><code>RolloutItem</code></a>
+              can store <code>SessionMeta</code>, <code>ResponseItem</code>, <code>Compacted</code>,
+              <code>TurnContext</code>, and <code>EventMsg</code>. It stores rebuildable material,
+              not a screen snapshot.
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2368-L2440"><code>InitialHistory</code></a>
+              exposes <code>get_event_msgs()</code> for resumed and forked histories by extracting
+              <code>RolloutItem::EventMsg</code>. Core
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L1222-L1285"><code>record_initial_history</code></a>
+              applies rollout reconstruction and seeds token usage from the last persisted
+              <code>TokenCount</code>.
+            </p>
+
+            <p>
+              app-server has a dedicated reducer too:
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L74-L84"><code>build_turns_from_rollout_items</code></a>
+              converts persisted rollout items into <code>Turn</code> values. Its
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L166-L245"><code>ThreadHistoryBuilder</code></a>
+              handles persisted event messages, compacted items, response items, and turn context.
+              <code>TurnStarted</code> opens a turn; <code>TurnComplete</code> closes it.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                Resume is therefore a reduction over persisted runtime facts. It does not try to
+                recreate one old frontend page; it rebuilds turns and items from durable evidence.
+              </p>
+            </div>
+
+            <h2>7. A Reading Checklist</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Type</th>
+                    <th>Ask First</th>
+                    <th>Better Reading</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>TurnStartParams</code></td>
+                    <td>What boundaries does this turn carry?</td>
+                    <td>Read input together with cwd, approvals, sandbox, model, permissions, and metadata.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Op</code></td>
+                    <td>What runtime operation is being submitted?</td>
+                    <td>Include approvals, interrupts, compact, rollback, and review, not only user input.</td>
+                  </tr>
+                  <tr>
+                    <td><code>EventMsg</code></td>
+                    <td>Which runtime fact just happened?</td>
+                    <td>Classify it as lifecycle, content, tool, approval, diff, usage, or recovery-related.</td>
+                  </tr>
+                  <tr>
+                    <td><code>ServerNotification</code></td>
+                    <td>Which client view needs this projection?</td>
+                    <td>Check whether bespoke handling transformed, suppressed, or split the core event.</td>
+                  </tr>
+                  <tr>
+                    <td><code>RolloutItem</code></td>
+                    <td>What can this record rebuild?</td>
+                    <td>Treat it as replayable history material rather than rendered UI.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The first three parts now form a path: the overview follows one request through the
+              runtime; context management explains what the turn prepares for the model; protocol and
+              events explain how people and clients observe what the runtime did. The next natural
+              topic is tools: once the model asks for a tool call, how does Codex route, execute,
+              approve, and record it?
+            </p>
+
+            <h2 id="sources">Sources</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">Pinned openai/codex source snapshot</a></li>
+              <li><a href="https://openai.com/index/unlocking-the-codex-harness/">OpenAI: Unlocking the Codex harness: how we built the App Server</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L177-L210">ClientRequest macro</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L787-L792">turn/start request definition</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L125">TurnStartParams</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L427-L479">turn_start_inner mapping to Op::UserInput</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L154-L165">Submission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L477-L635">Op</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L380-L390">Codex queue pair</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L693-L742">submit / submit_with_id</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L767-L774">next_event</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1149-L1325">Event / EventMsg</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1318-L1338">ServerNotification macro</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L136-L198">apply_bespoke_event_handling</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L35">item_event_to_server_notification</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L511-L565">Approval request mapping</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1607-L1633">TokenCount mapping</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1278-L1291">TurnDiff mapping</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2890">RolloutItem</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L74-L84">build_turns_from_rollout_items</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L166-L245">ThreadHistoryBuilder</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
