@@ -116,11 +116,11 @@
             </p>
 
             <p>
-              这也是
               <a href="https://openai.com/zh-Hans-CN/index/unrolling-the-codex-agent-loop/">官方 agent loop 文章</a>
-              放在第二篇最合适的原因：它从产品和 API 请求的角度解释 prompt、tools、input、
-              prompt cache、context window 与 compact 的取舍；本文继续往源码里走，追问这些取舍在
-              <code>ContextManager</code>、<code>TurnContext</code> 和 replacement history 里由谁承担。
+              把外部约束说得更具体：一次模型请求由 prompt、tools、input 等部分组成，
+              长任务还要面对 prompt cache、context window 与 compact。源码层接着追问：
+              这些约束在 <code>ContextManager</code>、<code>TurnContext</code> 和 replacement history 里分别由谁承担，
+              哪些状态留下，哪些状态只进入本轮请求。
             </p>
 
             <div class="note">
@@ -136,6 +136,8 @@
               这篇的阅读契约很简单：先分清 <strong>哪本账负责保存状态</strong>，
               再分清 <strong>哪一部分会被投影给模型</strong>。只要这两件事清楚了，
               后面的 diff、projection、compact 和 resume 都会落到同一条主线上。
+              后文只跟三次转换：运行环境怎样入账，history 怎样经过模型投影变成 prompt，
+              compact 怎样把旧账替换成新的恢复点。
             </p>
 
             <p>所以这篇只追五个问题：</p>
@@ -227,9 +229,9 @@
 
             <div class="note key-point">
               <p>
-                这就是本文的核心模型：Codex 的上下文不是一段不断变长的聊天记录，
-                而是一个 <strong>durable ledger</strong>。每一轮请求前，运行时从账本里取一个快照，
-                把它投影成当前模型能接受的 prompt；当账本太大时，再用 replacement history 写入新的恢复点。
+              这就是本文的核心模型：Codex 的上下文不是一段不断变长的聊天记录，
+              而是一个 <strong>durable ledger</strong>。每一轮请求前，运行时从账本里取一个快照，
+              整理成当前模型能接受的 prompt；当账本太大时，再用 replacement history 写入新的恢复点。
               </p>
             </div>
 
@@ -264,7 +266,7 @@
                     <td>贴在旧 history 旁边的一条摘要备注。</td>
                   </tr>
                   <tr>
-                    <td>projection / 投影</td>
+                    <td>model projection / 模型投影</td>
                     <td>从 durable history 生成 model-visible view 的过滤和规整过程。</td>
                     <td>简单复制消息数组。</td>
                   </tr>
@@ -272,7 +274,7 @@
               </table>
             </div>
 
-            <h2>二、一轮 turn 不是从用户消息直接进模型</h2>
+            <h2>二、一轮 turn 先整理运行环境，再进入模型</h2>
             <p>
               现在看一轮 turn。<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L137-L184"><code>run_turn</code></a>
               进入后，第一件事不是记录新用户消息，而是先检查旧账是否已经太大。
@@ -396,7 +398,7 @@ reference_context_item = current TurnContextItem</code></pre>
               </p>
             </div>
 
-            <h2>三、history 到 prompt 中间有一次 projection</h2>
+            <h2>三、history 到 prompt 中间有一次模型投影</h2>
             <p>
               当 <code>run_turn</code> 准备采样请求时，它不会把 <code>ContextManager.items</code> 原封不动发出去。
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L107-L114"><code>for_prompt()</code></a>
@@ -446,9 +448,10 @@ model-visible view for a text-only model:
               <code>Prompt</code>。工具 schema 不是聊天消息，但它们仍然是模型可见请求的一部分。
             </p>
 
-            <h3>3.1 token 账也是混合账</h3>
+            <h3>3.1 compact 触发前，token 账也要对齐</h3>
             <p>
-              Codex 的 token 判断也不是单纯读服务端最后一次 usage。
+              模型投影解释了“给模型看什么”，还剩一个问题：旧账什么时候大到必须 compact？
+              Codex 的 token 判断不只读服务端最后一次 usage。
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L249-L314"><code>get_total_token_usage</code></a>
               会在 last token usage 之外，加上最近一次模型生成之后本地追加的 items；如果服务端没有把历史 reasoning tokens 算入，
               客户端还会估算非最后一段 reasoning item。这个数不是 tokenizer 精确计数，
@@ -563,7 +566,7 @@ model-visible view for a text-only model:
 
             <p>
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L196-L330"><code>run_compact_task_inner_impl</code></a>
-              的可见流程可以拆成六步。这样看会比一个长句更接近真实运行时的手感：
+              的可见流程可以拆成六步：
             </p>
 
             <div class="table-wrap">
@@ -632,7 +635,7 @@ replacement history, shape-level:
 
             <h3>4.3 replacement 还要写入 rollout</h3>
             <p>
-              这里先给 <code>rollout</code> 一个位置：它是恢复 thread 时可以重放的持久事件记录，
+              这里先给 <code>rollout</code> 一个位置：它是恢复 thread 时可以重放的持久记录层，
               不等于当前内存里的 <code>history</code>。
               compact 不只改内存。<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2732-L2753"><code>replace_compacted_history</code></a>
               会替换 <code>SessionState.history</code>，持久化 <code>RolloutItem::Compacted</code>，
@@ -810,8 +813,8 @@ replacement history, shape-level:
             </div>
 
             <p>
-              这也是为什么 Codex 的上下文管理适合作为总览后的第一个机制专题。工具调用、权限系统、多 agent、
-              skills 和插件，后面仍会回到同一个问题：运行时必须先决定哪本账有权保存状态，
+              读到这里，后面的机制就有了共同入口。工具调用、权限系统、多 agent、
+              skills 和插件，都会回到同一个问题：运行时必须先决定哪本账有权保存状态，
               再决定哪一部分应该被投影给模型。没有这层上下文纪律，agent 越强，越容易把自己之前做过的事搅成一团。
             </p>
 
