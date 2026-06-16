@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex 源码阅读（六）：客户端投影，同一套事实怎样变成可见状态</title>
+    <meta
+      name="description"
+      content="沿 openai/codex 源码拆解 Codex 的客户端投影机制：EventMsg、TurnItem、ThreadItem、ServerNotification、TUI history cell、rollout 与 resume。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex 源码阅读（六）：客户端投影，同一套事实怎样变成可见状态" />
+    <meta
+      property="og:description"
+      content="从一次 turn 的事件流出发，读懂 Codex 怎样把 core 事实投影到 app-server、TUI、rollout 和恢复路径。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/client-projection-fanout.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/zh/client-projection/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/client-projection/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/client-projection/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(45, 95, 139, 0.32);
+        background: rgba(45, 95, 139, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Codex 系列</a>
+        <a href="../permissions-sandbox/">上一篇：权限</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/client-projection/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex 源码阅读 · 第六篇</p>
+            <h1>客户端投影，同一套事实怎样变成可见状态</h1>
+            <p class="lead">
+              前五篇一直站在 core runtime 里看：请求怎样进入 turn，上下文怎样整理，工具怎样执行，
+              权限怎样收口。现在换一个角度。用户看到的 streaming 文本、命令卡片、审批弹窗、
+              最终状态和可恢复历史，来自同一条事件流；不同客户端只是按自己的职责，把这些事实投影成不同界面。
+            </p>
+            <div class="meta-line">
+              <span>项目：openai/codex</span>
+              <span>主题：client projection</span>
+              <span>范围：公开源码</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/client-projection-fanout.png"
+                alt="Codex 客户端投影图，展示 EventMsg 分叉到 app-server ServerNotification、TUI history cells 与 rollout resume"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先看一个很熟悉的场景：Codex 正在回答，屏幕上有一段流式文本；它准备跑命令，
+              于是你看到一个 command item；命令需要审批，客户端弹出确认；最后 turn 结束，
+              状态从 running 变成 completed；过一会儿你恢复这个 thread，历史又能重新出现。
+            </p>
+
+            <p>
+              如果只盯着 UI，很容易以为这些都是各自实现的小功能。源码给出的答案更克制：
+              <strong>core 负责产生和持久化事实，app-server 把事实变成 JSON-RPC 通知，
+              TUI 把通知变成 history cell 和状态行，rollout 保留 resume 所需的可恢复记录。</strong>
+              这篇要讲的“客户端投影”，就是这几层之间的转换边界。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                本文里的“投影”指一件具体的事：同一个 runtime 事实，在不同 owner 手里变成不同形状。
+                它可能是 <code>EventMsg</code>，也可能是 <code>ServerNotification</code>、
+                <code>ThreadItem</code>、TUI 的 history cell，或者 rollout 里的可恢复记录。
+                读源码时先问 owner，再问形状，最后再问 UI。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文只描述 openai/codex 公开源码里可验证的事件类型、转换函数、通知结构、
+                TUI 处理分支和 rollout 恢复逻辑。文中提到“客户端”“界面”“状态”时，指这些公开代码暴露的
+                app-server 协议和 TUI 渲染路径，不推断私有产品客户端的页面实现。
+              </p>
+            </div>
+
+            <p>这一篇按五个问题往下拆：</p>
+            <ol>
+              <li>哪些词必须先分开，才不会把事实、通知、UI 和持久化混在一起？</li>
+              <li>core 什么时候把 provider response 变成可展示的 turn item？</li>
+              <li>app-server 怎样把 <code>EventMsg</code> 投影成 <code>ServerNotification</code>？</li>
+              <li>TUI 怎样把通知变成 streaming、history cell、status 和 replay？</li>
+              <li>rollout 里保留的记录，怎样服务 resume，而不是复刻每一次 UI 变化？</li>
+            </ol>
+
+            <h2>一、先把五个形状分开</h2>
+            <p>
+              第三篇讲 protocol 时已经见过 <code>EventMsg</code>。这一篇往客户端走，会再碰到
+              <code>TurnItem</code>、<code>ThreadItem</code>、<code>ServerNotification</code>、
+              history cell 和 rollout record。它们名字都像“历史”或“事件”，实际 owner 不一样。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>形状</th>
+                    <th>owner</th>
+                    <th>它回答的问题</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>EventMsg</code></td>
+                    <td>core protocol</td>
+                    <td>运行时刚发生了什么事实：turn started、item completed、delta、approval request。</td>
+                  </tr>
+                  <tr>
+                    <td><code>TurnItem</code></td>
+                    <td>core item stream</td>
+                    <td>哪些 provider response item 值得作为一轮里的可展示条目。</td>
+                  </tr>
+                  <tr>
+                    <td><code>ThreadItem</code></td>
+                    <td>app-server v2 protocol</td>
+                    <td>客户端协议里如何表达用户消息、assistant 消息、命令、文件修改、MCP 调用等条目。</td>
+                  </tr>
+                  <tr>
+                    <td><code>ServerNotification</code></td>
+                    <td>app-server JSON-RPC</td>
+                    <td>客户端应该收到什么通知：<code>turn/started</code>、<code>item/completed</code>、delta。</td>
+                  </tr>
+                  <tr>
+                    <td>history cell</td>
+                    <td>TUI</td>
+                    <td>终端上最终怎么显示：流式尾巴、命令块、审批记录、分隔线、状态行。</td>
+                  </tr>
+                  <tr>
+                    <td>rollout record</td>
+                    <td>persistence / resume</td>
+                    <td>恢复时需要哪些事实重新构造上下文、turn 状态和可见历史。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这张表是后面阅读的护栏。<code>EventMsg::AgentMessageContentDelta</code>
+              可以让 TUI 立刻追加一段流式文本；等最终的 assistant message 完成后，
+              同一段内容又会以 <code>ThreadItem::AgentMessage</code> 的形式进入稳定历史。
+              这两个动作服务的是不同 owner：前者服务“正在发生”，后者服务“已经完成且可重放”。
+            </p>
+
+            <h2>二、core 先确定哪些内容能成为 turn item</h2>
+            <p>
+              客户端能看到什么，不是 app-server 临时从 provider payload 里挑出来的。
+              core 在更早的位置就做了一次窄化：
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/event_mapping.rs#L139-L213"><code>parse_turn_item</code></a>
+              会把 <code>ResponseItem::Message</code>、reasoning、web search、image generation
+              等 provider response item 转成 <code>TurnItem</code>。它还会过滤一些只给 runtime 用的上下文碎片，
+              比如带有权限、skills、collaboration mode 等前缀的 contextual developer/user 内容。
+            </p>
+
+            <p>
+              完成的 response item 会先进入会话历史和 rollout，然后再发出可展示条目。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L3296-L3309"><code>record_response_item_and_emit_turn_item</code></a>
+              的顺序很直接：先 <code>record_conversation_items</code>，再尝试 <code>parse_turn_item</code>，
+              如果有结果，就发 <code>ItemStarted</code> 和 <code>ItemCompleted</code>。
+            </p>
+
+            <p>
+              而 <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2647-L2660"><code>record_conversation_items</code></a>
+              自身还做了三件事：更新内存里的 history，把 response item 写入 rollout，并发送
+              <code>RawResponseItem</code> 事件。这个顺序说明了一件事：raw item、turn item、UI item
+              是不同层面的投影。raw item 可以服务内部观察和云端处理；turn item 服务可展示的对话条目；
+              UI 最终怎么呈现，还要看后面的客户端。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                读到 <code>RawResponseItem</code> 时不要急着把它理解成“用户看到的消息”。
+                它保存的是原始 response item；真正进入客户端 transcript 的，通常要经过
+                <code>parse_turn_item</code>、<code>ThreadItem::from</code> 和客户端渲染逻辑。
+              </p>
+            </div>
+
+            <h2>三、app-server 把事实变成客户端通知</h2>
+            <p>
+              app-server 的入口在
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L137-L199"><code>apply_bespoke_event_handling</code></a>。
+              它拿到 core 的 <code>Event</code> 后按 <code>EventMsg</code> 分支处理。
+              <code>TurnStarted</code> 会清理 pending server requests、标记 thread watch，然后发送
+              <code>ServerNotification::TurnStarted</code>；<code>TurnComplete</code> 会中止本轮 pending request，
+              再把结果交给 turn complete 处理函数。
+            </p>
+
+            <p>
+              app-server 协议层定义了 <code>ServerNotification</code> 的 wire name：
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1541-L1585"><code>turn/started</code>、<code>turn/completed</code>、<code>item/started</code>、<code>item/completed</code>、delta</a>
+              都在这里。对应的 <code>Turn</code> 结构有 <code>items</code>、<code>items_view</code>、
+              <code>status</code>、<code>error</code> 和时间字段；
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs#L185-L217"><code>TurnItemsView</code></a>
+              还会告诉客户端：这次 payload 里的 items 是完整、摘要，还是根本没加载。
+            </p>
+
+            <h3>3.1 turn 状态是投影出来的</h3>
+            <p>
+              <code>TurnStarted</code> 发出的 turn 不是完整历史，只是一个当前状态快照。
+              源码里它会构造 <code>TurnStatus::InProgress</code>，并把 <code>items_view</code> 设成
+              <code>NotLoaded</code>。turn 完成时，
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1502-L1528"><code>handle_turn_complete</code></a>
+              会根据 <code>turn_summary.last_error</code> 选择 <code>Completed</code> 或 <code>Failed</code>，
+              然后通过
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1324-L1345"><code>emit_turn_completed_with_status</code></a>
+              发送 <code>TurnCompletedNotification</code>。
+            </p>
+
+            <p>
+              这里真正要看的，是 owner 的变化：core 说“turn complete 事件发生了”，
+              app-server 结合自己的 turn summary，给客户端一个“这个 turn 已完成或失败”的状态。
+              这个状态来自客户端协议视角，而非 provider 原始 payload 的字段。
+            </p>
+
+            <h3>3.2 item 和 delta 走不同通道</h3>
+            <p>
+              对 item 生命周期，app-server 有两类处理。简单的一对一映射交给
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L34"><code>item_event_to_server_notification</code></a>。
+              它把 <code>ItemStarted</code>、<code>ItemCompleted</code> 转成客户端通知，把
+              <code>AgentMessageContentDelta</code> 转成 <code>AgentMessageDelta</code>，
+              把 <code>ExecCommandOutputDelta</code> 转成 <code>CommandExecutionOutputDelta</code>。
+            </p>
+
+            <p>
+              另一类需要 app-server 加一点状态。命令开始时，
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1085-L1144">源码会用 <code>command_execution_started</code> 去重</a>，
+              并且对 unified exec interaction 抑制旧的 command item，避免客户端渲染两份等待状态。
+              这说明 projection 还承担客户端兼容和展示去重，并不只是在替换 JSON 字段名。
+            </p>
+
+            <h3>3.3 审批请求走 request 通道</h3>
+            <p>
+              权限篇讲过审批。到客户端投影这一层，<code>ExecApprovalRequest</code> 和
+              <code>ApplyPatchApprovalRequest</code> 会通过 app-server 的 server request 发给客户端，
+              因为这里需要客户端给出回答。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L511-L538"><code>ApplyPatchApprovalRequest</code></a>
+              会发送 <code>FileChangeRequestApproval</code>；
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L540-L575"><code>ExecApprovalRequest</code></a>
+              会构造 command approval 的展示信息，再等待客户端响应。
+            </p>
+
+            <p>
+              这也是为什么审批弹窗不应该和普通 history item 混为一谈。它是一个需要客户端回答的 request，
+              不是只要显示出来就结束的通知。
+            </p>
+
+            <h2>四、TUI 再把通知变成终端体验</h2>
+            <p>
+              TUI 自己也不是直接渲染所有 app-server notification。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/app/app_server_events.rs#L30-L57"><code>handle_app_server_event</code></a>
+              先区分 notification、request、disconnect；
+              notification 会根据 thread target 进入当前 thread 或后台 thread。
+              对当前 thread，
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/app/thread_routing.rs#L1428-L1458"><code>handle_thread_event_now</code></a>
+              再把它交给 <code>ChatWidget::handle_server_notification</code>。
+            </p>
+
+            <p>
+              真正的 UI 决策在
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/protocol.rs#L31-L124"><code>chatwidget/protocol.rs</code></a>。
+              <code>TurnStarted</code> 调 <code>on_task_started</code>，打开 running 状态；
+              <code>TurnCompleted</code> 走完成处理；<code>ItemStarted</code> 和
+              <code>ItemCompleted</code> 进入 item 分发；agent message delta 走 streaming；
+              command output delta 只追加到正在活动的 exec cell。
+            </p>
+
+            <h3>4.1 streaming 是临时尾巴，完成后会合并</h3>
+            <p>
+              流式文本进入 TUI 时，<code>on_agent_message_delta</code> 会追加 delta；
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/streaming.rs#L375-L409"><code>handle_streaming_delta</code></a>
+              会创建或更新 <code>StreamController</code>，并启动 commit animation。等完整 assistant item 到来，
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/streaming.rs#L19-L55"><code>flush_answer_stream_with_separator</code></a>
+              会把这一串临时的 streaming cell 合并成稳定的 markdown cell，方便 resize 和 replay。
+            </p>
+
+            <p>
+              所以屏幕上的“正在打字”和 transcript 里的“最终消息”不是两份事实。
+              它们是同一条 assistant 内容在不同生命周期里的两个投影：一个追求即时反馈，一个追求稳定重绘。
+            </p>
+
+            <h3>4.2 item 类型决定 history cell</h3>
+            <p>
+              <code>ItemStarted</code> 到达后，
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/protocol.rs#L302-L345"><code>handle_item_started_notification</code></a>
+              会按 <code>ThreadItem</code> 类型分发：命令进入 command lifecycle，文件修改进入 patch cell，
+              MCP 调用进入 MCP cell，web search 进入 active search cell，image generation 只刷新可见活动。
+              <code>ItemCompleted</code> 则交给
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/replay.rs#L66-L155"><code>handle_thread_item</code></a>，
+              由同一套函数处理 live 和 replay。
+            </p>
+
+            <p>
+              命令是一个很好的例子。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/command_lifecycle.rs#L20-L73"><code>on_command_execution_started</code> 与 <code>on_exec_command_output_delta</code></a>
+              负责创建 active exec cell、追加输出、请求重绘；
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/command_lifecycle.rs#L134-L163"><code>on_command_execution_completed</code></a>
+              再结束这一组活动。app-server 只说“命令 item 开始/输出/完成”，TUI 决定它在终端里是一个活动块、
+              输出增量，还是一条最终历史。
+            </p>
+
+            <h3>4.3 turn 状态会同步到底部状态和最终分隔线</h3>
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/turn_runtime.rs#L49-L77"><code>on_task_started</code></a>
+              会重置 turn flags、打开 running 状态、设置 status header、显示 interrupt hint。
+              turn 完成时，
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/turn_runtime.rs#L79-L204"><code>on_task_complete</code></a>
+              会 flush streaming、flush unified exec、补 final separator、清理 running commands，
+              并决定是否发桌面通知或提交 queued follow-up。
+            </p>
+
+            <p>
+              这一步解释了一个常见现象：turn complete 不只是让 UI 上的 spinner 停下。
+              对 TUI 来说，它还是“把所有临时可见状态收拢成稳定 transcript”的时间点。
+            </p>
+
+            <h2>五、rollout 保存的是恢复线索</h2>
+            <p>
+              现在回到持久化。core 写 rollout 时，不会把每一个临时 UI delta 都原样保存。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/policy.rs#L5-L26"><code>rollout policy</code></a>
+              会先筛选哪些 <code>RolloutItem</code> 需要持久化；<code>ResponseItem</code> 只保留有恢复价值的类型，
+              <code>EventMsg</code> 也只保留用户消息、assistant 消息、reasoning、turn started/complete、
+              compaction、rollback、web search end、image generation end 等关键事件。
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/policy.rs#L74-L159">大量中间 delta、approval request、exec output delta、hook started/completed</a>
+              都不会作为普通 rollout 记录保留下来。
+            </p>
+
+            <p>
+              写入路径在
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L786-L839"><code>RolloutRecorder</code></a>：
+              <code>record_canonical_items</code> 只是把 items 排队给 writer；
+              <code>persist</code> 和 <code>flush</code> 负责 materialize 与等待落盘。
+              读取时，
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L842-L927"><code>load_rollout_items</code> 与 <code>get_rollout_history</code></a>
+              会把 jsonl 行重新解析成 <code>InitialHistory::Resumed</code>。
+            </p>
+
+            <h3>5.1 resume 是重建，不是回放 UI 帧</h3>
+            <p>
+              恢复时，core 用
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/rollout_reconstruction.rs#L93-L230"><code>reconstruct_history_from_rollout</code></a>
+              从后往前扫描 rollout，找 compaction replacement history、previous turn settings、
+              reference context item、rollback 边界和 turn started/complete 段落。
+              接着再把 surviving suffix 往前重放，形成新的 <code>ContextManager</code> history。
+            </p>
+
+            <p>
+              到这里，rollout 的职责就清楚了：它不是终端 scrollback 的录像。
+              它保存足够的事实，让 runtime 能重建模型历史、turn metadata、上下文 baseline 和客户端可见 items。
+              TUI 的
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/replay.rs#L8-L55"><code>replay_thread_turns</code></a>
+              也遵循这个原则：恢复时只渲染安全可重放的 items，并用 replay 标记避免触发 live-only 副作用。
+            </p>
+
+            <h2>六、读客户端投影时的四条规则</h2>
+            <p>
+              这一篇把链路拉通之后，可以用四条规则收尾。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>看到的现象</th>
+                    <th>先问什么</th>
+                    <th>对应源码层</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>屏幕上正在流式输出。</td>
+                    <td>这是 delta 还是完成后的 item？</td>
+                    <td><code>AgentMessageDelta</code> 与 <code>flush_answer_stream_with_separator</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>命令卡片开始、追加输出、结束。</td>
+                    <td>这是 item lifecycle，还是 exec output delta？</td>
+                    <td><code>item_event_to_server_notification</code> 与 command lifecycle。</td>
+                  </tr>
+                  <tr>
+                    <td>审批弹窗出现。</td>
+                    <td>客户端要不要回一个 response？</td>
+                    <td><code>ServerRequestPayload</code>，不是普通 notification。</td>
+                  </tr>
+                  <tr>
+                    <td>resume 后历史重新出现。</td>
+                    <td>这是从 rollout 重建的事实，还是 live event？</td>
+                    <td><code>InitialHistory::Resumed</code>、rollout reconstruction、TUI replay。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以，客户端投影这一层真正保护的是可理解性和可恢复性：core 只产生事实；
+              app-server 负责协议边界；TUI 负责即时体验和稳定 transcript；rollout 负责 resume。
+              这些层都在讲同一轮工作，但每一层只保存自己需要承担的那一份形状。
+            </p>
+
+            <p>
+              后面继续写扩展和多 agent 时，这个分层还会继续派上用场。skills、plugins、MCP、
+              subagents 进入 runtime 后，最终仍然要回答同一个问题：事实由谁拥有，客户端看到什么，
+              哪些记录能在下一次恢复时重新成立。
+            </p>
+
+            <h2 id="sources">参考源码</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex 固定源码快照</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1202-L1335">EventMsg turn、item、tool、delta 事件</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/items.rs#L38-L54">Core TurnItem</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/event_mapping.rs#L72-L213">parse_turn_item 与 contextual message 过滤</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2647-L2660">record_conversation_items 更新 history、rollout 与 RawResponseItem</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L3296-L3309">record_response_item_and_emit_turn_item</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L137-L199">app-server apply_bespoke_event_handling turn 分支</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L511-L575">approval request 投影成 server request</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1085-L1144">command execution notification 去重与 unified exec 抑制</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1324-L1345">emit_turn_completed_with_status</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1502-L1528">handle_turn_complete</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1541-L1585">ServerNotification wire names</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L34">item_event_to_server_notification 说明</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L360-L463">delta、ItemStarted、ItemCompleted、exec event 到 ServerNotification</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/item.rs#L213-L275">ThreadItem 主要变体</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/item.rs#L788-L876">CoreTurnItem 到 ThreadItem 的转换</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs#L185-L217">Turn 与 TurnItemsView</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/app/app_server_events.rs#L30-L57">TUI handle_app_server_event</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/app/thread_routing.rs#L1428-L1458">TUI handle_thread_event_now</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/protocol.rs#L31-L124">ChatWidget handle_server_notification</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/protocol.rs#L302-L358">ChatWidget item notification 分发</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/streaming.rs#L19-L55">flush_answer_stream_with_separator</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/streaming.rs#L375-L409">handle_streaming_delta</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/command_lifecycle.rs#L20-L73">command start 与 output delta</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/command_lifecycle.rs#L134-L163">command completed</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/turn_runtime.rs#L49-L77">on_task_started</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/turn_runtime.rs#L79-L204">on_task_complete</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/replay.rs#L8-L155">TUI replay_thread_turns 与 handle_thread_item</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/policy.rs#L5-L159">rollout 持久化筛选策略</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L786-L927">RolloutRecorder 写入与读取</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/rollout_reconstruction.rs#L93-L320">rollout reconstruction</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

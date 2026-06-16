@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes VI: Client Projection</title>
+    <meta
+      name="description"
+      content="A source-guided walkthrough of Codex client projection: EventMsg, TurnItem, ThreadItem, ServerNotification, TUI history cells, rollout, and resume."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes VI: Client Projection" />
+    <meta
+      property="og:description"
+      content="How one Codex runtime fact stream becomes app-server notifications, TUI transcript state, and resumable rollout history."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/client-projection-fanout.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/client-projection/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/client-projection/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/client-projection/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(45, 95, 139, 0.32);
+        background: rgba(45, 95, 139, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Codex series</a>
+        <a href="../permissions-sandbox/">Previous: permission</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/client-projection/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part VI</p>
+            <h1>Client Projection</h1>
+            <p class="lead">
+              The first five parts stayed inside the core runtime: request entry,
+              turn context, tools, and permission gates. This part moves outward.
+              The streaming text, command cards, approval prompts, final turn status,
+              and resumable history that a user sees are different projections of
+              the same runtime fact stream.
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: client projection</span>
+              <span>Scope: public source</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/client-projection-fanout.png"
+                alt="Codex client projection fanout from EventMsg into app-server ServerNotification, TUI history cells, and rollout resume"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Start from an ordinary turn. The assistant is streaming text. A command
+              starts, produces output, and completes. A permission prompt may need a
+              user response. The turn finally moves from running to completed. Later,
+              the same thread can be resumed and the transcript appears again.
+            </p>
+
+            <p>
+              The source does not treat those as separate UI tricks. <strong>Core emits
+              and persists facts; app-server projects them into JSON-RPC notifications;
+              TUI projects them into history cells and status surfaces; rollout keeps
+              the records needed for resume.</strong> Client projection is the boundary
+              between those shapes.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                Projection means one runtime fact changing owner and shape. It may be
+                an <code>EventMsg</code>, a <code>ServerNotification</code>, a
+                <code>ThreadItem</code>, a TUI history cell, or a rollout record. Ask who
+                owns the shape before asking how it appears on screen.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                This article only describes event types, mapping functions, notification
+                structs, TUI handlers, and rollout reconstruction visible in the public
+                openai/codex source. It does not infer private product UI internals.
+              </p>
+            </div>
+
+            <h2>1. Separate the Shapes First</h2>
+            <p>
+              The terms are easy to blur because several of them sound like history or
+              events. They carry different ownership.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Shape</th>
+                    <th>Owner</th>
+                    <th>Question answered</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>EventMsg</code></td>
+                    <td>core protocol</td>
+                    <td>What runtime fact just happened?</td>
+                  </tr>
+                  <tr>
+                    <td><code>TurnItem</code></td>
+                    <td>core item stream</td>
+                    <td>Which response item is worth exposing as a turn item?</td>
+                  </tr>
+                  <tr>
+                    <td><code>ThreadItem</code></td>
+                    <td>app-server v2 protocol</td>
+                    <td>How should clients receive transcript items?</td>
+                  </tr>
+                  <tr>
+                    <td><code>ServerNotification</code></td>
+                    <td>app-server JSON-RPC</td>
+                    <td>Which notification should clients observe?</td>
+                  </tr>
+                  <tr>
+                    <td>history cell</td>
+                    <td>TUI</td>
+                    <td>How should this fact render in terminal scrollback or live status?</td>
+                  </tr>
+                  <tr>
+                    <td>rollout record</td>
+                    <td>persistence / resume</td>
+                    <td>Which fact must survive so the thread can be reconstructed?</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              A message delta can update a live TUI stream immediately. The completed
+              assistant message later becomes a stable item. Those two surfaces serve
+              different lifetimes: one is live feedback, the other is replayable history.
+            </p>
+
+            <h2>2. Core Decides What Becomes a Turn Item</h2>
+            <p>
+              Client-visible items are narrowed before app-server rendering.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/event_mapping.rs#L139-L213"><code>parse_turn_item</code></a>
+              maps provider <code>ResponseItem</code> values into <code>TurnItem</code>
+              values for user messages, assistant messages, reasoning, web search, and
+              image generation. It also filters contextual fragments such as permission,
+              skills, and collaboration-mode payloads that are runtime context rather
+              than visible transcript.
+            </p>
+
+            <p>
+              Completed response items pass through
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L3296-L3309"><code>record_response_item_and_emit_turn_item</code></a>:
+              record the response item, parse a turn item, then emit item-started and
+              item-completed events when a visible item exists.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2647-L2660"><code>record_conversation_items</code></a>
+              updates in-memory history, persists rollout response items, and emits
+              <code>RawResponseItem</code>. Raw response, turn item, and UI item are
+              therefore separate layers.
+            </p>
+
+            <h2>3. App-Server Projects Facts Into Notifications</h2>
+            <p>
+              The app-server entry point is
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L137-L199"><code>apply_bespoke_event_handling</code></a>.
+              It receives core events and maps them to app-server protocol surfaces.
+              <code>TurnStarted</code> clears pending server requests, notes the running
+              turn, and sends <code>ServerNotification::TurnStarted</code>. Turn completion
+              aborts pending requests and emits a completion notification with status.
+            </p>
+
+            <p>
+              The wire names live in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1541-L1585"><code>ServerNotification</code></a>:
+              <code>turn/started</code>, <code>turn/completed</code>,
+              <code>item/started</code>, <code>item/completed</code>, and delta notifications.
+              The v2 <code>Turn</code> shape carries <code>items</code>,
+              <code>items_view</code>, <code>status</code>, errors, and timing metadata.
+            </p>
+
+            <h3>3.1 Turn Status Is a Client Projection</h3>
+            <p>
+              Turn start sends an in-progress turn with unloaded items. Completion goes
+              through
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1502-L1528"><code>handle_turn_complete</code></a>,
+              which reads app-server turn summary state and chooses
+              <code>Completed</code> or <code>Failed</code>. Then
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1324-L1345"><code>emit_turn_completed_with_status</code></a>
+              sends the client-facing shape.
+            </p>
+
+            <h3>3.2 Item Lifecycle and Deltas Use Different Channels</h3>
+            <p>
+              Stateless one-to-one mappings use
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L34"><code>item_event_to_server_notification</code></a>.
+              It maps item lifecycle events to item notifications, agent text deltas to
+              <code>AgentMessageDelta</code>, and command output bytes to
+              <code>CommandExecutionOutputDelta</code>. Some paths add app-server state:
+              command begin/end events are deduplicated, and legacy command items are
+              suppressed for unified exec interactions so clients do not render duplicate
+              wait states.
+            </p>
+
+            <h3>3.3 Approval Is a Request Surface</h3>
+            <p>
+              Approval events become server requests because the client must answer.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L511-L575"><code>ApplyPatchApprovalRequest</code> and <code>ExecApprovalRequest</code></a>
+              send approval requests and await responses. They are not passive history
+              notifications.
+            </p>
+
+            <h2>4. TUI Projects Notifications Into Terminal State</h2>
+            <p>
+              TUI first routes app-server events by thread. For the active thread,
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/app/thread_routing.rs#L1428-L1458"><code>handle_thread_event_now</code></a>
+              forwards notifications to <code>ChatWidget::handle_server_notification</code>.
+              That handler maps turn start to running state, turn completion to final
+              cleanup, item notifications to item-specific lifecycle handlers, and deltas
+              to streaming or active command cells.
+            </p>
+
+            <h3>4.1 Streaming Is a Temporary Tail</h3>
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/streaming.rs#L375-L409"><code>handle_streaming_delta</code></a>
+              creates or updates a stream controller and starts commit animation. When
+              the final assistant item lands,
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/streaming.rs#L19-L55"><code>flush_answer_stream_with_separator</code></a>
+              consolidates the streaming cells into one source-backed markdown cell so
+              resize and replay remain stable.
+            </p>
+
+            <h3>4.2 Item Type Chooses the History Cell</h3>
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/protocol.rs#L302-L358"><code>handle_item_started_notification</code></a>
+              dispatches by <code>ThreadItem</code>: commands to command lifecycle, patches
+              to patch cells, MCP calls to MCP cells, web search to active search cells,
+              and so on. Completed items pass through
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/replay.rs#L66-L155"><code>handle_thread_item</code></a>,
+              which is shared by live handling and replay.
+            </p>
+
+            <h3>4.3 Turn Completion Settles Temporary Surfaces</h3>
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/turn_runtime.rs#L49-L77"><code>on_task_started</code></a>
+              resets turn flags, opens the running status, and shows the interrupt hint.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/turn_runtime.rs#L79-L204"><code>on_task_complete</code></a>
+              flushes streaming and unified exec state, adds final separators when needed,
+              clears running commands, and decides whether to send notifications or queued
+              follow-up input.
+            </p>
+
+            <h2>5. Rollout Keeps Recovery Evidence</h2>
+            <p>
+              Rollout persistence does not store every transient UI delta.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/policy.rs#L5-L159"><code>rollout policy</code></a>
+              selects recordable response items and event messages. User messages,
+              assistant messages, reasoning, turn boundaries, compaction, rollback,
+              web search end, and image generation end survive. Many intermediate deltas,
+              approval requests, exec output deltas, and hook lifecycle events do not.
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L786-L927"><code>RolloutRecorder</code></a>
+              queues canonical items, materializes and flushes rollout files, and loads
+              jsonl lines back into <code>InitialHistory::Resumed</code>. Core then uses
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/rollout_reconstruction.rs#L93-L320"><code>reconstruct_history_from_rollout</code></a>
+              to rebuild model history, turn metadata, reference context, and rollback
+              effects. TUI replay renders safe items and marks them as replayed so live
+              side effects are not triggered.
+            </p>
+
+            <h2>6. Four Reading Rules</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Visible symptom</th>
+                    <th>Ask first</th>
+                    <th>Source layer</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Text is streaming.</td>
+                    <td>Is this a delta or a completed item?</td>
+                    <td><code>AgentMessageDelta</code> and stream consolidation.</td>
+                  </tr>
+                  <tr>
+                    <td>A command card changes.</td>
+                    <td>Is this lifecycle or output delta?</td>
+                    <td>event mapping and command lifecycle.</td>
+                  </tr>
+                  <tr>
+                    <td>An approval prompt opens.</td>
+                    <td>Does the client need to answer?</td>
+                    <td><code>ServerRequestPayload</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>History reappears after resume.</td>
+                    <td>Is this reconstructed state or a live event?</td>
+                    <td>rollout reconstruction and TUI replay.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Client projection protects readability and recovery. Core owns facts,
+              app-server owns protocol boundaries, TUI owns live terminal experience,
+              and rollout owns resume evidence. The next runtime layers, including
+              plugins, MCP, skills, and subagents, still have to pass through the same
+              question: who owns this fact, what can clients see, and what must survive
+              for a future resume?
+            </p>
+
+            <h2 id="sources">Sources</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">Pinned openai/codex source snapshot</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1202-L1335">EventMsg turn, item, tool, and delta events</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/items.rs#L38-L54">Core TurnItem</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/event_mapping.rs#L72-L213">parse_turn_item and contextual message filtering</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2647-L2660">record_conversation_items</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L3296-L3309">record_response_item_and_emit_turn_item</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L137-L199">app-server turn event handling</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L511-L575">approval request projection</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1085-L1144">command execution notification handling</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1324-L1345">emit_turn_completed_with_status</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1502-L1528">handle_turn_complete</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1541-L1585">ServerNotification wire names</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L34">item_event_to_server_notification</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L360-L463">item and delta event mapping</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/item.rs#L213-L275">ThreadItem variants</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/item.rs#L788-L876">CoreTurnItem to ThreadItem conversion</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs#L185-L217">Turn and TurnItemsView</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/app/app_server_events.rs#L30-L57">TUI handle_app_server_event</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/app/thread_routing.rs#L1428-L1458">TUI handle_thread_event_now</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/protocol.rs#L31-L124">ChatWidget handle_server_notification</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/protocol.rs#L302-L358">ChatWidget item notification dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/streaming.rs#L19-L55">flush_answer_stream_with_separator</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/streaming.rs#L375-L409">handle_streaming_delta</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/command_lifecycle.rs#L20-L73">command start and output delta</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/command_lifecycle.rs#L134-L163">command completed</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/turn_runtime.rs#L49-L77">on_task_started</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/turn_runtime.rs#L79-L204">on_task_complete</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/tui/src/chatwidget/replay.rs#L8-L155">TUI replay_thread_turns and handle_thread_item</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/policy.rs#L5-L159">rollout persistence policy</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L786-L927">RolloutRecorder write and load</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/rollout_reconstruction.rs#L93-L320">rollout reconstruction</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
