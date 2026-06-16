@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes V: Permission and Sandboxing</title>
+    <meta
+      name="description"
+      content="A source-guided walkthrough of Codex permission and sandboxing: turn policy, permission profiles, tool hooks, permission hooks, ToolOrchestrator, SandboxAttempt, and retry."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes V: Permission and Sandboxing" />
+    <meta
+      property="og:description"
+      content="How Codex gates side-effecting tool calls before they touch processes, files, or the network."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/permission-sandbox-gates.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/permissions-sandbox/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/permissions-sandbox/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/permissions-sandbox/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Codex series</a>
+        <a href="../tools/">Previous: tools</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/permissions-sandbox/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part V</p>
+            <h1>Permission and Sandboxing</h1>
+            <p class="lead">
+              The previous part followed tool calls into the runtime contract: routing,
+              hooks, lifecycle events, and normalized output. This part continues one
+              step deeper. When a tool wants to start a process, edit files, reach the
+              network, or request wider authority, Codex has to decide whether that
+              action may happen, and under which sandbox it should happen.
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: permissions / sandbox</span>
+              <span>Scope: public source</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/permission-sandbox-gates.png"
+                alt="Codex permission and sandboxing pipeline showing tool call, pre hooks, approval, sandbox, attempt, denial, retry, output, events, and history"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Start with a normal action: the model wants to run tests. The shell tool
+              call looks valid. Before anything runs, Codex still needs to know the
+              current working directory, writable roots, network policy, approval
+              mode, and whether any hook wants to block or rewrite the request.
+            </p>
+
+            <p>
+              That is the permission path this article follows. Permission is not a
+              single UI switch and not a prompt-only promise. It is a runtime path:
+              <strong>the turn carries policy, registry runs hooks, the orchestrator
+              decides approval and sandboxing, and the concrete runtime executes only
+              inside a selected <code>SandboxAttempt</code>.</strong>
+            </p>
+
+            <div class="note key-point">
+              <p>
+                In this article, side effects mean actions that touch the outside
+                environment: starting processes, writing files, widening filesystem
+                access, using the network, or retrying a denied sandboxed attempt with
+                broader authority.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                This article describes the policy fields, hook calls, approval events,
+                sandbox selection, and retry logic visible in the public openai/codex
+                source. It uses gate and authority as reading aids for source objects
+                such as <code>AskForApproval</code>, <code>PermissionProfile</code>,
+                <code>ExecApprovalRequirement</code>, <code>ToolOrchestrator</code>, and
+                <code>SandboxAttempt</code>. It does not infer private guardian model
+                behavior or undisclosed operating-system sandbox details.
+              </p>
+            </div>
+
+            <p>This part answers six questions:</p>
+            <ol>
+              <li>Which permission and sandbox fields enter at turn start?</li>
+              <li>Where do those fields land inside the runtime?</li>
+              <li>Where do pre/post hooks and permission-request hooks attach?</li>
+              <li>How does <code>ToolOrchestrator</code> choose skip, reject, or approval?</li>
+              <li>How are the first sandbox attempt and retry attempt selected?</li>
+              <li>How do we separate a model request from runtime authority?</li>
+            </ol>
+
+            <h2>1. Permission Enters With the Turn</h2>
+            <p>
+              The boundary appears before any shell handler runs. App-server v2
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L116"><code>TurnStartParams</code></a>
+              includes <code>approval_policy</code>, <code>sandbox_policy</code>, and
+              <code>permissions</code>. The <code>permissions</code> field selects a named
+              permission profile and cannot be combined with <code>sandboxPolicy</code>.
+            </p>
+
+            <p>
+              In core,
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L70-L104"><code>TurnContext</code></a>
+              stores <code>approval_policy</code>, <code>permission_profile</code>, the managed
+              network proxy, and platform sandbox settings. Its helpers
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L115-L130"><code>file_system_sandbox_policy()</code> and <code>network_sandbox_policy()</code></a>
+              project the active <code>PermissionProfile</code> into runtime policies.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Turn Field</th>
+                    <th>Runtime Object</th>
+                    <th>Meaning</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>approval_policy</code></td>
+                    <td><code>AskForApproval</code></td>
+                    <td>When Codex should request approval or return failure.</td>
+                  </tr>
+                  <tr>
+                    <td><code>sandbox_policy</code></td>
+                    <td><code>SandboxPolicy</code></td>
+                    <td>Legacy sandbox shape: full access, read-only, workspace-write, and network flags.</td>
+                  </tr>
+                  <tr>
+                    <td><code>permissions</code></td>
+                    <td><code>PermissionProfile</code></td>
+                    <td>A richer profile projected into filesystem and network policies.</td>
+                  </tr>
+                  <tr>
+                    <td><code>runtime_workspace_roots</code></td>
+                    <td>workspace roots</td>
+                    <td>The roots against which writable workspace policy is interpreted.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Session updates preserve this shape.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/session.rs#L248-L341"><code>apply_updates</code></a>
+              merges approval policy first, then either a permission-profile projection
+              or a legacy sandbox-policy projection into the session configuration.
+            </p>
+
+            <h2>2. Separate the Terms Before Reading the Gates</h2>
+            <p>
+              Approval, permissions, sandboxing, and hooks all describe authority, but
+              they answer different questions in the source.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Term</th>
+                    <th>Source Handle</th>
+                    <th>Question Answered</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Approval policy</td>
+                    <td><code>AskForApproval</code></td>
+                    <td>Should this action ask a user, guardian, or hook for a decision?</td>
+                  </tr>
+                  <tr>
+                    <td>Permission profile</td>
+                    <td><code>PermissionProfile</code></td>
+                    <td>Which filesystem, network, and additional permissions are active?</td>
+                  </tr>
+                  <tr>
+                    <td>Exec requirement</td>
+                    <td><code>ExecApprovalRequirement</code></td>
+                    <td>Is this request skipped, approved interactively, or forbidden?</td>
+                  </tr>
+                  <tr>
+                    <td>Sandbox attempt</td>
+                    <td><code>SandboxAttempt</code></td>
+                    <td>Which concrete execution environment is used for this attempt?</td>
+                  </tr>
+                  <tr>
+                    <td>Hooks</td>
+                    <td>pre/post/permission hooks</td>
+                    <td>Where extension or policy code can intercept the flow.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L791-L821"><code>AskForApproval</code></a>
+              defines modes such as <code>OnRequest</code>, <code>Granular</code>, and
+              <code>Never</code>. <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L881-L930"><code>SandboxPolicy</code></a>
+              describes execution restrictions such as <code>danger-full-access</code>,
+              <code>read-only</code>, <code>external-sandbox</code>, and
+              <code>workspace-write</code>. Approval decides whether to ask. Sandbox policy
+              decides the shape of containment.
+            </p>
+
+            <h2>3. Registry Hooks Run Before the Handler</h2>
+            <p>
+              Before the handler executes, <code>ToolRegistry</code> gives pre-tool-use hooks
+              a chance to respond.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L491-L537">The dispatch path</a>
+              obtains a pre-tool-use payload, runs <code>run_pre_tool_use_hooks</code>, and
+              either blocks the call, rewrites the invocation input, or continues.
+            </p>
+
+            <p>
+              After successful handler execution, post-tool-use hooks can add context
+              or replace model-visible output. That logic is visible in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L581-L628">the post hook block</a>.
+              These hooks wrap the handler. They are distinct from permission-request
+              hooks, which sit inside approval.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                Pre/post hooks intercept tool execution. Permission-request hooks
+                intercept an approval request before it reaches guardian or user review.
+              </p>
+            </div>
+
+            <h2>4. Side-Effecting Tools Enter the Orchestrator</h2>
+            <p>
+              The shell handler builds a <code>ShellRequest</code>, then
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/shell.rs#L180-L214">creates <code>ToolOrchestrator</code> and <code>ShellRuntime</code></a>.
+              The apply-patch path does the same after constructing an
+              <code>ApplyPatchRequest</code>:
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/apply_patch.rs#L399-L428">it delegates to the same orchestrator</a>.
+            </p>
+
+            <p>
+              The module header of
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L1-L8"><code>orchestrator.rs</code></a>
+              states the sequence: approval, sandbox selection, attempt, and retry
+              with escalation on denial. The generic shape comes from
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L316-L407"><code>Approvable</code>, <code>Sandboxable</code>, and <code>ToolRuntime</code></a>.
+            </p>
+
+            <h2>5. First Gate: Does This Need Approval?</h2>
+            <p>
+              In
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L131-L218"><code>ToolOrchestrator::run</code></a>,
+              approval comes first. Codex reads the active filesystem and network
+              sandbox policies, asks the tool for a custom
+              <code>exec_approval_requirement(req)</code>, and otherwise falls back to
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L197-L238"><code>default_exec_approval_requirement</code></a>.
+            </p>
+
+            <p>
+              The default rule is compact: <code>Never</code> and <code>OnFailure</code> do not
+              ask by default; <code>OnRequest</code> and <code>Granular</code> ask when filesystem
+              access is restricted; <code>UnlessTrusted</code> always asks. Granular policy
+              can convert a disabled category into <code>Forbidden</code>, so the runtime
+              rejects instead of presenting a prompt.
+            </p>
+
+            <pre><code class="language-text">approval skeleton:
+  tool.exec_approval_requirement(req)
+      or default_exec_approval_requirement(policy, fs_policy)
+        ↓
+  Skip / Forbidden / NeedsApproval
+        ↓
+  continue / reject / request_approval(...)</code></pre>
+
+            <h2>6. Permission Hooks Can Answer Before User Review</h2>
+            <p>
+              The approval path has another interception point.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L482-L546"><code>request_approval</code></a>
+              runs permission-request hooks first when the tool provides a
+              <code>permission_request_payload</code>. A hook may return allow, deny with a
+              message, or no decision. Only the no-decision case falls through to
+              guardian or user approval.
+            </p>
+
+            <p>
+              Shell provides a bash permission payload in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/shell.rs#L190-L203"><code>ShellRuntime</code></a>.
+              Apply patch provides an <code>apply_patch</code> permission payload in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/apply_patch.rs#L132-L213"><code>ApplyPatchRuntime</code></a>.
+            </p>
+
+            <h2>7. Second Gate: Select the First Sandbox Attempt</h2>
+            <p>
+              Once approval is satisfied, the orchestrator selects the first sandbox.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L220-L268">This block</a>
+              computes any first-attempt override, asks the sandbox manager for the
+              initial sandbox, and assembles a <code>SandboxAttempt</code> with sandbox type,
+              permission profile, managed-network flag, cwd, workspace roots, and
+              platform settings.
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L409-L459"><code>SandboxAttempt</code></a>
+              exposes <code>env_for</code>, which transforms a command plus active permission
+              profile into an executable request. Shell uses it in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/shell.rs#L236-L318"><code>ShellRuntime::run</code></a>.
+              Apply patch builds a filesystem sandbox context from the same attempt
+              and returns <code>SandboxErr::Denied</code> when a failure looks like sandbox denial.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                Sandbox is not a cleanup step after failure. It is the environment for
+                each attempt. The runtime receives <code>SandboxAttempt</code> and executes
+                inside that attempt.
+              </p>
+            </div>
+
+            <h2>8. Retry After Denial Runs Through Policy Again</h2>
+            <p>
+              If the first attempt succeeds, the orchestrator returns output. The
+              interesting path starts with sandbox denial.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L270-L466">The retry branch</a>
+              checks network-denial context, whether the tool may escalate on failure,
+              whether unsandboxed execution can preserve the active filesystem policy,
+              and whether approval policy allows a retry prompt.
+            </p>
+
+            <p>
+              If retry is allowed, Codex may request approval again with a
+              <code>:retry</code> permission-request run id. After approval, it selects
+              either <code>SandboxType::None</code> or another sandboxed retry attempt,
+              depending on whether unsandboxed execution is allowed.
+            </p>
+
+            <pre><code class="language-text">after sandbox denial:
+  denial output + network policy
+      ↓
+  tool escalation rules
+      ↓
+  no-sandbox / network approval policy
+      ↓
+  maybe request_approval(call_id:retry)
+      ↓
+  retry attempt or denied output to the model</code></pre>
+
+            <h2>9. Approval Requests Are Structured Events</h2>
+            <p>
+              Approval prompts are protocol objects, not plain strings.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/approvals.rs#L217-L264"><code>ExecApprovalRequestEvent</code></a>
+              includes call id, approval id, turn id, command, cwd, reason, network
+              context, proposed execpolicy amendment, additional permissions, and
+              available decisions. <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/approvals.rs#L373-L390"><code>ApplyPatchApprovalRequestEvent</code></a>
+              carries patch changes, reason, and grant root.
+            </p>
+
+            <p>
+              Shell calls <code>session.request_command_approval</code> in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/shell.rs#L135-L188"><code>start_approval_async</code></a>.
+              Apply patch calls <code>session.request_patch_approval</code> in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/apply_patch.rs#L132-L180"><code>start_approval_async</code></a>.
+              The result is a
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L3718-L3744"><code>ReviewDecision</code></a>.
+            </p>
+
+            <h2>10. Rules for Reading This Path</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Observation</th>
+                    <th>Source Question</th>
+                    <th>Handle</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>The model asks to run a command.</td>
+                    <td>Did the handler translate it into a side-effecting runtime request?</td>
+                    <td>shell/apply_patch handler to <code>ToolOrchestrator</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>A tool asks for approval.</td>
+                    <td>Is approval coming from default policy or a tool-specific requirement?</td>
+                    <td><code>exec_approval_requirement</code> and <code>default_exec_approval_requirement</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>No user prompt appears.</td>
+                    <td>Did a permission-request hook already allow or deny it?</td>
+                    <td><code>run_permission_request_hooks</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>A command runs in sandbox.</td>
+                    <td>Which sandbox, permissions, cwd, and network flags are on this attempt?</td>
+                    <td><code>SandboxAttempt</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>A denied sandboxed command retries.</td>
+                    <td>Is it a network approval, no-sandbox retry, or terminal denial?</td>
+                    <td><code>ToolOrchestrator::run</code> retry branch.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The permission path now closes: turn start carries approval and permission
+              policy; <code>TurnContext</code> stores the runtime projection; registry hooks
+              wrap tool entry and exit; side-effecting handlers delegate to
+              <code>ToolOrchestrator</code>; the orchestrator decides approval, sandbox
+              attempt, and denial retry.
+            </p>
+
+            <p>
+              The key distinction is that the model proposes an action. Runtime gates
+              decide whether that action may touch the system. The next part can move
+              outward again: how these structured events and history entries are
+              projected by the TUI, app-server, and recovery paths into the same user
+              visible facts.
+            </p>
+
+            <h2 id="sources">Sources</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">Pinned openai/codex source snapshot</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L116">TurnStartParams approval_policy, sandbox_policy, and permissions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L70-L130">TurnContext approval_policy, permission_profile, and sandbox policy helpers</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/session.rs#L248-L341">SessionConfiguration apply_updates for approval, permission profile, and sandbox policy</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L791-L821">AskForApproval</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L824-L860">GranularApprovalConfig</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L881-L930">SandboxPolicy</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L491-L537">ToolRegistry pre-tool-use hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L581-L628">ToolRegistry post-tool-use hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/shell.rs#L180-L214">shell handler enters ToolOrchestrator</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/apply_patch.rs#L399-L428">apply_patch handler enters ToolOrchestrator</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L118-L179">ApprovalCtx, PermissionRequestPayload, and ExecApprovalRequirement</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L197-L238">default_exec_approval_requirement</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L246-L303">sandbox_override_for_first_attempt and denied-read protection</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L316-L407">Approvable, Sandboxable, and ToolRuntime</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L409-L459">SandboxAttempt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L1-L8">ToolOrchestrator module header</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L131-L218">ToolOrchestrator approval phase</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L220-L268">ToolOrchestrator first sandbox attempt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L270-L466">ToolOrchestrator sandbox-denied retry</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L482-L546">request_approval and PermissionRequest hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/shell.rs#L135-L203">ShellRuntime approval and permission request payload</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/shell.rs#L236-L318">ShellRuntime executes with SandboxAttempt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/apply_patch.rs#L132-L213">ApplyPatchRuntime approval and permission request payload</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/apply_patch.rs#L220-L267">ApplyPatchRuntime executes with SandboxAttempt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/approvals.rs#L217-L264">ExecApprovalRequestEvent</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/approvals.rs#L373-L390">ApplyPatchApprovalRequestEvent</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L3718-L3744">ReviewDecision</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

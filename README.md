@@ -42,6 +42,10 @@ tools, permissions, client projection, and recovery as separate mechanisms.
   [Codex 源码阅读（四）：工具调用背后的运行时合约](https://rememorio.github.io/blog/codex/zh/tools/)
 - English tools:
   [Codex Source Notes IV: Tools Are Runtime Contracts](https://rememorio.github.io/blog/codex/en/tools/)
+- Chinese permission and sandboxing:
+  [Codex 源码阅读（五）：权限与 sandbox，副作用怎样被运行时收口](https://rememorio.github.io/blog/codex/zh/permissions-sandbox/)
+- English permission and sandboxing:
+  [Codex Source Notes V: Permission and Sandboxing](https://rememorio.github.io/blog/codex/en/permissions-sandbox/)
 
 ### Hermes Agent
 
@@ -72,11 +76,13 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/context-management/  # Chinese context-management article
 │   ├── zh/protocol-events/     # Chinese protocol/event-stream article
 │   ├── zh/tools/               # Chinese tools-runtime article
+│   ├── zh/permissions-sandbox/ # Chinese permission/sandbox article
 │   ├── en/index.html           # English series index
 │   ├── en/overview/            # English series overview article
 │   ├── en/context-management/  # English context-management article
 │   ├── en/protocol-events/     # English protocol/event-stream article
 │   ├── en/tools/               # English tools-runtime article
+│   ├── en/permissions-sandbox/ # English permission/sandbox article
 │   └── assets/*.png            # Final raster figures
 ├── hermes-agent/
 │   ├── index.html              # Language gateway
@@ -113,6 +119,8 @@ Then open:
 - `http://127.0.0.1:4173/codex/en/protocol-events/`
 - `http://127.0.0.1:4173/codex/zh/tools/`
 - `http://127.0.0.1:4173/codex/en/tools/`
+- `http://127.0.0.1:4173/codex/zh/permissions-sandbox/`
+- `http://127.0.0.1:4173/codex/en/permissions-sandbox/`
 - `http://127.0.0.1:4173/hermes-agent/`
 
 Use a local server rather than opening files directly when checking relative
