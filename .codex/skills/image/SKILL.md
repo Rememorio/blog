@@ -1,7 +1,6 @@
 ---
 name: image
 description: "Generate and maintain Rememorio hand-drawn technical article images with imagegen."
-argument-hint: "[article-or-figure topic]"
 ---
 
 # Rememorio Imagegen Hand-Drawn Figures
@@ -39,6 +38,13 @@ into the prompt and later quality checks.
 Adapt the visual system to Rememorio by keeping a restrained, integrated
 bottom-right `Rememorio` source-notes treatment and the article's
 source-accurate labels.
+
+For Rememorio brand fidelity, treat the repository-root `Eyjafjalla.png` as
+the canonical character reference for the small source-notes card. Accepted
+in-repo figures may be used only to calibrate the brand treatment's placement,
+paper-card shape, line integration, and `Rememorio / source notes` feel; they
+must not replace the Wine & Chord reference as the overall article-figure style
+authority.
 
 ## Non-Negotiables
 
@@ -105,17 +111,25 @@ Brand mark treatment:
 - Generate the Rememorio treatment as part of the whole figure by default,
   usually as a small bottom-right paper note or source-notes card that includes
   a tiny Eyjafjalla-like character and the word `Rememorio`.
-- The repository-root `Eyjafjalla.png` image may be used as a visual reference
-  for the character's broad look, but the final figure should feel like one
-  unified hand-drawn illustration, not a base diagram with a later pasted
-  sticker.
+- Use the repository-root `Eyjafjalla.png` image as the canonical visual
+  reference for the character's broad look: small chibi girl, warm brown hair,
+  curled ram-like horns, red eyes, and white/red outfit cues. The final
+  character must be redrawn into the figure's hand-drawn style; do not paste,
+  crop, trace, recolor, or mechanically composite the source image unless the
+  user explicitly asks for exact pixel-level fidelity.
 - Keep the brand legible but secondary: roughly `10%` to `18%` of image width,
   with at least `3%` canvas padding from the right and bottom edges.
 - Ask for the brand area to be naturally integrated into the paper texture,
   line weight, shadows, and palette of the figure. The note should look drawn
   with the same hand as the diagram.
+- When revising a figure whose mechanism is otherwise acceptable but the brand
+  card drifted, use the current figure as the edit target and regenerate or
+  edit the whole image area so the brand remains integrated. Use an accepted
+  in-repo Rememorio figure as a brand-card reference when helpful, but keep the
+  article's existing nodes, labels, and arrows as the mechanism source.
 - Do not use a generic badge, alternate logo, image-model imitation of an
-  unrelated mark, clover/leaf icon, route-line logo, or large avatar badge.
+  unrelated mark, generic reading mascot, clover/leaf icon, route-line logo, or
+  large avatar badge.
 - Deterministic compositing with the exact `Eyjafjalla.png` asset is an
   exception, not the default. Use it only when the user explicitly requires
   pixel-level brand fidelity or asks to use the exact source image. Before
@@ -162,6 +176,9 @@ Before generating, write a compact figure brief:
 5. Caption role: what the surrounding prose will explain so the image can stay
    visually clean.
 6. References: which Wine-style image roles should guide style and layout.
+   If the figure includes or revises a Rememorio brand treatment, separately
+   name the Eyjafjalla character reference and any accepted in-repo
+   source-notes card used only for brand-card integration.
 
 For runtime and protocol figures, prefer lifecycle or before/after layouts over
 generic box clusters. A good figure should make one transition visible:
@@ -248,12 +265,14 @@ amber highlights.
 Subject: [one precise source-level idea].
 Composition: [nodes and arrows in exact order].
 Integrate a small bottom-right Rememorio source-notes paper card into the same
-hand-drawn style, with a tiny Eyjafjalla-like character and the exact word
-`Rememorio`.
+hand-drawn style, with a tiny Eyjafjalla-like character based on
+`Eyjafjalla.png` (warm brown hair, curled horns, red eyes, white/red outfit
+cues) and the exact words `Rememorio` and `source notes`.
 No process notes, no prompt references, no meta text.
 Use only these short English labels: [label list].
-Avoid generic logos, clovers, leaves, pasted stickers, competing badges, and
-any brand mark that looks detached from the illustration.
+Avoid generic mascots, reading mascots, generic logos, clovers, leaves, pasted
+stickers, competing badges, and any brand mark that looks detached from the
+illustration.
 Keep arrows clean and non-crossing; leave generous margins.
 Professional editorial diagram, not cartoonish, not glossy 3D.
 ```
@@ -291,12 +310,16 @@ Integrated brand protocol:
 1. Include the Rememorio treatment in the figure brief before generation.
 2. Place it as a small bottom-right source-notes card, roughly `10%` to `18%`
    of canvas width, with at least `3%` right and bottom padding.
-3. Keep the character, wordmark, card paper, line weight, shadows, and palette
+3. Derive the tiny character from `Eyjafjalla.png`: brown hair, curled
+   ram-like horns, red eyes, and white/red outfit hints. Redraw those traits in
+   the figure's sketch style instead of compositing the original asset.
+4. Keep the character, wordmark, card paper, line weight, shadows, and palette
    consistent with the rest of the figure.
-4. If the brand area looks like a pasted sticker, generic icon, clover/leaf
-   badge, unrelated mascot, or detached logo, regenerate or use a built-in edit
-   for the whole figure area rather than layering a patch on top.
-5. Save the final integrated image as the only PNG referenced by the article.
+5. If the brand area looks like a pasted sticker, generic icon, clover/leaf
+   badge, unrelated mascot, generic reading mascot, or detached logo,
+   regenerate or use a built-in edit for the whole figure area rather than
+   layering a patch on top.
+6. Save the final integrated image as the only PNG referenced by the article.
 
 Recommended final asset layout:
 
@@ -354,9 +377,11 @@ Inspect every generated figure before publishing:
   triggers and permissions differ.
 - The figure matches the article's source claims.
 - The Rememorio treatment is integrated into the bottom-right of the figure and
-  looks drawn with the same paper, line weight, palette, and shadows. No pasted
-  sticker, alternate badge, generic icon, clover/leaf mark, distorted crop,
-  recolor, or competing generated logo is visible.
+  looks drawn with the same paper, line weight, palette, and shadows. The
+  character visibly follows `Eyjafjalla.png`'s broad traits: brown hair,
+  curled horns, red eyes, and white/red outfit hints. No pasted sticker,
+  alternate badge, generic icon, generic reading mascot, clover/leaf mark,
+  distorted crop, recolor, or competing generated logo is visible.
 - The published article references the correct local relative URL for each
   generated figure, and the referenced PNG exists in the repository.
 - No private instruction, prompt, unfinished editorial marker, or process note
