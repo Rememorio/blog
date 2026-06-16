@@ -38,6 +38,10 @@ tools, permissions, client projection, and recovery as separate mechanisms.
   [Codex 源码阅读（三）：protocol 与事件流，客户端怎样共享同一套事实](https://rememorio.github.io/blog/codex/zh/protocol-events/)
 - English protocol and events:
   [Codex Source Notes III: Protocol and Event Stream](https://rememorio.github.io/blog/codex/en/protocol-events/)
+- Chinese tools:
+  [Codex 源码阅读（四）：工具调用背后的运行时合约](https://rememorio.github.io/blog/codex/zh/tools/)
+- English tools:
+  [Codex Source Notes IV: Tools Are Runtime Contracts](https://rememorio.github.io/blog/codex/en/tools/)
 
 ### Hermes Agent
 
@@ -67,10 +71,12 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/overview/            # Chinese series overview article
 │   ├── zh/context-management/  # Chinese context-management article
 │   ├── zh/protocol-events/     # Chinese protocol/event-stream article
+│   ├── zh/tools/               # Chinese tools-runtime article
 │   ├── en/index.html           # English series index
 │   ├── en/overview/            # English series overview article
 │   ├── en/context-management/  # English context-management article
 │   ├── en/protocol-events/     # English protocol/event-stream article
+│   ├── en/tools/               # English tools-runtime article
 │   └── assets/*.png            # Final raster figures
 ├── hermes-agent/
 │   ├── index.html              # Language gateway
@@ -103,6 +109,10 @@ Then open:
 - `http://127.0.0.1:4173/codex/en/overview/`
 - `http://127.0.0.1:4173/codex/zh/context-management/`
 - `http://127.0.0.1:4173/codex/en/context-management/`
+- `http://127.0.0.1:4173/codex/zh/protocol-events/`
+- `http://127.0.0.1:4173/codex/en/protocol-events/`
+- `http://127.0.0.1:4173/codex/zh/tools/`
+- `http://127.0.0.1:4173/codex/en/tools/`
 - `http://127.0.0.1:4173/hermes-agent/`
 
 Use a local server rather than opening files directly when checking relative

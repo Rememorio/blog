@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes IV: Tools Are Runtime Contracts</title>
+    <meta
+      name="description"
+      content="A source-guided walkthrough of Codex tool runtime: tool specs, ToolRouter, ToolRegistry, ToolCallRuntime, ToolInvocation, hooks, approval, sandboxing, and tool output recording."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes IV: Tools Are Runtime Contracts" />
+    <meta
+      property="og:description"
+      content="How Codex turns model-visible tool specs into governed runtime invocations, then records tool results for the model, clients, and history."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/tool-runtime-pipeline.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/tools/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/tools/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/tools/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Codex series</a>
+        <a href="../protocol-events/">Previous: protocol</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/tools/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part IV</p>
+            <h1>Tools Are Runtime Contracts</h1>
+            <p class="lead">
+              The first three parts established the route through a turn, the context
+              boundary, and the event stream. This part enters the most commonly
+              misread step: when the model asks for a tool, Codex does not hand the
+              filesystem to the model. It exposes a turn-scoped tool menu, parses the
+              returned call, routes it through registry and runtime layers, applies
+              hooks, approval, and sandboxing where needed, then records the result.
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: tools runtime</span>
+              <span>Scope: public source</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/tool-runtime-pipeline.png"
+                alt="Codex tool runtime pipeline showing model specs, ToolRouter, registry, dispatch, orchestrator, handler, events, and history"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Start with a normal action: the model wants to run tests. In the UI this
+              looks like a shell tool call. In the source, several questions appear at
+              once. Why was shell visible in this turn? How is the model's call parsed?
+              Who decides whether it can run in parallel? Where do approval and sandbox
+              checks happen? If the tool fails, what does the model see next?
+            </p>
+
+            <p>
+              That is the reading route for Codex tools. Do not begin with a tool
+              inventory. Follow the contract:
+              <strong>a tool starts as a model-visible spec, returns as a model call,
+              becomes a runtime invocation, and leaves output plus events behind.</strong>
+            </p>
+
+            <div class="note key-point">
+              <p>
+                Keep four objects in view:
+                <strong><code>ToolSpec</code></strong> is the model-visible menu;
+                <strong><code>ToolRouter</code></strong> is the turn-scoped router;
+                <strong><code>ToolInvocation</code></strong> is the runtime execution request;
+                <strong><code>ResponseInputItem</code></strong> is the tool result shape returned
+                to the next model call.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                This article describes only the tool construction, routing, execution,
+                and recording logic visible in the public openai/codex source. Terms
+                such as tool menu, router, execution request, and evidence are reading
+                aids for source objects including <code>ToolSpec</code>,
+                <code>ToolRouter</code>, <code>ToolInvocation</code>, <code>EventMsg</code>,
+                and <code>ResponseInputItem</code>. It does not infer private model
+                service behavior or private deployment-specific tools.
+              </p>
+            </div>
+
+            <p>This part follows six questions:</p>
+            <ol>
+              <li>Where does the tool menu for each model request come from?</li>
+              <li>Why is the model-visible tool list not the same as the runtime registry?</li>
+              <li>How does a model function call become a <code>ToolInvocation</code>?</li>
+              <li>Where do parallelism, cancellation, hooks, and lifecycle notifications attach?</li>
+              <li>Why do approval and sandboxing belong to the runtime path, not to the model output?</li>
+              <li>How does a tool result flow back to the model, clients, and history?</li>
+            </ol>
+
+            <h2>1. Split "Tool" Into Layers</h2>
+            <p>
+              The word tool is overloaded. It can mean a schema in the model request,
+              a shell executor, apply_patch, MCP, plugins, dynamic tools, multi-agent
+              collaboration tools, or tools discoverable later through tool search.
+              The source becomes readable only after separating model visibility from
+              runtime dispatch.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Layer</th>
+                    <th>Source Object</th>
+                    <th>Responsibility</th>
+                    <th>Common Misread</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Model menu</td>
+                    <td><code>ToolSpec</code></td>
+                    <td>Describe how the model may request tools in this turn.</td>
+                    <td>Treating schema visibility as execution authority.</td>
+                  </tr>
+                  <tr>
+                    <td>Runtime index</td>
+                    <td><code>ToolRegistry</code></td>
+                    <td>Map tool names to handlers and capability metadata.</td>
+                    <td>Assuming hidden-from-model means absent from runtime.</td>
+                  </tr>
+                  <tr>
+                    <td>Turn router</td>
+                    <td><code>ToolRouter</code></td>
+                    <td>Parse model outputs into tool calls and dispatch them.</td>
+                    <td>Missing direct, deferred, and dispatch-only exposure.</td>
+                  </tr>
+                  <tr>
+                    <td>Execution request</td>
+                    <td><code>ToolInvocation</code></td>
+                    <td>Carry session, turn, call id, cancellation, diff tracking, and payload.</td>
+                    <td>Thinking handlers receive only model arguments.</td>
+                  </tr>
+                  <tr>
+                    <td>Returned evidence</td>
+                    <td><code>ToolOutput</code> / <code>ResponseInputItem</code></td>
+                    <td>Normalize results for the next model call and history.</td>
+                    <td>Looking only at terminal output.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              These layers make Codex tools a runtime contract. The model proposes
+              an action. The runtime decides whether the call is known, whether it can
+              run in parallel, which hooks apply, whether approval or sandboxing is
+              required, and what output shape returns to the model.
+            </p>
+
+            <h2>2. The Tool Menu Is Built Per Turn</h2>
+            <p>
+              The menu is constructed before each sampling request.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L1029-L1055"><code>run_sampling_request</code></a>
+              calls <code>built_tools(sess, turn_context, cancellation_token)</code> to obtain
+              the turn's <code>ToolRouter</code>, then creates <code>ToolCallRuntime</code>.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L999-L1017"><code>build_prompt</code></a>
+              sends <code>router.model_visible_specs()</code> as <code>Prompt.tools</code> and
+              passes the model's parallel-tool-call capability into the prompt.
+            </p>
+
+            <p>
+              That menu depends on the current <code>TurnContext</code>. Shell availability,
+              model tool shape, MCP servers, enabled plugins and apps, discoverable
+              connectors, extension executors, and dynamic tools can all change the
+              router for this specific turn.
+            </p>
+
+            <p>
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L1128-L1226"><code>built_tools</code></a>
+              makes those sources visible: it loads MCP tools, plugins, connectors,
+              discoverable tools, MCP exposure, extension executors, and dynamic tools,
+              then passes them to <code>ToolRouter::from_turn_context</code>.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The key property is <strong>turn-scoped</strong>. In the same Codex
+                process, different turns can have different tool surfaces.
+              </p>
+            </div>
+
+            <h2>3. Model Visibility and Runtime Registration Are Separate</h2>
+            <p>
+              <code>ToolRouter</code> stores two things:
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/router.rs#L34-L61"><code>registry</code> and <code>model_visible_specs</code></a>.
+              The first is for dispatch. The second is for the model request. They are
+              related, but not identical.
+            </p>
+
+            <p>
+              Both are built in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/spec_plan.rs#L153-L190"><code>build_tool_specs_and_registry</code></a>.
+              Codex creates <code>PlannedTools</code>, adds shell, MCP resource tools, core
+              utility tools, collaboration tools, MCP runtime tools, extension tools,
+              dynamic tools, and hosted model specs, then appends tool search and
+              prepends code-mode executors.
+            </p>
+
+            <p>
+              The split happens in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/spec_plan.rs#L193-L231"><code>build_model_visible_specs_and_registry</code></a>.
+              Only direct exposure that is not hidden by code-mode-only becomes a
+              model-visible spec. The registry is built from all runtimes. A tool can
+              therefore be hidden from the model while still remaining dispatchable.
+            </p>
+
+            <p>
+              Shell tools show why this matters.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/spec_plan.rs#L579-L617"><code>add_shell_tools</code></a>
+              can make unified exec model-visible while keeping the legacy shell
+              handler registered as dispatch-only. The prompt can move forward without
+              breaking older runtime calls.
+            </p>
+
+            <h2>4. A Model Call Becomes a Runtime Invocation</h2>
+            <p>
+              When the model stream contains a tool call, Codex does not execute raw
+              JSON. <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/router.rs#L95-L143"><code>ToolRouter::build_tool_call</code></a>
+              parses response items into <code>ToolCall</code>: function calls become
+              named tool payloads, client-side tool search calls become tool-search
+              payloads, and custom tool calls keep their custom input.
+            </p>
+
+            <p>
+              Then
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/router.rs#L192-L223"><code>dispatch_tool_call_with_code_mode_result_inner</code></a>
+              wraps the call in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/context.rs#L53-L63"><code>ToolInvocation</code></a>.
+              The invocation carries session, turn, cancellation token, diff tracker,
+              call id, tool name, source, and payload. That complete request is passed
+              to the registry.
+            </p>
+
+            <pre><code class="language-text">Shape sketch:
+  model function_call
+      ↓
+  ToolRouter::build_tool_call(...)
+      ↓
+  ToolCall { tool_name, call_id, payload }
+      ↓
+  ToolInvocation { session, turn, cancellation_token, tracker, source, payload }
+      ↓
+  ToolRegistry dispatch</code></pre>
+
+            <h2>5. Registry Owns Hooks, Lifecycle, and Normalized Output</h2>
+            <p>
+              <code>ToolRegistry</code> is the map from tool name to runtime.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L330-L340"><code>from_tools</code></a>
+              rejects duplicate names. During dispatch,
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L403-L491"><code>dispatch_any_with_terminal_outcome</code></a>
+              increments the active turn's tool count and looks up the handler. Unknown
+              tools become model-visible failures instead of silent drops.
+            </p>
+
+            <p>
+              Registry also wraps the handler with cross-cutting runtime behavior. It
+              notifies lifecycle start, runs pre-tool-use hooks that can block or
+              rewrite input, records telemetry, runs the handler, runs post-tool-use
+              hooks, records additional context, optionally replaces model-visible
+              output, and finally notifies lifecycle finish. That flow is visible in
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L539-L672">the second half of dispatch</a>.
+            </p>
+
+            <h2>6. Parallelism and Cancellation Are Runtime Decisions</h2>
+            <p>
+              A prompt can say the model supports parallel tool calls, but Codex still
+              gates actual concurrency per tool. <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/parallel.rs#L30-L60"><code>ToolCallRuntime</code></a>
+              holds a <code>parallel_execution</code> read/write lock and asks the router
+              whether each tool supports parallel execution.
+            </p>
+
+            <p>
+              In
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/parallel.rs#L81-L179"><code>handle_tool_call_with_source</code></a>,
+              parallel-safe tools take the read lock; non-parallel tools take the
+              write lock. Cancellation is handled in the same runtime layer: Codex
+              either waits for runtime teardown or aborts the task, then creates an
+              aborted response and notifies lifecycle contributors.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                Parallel tool calls mean the model may express parallel intent.
+                Actual concurrency is narrowed by each tool runtime's capability and
+                <code>ToolCallRuntime</code>'s lock policy.
+              </p>
+            </div>
+
+            <h2>7. Side Effects Enter Approval and Sandbox Gates</h2>
+            <p>
+              Tools that affect the external environment enter a narrower runtime
+              gate. The header of
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L1-L8"><code>orchestrator.rs</code></a>
+              describes it as the central place for approvals, sandbox selection, and
+              retry semantics. <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L131-L270"><code>ToolOrchestrator::run</code></a>
+              checks approval requirements, selects the first sandbox attempt, and
+              runs the tool.
+            </p>
+
+            <p>
+              If the sandboxed attempt is denied, the retry path
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L270-L466">uses denial details, network policy, approval policy, and tool escalation rules</a>
+              to decide whether to request approval again and which retry sandbox to use.
+              The model's request and the real side effect are therefore separated by
+              runtime authority checks.
+            </p>
+
+            <h2>8. Results Return to the Model, Events, and History</h2>
+            <p>
+              Tool results first need a model-visible shape.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/context.rs#L184-L233"><code>FunctionToolOutput</code></a>,
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/context.rs#L235-L272"><code>ApplyPatchToolOutput</code></a>,
+              and
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/context.rs#L307-L380"><code>ExecCommandToolOutput</code></a>
+              implement <code>to_response_item</code>, producing <code>ResponseInputItem</code>.
+              Shell output includes wall time, exit code or session id, token counts,
+              and truncated output text.
+            </p>
+
+            <p>
+              Client progress comes through the event layer. Tool events include
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/events.rs#L95-L120"><code>emit_exec_command_begin</code></a>
+              and <code>ToolEmitter</code> variants for shell, apply patch, and unified
+              exec. Extension lifecycle contributors receive start and finish through
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/lifecycle.rs#L12-L84"><code>notify_tool_start</code> / <code>notify_tool_finish</code></a>.
+            </p>
+
+            <p>
+              History is closed by the turn loop.
+              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L1767-L1792"><code>drain_in_flight</code></a>
+              waits for in-flight tool futures, converts <code>ResponseInputItem</code>
+              into <code>ResponseItem</code>, and records conversation items. A tool output
+              is therefore not just user-visible output. It becomes model input and
+              recoverable history.
+            </p>
+
+            <h2>9. Rules To Carry Forward</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Observation</th>
+                    <th>Source Question</th>
+                    <th>Handle</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>The model can call a tool.</td>
+                    <td>Is it direct, deferred, or dispatch-only?</td>
+                    <td>Separate <code>model_visible_specs</code> from <code>ToolRegistry</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>The model emits a function call.</td>
+                    <td>Which <code>ToolPayload</code> does it parse into?</td>
+                    <td><code>ToolRouter::build_tool_call</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>A tool starts running.</td>
+                    <td>Which turn-level data does the handler receive?</td>
+                    <td><code>ToolInvocation</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>Tools appear to run in parallel.</td>
+                    <td>Does each runtime support parallel calls?</td>
+                    <td><code>ToolCallRuntime</code> read/write locking.</td>
+                  </tr>
+                  <tr>
+                    <td>A command is approved, sandboxed, denied, or retried.</td>
+                    <td>Did it enter the orchestrator path?</td>
+                    <td><code>ToolOrchestrator::run</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>A tool returns output.</td>
+                    <td>What shape is seen by the user, the model, and history?</td>
+                    <td><code>EventMsg</code>, <code>ToolOutput</code>, <code>ResponseInputItem</code>.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The tool path is now closed: turn context builds the tool surface; the
+              prompt exposes model-visible specs; the model returns a call; the router
+              creates an invocation; registry dispatches it with hooks and lifecycle;
+              side-effecting handlers pass through approval and sandbox gates; outputs
+              return to the model, event stream, and history.
+            </p>
+
+            <p>
+              The next part can now focus on authority: where approval policy,
+              permission hooks, sandbox policy, and exec policy each intercept a tool
+              that wants to touch processes, files, or the network.
+            </p>
+
+            <h2 id="sources">Sources</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">Pinned openai/codex source snapshot</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L999-L1017">build_prompt puts router.model_visible_specs() into Prompt.tools</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L1029-L1055">run_sampling_request builds ToolRouter and ToolCallRuntime</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L1128-L1226">built_tools</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/router.rs#L34-L61">ToolRouter registry and model_visible_specs</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/router.rs#L95-L143">ToolRouter::build_tool_call</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/router.rs#L192-L223">router creates ToolInvocation and dispatches it</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/spec_plan.rs#L153-L231">build_tool_specs_and_registry</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/spec_plan.rs#L556-L568">add_tool_sources</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/spec_plan.rs#L579-L617">add_shell_tools</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/spec_plan.rs#L789-L859">MCP runtime tools, dynamic tools, extension tools, and tool search</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/context.rs#L53-L63">ToolInvocation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/context.rs#L184-L380">ToolOutput to ResponseInputItem conversion</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L321-L340">ToolRegistry</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L403-L672">dispatch_any_with_terminal_outcome</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/parallel.rs#L30-L179">ToolCallRuntime parallelism and cancellation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L1-L8">ToolOrchestrator header</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L131-L466">ToolOrchestrator::run approval, sandbox, and retry</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/events.rs#L95-L220">Tool event emission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/lifecycle.rs#L12-L84">Tool lifecycle contributors</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L1767-L1792">drain_in_flight records tool outputs</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
