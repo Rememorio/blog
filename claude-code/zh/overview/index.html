@@ -1,0 +1,650 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Code 源码阅读（一）：先跟一次任务走完整条运行主线</title>
+    <meta
+      name="description"
+      content="Claude Code 源码阅读系列第一篇：不先钻某个机制，而是从一次普通任务出发，沿 CLI、REPL、队列、query loop、工具权限、消息和恢复记录建立源码阅读路线。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Claude Code 源码阅读（一）：先跟一次任务走完整条运行主线" />
+    <meta
+      property="og:description"
+      content="先跟一次普通任务走过 Claude Code 的入口、队列、query loop、模型流、工具关口和恢复记录，再决定后续源码怎么读。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/claude-code-runtime-overview.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/zh/overview/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/overview/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/claude-code/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.route-note {
+        border-color: rgba(31, 119, 123, 0.32);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .note.route-note strong {
+        color: var(--rose);
+      }
+
+      .shape-example {
+        margin: 28px 0;
+      }
+
+      .shape-example pre {
+        margin-bottom: 8px;
+      }
+
+      .article-body pre code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .shape-example figcaption {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Claude Code</a>
+        <a href="../context-management/">下一篇：上下文</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Claude Code 源码阅读 · 第一篇</p>
+            <h1>先跟一次任务走完 Claude Code 的运行主线</h1>
+            <p class="lead">
+              读一个 coding agent 的源码，最怕一上来就钻进某个细节：上下文、工具、MCP、权限、hook，
+              每个词都像入口，每个入口又都连着一串文件。更稳的办法，是先拿一条普通任务当线头：
+              用户敲下一句话后，它怎样进入 REPL，怎样变成一轮 <code>query()</code>，怎样调用模型，
+              又怎样把 <code>tool_use</code> 变成真正的本地动作。
+            </p>
+            <div class="meta-line">
+              <span>项目：Rememorio/claude-code</span>
+              <span>主题：runtime overview</span>
+              <span>范围：公开镜像源码与官方文档</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/claude-code-runtime-overview.png"
+                alt="Claude Code 运行主线图，展示 CLI、REPL、queue、query loop、model view、API stream、tool gates、messages、transcript 和 resume"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先把场景说小一点。你在项目里输入：“帮我修一下这个测试失败。”Claude Code 没有立刻把这句话原样扔给模型。
+              它先经过入口分流，进入交互界面；再和 slash command、本地命令、后台通知、权限请求一起排队；
+              然后 REPL 组装这一轮要用的系统提示词、用户记忆、仓库状态、工具上下文；最后才进入
+              <code>query()</code> 这条 agent loop。
+            </p>
+
+            <p>
+              所以第一篇不急着拆某个机制。我们先建立一张地图：一次任务到底穿过哪些关口，
+              每个关口守住什么边界，后续文章又应该从哪一层继续往下读。
+              <strong>只要这条主线清楚，后面看上下文、工具、权限、MCP、compact 和 resume，都不会迷路。</strong>
+            </p>
+
+            <div class="note route-note">
+              <p>
+                这篇的结论先放在前面：Claude Code 不是“一个大函数里问模型、执行工具、打印结果”。
+                它更像一条分层流水线：入口负责分流，队列负责排序，REPL 负责装配回合，<code>query()</code>
+                负责模型循环，工具层负责副作用关口，记录层负责让 UI、磁盘和恢复路径各自拿到该拿的事实。
+              </p>
+            </div>
+
+            <p>
+              证据边界也先说明。本文的源码依据来自
+              <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
+              这个镜像不是 Anthropic 官方源码仓库，所以本文只把可见客户端代码写成直接事实；
+              产品概念和使用契约则参考
+              <a href="https://docs.anthropic.com/en/docs/claude-code/overview">Claude Code 官方概览</a>、
+              <a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory 文档</a>
+              和 Anthropic 的
+              <a href="https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview">tool use 文档</a>。
+              遇到服务端内部行为、feature gate 背后的策略和 provider 实现，本文只描述客户端能看到的请求形状和状态边界。
+            </p>
+
+            <p>这篇只回答五个问题：</p>
+            <ol>
+              <li>CLI 接到参数以后，哪些路径会提前返回，哪条才是普通交互主线？</li>
+              <li>为什么用户输入、slash command、后台通知和权限请求要先进统一队列？</li>
+              <li>REPL 在调用 <code>query()</code> 前，要把哪些上下文和工具环境装好？</li>
+              <li>模型吐出 <code>tool_use</code> 以后，为什么不是直接执行，而是要过工具和权限关口？</li>
+              <li>屏幕消息、transcript、resume 记录为什么要分开看？</li>
+            </ol>
+
+            <h2>一、先把一条任务拆成七个关口</h2>
+            <p>
+              先不要打开文件树乱逛。把一次任务想成一张路线图，会更容易看清源码的职责边界。
+              下面这七个关口，就是后面几篇文章反复会回来的骨架。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>关口</th>
+                    <th>它做什么</th>
+                    <th>先看哪些源码</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>入口分流</td>
+                    <td>处理版本、远程控制、MCP host、恢复参数，再把普通交互交给 REPL。</td>
+                    <td><code>entrypoints/cli.tsx</code>、<code>main.tsx</code>、<code>replLauncher.tsx</code></td>
+                  </tr>
+                  <tr>
+                    <td>统一队列</td>
+                    <td>把用户输入、slash command、后台消息和权限补偿放进同一条可排序队列。</td>
+                    <td><code>commands.ts</code>、<code>messageQueueManager.ts</code></td>
+                  </tr>
+                  <tr>
+                    <td>REPL 回合装配</td>
+                    <td>为一轮请求准备系统提示词、用户记忆、仓库快照、工具上下文和权限函数。</td>
+                    <td><code>screens/REPL.tsx</code>、<code>context.ts</code>、<code>Tool.ts</code></td>
+                  </tr>
+                  <tr>
+                    <td><code>query()</code> 循环</td>
+                    <td>在每轮 API 调用前整理 model-visible view，处理流式响应和 follow-up。</td>
+                    <td><code>query.ts</code>、<code>utils/api.ts</code>、<code>services/api/claude.ts</code></td>
+                  </tr>
+                  <tr>
+                    <td>模型流</td>
+                    <td>把 assistant message、文本、thinking、tool_use 和错误边界变成可消费事件。</td>
+                    <td><code>query.ts</code>、<code>services/api/claude.ts</code></td>
+                  </tr>
+                  <tr>
+                    <td>工具关口</td>
+                    <td>把模型提出的工具调用变成经过校验、权限、并发策略和进度事件的本地动作。</td>
+                    <td><code>toolOrchestration.ts</code>、<code>toolExecution.ts</code>、<code>useCanUseTool.tsx</code></td>
+                  </tr>
+                  <tr>
+                    <td>记录与恢复</td>
+                    <td>让屏幕、transcript、内容替换、compact 边界和 resume 路径服务不同目的。</td>
+                    <td><code>sessionStorage.ts</code>、<code>conversationRecovery.ts</code>、<code>sessionRestore.ts</code></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这张表不是目录，而是阅读顺序。入口层告诉你“任务从哪里来”，队列层告诉你“谁先被处理”，
+              REPL 和 <code>query()</code> 告诉你“模型到底看到了什么”，工具层告诉你“副作用怎么被收口”，
+              记录层告诉你“为什么能继续、能恢复、能回放”。
+            </p>
+
+            <h2>二、入口层：CLI 负责分流，REPL 才是普通交互主路</h2>
+            <p>
+              Claude Code 的入口不是直接进入聊天循环。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/entrypoints/cli.tsx#L28-L48"><code>entrypoints/cli.tsx</code></a>
+              一开始就把启动路径切得很细：版本号、系统提示词 dump、MCP 原生 host、远程控制、后台 session 这类路径，
+              都可能在真正渲染 REPL 之前提前返回。
+            </p>
+
+            <p>
+              普通交互主线继续走到 <code>main.tsx</code>。这里先把 session config、commands、初始工具、MCP client、
+              系统提示词和 turn complete 回调装好。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/main.tsx#L3070-L3090">这段 sessionConfig</a>
+              是后面 REPL 和 <code>query()</code> 的公共底座。
+              如果用户是 <code>--continue</code> 或指定 resume session，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/main.tsx#L3101-L3146">它会先加载并处理旧会话</a>；
+              如果是新会话，则沿
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/main.tsx#L3760-L3807">fresh interactive path</a>
+              进入 REPL。
+            </p>
+
+            <p>
+              真正的 UI 入口在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/replLauncher.tsx#L12-L21"><code>replLauncher.tsx</code></a>。
+              它动态加载 <code>App</code> 和 <code>REPL</code>，再把 REPL 挂到应用壳里。
+              这一步看起来很轻，但它完成了一个重要分界：CLI 之后，普通任务开始生活在一个可以显示进度、接收快捷命令、
+              处理权限提示、维护消息状态的交互运行时里。
+            </p>
+
+            <div class="note">
+              <p>
+                所以读入口层时，先抓住一个判断：不是所有 CLI 参数都会进入 agent loop。
+                真正需要沿源码往下追的，是“普通交互或恢复后的交互”这条路。
+              </p>
+            </div>
+
+            <h2>三、队列层：输入先变成可排序的 command</h2>
+            <p>
+              进入 REPL 后，下一件容易被低估的事是队列。Claude Code 不把所有输入都当成一行文本处理。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/commands.ts#L1-L46"><code>commands.ts</code></a>
+              里可以看到大量内建 slash command；后面还会加载技能和插件提供的命令。
+              换句话说，用户敲的 <code>/compact</code>、<code>/context</code>、普通 prompt、本地命令、后台 task 通知，
+              都可能变成不同形状的 command。
+            </p>
+
+            <p>
+              统一排队的代码在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messageQueueManager.ts#L41-L51"><code>messageQueueManager.ts</code></a>。
+              注释写得很直白：所有命令、用户输入、task notification、orphaned permission requests 都走同一条 command queue。
+              队列有 <code>now</code>、<code>next</code>、<code>later</code> 三档优先级，同档内部保持 FIFO。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messageQueueManager.ts#L128-L193"><code>enqueue()</code> 和 <code>dequeue()</code></a>
+              就是在维护这个顺序。
+            </p>
+
+            <p>
+              这个设计解决的不是“代码写得整齐”这种表面问题，而是交互一致性问题：
+              用户刚输入的下一句话、后台 agent 的结果、一个正在等待答复的权限请求，不能随便抢占彼此。
+              它们要先变成同一类可排序对象，REPL 才能稳定地把一轮轮请求送进 <code>query()</code>。
+            </p>
+
+            <h2>四、REPL 层：一轮请求先装好上下文和工具环境</h2>
+            <p>
+              到了 REPL，重点不是“把输入框内容传给模型”，而是准备一轮运行所需的材料。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2746-L2788"><code>REPL.tsx</code></a>
+              会创建 <code>toolUseContext</code>，读取当前 tools 和 MCP clients，再拿默认系统提示词、用户上下文、系统上下文，
+              最后构造这一轮 effective system prompt。
+            </p>
+
+            <p>
+              用户上下文和系统上下文来自
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts#L113-L188"><code>context.ts</code></a>。
+              系统侧会记录会话开始时的 git 状态快照；用户侧会读取 <code>CLAUDE.md</code> 这类 memory 文件并补上日期。
+              这些信息不会自动等同于聊天历史。进入 API 前，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts#L437-L474"><code>appendSystemContext()</code> 和 <code>prependUserContext()</code></a>
+              会把它们分别放到系统提示词和 meta user message 的位置。
+            </p>
+
+            <p>
+              工具环境也不是一串函数名。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/Tool.ts#L158-L300"><code>ToolUseContext</code></a>
+              里放着 commands、tools、MCP clients、agent definitions、权限上下文、消息、内容替换状态、渲染后的系统提示词等东西。
+              这就是后面工具调用为什么能看到当前会话状态、权限设置、可用 MCP 工具和内容替换记录的原因。
+            </p>
+
+            <p>
+              材料装好后，REPL 才真正进入
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2793-L2803"><code>for await (const event of query(...))</code></a>。
+              从这里开始，任务进入 agent loop。
+            </p>
+
+            <h2>五、<code>query()</code> 层：真正的 agent loop 在这里</h2>
+            <p>
+              <code>query()</code> 是这条主线的中轴。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L220-L239">外层 <code>query()</code></a>
+              是一个 async generator，它把工作委托给 <code>queryLoop()</code>，并在结束时把已消费 command 标记完成。
+              里面的
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L241-L307"><code>queryLoop()</code></a>
+              才是反复问模型、处理工具、继续下一轮的地方。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/claude-query-loop.png"
+                alt="Claude Code query loop 图，展示 query、context pass、callModel、stream、tool_use、runTools、tool_result 和 done 的循环"
+              />
+              <figcaption><code>query()</code> 每轮都先整理上下文，再调用模型；模型如果产生 <code>tool_use</code>，工具结果会回到下一轮。</figcaption>
+            </figure>
+
+            <h3>5.1 调模型之前，先整理 model-visible view</h3>
+            <p>
+              <code>queryLoop()</code> 不是拿到 messages 就直接发。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L365-L467">在发请求前</a>，
+              它会先从最后一个 compact boundary 之后取消息，应用工具结果预算，再按 feature gate 处理 snip、microcompact、
+              context collapse 和 auto compact。也就是说，模型看到的是运行时投影后的 view，不是 REPL 原始历史。
+            </p>
+
+            <p>
+              这一段正是下一篇要详细拆的上下文管理主线。这里先记住一个判断就够了：
+              <strong>保存过，不等于下一次 API 请求一定会原样带上。</strong>
+              Claude Code 每轮都会重新决定哪些内容进 model-visible view，哪些只留在本地记录里。
+            </p>
+
+            <h3>5.2 API 调用是“带工具和上下文的请求形状”</h3>
+            <p>
+              真正调用模型发生在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L659-L708"><code>deps.callModel()</code></a>。
+              这一层传进去的不只是 messages，还有完整系统提示词、thinking 配置、可用工具、模型、query source、agents、MCP tools、
+              task budget、cache 策略和权限上下文获取函数。
+              再往下，<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1017-L1071"><code>queryModel()</code></a>
+              会把这些客户端状态变成 Anthropic API 能接收的请求参数。
+            </p>
+
+            <p>
+              消息转换也有自己的边界。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L588-L674">user / assistant message 到 API param 的映射</a>
+              会处理 cache control、工具结果、媒体 block、thinking block 等细节。
+              所以“Claude Code 调了一次模型”这句话背后，其实是把 runtime 状态投影成一次合法的 provider 请求。
+            </p>
+
+            <h3>5.3 流里出现工具调用，loop 不会马上结束</h3>
+            <p>
+              模型返回的是流。<a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L823-L845"><code>queryLoop()</code></a>
+              会一边 yield assistant message，一边收集 <code>tool_use</code> block，并把它们交给 streaming tool executor。
+              如果没有新的 follow-up，loop 会处理停止原因、输出上限、token budget、hook 等收尾逻辑；
+              如果有工具结果或后续输入，就把工具结果整理成下一轮 messages，继续循环。
+            </p>
+
+            <p>
+              这就是 agent loop 和普通聊天最直观的差别：模型不只输出文字，它还提出“我想做某个动作”。
+              但这个动作只是提案，真正执行要进入下一层。
+            </p>
+
+            <h2>六、工具层：模型提出动作，运行时决定能不能做</h2>
+            <p>
+              工具调用的总入口是
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolOrchestration.ts#L19-L82"><code>runTools()</code></a>。
+              它会先按并发安全性分组：可以安全并发的工具走 concurrent path，其他工具走 serial path。
+              这一步不是性能优化那么简单，它还在维护副作用顺序。读文件、查找、列目录可以并发，写文件、跑命令、改状态就不能随便并起来。
+            </p>
+
+            <p>
+              单个工具调用会进
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L337-L490"><code>runToolUse()</code></a>。
+              这里先找工具、处理未知工具和 abort，再进入权限与执行包装。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L599-L752"><code>checkPermissionsAndCallTool()</code></a>
+              会做输入校验、schema 错误处理、工具自身校验和执行前的附加判断。
+            </p>
+
+            <p>
+              权限判断在 React hook 侧也有一层。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L93"><code>useCanUseTool()</code></a>
+              会创建 permission context，调用
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L473-L525"><code>hasPermissionsToUseTool()</code></a>，
+              再把 allow、deny、ask 分支交给不同交互路径。
+              所以模型说“我要改文件”并不等于文件马上被改；运行时还要看工具是否存在、参数是否合法、当前权限策略是否允许、是否需要用户确认。
+            </p>
+
+            <div class="note">
+              <p>
+                后面写工具篇时，会沿这条线继续拆：tool schema 怎样进入模型视图，MCP tool 怎样合并进工具列表，
+                并发策略怎样影响执行顺序，权限和 sandbox 怎样把副作用收住。
+              </p>
+            </div>
+
+            <h2>七、记录层：屏幕消息、transcript 和 resume 不是同一层</h2>
+            <p>
+              <code>query()</code> yield 出来的事件先回到 REPL。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2584-L2660"><code>onQueryEvent</code></a>
+              会调用 <code>handleMessageFromStream()</code> 更新屏幕上的 messages，还会处理 compact boundary、progress tombstone 等显示细节。
+              这是一条 UI 可见路径。
+            </p>
+
+            <p>
+              但 UI 可见不等于恢复所需。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1408-L1440"><code>recordTranscript()</code></a>
+              会把需要持久化的 transcript 写入会话记录；内容替换、队列操作、compact 链条也各有记录入口。
+              这些记录服务的是 resume、审计和恢复，而不是当下屏幕怎么显示。
+            </p>
+
+            <p>
+              继续会话时，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/conversationRecovery.ts#L456-L592"><code>loadConversationForResume()</code></a>
+              会加载旧消息、文件历史快照、内容替换、context collapse commits 和 session metadata；
+              然后
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionRestore.ts#L409-L503"><code>processResumedConversation()</code></a>
+              恢复 session、成本状态、worktree、content replacement state、collapse 快照等运行时状态。
+              这解释了为什么 Claude Code 的“继续”不是简单把旧聊天贴回输入框，而是恢复一套可继续运行的 runtime。
+            </p>
+
+            <h2>八、沿这条路线继续读</h2>
+            <p>
+              有了这条主线，后续文章就不需要各自从零开始。每一篇只是在同一条运行路径上放大一个关口。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/claude-code-reading-route.png"
+                alt="Claude Code 源码阅读路线图，依次展示 overview、context、tools、permissions、MCP、compact 和 resume"
+              />
+              <figcaption>后续文章会沿同一条任务路径拆机制，而不是把源码按目录切成孤立章节。</figcaption>
+            </figure>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>篇目</th>
+                    <th>主问题</th>
+                    <th>会回到哪一层</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>总览</td>
+                    <td>一次任务怎样穿过入口、队列、模型循环、工具关口和恢复记录？</td>
+                    <td>全链路。</td>
+                  </tr>
+                  <tr>
+                    <td><a href="../context-management/">上下文管理</a></td>
+                    <td>上下文快爆时，为什么不是直接总结？</td>
+                    <td><code>query()</code> 调模型前的 model-visible view。</td>
+                  </tr>
+                  <tr>
+                    <td>工具调用</td>
+                    <td>模型提出 <code>tool_use</code> 后，运行时怎样验证、排队和回填结果？</td>
+                    <td><code>runTools()</code>、<code>runToolUse()</code>、streaming executor。</td>
+                  </tr>
+                  <tr>
+                    <td>权限与副作用</td>
+                    <td>什么时候 allow、deny、ask，权限上下文怎样影响工具执行？</td>
+                    <td><code>useCanUseTool()</code>、permission context、tool validation。</td>
+                  </tr>
+                  <tr>
+                    <td>MCP 与扩展</td>
+                    <td>外部工具、技能、插件怎样进入一轮请求？</td>
+                    <td>commands、MCP clients、tool schema、agent definitions。</td>
+                  </tr>
+                  <tr>
+                    <td>compact 与恢复</td>
+                    <td>旧会话怎样被总结成恢复点，恢复时哪些状态要重新接上？</td>
+                    <td>compact boundary、transcript、resume、session restore。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>九、复盘：先记住这几个不变量</h2>
+            <p>
+              读源码时，文件名会很多，feature gate 也会很多。先记住这些不变量，后面深入细节会省很多力。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>不变量</th>
+                    <th>为什么重要</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>入口不是 loop</td>
+                    <td>CLI 先做大量分流，普通交互只是其中一条路。</td>
+                  </tr>
+                  <tr>
+                    <td>输入先排队</td>
+                    <td>用户 prompt、slash command、后台通知和权限补偿要共享顺序语义。</td>
+                  </tr>
+                  <tr>
+                    <td>REPL 装配回合</td>
+                    <td>系统提示词、memory、git snapshot、工具上下文和权限函数都在进 <code>query()</code> 前准备。</td>
+                  </tr>
+                  <tr>
+                    <td><code>query()</code> 是中轴</td>
+                    <td>上下文投影、API 调用、流式响应、工具结果和 follow-up 都围着它转。</td>
+                  </tr>
+                  <tr>
+                    <td>工具调用是提案</td>
+                    <td>真正执行要经过工具查找、输入校验、权限判断、并发策略和结果回填。</td>
+                  </tr>
+                  <tr>
+                    <td>记录分层</td>
+                    <td>屏幕显示、transcript、内容替换和 resume 状态服务不同目的，不能混成“聊天记录”。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              下一篇就沿这里的第五层继续往下钻：<a href="../context-management/">上下文快爆时，
+              Claude Code 为什么不是直接总结</a>。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/claude-code/overview">Claude Code overview</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview">Anthropic tool use overview</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/entrypoints/cli.tsx#L28-L48">CLI entrypoint</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/main.tsx#L3070-L3090">sessionConfig assembly</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/replLauncher.tsx#L12-L21">launchRepl</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messageQueueManager.ts#L41-L51">MessageQueueManager</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2746-L2803">REPL turn setup and query call</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts#L113-L188">system and user context</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/Tool.ts#L158-L300">ToolUseContext</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L220-L239">query generator</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L365-L467">query context pressure path</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L659-L708">callModel boundary</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolOrchestration.ts#L19-L82">runTools orchestration</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L337-L490">runToolUse</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L93">useCanUseTool</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/conversationRecovery.ts#L456-L592">conversation recovery</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionRestore.ts#L409-L503">session restore</a></li>
+              <li><a href="https://rememorio.github.io/blog/codex/zh/overview/">Codex 源码阅读首篇的路线写法参考</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

@@ -21,16 +21,18 @@ pipeline.
 
 Claude Code Source Notes is a Chinese source-reading series on the public
 [Rememorio/claude-code](https://github.com/Rememorio/claude-code) mirror. It
-starts from context management: how stable context, transcript records,
-runtime projections, prompt caching, microcompaction, and compact recovery
-combine into the next model-visible request.
+starts by following one ordinary task through the runtime path, then drills
+into context management, tools, permissions, MCP, compaction, and recovery as
+separate mechanisms.
 
 - Language gateway:
   [rememorio.github.io/blog/claude-code/](https://rememorio.github.io/blog/claude-code/)
 - Chinese index:
   [rememorio.github.io/blog/claude-code/zh/](https://rememorio.github.io/blog/claude-code/zh/)
+- Chinese overview:
+  [Claude Code 源码阅读（一）：先跟一次任务走完整条运行主线](https://rememorio.github.io/blog/claude-code/zh/overview/)
 - Chinese context management:
-  [Claude Code 源码阅读（一）：上下文快爆了，Claude Code 不是直接总结](https://rememorio.github.io/blog/claude-code/zh/context-management/)
+  [Claude Code 源码阅读（二）：上下文快爆了，Claude Code 不是直接总结](https://rememorio.github.io/blog/claude-code/zh/context-management/)
 
 ### Codex Source Notes
 
@@ -112,6 +114,7 @@ background review, curator, gateway, cron, and delegation.
 ├── claude-code/
 │   ├── index.html              # Series gateway
 │   ├── zh/index.html           # Chinese series index
+│   ├── zh/overview/            # Chinese series overview article
 │   ├── zh/context-management/  # Chinese context-management article
 │   └── assets/*.png            # Final raster figures
 ├── codex/
@@ -169,6 +172,7 @@ Then open:
 - `http://127.0.0.1:4173/en/`
 - `http://127.0.0.1:4173/claude-code/`
 - `http://127.0.0.1:4173/claude-code/zh/`
+- `http://127.0.0.1:4173/claude-code/zh/overview/`
 - `http://127.0.0.1:4173/claude-code/zh/context-management/`
 - `http://127.0.0.1:4173/codex/`
 - `http://127.0.0.1:4173/codex/zh/overview/`
