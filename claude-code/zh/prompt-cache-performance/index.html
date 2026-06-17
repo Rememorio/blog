@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Code 源码阅读（九）：Prompt cache 不是开关，速度来自请求形状</title>
+    <meta
+      name="description"
+      content="沿 Claude Code 公开镜像源码拆解 prompt cache、cache_control、稳定前缀、fork cache-safe params、cached microcompact、tool result replacement 和 cache break detection。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Claude Code 源码阅读（九）：Prompt cache 不是开关，速度来自请求形状" />
+    <meta
+      property="og:description"
+      content="真正影响 Claude Code 速度和成本的，不是有没有打开缓存，而是 system、tools、messages、headers 和 fork suffix 是否被组织成可复用的请求前缀。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/fork-cache-prefix.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/zh/prompt-cache-performance/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/prompt-cache-performance/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/claude-code/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.reading-contract {
+        border-color: rgba(31, 119, 123, 0.32);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .shape-example {
+        margin: 28px 0;
+      }
+
+      .shape-example pre {
+        margin-bottom: 8px;
+      }
+
+      .article-body pre code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .shape-example figcaption {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../transcript-resume/">上一篇：Resume</a>
+        <a href="../">Claude Code</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Claude Code 源码阅读 · 第九篇</p>
+            <h1>Prompt cache 不是开关，速度来自请求形状</h1>
+            <p class="lead">
+              写到第九篇，前面那些看起来分散的机制终于汇合到同一个问题：为什么同一段长会话，
+              有时下一轮能很快，有时又像从头读了一遍？Claude Code 的源码答案不是“打开 prompt cache 就行”，
+              而是让 system、tools、messages、headers、compact、resume 和 fork 子任务都尽量长成稳定的请求前缀。
+            </p>
+            <div class="meta-line">
+              <span>项目：Claude Code</span>
+              <span>主题：prompt cache / performance / request shape</span>
+              <span>范围：公开镜像源码与官方文档</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/fork-cache-prefix.png"
+                alt="Claude Code fork path 图，展示父查询和分叉子查询共享 system prompt、tools、thinking config 和 messages prefix，只在尾部追加 fork directive"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              <a href="../transcript-resume/">上一篇</a>讲 resume 时，我们一直在区分 UI、transcript、
+              runtime view 和 API view。到了 prompt cache，这个区分更重要。缓存命中的对象不是“聊天窗口”，
+              也不是“磁盘里的 transcript”，而是 provider 看到的一段请求前缀。
+              只要这段前缀的字节形状、工具 schema、系统块、cache marker、beta headers 或模型参数变了，
+              客户端本地再怎么觉得“还是同一段会话”，服务端也可能没法复用上一轮的处理结果。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这篇的结论先说清：<strong>Claude Code 的性能设计，是一套请求形状纪律。</strong>
+                <code>cache_control</code> 只是 marker；真正让 marker 有用的，是把动态内容挪到尾部，
+                把会话级开关 latch 住，把 fork 子任务做成共享前缀加短尾巴，把 compact 和工具结果替换做成不会让旧前缀漂移的投影。
+              </p>
+            </div>
+
+            <div class="note reading-contract">
+              <p>
+                <strong>阅读契约：</strong>本篇只追客户端源码可见的 cache discipline：
+                <code>getCacheControl()</code> 怎样生成 marker，<code>addCacheBreakpoints()</code>
+                怎样放置请求级 cache marker，动态工具和 beta header 怎样避免打穿前缀，
+                fork path 怎样复用父级 cache-safe params，cached microcompact 和 content replacement
+                怎样缩短上下文但保持旧前缀稳定，最后再看 cache break detection 用响应计数验证是否真的断了。
+              </p>
+            </div>
+
+            <p>
+              证据边界同前几篇一样：产品和 API 契约参考 Anthropic
+              <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">prompt caching 文档</a>
+              与 Claude Code
+              <a href="https://docs.anthropic.com/en/docs/claude-code/overview">官方概览</a>；
+              源码层来自
+              <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
+              本文只讲客户端源码能观察到的请求形状、缓存标记、计数和恢复边界，不推断 provider 内部如何实现 KV 或缓存替换。
+            </p>
+
+            <h2>一、先把 prompt cache 看成“前缀契约”</h2>
+            <p>
+              如果把 prompt cache 想成一个布尔开关，很快会误读源码。Claude Code 的 API 请求不是一段单纯的 text prompt；
+              它至少由 system blocks、message list、tool schemas、model、thinking、extra body、beta headers
+              和 cache marker 共同构成。缓存复用依赖的是这些东西在可缓存前缀内足够稳定，而不是某个配置值孤立地为真。
+            </p>
+
+            <p>
+              源码里最直接的 marker 生成在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L360-L373"><code>getCacheControl()</code></a>。
+              它返回 <code>{ type: "ephemeral" }</code>，并在符合条件时加上 <code>ttl: "1h"</code>，
+              在全局缓存策略允许时加上 <code>scope: "global"</code>。这说明 marker 本身并不神秘：
+              它只是告诉 API 哪个断点值得缓存。真正难的是：下次请求来到同一个断点时，前面的结构还像不像上次。
+            </p>
+
+            <h3>1.1 TTL 也会影响请求形状</h3>
+            <p>
+              一个容易忽略的细节是 TTL。<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L376-L430"><code>should1hCacheTTL()</code></a>
+              不只是查一次 feature flag。源码注释明确说，用户资格和 allowlist 会被 latch 到 bootstrap state，
+              目的是避免会话中途 GrowthBook 缓存或 overage 状态变化，导致 <code>cache_control</code>
+              从 5 分钟形状变成 1 小时形状，或者反过来。对 provider 来说，这不是“同一段文本只是缓存时长不同”，
+              而是请求里的 cache marker 变了。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/context-ledger-cover.png"
+                alt="Claude Code runtime view 图，展示 history 和 tools 进入 stable prefix、runtime view、API view、compact 与 resume"
+              />
+              <figcaption>Prompt cache 命中的是 API view 里的稳定前缀；transcript 和 UI 只是它的上游材料。</figcaption>
+            </figure>
+
+            <h3>1.2 system 和 message 各有自己的 marker 位置</h3>
+            <p>
+              system prompt 的 marker 在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3213-L3237"><code>buildSystemPromptBlocks()</code></a>
+              里加。源码还留下一个很硬的提醒：不要再为了缓存多加 block，否则可能被 API 拒绝。
+              message 侧则由
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3062-L3109"><code>addCacheBreakpoints()</code></a>
+              控制。它每个请求只放一个 message-level <code>cache_control</code> marker；
+              普通请求放在最后一条 message，<code>skipCacheWrite</code> 场景则把 marker 放到倒数第二条，
+              让共享前缀可以被读到，但 fork-only 尾巴不留下新的缓存尾部。
+            </p>
+
+            <figure class="shape-example">
+              <pre><code>shape-level example
+
+main turn:
+  S = system + tools + stable history
+  U = current user turn
+  cache marker sits after S + U
+
+fire-and-forget fork:
+  S = shared parent prefix
+  F = fork-only task suffix
+  cache marker sits after S, not after S + F</code></pre>
+              <figcaption>
+                这只是形状示例，不表示 provider 内部索引。源码事实是：<code>skipCacheWrite</code>
+                会改变 marker index，让短生命周期 fork 读共享前缀而不写入自己的尾巴。
+              </figcaption>
+            </figure>
+
+            <h2>二、动态内容必须躲开稳定前缀</h2>
+            <p>
+              一个 coding agent 的请求很容易变：工具池会变，MCP server 会重连，Chrome 工具可能晚到，
+              slash command 和 skill 会让可用能力变化，advisor 可能临时打开。简单做法是每次把这些动态材料都塞进系统提示词前面。
+              但这样每多一个工具、少一个工具，稳定前缀就被改写了。
+            </p>
+
+            <p>
+              Claude Code 的源码里有很多“为了不动前缀”的小设计。
+              在 API 请求装配中，<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1322-L1345">deferred tools</a>
+              原本会被 prepend 成一段 meta user message；注释说如果启用 delta attachment，就改走持久化的
+              <code>deferred_tools_delta</code>，因为每次工具池变化都 prepend 会 bust cache。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1347-L1356">Chrome tool-search instructions</a>
+              也是同样逻辑：Chrome 晚连接时，如果把说明 append 到 system prompt，会打穿 prompt cache，
+              所以启用 delta 后挪到 <code>mcp_instructions_delta</code>。
+            </p>
+
+            <p>
+              MCP 和 global cache 的关系也在请求装配处显式处理。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1207-L1230">源码判断</a>
+              全局缓存可用时，如果将要渲染的是用户级、动态的 MCP tool，就不把 marker 放在 system prompt 的全局缓存路径上。
+              这不是性能保守，而是边界正确：一个用户的动态工具段不应该被当成全局稳定材料。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>动态来源</th>
+                    <th>源码处理</th>
+                    <th>保护的东西</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>deferred tools</td>
+                    <td>优先走 delta attachment，避免每次 prepend 新 meta message。</td>
+                    <td>messages 前缀不因工具池发现顺序改变。</td>
+                  </tr>
+                  <tr>
+                    <td>Chrome tool instructions</td>
+                    <td>连接晚到时移出 system prompt append 路径。</td>
+                    <td>system prompt 不被临时说明打穿。</td>
+                  </tr>
+                  <tr>
+                    <td>MCP tools</td>
+                    <td>动态 MCP tool 会改变 global cache strategy。</td>
+                    <td>全局缓存只覆盖真正稳定的 system prompt。</td>
+                  </tr>
+                  <tr>
+                    <td>advisor tool</td>
+                    <td>追加在已有 tool schemas 后面。</td>
+                    <td>开关 advisor 只扰动尾部，而不是整段工具前缀。</td>
+                  </tr>
+                  <tr>
+                    <td>beta headers</td>
+                    <td>会话级 sticky-on latch。</td>
+                    <td>中途开关不改变 server-side cache key。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>2.1 headers 也要稳定</h3>
+            <p>
+              很多 cache miss 不来自正文，而来自请求配置。Claude Code 在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1405-L1458">API 装配中 latch 动态 beta headers</a>：
+              AFK、fast mode、cache editing、thinking clear 都有各自的 sticky 逻辑。
+              注释写得很清楚：一旦某个 header 首次发送，就尽量在本会话余下请求中继续发送，
+              以免中途 toggle 改变 server-side cache key。
+            </p>
+
+            <p>
+              这里的微妙之处是“header 稳定”和“行为仍可动态”并不冲突。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1642-L1657">fast mode</a>
+              的 header 会 latch，<code>speed="fast"</code> 仍然会按 cooldown 动态决定；
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1672-L1689">cache editing</a>
+              的 beta header 会 latch，但是否真的发送 <code>cache_edits</code> 仍由当前 feature 和 provider 条件决定。
+              也就是说，源码把“会影响 cache key 的外形”和“本轮实际行为”拆开了。
+            </p>
+
+            <h2>三、Fork path：为了 cache，故意不像普通 subagent</h2>
+            <p>
+              第六篇讲 subagent 时，我们已经看过普通子代理会有自己的 system prompt、工具上下文、权限模式和消息链。
+              但 fork path 不是普通子代理。它的目标不是“换一个人格去做任务”，而是从父会话分出一条短尾巴，
+              让子任务尽量复用父查询已经写好的缓存前缀。
+            </p>
+
+            <p>
+              这个设计在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L483-L541"><code>AgentTool.tsx</code></a>
+              里写得很直白：fork child 继承父级 system prompt，而不是使用 FORK_AGENT 自己的 system prompt；
+              <code>buildForkedMessages()</code> 会复制父 assistant message 和占位 tool results，再追加每个 child 自己的 directive。
+              到
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L603-L633">组装 <code>runAgent</code> 参数</a>
+              时，fork path 还会传父级工具数组、父级消息和 <code>useExactTools: true</code>。
+            </p>
+
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L666-L695"><code>runAgent()</code></a>
+              继续沿着这个选择走：<code>useExactTools</code> 的 fork child 继承父级
+              <code>isNonInteractiveSession</code> 和 <code>thinkingConfig</code>。普通 subagent 则会关闭 thinking 来控输出成本。
+              如果把 fork child 当普通 subagent 处理，system、tools、thinking config 任意一个不一致，缓存前缀都可能从第一次不同处断掉。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/fork-cache-prefix.png"
+                alt="Fork path 复制父级前缀图，展示子查询共享 system prompt、tools、thinking config 和 messages prefix，尾部追加 placeholder tool_results、fork directive 和 child task"
+              />
+              <figcaption>Fork path 的关键不是“又启动一个 agent”，而是“共享父级稳定前缀，只替换任务尾巴”。</figcaption>
+            </figure>
+
+            <h2>四、Compact：缩短上下文时，也不能随手改旧前缀</h2>
+            <p>
+              上下文压缩看起来和 prompt cache 天然冲突：既然 compact 会改 messages，它不是必然让缓存失效吗？
+              Claude Code 的答案分两层。第一层是 full compact：它把旧会话总结成新的 compact boundary，
+              之后的请求自然进入一条新前缀。第二层是 microcompact / content replacement：
+              它们想缩短模型可见的工具结果，但尽量不让已经缓存过的旧前缀字节突然漂移。
+            </p>
+
+            <p>
+              full compact 也有 cache sharing。<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L431-L458">compact 主流程</a>
+              读取 <code>tengu_compact_cache_prefix</code>，默认让 compact summary 的 fork 路径复用主会话 prompt cache。
+              这和前面的 fork path 是同一套思想：summary request 是短生命周期 side path，
+              它应该读取主会话稳定前缀，而不是把自己当成完全陌生的请求从头开始。
+            </p>
+
+            <p>
+              cached microcompact 更直接。<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L253-L292"><code>microcompactMessages()</code></a>
+              先处理时间触发：如果离上一条 assistant message 太久，源码认为服务端缓存可能已经过期，
+              这时直接走 content-clear 老工具结果，因为完整前缀反正要重写。只有在 main thread、feature 打开、模型支持、
+              缓存仍有意义时，才进入 cached microcompact。
+            </p>
+
+            <p>
+              cached path 的关键注释在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L295-L304"><code>cachedMicrocompactPath()</code></a>：
+              它不修改本地 message content；<code>cache_reference</code> 和 <code>cache_edits</code>
+              在 API 层添加；它追踪工具结果并排队 cache edits。
+              真正有删除发生时，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L332-L390">源码会 queue <code>cache_edits</code></a>，
+              通知 cache break detection 这是预期下降，然后返回未改动的 messages。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/compact-recovery-loop.png"
+                alt="Claude Code compact 恢复循环图，展示 trigger、pre hooks、summary fork、ledger、restore files memory tools 和 next turn"
+              />
+              <figcaption>Compact 会重写运行时边界；cached microcompact 则尽量把删除动作推到 API 层，避免本地历史直接漂移。</figcaption>
+            </figure>
+
+            <h3>4.1 cache_edits 不是“本地删消息”</h3>
+            <p>
+              <code>addCacheBreakpoints()</code> 里可以看到 cache editing 的真正入口。
+              它先把正常 message 转成 API param，再在启用 cached microcompact 时
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3112-L3159">去重并插入 <code>cache_edits</code> block</a>。
+              后面还会给处于缓存前缀内的 tool_result 加 <code>cache_reference</code>。
+              所以它保护的是 provider-side cached prefix 的可编辑路径，而不是把本地 transcript 改得更短。
+            </p>
+
+            <p>
+              这也是为什么它要把 pending edits 在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1528-L1533">定义 <code>paramsFromContext</code> 之前消费一次</a>。
+              <code>paramsFromContext</code> 可能被 logging、retry、fallback 多次调用；
+              如果每次调用都重新消费 pending edits，同一轮重试里的请求形状就会自己不一致。
+            </p>
+
+            <h2>五、Tool result replacement：变小，也要字节一致</h2>
+            <p>
+              工具输出太大时，Claude Code 会把大结果持久化到本地，只把 preview 放进模型视野。
+              但这里也不能“看心情替换”。一个旧 tool_result 第一轮没被替换，第二轮突然替换；
+              或者第一轮替换成某段 preview，第三轮重新从磁盘读出一段略有差异的 preview，
+              都会改变已经缓存过的前缀。
+            </p>
+
+            <p>
+              所以 <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L367-L405"><code>toolResultStorage.ts</code></a>
+              明确维护 <code>ContentReplacementState</code>。<code>seenIds</code> 记录哪些 tool result 已经过预算判断；
+              <code>replacements</code> 记录已经持久化并替换的 preview 字符串。
+              注释强调：被替换过的结果以后通过 Map lookup 重新应用，不做文件 I/O，保证 byte-identical。
+              fork 这类共享缓存前缀的路径还会 clone replacement state，让子任务和父任务做出同样选择。
+            </p>
+
+            <p>
+              预算执行时，<a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L641-L667">候选结果先按历史决策分区</a>：
+              以前替换过的必须复用同一段 preview；以前见过但没替换的冻结，不允许后面再替换；
+              只有从未见过的 fresh 结果才参与新一轮预算选择。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L739-L789"><code>enforceToolResultBudget()</code></a>
+              的注释把这个约束说得更直接：以前处理过的消息每轮只重新应用缓存 replacement，
+              新消息才做预算判断。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/context-surfaces.png"
+                alt="Claude Code UI、transcript、runtime、API view 四列表面图，展示 UI 写入 transcript，runtime projection 后进入 API view"
+              />
+              <figcaption>工具结果替换影响的是 runtime projection 和 API view；transcript 还要能支撑 resume 重建同一套替换状态。</figcaption>
+            </figure>
+
+            <h3>5.1 resume 和 fork 都要带上替换历史</h3>
+            <p>
+              这和上一篇 resume 连在一起。替换历史如果恢复错了，旧 transcript 能读回来，
+              但下一轮 API view 会变成另一条前缀。源码在 <code>ContentReplacementState</code>
+              的生命周期注释里把 main thread、subagent、resumeAgentBackground 和 cache-sharing fork 都列出来；
+              目的不是为了本地文件管理好看，而是让“哪些 tool result 应该还是 preview”这件事跨 turn、resume、fork 都稳定。
+            </p>
+
+            <p>
+              还有一个更小的并发边界：
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L802-L849">源码在 await 前后维护 <code>seenIds</code> 和 <code>replacements</code> 的原子性</a>。
+              如果并发读者看到某个 id 已经 seen，但 replacement 还没写入，它可能把这个结果误判成 frozen，
+              发送完整内容；而主线程发送的是 preview。两条路径对同一个历史前缀给出不同 wire content，结果就是 cache miss。
+            </p>
+
+            <h2>六、Cache break detection：别靠感觉判断命中</h2>
+            <p>
+              前面讲的都是“怎样避免 break”。但真正上线后，客户端还要回答另一个问题：
+              如果 cache read tokens 突然掉了，到底是 system prompt 改了、tools 变了、TTL 到了、headers 变了，
+              还是 provider 侧路由或 eviction？Claude Code 为此有一套 cache break detection。
+            </p>
+
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L28-L99"><code>PreviousState</code></a>
+              里保存 system hash、tools hash、cache_control hash、tool names、model、fast mode、global cache strategy、
+              beta headers、overage、cached microcompact、effort、extra body、上一轮 cache read tokens 和 pending changes。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L133-L158"><code>getTrackingKey()</code></a>
+              又把 main thread、SDK、tracked agents 和 compact 分开；compact 会共享 <code>repl_main_thread</code>
+              的 tracking key，因为它共享同一套 cache-safe params。
+            </p>
+
+            <p>
+              API 请求前，<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1460-L1485">query 装配调用 <code>recordPromptState()</code></a>。
+              注意它传的是已经 latch 后的 header 状态，并且排除了 <code>defer_loading</code> tools，
+              因为这些工具不会进入实际 prompt。也就是说 detection 不是拿“用户开了什么开关”做猜测，
+              而是记录“本次真的会影响 server-side cache key 的客户端可见形状”。
+            </p>
+
+            <p>
+              API 响应后，<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L2382-L2392">源码用 response usage 调 <code>checkResponseForCacheBreak()</code></a>。
+              这个函数先比较上一轮和本轮的 <code>cache_read_input_tokens</code>，
+              如果下降不明显就直接清空 pending changes；如果 cached microcompact 刚做过 cache deletion，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L470-L481">它把下降视为预期现象</a>。
+              真正疑似 break 时，才把 model、system、tools、cache_control、betas、effort、extra body
+              等变化整理成原因。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/survival-map.png"
+                alt="Claude Code stable、reloaded、triggered 三类上下文进入 compact 后供 next turn 使用的生存地图"
+              />
+              <figcaption>Cache break detection 的作用，是把“前缀为什么没活下来”从体感问题变成可归因的请求形状问题。</figcaption>
+            </figure>
+
+            <h2>七、把九篇串起来：最后看的是同一条 runtime 账本</h2>
+            <p>
+              到这里，Claude Code 系列的第一轮路线就闭合了。第一篇建立运行主线；
+              第二篇讲上下文怎样进入 model-visible view；第三、四篇讲工具和权限怎样把副作用收口；
+              第五篇讲命令、skills、MCP 怎样把能力引入本轮；第六篇讲 subagent 和 fork；
+              第七篇讲 hooks 的生命周期插槽；第八篇讲 transcript 和 resume；第九篇把这些都收回到性能层。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>机制</th>
+                    <th>如果只看功能</th>
+                    <th>从 prompt cache 看</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>context management</td>
+                    <td>把长会话变短。</td>
+                    <td>决定哪些内容留在稳定前缀，哪些变成尾部或摘要。</td>
+                  </tr>
+                  <tr>
+                    <td>tools / MCP</td>
+                    <td>给模型更多能力。</td>
+                    <td>工具 schema 和动态说明会改变 cache key，必须控制注入位置。</td>
+                  </tr>
+                  <tr>
+                    <td>permissions / hooks</td>
+                    <td>拦截副作用。</td>
+                    <td>hooks 结果和运行时状态不能无意污染缓存前缀。</td>
+                  </tr>
+                  <tr>
+                    <td>subagent / fork</td>
+                    <td>把任务分出去。</td>
+                    <td>普通 subagent 隔离上下文；fork child 共享父级稳定前缀。</td>
+                  </tr>
+                  <tr>
+                    <td>resume / replacement</td>
+                    <td>继续旧会话。</td>
+                    <td>恢复的不只是 messages，还要恢复会影响 wire prefix 的替换决策。</td>
+                  </tr>
+                  <tr>
+                    <td>compact / microcompact</td>
+                    <td>压缩上下文。</td>
+                    <td>full compact 建新前缀；cached microcompact 尽量编辑旧缓存而不改本地历史。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以，Claude Code 的 prompt cache 不是最后加上的性能小技巧，而是倒逼很多 runtime 设计变得精细的约束。
+              请求形状越稳定，长会话、fork、compact、resume 和工具输出替换才越像一套系统；
+              请求形状一漂，前面再多工程都可能在下一次 API 调用时重新付账。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic prompt caching</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/claude-code/overview">Claude Code overview</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L360-L373">claude.ts：getCacheControl</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L376-L430">claude.ts：should1hCacheTTL</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1207-L1230">claude.ts：global cache strategy and MCP tools</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1322-L1356">claude.ts：deferred tools and Chrome instructions</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1405-L1458">claude.ts：latched beta headers</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1518-L1720">claude.ts：paramsFromContext and cache edits</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3048-L3165">claude.ts：addCacheBreakpoints</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3213-L3237">claude.ts：buildSystemPromptBlocks</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L483-L633">AgentTool.tsx：fork path cache-identical prefix</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L666-L695">runAgent.ts：useExactTools options</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L431-L458">compact.ts：promptCacheSharingEnabled</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L253-L390">microCompact.ts：cached microcompact path</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L367-L405">toolResultStorage.ts：ContentReplacementState</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L641-L789">toolResultStorage.ts：replacement partition and budget</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L28-L158">promptCacheBreakDetection.ts：tracking state and keys</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L247-L430">promptCacheBreakDetection.ts：recordPromptState</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L437-L698">promptCacheBreakDetection.ts：checkResponseForCacheBreak</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          item.className = `toc-${heading.tagName.toLowerCase()}`;
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (let deeper = level + 1; deeper <= 4; deeper += 1) {
+            lastItems.delete(deeper);
+          }
+        });
+
+        toc.appendChild(list);
+      })();
+    </script>
+  </body>
+</html>

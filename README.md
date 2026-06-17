@@ -45,6 +45,8 @@ transcript recovery, and prompt cache behavior as separate mechanisms.
   [Claude Code 源码阅读（七）：Hooks 不是脚本回调，而是运行时关口](https://rememorio.github.io/blog/claude-code/zh/hooks-lifecycle/)
 - Chinese transcript and resume:
   [Claude Code 源码阅读（八）：Resume 不是续聊天，而是重建运行时状态](https://rememorio.github.io/blog/claude-code/zh/transcript-resume/)
+- Chinese performance and prompt cache:
+  [Claude Code 源码阅读（九）：Prompt cache 不是开关，速度来自请求形状](https://rememorio.github.io/blog/claude-code/zh/prompt-cache-performance/)
 
 ### Codex Source Notes
 
@@ -134,6 +136,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/subagents-fork/       # Chinese subagents/fork article
 │   ├── zh/hooks-lifecycle/      # Chinese hooks/lifecycle article
 │   ├── zh/transcript-resume/    # Chinese transcript/resume article
+│   ├── zh/prompt-cache-performance/ # Chinese performance/cache article
 │   └── assets/*.png            # Final raster figures
 ├── codex/
 │   ├── index.html              # Language gateway
@@ -198,6 +201,7 @@ Then open:
 - `http://127.0.0.1:4173/claude-code/zh/subagents-fork/`
 - `http://127.0.0.1:4173/claude-code/zh/hooks-lifecycle/`
 - `http://127.0.0.1:4173/claude-code/zh/transcript-resume/`
+- `http://127.0.0.1:4173/claude-code/zh/prompt-cache-performance/`
 - `http://127.0.0.1:4173/codex/`
 - `http://127.0.0.1:4173/codex/zh/overview/`
 - `http://127.0.0.1:4173/codex/en/overview/`
