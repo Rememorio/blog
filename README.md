@@ -22,8 +22,8 @@ pipeline.
 Codex Source Notes is a bilingual source-reading series on
 [openai/codex](https://github.com/openai/codex). It starts by following one
 ordinary user request through the runtime path, then drills into context,
-tools, permissions, client projection, extensions, hooks, and recovery as separate
-mechanisms.
+tools, permissions, client projection, extensions, hooks, prompt caching, and
+recovery as separate mechanisms.
 
 - Language gateway:
   [rememorio.github.io/blog/codex/](https://rememorio.github.io/blog/codex/)
@@ -59,6 +59,10 @@ mechanisms.
   [Codex 源码阅读（八）：Hooks 与生命周期，边界处还能改变什么](https://rememorio.github.io/blog/codex/zh/hooks-lifecycle/)
 - English hooks and lifecycle:
   [Codex Source Notes VIII: Hooks and Lifecycle Slots](https://rememorio.github.io/blog/codex/en/hooks-lifecycle/)
+- Chinese performance and prompt cache:
+  [Codex 源码阅读（九）：性能与 prompt cache，速度来自请求形状](https://rememorio.github.io/blog/codex/zh/prompt-cache-performance/)
+- English performance and prompt cache:
+  [Codex Source Notes IX: Performance and Prompt Cache](https://rememorio.github.io/blog/codex/en/prompt-cache-performance/)
 
 ### Hermes Agent
 
@@ -93,6 +97,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/client-projection/   # Chinese client-projection article
 │   ├── zh/extensions-agents/   # Chinese extensions/multi-agent article
 │   ├── zh/hooks-lifecycle/     # Chinese hooks/lifecycle article
+│   ├── zh/prompt-cache-performance/ # Chinese performance/cache article
 │   ├── en/index.html           # English series index
 │   ├── en/overview/            # English series overview article
 │   ├── en/context-management/  # English context-management article
@@ -102,6 +107,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── en/client-projection/   # English client-projection article
 │   ├── en/extensions-agents/   # English extensions/multi-agent article
 │   ├── en/hooks-lifecycle/     # English hooks/lifecycle article
+│   ├── en/prompt-cache-performance/ # English performance/cache article
 │   └── assets/*.png            # Final raster figures
 ├── hermes-agent/
 │   ├── index.html              # Language gateway
@@ -146,6 +152,8 @@ Then open:
 - `http://127.0.0.1:4173/codex/en/extensions-agents/`
 - `http://127.0.0.1:4173/codex/zh/hooks-lifecycle/`
 - `http://127.0.0.1:4173/codex/en/hooks-lifecycle/`
+- `http://127.0.0.1:4173/codex/zh/prompt-cache-performance/`
+- `http://127.0.0.1:4173/codex/en/prompt-cache-performance/`
 - `http://127.0.0.1:4173/hermes-agent/`
 
 Use a local server rather than opening files directly when checking relative

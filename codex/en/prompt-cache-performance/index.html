@@ -1,0 +1,627 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes IX: Performance and Prompt Cache</title>
+    <meta
+      name="description"
+      content="A source-guided walk through Codex request shaping for OpenAI prompt caching: stable prefixes, prompt_cache_key, dynamic tails, compaction, and token usage telemetry."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes IX: Performance and Prompt Cache" />
+    <meta
+      property="og:description"
+      content="Read how Codex turns performance into request-shape discipline: stable prefixes, dynamic tails, prompt_cache_key, cached input tokens, and compaction."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/prompt-cache-discipline.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/prompt-cache-performance/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/prompt-cache-performance/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/prompt-cache-performance/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(15, 118, 110, 0.32);
+        background: rgba(15, 118, 110, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Codex series</a>
+        <a href="../hooks-lifecycle/">Previous: hooks</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/prompt-cache-performance/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part IX</p>
+            <h1>Performance and Prompt Cache: Speed Comes From Request Shape</h1>
+            <p class="lead">
+              Once the first eight parts have separated the owners of a turn,
+              performance becomes easier to place. Codex repeatedly builds a
+              Responses request from instructions, tools, history, context
+              updates, and fresh user input. If the prefix stays stable, OpenAI
+              automatic prefix caching can reuse prior work. If volatile data
+              moves too early, even the same thread can keep paying the prefill
+              cost.
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: prompt cache / performance</span>
+              <span>Scope: official docs and public source</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/prompt-cache-discipline.png"
+                alt="Codex prompt cache discipline showing stable prefix, dynamic tail, prompt_cache_key, cache route, and usage metrics"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              A coding agent often feels slow long before the model itself is
+              the only bottleneck. Each turn has to reintroduce a working scene:
+              base instructions, tool schemas, project rules, permission state,
+              prior messages, tool outputs, and the new user request. In a long
+              task, the cost of rebuilding that scene becomes visible.
+            </p>
+
+            <p>
+              The official
+              <a href="https://developers.openai.com/api/docs/guides/prompt-caching">OpenAI prompt caching guide</a>
+              gives the provider contract: cache hits require exact prefix
+              matches; stable content belongs at the beginning; dynamic content
+              belongs near the end; <code>prompt_cache_key</code> can influence
+              routing; and <code>usage.prompt_tokens_details.cached_tokens</code>
+              is the observable result. Codex source then answers a narrower
+              question: how does the client build a repeatable model-visible
+              request?
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The working claim is simple: <strong>Codex prompt caching is
+                request-shape discipline.</strong> <code>prompt_cache_key</code>
+                helps similar requests land in a useful cache domain, but the
+                hit still depends on the ordered request fields: instructions,
+                tools, input history, context updates, tool output, and
+                compaction shape.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                OpenAI docs define the provider-level prompt caching contract:
+                exact prefixes, eligibility threshold, routing, retention,
+                <code>prompt_cache_key</code>, and <code>cached_tokens</code>.
+                Public Codex source shows request construction, history
+                persistence, compaction, and token usage accounting. This
+                article does not infer private server serialization, machine
+                routing, or KV-cache placement from client code.
+              </p>
+            </div>
+
+            <p>This part follows six questions:</p>
+            <ol>
+              <li>Which view is actually cacheable?</li>
+              <li>Where does Codex get <code>prompt_cache_key</code>, and why is it thread-scoped by default?</li>
+              <li>How do <code>instructions</code>, <code>tools</code>, and <code>input</code> form a stable prefix?</li>
+              <li>Why should settings, environment context, and tool output land after that prefix?</li>
+              <li>Why does compaction reduce pressure while changing future cache shape?</li>
+              <li>Which metrics connect cache behavior to perceived latency?</li>
+            </ol>
+
+            <h2>1. Cache the Model View, Not the UI Transcript</h2>
+            <p>
+              Asking whether a turn “hit the cache” is too coarse. First ask:
+              what was sent to the provider, in what order, and through which
+              fields? The visible UI history, the rollout persisted on disk, and
+              the request assembled for the model are related surfaces, but they
+              are not identical.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Layer</th>
+                    <th>Owner</th>
+                    <th>Role</th>
+                    <th>Cache relevance</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Visible history</td>
+                    <td>Client projection</td>
+                    <td>Shows turns, tools, hooks, events, and final answers.</td>
+                    <td>Useful for reading; not proof of the next model input.</td>
+                  </tr>
+                  <tr>
+                    <td>Durable record</td>
+                    <td>Rollout / thread store</td>
+                    <td>Supports resume, replay, fork, and audit.</td>
+                    <td>Seeds reconstruction, but is not the provider cache.</td>
+                  </tr>
+                  <tr>
+                    <td>Model view</td>
+                    <td><code>Prompt</code> / Responses request</td>
+                    <td>Contains this turn's <code>instructions</code>, <code>tools</code>, <code>input</code>, and controls.</td>
+                    <td>The provider can only reuse this ordered request view.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Codex makes this separation visible in <code>Prompt</code>. It
+              carries conversation <code>input</code>, model-visible
+              <code>tools</code>, <code>parallel_tool_calls</code>,
+              <code>base_instructions</code>, personality, and output schema.
+              <code>ModelClient::build_responses_request</code> turns that into
+              a Responses payload: <code>instructions</code>, <code>input</code>,
+              <code>tools</code>, <code>reasoning</code>, <code>text</code>, and
+              <code>prompt_cache_key</code>.
+            </p>
+
+            <pre><code class="language-text">Shape-level request:
+Responses request
+  instructions: stable base instructions
+  tools:        model-visible tool schemas
+  input:        prior context + dynamic turn tail
+  text:         output schema / verbosity
+  prompt_cache_key: thread-scoped cache domain</code></pre>
+
+            <h2>2. The Cache Domain Comes From the Thread</h2>
+            <p>
+              <code>ModelClient</code> is session-scoped. Its comments say it
+              holds cross-turn state such as auth, provider selection, thread id,
+              and transport fallback state. That scope explains its default
+              prompt cache key.
+            </p>
+
+            <p>
+              <code>ModelClient::prompt_cache_key()</code> returns an override
+              when one exists; otherwise it uses the <code>thread_id</code>.
+              <code>build_responses_request</code> places that value on every
+              Responses request. Consecutive turns in one thread therefore share
+              a stable cache domain unless a higher-level session type has a
+              reason to override it.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <code>prompt_cache_key</code> should not be read as a manual
+                breakpoint. It does not tell the provider where to cache. It
+                keeps related requests near the same routing domain so repeated
+                prefixes have a better chance to be found.
+              </p>
+            </div>
+
+            <p>
+              Guardian review sessions are the visible exception: session setup
+              can call <code>with_prompt_cache_key_override</code>. That keeps
+              the key tied to a request family, not to a one-off user message.
+            </p>
+
+            <h2>3. Stable Prefix: Instructions, Tools, Context Base</h2>
+            <p>
+              OpenAI's best practice is to put stable content first. Codex has
+              three obvious candidates: base instructions, tool schemas, and the
+              initial or diffed context baseline.
+            </p>
+
+            <h3>3.1 Instructions Stay Stable Across Ordinary Turns</h3>
+            <p>
+              <code>build_responses_request</code> reads
+              <code>prompt.base_instructions.text</code> into
+              <code>instructions</code>. The prompt caching test suite submits
+              two ordinary turns and checks that <code>instructions</code>
+              remains unchanged. When a model path needs stable apply-patch
+              guidance because the tool itself is absent, the test also checks
+              that the appended instruction block remains identical.
+            </p>
+
+            <h3>3.2 Tools Are Prefix Material</h3>
+            <p>
+              OpenAI docs say tool definitions can be cached and count toward
+              the eligibility threshold. Codex converts <code>prompt.tools</code>
+              into the Responses <code>tools</code> field. Parts IV and VII
+              already showed why that list can be large: core tools, MCP tools,
+              deferred tool search, dynamic tools, and plugin or skill supplied
+              capabilities all feed the model-visible tool surface.
+            </p>
+
+            <p>
+              A large tool surface has a cost. But a stable tool surface is also
+              excellent prefix material. Unnecessary per-turn tool churn hurts
+              cacheability before the model even looks at the new user input.
+            </p>
+
+            <h3>3.3 Context Base: Inject Once, Diff Later</h3>
+            <p>
+              The context-management part introduced
+              <code>reference_context_item</code>. It is the baseline for later
+              context diffs. When the baseline is still valid, Codex can append
+              an update rather than reinjecting the whole context bundle.
+              The test named
+              <code>prefixes_context_and_instructions_once_and_consistently_across_requests</code>
+              demonstrates the effect: the second request preserves the first
+              request's input prefix and appends the next user message.
+            </p>
+
+            <h2>4. Dynamic Tail: Change Later, Not Earlier</h2>
+            <p>
+              Dynamic material is inevitable. Users switch settings, change
+              cwd, change approval policy, request a different model, trigger
+              tools, receive tool outputs, or let hooks add context. Codex does
+              not try to remove all change. It tries to keep change behind the
+              already-stable prefix.
+            </p>
+
+            <p>
+              Two tests make that concrete. One applies thread settings
+              overrides and checks that <code>prompt_cache_key</code> stays
+              constant while updated permissions and environment messages are
+              appended after the existing prefix. Another applies per-turn
+              overrides and checks the same invariant while adding a model
+              switch and new environment context.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Change source</th>
+                    <th>Codex handling</th>
+                    <th>Protected property</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>New user input</td>
+                    <td>Append a new user message.</td>
+                    <td>Prior prefix is not reformatted.</td>
+                  </tr>
+                  <tr>
+                    <td>Thread settings override</td>
+                    <td>Append settings and environment updates.</td>
+                    <td>Stable context remains before the change.</td>
+                  </tr>
+                  <tr>
+                    <td>Tool output</td>
+                    <td>Record history, then normalize with <code>for_prompt()</code>.</td>
+                    <td>Call/output invariants stay intact.</td>
+                  </tr>
+                  <tr>
+                    <td>Hook additional context</td>
+                    <td>Write a contextual fragment into model context.</td>
+                    <td>Policy additions become visible input changes.</td>
+                  </tr>
+                  <tr>
+                    <td>Compaction</td>
+                    <td>Install summary or replacement history as a new baseline.</td>
+                    <td>Future turns get a smaller but reconstructible prefix.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>5. Compaction Relieves Pressure and Changes Shape</h2>
+            <p>
+              Prompt cache does not replace the context window. Once history
+              grows too large, Codex still has to compact. <code>ContextManager</code>
+              stores token usage, estimates counts, and bumps
+              <code>history_version</code> when history is rewritten. The
+              <code>get_context_remaining</code> tool exposes the remaining
+              window by subtracting active token usage from the model context
+              window.
+            </p>
+
+            <p>
+              In remote compaction v2, Codex clones history, reads base
+              instructions, and trims function-call history to fit the window
+              before building the compact request. The compact path then reuses
+              the same shared request fields. Tests assert that the compact
+              request carries a string <code>prompt_cache_key</code> and that it
+              matches the normal Responses request.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                Compaction has two performance effects: it reduces future
+                history pressure, and it establishes a new prefix shape. The
+                old prefix is no longer the mainline model view; the summary,
+                retained outputs, and reinjected context become the next cache
+                candidate.
+              </p>
+            </div>
+
+            <h2>6. Metrics: Cached Input, Non-Cached Input, First Token</h2>
+            <p>
+              The provider reports cache behavior through usage. Codex tracks
+              <code>input_tokens</code>, <code>cached_input_tokens</code>,
+              <code>output_tokens</code>, <code>reasoning_output_tokens</code>,
+              and <code>total_tokens</code>. At turn completion,
+              <code>on_task_finished</code> compares the token snapshot from
+              turn start with current total usage to compute this turn's input,
+              cached input, non-cached input, output, and total tokens.
+            </p>
+
+            <p>
+              The same path records tracing fields, session telemetry
+              histograms, analytics events, <code>time_to_first_token_ms</code>,
+              and total turn duration. That matters because a high cached-token
+              count and a fast-feeling turn are related but not equivalent.
+              Tool loops, approvals, network retries, compaction, and output
+              length all shape user-visible latency.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Metric</th>
+                    <th>Meaning</th>
+                    <th>Do not read it as</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>cached_input_tokens</code></td>
+                    <td>Input tokens served from provider cache.</td>
+                    <td>Tokens the model did not see.</td>
+                  </tr>
+                  <tr>
+                    <td><code>non_cached_input()</code></td>
+                    <td>Input tokens that were not cache hits.</td>
+                    <td>All non-cached tokens are waste.</td>
+                  </tr>
+                  <tr>
+                    <td><code>time_to_first_token_ms</code></td>
+                    <td>Delay until the first visible model output.</td>
+                    <td>A value controlled only by prompt cache.</td>
+                  </tr>
+                  <tr>
+                    <td><code>total_tokens</code></td>
+                    <td>The turn token ledger.</td>
+                    <td>A guarantee of semantic completeness.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>7. Common Misreadings</h2>
+            <p>
+              The API fields look small, but the runtime discipline behind them
+              is large. These are the misreadings that tend to make performance
+              debugging noisy.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Misreading</th>
+                    <th>Better reading</th>
+                    <th>Source boundary</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>prompt_cache_key</code> decides the hit.</td>
+                    <td>The key helps routing; exact prefix still decides eligibility.</td>
+                    <td>Key construction and request shape are separate.</td>
+                  </tr>
+                  <tr>
+                    <td>If the chat shows it, the model sees it.</td>
+                    <td>The model sees <code>for_prompt()</code> output.</td>
+                    <td>History normalization owns the request input.</td>
+                  </tr>
+                  <tr>
+                    <td>Fewer tools are always faster.</td>
+                    <td>Stable tool schemas are costly but cacheable prefix material.</td>
+                    <td>The <code>tools</code> field comes from <code>prompt.tools</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>Compaction automatically improves cache.</td>
+                    <td>Compaction changes the future prefix and must remain reconstructible.</td>
+                    <td>Remote compact reuses the key while rewriting history.</td>
+                  </tr>
+                  <tr>
+                    <td>A cache hit guarantees a fast turn.</td>
+                    <td>Tool loops, approvals, compaction, output length, and network still matter.</td>
+                    <td>Codex records token usage, TTFT, and duration separately.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>8. Why Recovery Comes Next</h2>
+            <p>
+              Prompt cache pushes performance analysis onto model view shape.
+              But that shape has to be reconstructed from durable history:
+              rollout items, context updates, tool outputs, compaction
+              replacement, rollback markers, and fork state. If that durable
+              record cannot rebuild the same history, the next request shape
+              drifts and cache analysis loses its anchor.
+            </p>
+
+            <p>
+              The next part returns to persistence and recovery: how Codex writes
+              a turn into rollout, reconstructs history from <code>RolloutItem</code>,
+              handles rollback, fork, compact boundaries, and token usage. That
+              closes the loop between what the user saw, what disk retained, and
+              what the model sees on the next turn.
+            </p>
+
+            <h2 id="sources">Source References</h2>
+            <ul class="source-list">
+              <li><a href="https://developers.openai.com/api/docs/guides/prompt-caching">OpenAI Prompt caching guide</a></li>
+              <li><a href="https://developers.openai.com/cookbook/examples/prompt_caching_201">OpenAI Prompt Caching 201</a></li>
+              <li><a href="https://developers.openai.com/api/docs/guides/latest-model">OpenAI latest model guide: reasoning models and prompt caching</a></li>
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex pinned source snapshot</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client_common.rs#L18-L87"><code>Prompt</code> and <code>get_formatted_input_for_request()</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L207-L236"><code>ModelClient</code> and turn-scoped <code>ModelClientSession</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L355-L367"><code>with_prompt_cache_key_override()</code> and default thread id key</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L705-L758"><code>build_responses_request()</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/codex-api/src/common.rs#L182-L224"><code>ResponsesApiRequest</code> and websocket request mapping</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/session.rs#L1022-L1038">session model client initialization and Guardian override</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L145-L225"><code>run_turn</code> request input construction</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L32-L114"><code>ContextManager</code>, <code>reference_context_item</code>, and <code>for_prompt()</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L249-L321">token usage update and local estimation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1989-L2024"><code>TokenUsageInfo</code> and <code>TokenCountEvent</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tasks/mod.rs#L335-L393">turn start token usage snapshot</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tasks/mod.rs#L646-L721">turn completion cached / non-cached token usage</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tasks/mod.rs#L728-L751">turn duration and time-to-first-token event</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/get_context_remaining.rs#L78-L90"><code>get_context_remaining</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact_remote_v2.rs#L179-L239">remote compaction v2 prompt construction</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L455-L485">compact request reuses <code>prompt_cache_key</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L110-L220">prompt caching tests: stable tools and instructions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L304-L399">prompt caching tests: reused contextual prefix</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L401-L529">prompt caching tests: thread settings overrides</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L690-L816">prompt caching tests: per-turn overrides</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/compact_remote.rs#L727-L743">remote compact tests: matching <code>prompt_cache_key</code></a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen ? `${base}-${seen + 1}` : base;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          link.dataset.index = index;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (const knownLevel of [2, 3, 4]) {
+            if (knownLevel > level) lastItems.delete(knownLevel);
+          }
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (!visible.length) return;
+            const id = visible[0].target.id;
+            links.forEach((link) => {
+              link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+            });
+          },
+          { rootMargin: "-18% 0px -68% 0px", threshold: 0.01 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
