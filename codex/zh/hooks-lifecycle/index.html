@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex 源码阅读（八）：Hooks 与生命周期，边界处还能改变什么</title>
+    <meta
+      name="description"
+      content="沿 openai/codex 源码拆解 Codex hooks：SessionStart、UserPromptSubmit、PreToolUse、PermissionRequest、PostToolUse、Pre/PostCompact、Stop 与 HookStarted/HookCompleted 事件。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex 源码阅读（八）：Hooks 与生命周期，边界处还能改变什么" />
+    <meta
+      property="og:description"
+      content="从一次 turn 的生命周期出发，读懂 Codex hooks 为什么是有类型、有边界、有事件记录的运行时插槽。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/hook-lifecycle-slots.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/zh/hooks-lifecycle/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/hooks-lifecycle/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/hooks-lifecycle/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(45, 95, 139, 0.32);
+        background: rgba(45, 95, 139, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Codex 系列</a>
+        <a href="../extensions-agents/">上一篇：扩展</a>
+        <a href="../prompt-cache-performance/">下一篇：性能</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/hooks-lifecycle/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex 源码阅读 · 第八篇</p>
+            <h1>Hooks 与生命周期，边界处还能改变什么</h1>
+            <p class="lead">
+              第七篇讲完 extensions 之后，plugin manifest 里的 <code>hooks</code> 终于有了位置：
+              它们更准确地说，是挂在 turn 生命周期边界上的运行时代码；它们既不扩展模型本身，
+              也不以普通工具调用的形状进入 runtime。
+              这一篇沿源码看清楚：哪些边界允许补上下文，哪些边界能拦副作用，哪些边界只能让一次
+              turn 再多跑一步。
+            </p>
+            <div class="meta-line">
+              <span>项目：openai/codex</span>
+              <span>主题：hooks / lifecycle</span>
+              <span>范围：公开源码</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/hook-lifecycle-slots.png"
+                alt="Codex hook lifecycle slots，展示 session start、prompt gate、tool gates、compact、stop gate、events 和 model context"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先把场景放具体一点。用户提交一句话以后，Codex 可能先整理上下文，接着调用模型；
+              模型也许要跑 shell、改文件、访问 MCP 工具；中途上下文可能超限，需要 compact；
+              最后模型说完了，runtime 准备收尾。每个节点都有人会想插一段自动化：检查 prompt、
+              拦危险命令、给审批一个默认答案、记录工具结果，或者在结束前补一句“还要再检查测试”。
+            </p>
+
+            <p>
+              如果只把这些都叫作“hook”，源码会很快搅在一起。Codex 的做法更细：
+              <strong>hook 先归到具体事件，再由事件定义输入、输出和后果。</strong>
+              同样是一段 command hook，挂在 <code>PreToolUse</code> 上可以阻断工具；
+              挂在 <code>PermissionRequest</code> 上返回的是审批决策；挂在 <code>Stop</code> 上则可能把一次本该结束的
+              turn 拉回模型循环。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这篇抓住一个模型：<strong>Codex hooks 是 typed lifecycle slots。</strong>
+                它们由 <code>HookEventName</code>、request schema、
+                outcome parser、<code>HookStarted</code>/<code>HookCompleted</code> 事件和
+                <code>hook_runtime</code> 共同约束，最后接回 turn 主线。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文只描述 openai/codex 公开源码中可验证的 hook event、hook discovery、
+                preview/run/parse 流程、turn 内调用点、tool approval 接入、compact 接入、stop continuation
+                以及 protocol 事件。hook command 具体写什么策略，属于用户、项目、系统或 plugin 自己的配置，不在本文推断范围内。
+              </p>
+            </div>
+
+            <p>第八篇按六个问题走：</p>
+            <ol>
+              <li>为什么 hook 要放回 turn 生命周期来看，而不能只看脚本列表？</li>
+              <li>源码怎样把“可见 hook 条目”和“可执行 handler”分开？</li>
+              <li>hook run 为什么要先 preview，再 emit started/completed 事件？</li>
+              <li>prompt、tool、approval、compact、stop 这些 slot 分别能改变什么？</li>
+              <li><code>PermissionRequest</code> hook 和第 5 篇的 approval / sandbox 边界怎样区分？</li>
+              <li>这些边界如何为下一篇性能与 prompt cache 铺路？</li>
+            </ol>
+
+            <h2>一、先把 hook 放回时间线</h2>
+            <p>
+              读 hook 的第一层，应该先看事件名，再看配置文件。protocol 里 <code>HookEventName</code>
+              列出十个事件：<code>PreToolUse</code>、<code>PermissionRequest</code>、<code>PostToolUse</code>、
+              <code>PreCompact</code>、<code>PostCompact</code>、<code>SessionStart</code>、
+              <code>UserPromptSubmit</code>、<code>SubagentStart</code>、<code>SubagentStop</code>、
+              <code>Stop</code>。这些名字天然就是一条生命周期。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>slot</th>
+                    <th>触发位置</th>
+                    <th>能返回的后果</th>
+                    <th>读源码时的 owner</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>SessionStart</code> / <code>SubagentStart</code></td>
+                    <td>session 或 thread-spawn subagent 启动时。</td>
+                    <td>补充 model context；<code>SessionStart</code> 还能停止本轮。</td>
+                    <td><code>session_start.rs</code> 与 <code>run_pending_session_start_hooks</code>。</td>
+                  </tr>
+                  <tr>
+                    <td><code>UserPromptSubmit</code></td>
+                    <td>用户输入被接受进 history 之前。</td>
+                    <td>补充 model context，或阻止这条输入继续进入 turn。</td>
+                    <td><code>user_prompt_submit.rs</code> 与 <code>inspect_pending_input</code>。</td>
+                  </tr>
+                  <tr>
+                    <td><code>PreToolUse</code></td>
+                    <td>工具真正执行之前。</td>
+                    <td>阻断工具、补上下文、或者改写 hook-visible input。</td>
+                    <td><code>pre_tool_use.rs</code> 与 <code>tools/registry.rs</code>。</td>
+                  </tr>
+                  <tr>
+                    <td><code>PermissionRequest</code></td>
+                    <td>approval path 内，Guardian 或用户审批 UI 之前。</td>
+                    <td>返回 <code>Allow</code>、<code>Deny</code>，或者不决定。</td>
+                    <td><code>permission_request.rs</code> 与 tool orchestrator。</td>
+                  </tr>
+                  <tr>
+                    <td><code>PostToolUse</code></td>
+                    <td>工具成功产出结果之后。</td>
+                    <td>补上下文、给模型反馈、或者让结果变成停止信息。</td>
+                    <td><code>post_tool_use.rs</code> 与 <code>PostToolUseFeedbackOutput</code>。</td>
+                  </tr>
+                  <tr>
+                    <td><code>PreCompact</code> / <code>PostCompact</code></td>
+                    <td>compact 前后。</td>
+                    <td>允许 compact 继续，或把 compact/turn 打断。</td>
+                    <td><code>compact.rs</code> 与 <code>compact_remote_v2.rs</code>。</td>
+                  </tr>
+                  <tr>
+                    <td><code>Stop</code> / <code>SubagentStop</code></td>
+                    <td>runtime 认为本轮可以结束时。</td>
+                    <td>停止、放行，或写入 continuation fragment 让模型继续。</td>
+                    <td><code>stop.rs</code> 与 <code>run_turn_stop_hooks</code>。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这张表先建立一个直觉：hook 不是在 turn 外面绕一圈，它就在 turn 的关键边界上。
+              每个边界都只给它一个局部能力。能补上下文的地方，补进去的是 <code>ContextualUserFragment</code>；
+              能拦工具的地方，拦的是当前 tool call；能答审批的地方，答的是当前 permission request。
+            </p>
+
+            <h2>二、先发现，再决定哪些真的能跑</h2>
+            <p>
+              第七篇讲 plugin 时提到，plugin manifest 可以声明 <code>hooks</code>。但一个 hook 被“列出来”，
+              和它真的会在 turn 中执行，中间还隔着 discovery 和 trust filter。
+            </p>
+
+            <p>
+              <code>ClaudeHooksEngine::new</code> 会接收几类输入：是否启用 hooks、是否绕过 trust、
+              config layer stack、plugin hook sources、plugin hook load warnings，以及 command shell。
+              启用后，它调用 <code>discover_handlers</code>，产出两类东西：
+              面向用户展示的 <code>HookListEntry</code>，以及 runtime 真正执行的 <code>ConfiguredHandler</code>。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>结构</th>
+                    <th>包含什么</th>
+                    <th>为什么分开</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>HookListEntry</code></td>
+                    <td>event、matcher、command、source、plugin id、enabled、current hash、trust status。</td>
+                    <td>让 UI 能展示“这里有一个 hook”，即使它未启用、未信任或已被修改。</td>
+                  </tr>
+                  <tr>
+                    <td><code>ConfiguredHandler</code></td>
+                    <td>event、matcher、command、timeout、source path、source、display order、env。</td>
+                    <td>只保留本次 runtime 可以执行的 handler。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              discovery 的过滤逻辑很具体。它会从 config layers 和 plugin hook sources 读取 hook 配置，
+              校验 matcher，跳过空 command 和尚未支持的 async hook，计算 command hook hash，
+              再结合 <code>HookTrustStatus</code> 决定是否进入 <code>handlers</code>。managed hook 可以直接成为
+              managed；非 managed hook 只有在当前 hash 和已信任 hash 对得上时，才是 trusted。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这里保护的是一条很实际的边界：<strong>能被看见，不等于能被执行。</strong>
+                项目里多了一个 hook，或者 plugin 包里带了 hook，并不会自动绕过 trust 和 enablement。
+              </p>
+            </div>
+
+            <h2>三、hook run 是可见事实，不是后台日志</h2>
+            <p>
+              一个 hook event 触发时，Codex 不会直接静默运行 command。各个 event 文件都有相似的骨架：
+              先 <code>preview</code> 匹配 handler，把每个 handler 转成 <code>HookRunSummary</code>；
+              再 <code>run</code> command；最后把 stdout、stderr、exit code 或 JSON output 解析成 event-specific outcome。
+            </p>
+
+            <p>
+              <code>dispatcher::running_summary</code> 会给每个将要执行的 hook 生成 <code>Running</code> 状态。
+              <code>hook_runtime</code> 随后发出 <code>EventMsg::HookStarted</code>。
+              command 完成后，<code>emit_hook_completed_events</code> 会记录 telemetry 和 analytics，
+              再发出 <code>EventMsg::HookCompleted</code>。客户端不需要从 terminal log 猜测 hook 是否跑过；
+              它收到的是有类型、有状态、有 source 的事件。
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>为什么要 preview？</strong>
+                因为 UI 需要先展示“哪些 hook 正在跑”。如果等 command 跑完才知道，长耗时 hook
+                会看起来像 runtime 卡住。preview 让 hook 从一开始就是可观察的 turn fact。
+              </p>
+            </div>
+
+            <h2>四、prompt gate：输入进 history 前，先过一层</h2>
+            <p>
+              回到 <code>run_turn</code>。在第一次 model sampling 之前，Codex 先做 pre-sampling compact，
+              记录 context update，解析本轮 skill/plugin injection。接着调用
+              <code>run_pending_session_start_hooks</code>，再调用 <code>run_hooks_and_record_inputs</code>。
+            </p>
+
+            <p>
+              这条顺序说明了 prompt hook 的位置：用户输入还没有被 durable history 接受时，
+              <code>inspect_pending_input</code> 会构造 <code>UserPromptSubmitRequest</code>，
+              把 session id、turn id、cwd、transcript path、model、permission mode 和 prompt 发给 hook。
+              如果 hook 要停止，本轮可以在输入真正成为会话事实前结束；如果 hook 返回 additional context，
+              runtime 会把它转成 <code>HookAdditionalContext</code>，作为 developer message 记录。
+            </p>
+
+            <p>
+              这和 skill injection 的性质不同。skill 是用户点名后的工作方法，稍后作为 injection item 记录进 conversation；
+              prompt hook 更像一个输入闸门，能在用户输入进入 history 前给出提醒、附加上下文，或者阻止这条输入继续。
+            </p>
+
+            <h2>五、tool gates：执行前、审批中、执行后是三件事</h2>
+            <p>
+              工具路径里最容易混的是三层：<code>PreToolUse</code>、<code>PermissionRequest</code>、
+              <code>PostToolUse</code>。它们都围绕一次 tool call，但回答的问题不一样。
+            </p>
+
+            <h3>5.1 PreToolUse：工具执行前的局部改写和阻断</h3>
+            <p>
+              在 <code>tools/registry.rs</code> 中，tool invocation 通过 payload 检查后，会先调用
+              <code>run_pre_tool_use_hooks</code>。这个 hook 收到稳定的 hook payload：
+              canonical tool name、matcher aliases、tool use id 和 tool input。handler 选择时可以用兼容别名，
+              但 stdin 里的 <code>tool_name</code> 保持 canonical，避免审计和策略判断漂移。
+            </p>
+
+            <p>
+              <code>PreToolUseOutcome</code> 有三种有用后果。第一，<code>should_block</code> 为真时，
+              tool 不会执行，runtime 把阻断原因返回给模型。第二，<code>additional_contexts</code>
+              会写入 model context。第三，<code>updated_input</code> 可以让 handler 重建 invocation；
+              如果被阻断，updated input 会被丢弃。
+            </p>
+
+            <h3>5.2 PermissionRequest：审批路径里优先回答一次请求</h3>
+            <p>
+              <code>PermissionRequest</code> 的位置更靠后。只有 policy 算出需要 approval，
+              并且当前路径允许评估 permission-request hooks 时，tool orchestrator 才会调用它。
+              它不是 pre-tool validation 的另一个名字；它返回的是审批决策：
+              <code>Allow</code>、<code>Deny</code>，或者没有 hook verdict。
+            </p>
+
+            <p>
+              决策 fold 很保守：任何 <code>Deny</code> 直接胜出；没有 deny 时，allow 可以批准；
+              如果没有 handler 给出决策，就继续走普通 Guardian 或用户审批路径。
+              所以 permission hook 能回答“这次是否允许尝试”，但它不替代 sandbox。即使审批通过，
+              后面的执行仍然要受 permission profile、sandbox 和具体 tool runtime 约束。
+            </p>
+
+            <h3>5.3 PostToolUse：工具结果回来后，给模型一个可见反馈</h3>
+            <p>
+              tool 成功运行之后，如果 handler 提供了 post-tool payload，runtime 会调用
+              <code>run_post_tool_use_hooks</code>。它看到 tool input 和 tool response，可以补 additional context，
+              也可以返回 feedback message。
+            </p>
+
+            <p>
+              这里有一个细节值得记住：如果 post-tool hook 返回反馈，<code>tools/registry.rs</code>
+              会把原工具结果包进 <code>PostToolUseFeedbackOutput</code>，让模型可见部分变成 hook feedback。
+              原始结果没有完全消失，但模型下一步看到的是被 hook 调整后的输出视图。
+            </p>
+
+            <h2>六、compact 和 stop：边界不只在工具旁边</h2>
+            <p>
+              hooks 还出现在上下文压力和 turn 收尾处。compact 前后，<code>compact_remote_v2.rs</code>
+              分别调用 <code>run_pre_compact_hooks</code> 和 <code>run_post_compact_hooks</code>。
+              这两个事件的 outcome 很克制：继续，或者停止。它们不负责发明 compact 摘要策略，
+              也不直接改写 summary；它们只是在 compact 这个边界上给外部策略一次中断机会。
+            </p>
+
+            <p>
+              <code>Stop</code> 更微妙。<code>run_turn</code> 在发现模型不需要 follow-up、没有 pending input、
+              token 状态也不要求继续之后，才调用 <code>run_turn_stop_hooks</code>。这时 runtime 已经准备收尾，
+              但 stop hook 仍然可以返回 <code>should_block</code> 和 <code>continuation_fragments</code>。
+            </p>
+
+            <p>
+              如果能构造出 <code>HookPromptFragment</code>，Codex 会把它记录为 hook prompt message，
+              设置 <code>stop_hook_active</code>，然后回到 model loop。也就是说，stop hook 不是“结束后通知”；
+              它是结束边界上的最后一道续跑机会。适合这里的是非常具体的收尾补问：
+              例如“工具刚改过文件，先总结未验证项”，或者“回答前确认是否遗漏测试结果”；
+              笼统策略放在这里反而容易让 turn 多跑无用循环。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                到这里，hook 的设计取舍就很清楚：越靠近副作用，权限越窄、结果越具体；
+                越靠近输入和收尾，能影响的是模型上下文或循环是否继续。Codex 没有给 hook 一个全局万能开关，
+                而是把它切成生命周期上的小门。
+              </p>
+            </div>
+
+            <h2>七、常见误读：把相邻边界合并</h2>
+            <p>
+              读完源码后，最需要避免的是把相邻边界合并成一个词。尤其是 hook、approval、sandbox
+              和 event 这四个词，表面上都在“安全”和“可观察性”附近，实际 owner 完全不同。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>误读</th>
+                    <th>更准确的读法</th>
+                    <th>出错后果</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>hook list 就是可执行列表。</td>
+                    <td>list entry 可以展示未启用、未信任或修改过的 hook；runtime handler 还要经过 trust filter。</td>
+                    <td>把“存在自动化”误解成“自动化一定会跑”。</td>
+                  </tr>
+                  <tr>
+                    <td>PreToolUse 等同于 approval。</td>
+                    <td>PreToolUse 可以阻断或改 input；PermissionRequest 才返回 allow/deny。</td>
+                    <td>把 validation hook 误当成授权来源。</td>
+                  </tr>
+                  <tr>
+                    <td>approval 通过后 sandbox 就没用了。</td>
+                    <td>approval 只回答能否尝试；sandbox 仍然约束实际进程能访问什么。</td>
+                    <td>把授权决策理解成执行边界放开。</td>
+                  </tr>
+                  <tr>
+                    <td>PostToolUse 只能做日志。</td>
+                    <td>它可以返回 model-visible feedback，让下一次 model sampling 看到不同的结果视图。</td>
+                    <td>低估工具结果返回模型前的最后一层解释权。</td>
+                  </tr>
+                  <tr>
+                    <td>Stop hook 是 after hook。</td>
+                    <td>Stop hook 在收尾边界上运行，可以通过 continuation fragment 让模型继续。</td>
+                    <td>把一次续跑机会误读成纯通知。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>八、下一篇为什么可以讲性能与 prompt cache</h2>
+            <p>
+              第八篇把 hooks 放回生命周期之后，前八篇其实已经搭出一条完整主线：
+              用户输入进 turn，context 和 extensions 先形成 model-visible view；
+              tool surface 决定模型可以请求什么；hooks、approval、sandbox 决定副作用边界；
+              event stream 把每个关键动作变成客户端可见事实；stop 和 compact 处理长任务的继续与收束。
+            </p>
+
+            <p>
+              这时再讲性能和 prompt cache，才不会只剩“缓存命中率”这一个指标。Codex 的性能不是某个函数变快，
+              而是很多边界共同决定：稳定前缀能不能保留，动态工具和 skill 说明是不是按需进入，
+              hook additional context 会不会改变模型视图，compact 会不会重写历史形状，
+              event projection 能不能让用户先看到进度。下一篇就从这些已经读过的 owner 出发，
+              专门看 prompt cache 和体感速度之间的关系。
+            </p>
+
+            <h2 id="sources">参考源码</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex 固定源码快照</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1164-L1361">EventMsg 包含 HookStarted / HookCompleted</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1363-L1376">HookEventName 事件列表</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1453-L1488">HookRunSummary、HookStartedEvent、HookCompletedEvent</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/mod.rs#L42-L138">ConfiguredHandler、HookListEntry 与 ClaudeHooksEngine</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/mod.rs#L144-L266">Hook engine 的 preview / run 入口</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/discovery.rs#L63-L150">discover_handlers 读取 config 与 plugin hook sources</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/discovery.rs#L441-L540">append_matcher_groups、trust status 与 runnable handler 过滤</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/dispatcher.rs#L36-L110">handler selection、running summary 与并发执行</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/dispatcher.rs#L142-L153">HookScope：thread 与 turn 范围</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L139-L360">run_turn 主循环中的 hook 调用位置</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L430-L456">run_hooks_and_record_inputs 先检查 hook 再记录输入</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L101-L154">run_pending_session_start_hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L162-L218">run_pre_tool_use_hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L224-L260">run_permission_request_hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L263-L294">run_post_tool_use_hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L297-L364">run_turn_stop_hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L367-L425">pre/post compact hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L557-L650">run_context_injecting_hook、record_additional_contexts 与 hook events</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/session_start.rs#L22-L216">SessionStart / SubagentStart request 与 outcome</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/user_prompt_submit.rs#L22-L190">UserPromptSubmit request 与 outcome</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/pre_tool_use.rs#L22-L162">PreToolUse request、outcome 与 updated input 解析</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/permission_request.rs#L1-L168">PermissionRequest hook contract 与 deny-wins fold</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/post_tool_use.rs#L22-L143">PostToolUse request 与 outcome</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/stop.rs#L23-L199">Stop / SubagentStop request 与 outcome</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/stop.rs#L347-L407">Stop hook continuation fragments 聚合</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L494-L638">tool registry 中 pre/post tool hooks 的接入</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L501-L540">tool orchestrator 中 permission-request hook 优先回答 approval</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact_remote_v2.rs#L129-L164">remote compact 前后的 hook gate</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/manifest.rs#L8-L24">PluginManifest paths 包含 hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/load_outcome.rs#L108-L184">PluginLoadOutcome 暴露 effective plugin hook sources</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen ? `${base}-${seen + 1}` : base;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          link.dataset.index = index;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (const knownLevel of [2, 3, 4]) {
+            if (knownLevel > level) lastItems.delete(knownLevel);
+          }
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (!visible.length) return;
+            const id = visible[0].target.id;
+            links.forEach((link) => {
+              link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+            });
+          },
+          { rootMargin: "-18% 0px -68% 0px", threshold: 0.01 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

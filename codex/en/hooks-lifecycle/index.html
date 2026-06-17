@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes VIII: Hooks and Lifecycle Slots</title>
+    <meta
+      name="description"
+      content="A source-guided walkthrough of Codex hooks: SessionStart, UserPromptSubmit, PreToolUse, PermissionRequest, PostToolUse, Pre/PostCompact, Stop, and hook run events."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes VIII: Hooks and Lifecycle Slots" />
+    <meta
+      property="og:description"
+      content="Read how Codex hooks attach to typed turn lifecycle slots, emit visible hook events, and return bounded outcomes."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/hook-lifecycle-slots.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/hooks-lifecycle/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/hooks-lifecycle/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/hooks-lifecycle/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(45, 95, 139, 0.32);
+        background: rgba(45, 95, 139, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Codex series</a>
+        <a href="../extensions-agents/">Previous: extensions</a>
+        <a href="../prompt-cache-performance/">Next: performance</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/hooks-lifecycle/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part VIII</p>
+            <h1>Hooks and Lifecycle Slots: What Can Still Change at the Boundary</h1>
+            <p class="lead">
+              Part VII put plugin hooks on the map. They are not model
+              capability and they are not ordinary tools. They are runtime
+              programs attached to turn lifecycle boundaries. This part follows
+              the public source to see where hooks can add context, where they
+              can block side effects, where they can answer approval, and where
+              they can make a turn continue after it looked ready to stop.
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: hooks / lifecycle</span>
+              <span>Scope: public source</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/hook-lifecycle-slots.png"
+                alt="Codex hook lifecycle slots showing session start, prompt gate, tool gates, compact, stop gate, events, and model context"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Start with one ordinary turn. The user submits a prompt. Codex may
+              prepare context, call the model, run shell commands, edit files,
+              ask for approval, compact a long context, and eventually decide
+              that the model no longer needs a follow-up request. Each of those
+              points is attractive to local automation: inspect the prompt,
+              block a risky command, answer an approval request, annotate a tool
+              result, or ask the model to make one final check.
+            </p>
+
+            <p>
+              Calling all of that "hooks" is too loose for source reading.
+              Codex makes the boundary sharper. <strong>A hook belongs to a
+              specific event, and that event defines the request shape, parsed
+              output, and runtime consequence.</strong> A command hook attached
+              to <code>PreToolUse</code> can block a tool. The same style of
+              hook attached to <code>PermissionRequest</code> returns an approval
+              verdict. A <code>Stop</code> hook can push the turn back into the
+              model loop.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The useful model is this: <strong>Codex hooks are typed
+                lifecycle slots.</strong> They are governed by
+                <code>HookEventName</code>, request schemas, event-specific
+                parsers, <code>HookStarted</code>/<code>HookCompleted</code>
+                events, and <code>hook_runtime</code> glue that reconnects
+                outcomes to the turn.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                This article only describes behavior visible in the public
+                openai/codex source: hook events, discovery, preview/run/parse,
+                turn call sites, tool approval integration, compact integration,
+                stop continuation, and protocol events. The policy implemented
+                inside a user's hook command is outside this article's claim.
+              </p>
+            </div>
+
+            <p>This part follows six questions:</p>
+            <ol>
+              <li>Why read hooks as lifecycle slots rather than script lists?</li>
+              <li>How does Codex separate visible hook entries from runnable handlers?</li>
+              <li>Why does a hook run preview before it emits started/completed events?</li>
+              <li>What can the prompt, tool, approval, compact, and stop slots change?</li>
+              <li>How is <code>PermissionRequest</code> different from approval and sandboxing?</li>
+              <li>Why does this prepare the next part on performance and prompt cache?</li>
+            </ol>
+
+            <h2>1. Put Hooks Back on the Timeline</h2>
+            <p>
+              The first source-level object is not a config file; it is the
+              event name. The protocol-level <code>HookEventName</code> enum
+              lists <code>PreToolUse</code>, <code>PermissionRequest</code>,
+              <code>PostToolUse</code>, <code>PreCompact</code>,
+              <code>PostCompact</code>, <code>SessionStart</code>,
+              <code>UserPromptSubmit</code>, <code>SubagentStart</code>,
+              <code>SubagentStop</code>, and <code>Stop</code>. Read in order,
+              those names form a turn lifecycle.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Slot</th>
+                    <th>Where it fires</th>
+                    <th>Bounded consequence</th>
+                    <th>Owner to follow</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>SessionStart</code> / <code>SubagentStart</code></td>
+                    <td>When a session or thread-spawned subagent starts.</td>
+                    <td>Add model context; <code>SessionStart</code> can also stop the turn.</td>
+                    <td><code>session_start.rs</code> and <code>run_pending_session_start_hooks</code>.</td>
+                  </tr>
+                  <tr>
+                    <td><code>UserPromptSubmit</code></td>
+                    <td>Before user input is accepted into history.</td>
+                    <td>Add model context or prevent that input from continuing.</td>
+                    <td><code>user_prompt_submit.rs</code> and <code>inspect_pending_input</code>.</td>
+                  </tr>
+                  <tr>
+                    <td><code>PreToolUse</code></td>
+                    <td>Before a tool executes.</td>
+                    <td>Block the tool, add context, or rewrite hook-visible input.</td>
+                    <td><code>pre_tool_use.rs</code> and <code>tools/registry.rs</code>.</td>
+                  </tr>
+                  <tr>
+                    <td><code>PermissionRequest</code></td>
+                    <td>Inside the approval path, before Guardian or user UI.</td>
+                    <td>Return <code>Allow</code>, <code>Deny</code>, or no decision.</td>
+                    <td><code>permission_request.rs</code> and the tool orchestrator.</td>
+                  </tr>
+                  <tr>
+                    <td><code>PostToolUse</code></td>
+                    <td>After a tool has produced a successful result.</td>
+                    <td>Add context, provide model-visible feedback, or stop with feedback.</td>
+                    <td><code>post_tool_use.rs</code> and <code>PostToolUseFeedbackOutput</code>.</td>
+                  </tr>
+                  <tr>
+                    <td><code>PreCompact</code> / <code>PostCompact</code></td>
+                    <td>Around remote compaction.</td>
+                    <td>Let compact continue or interrupt compact/turn.</td>
+                    <td><code>compact.rs</code> and <code>compact_remote_v2.rs</code>.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Stop</code> / <code>SubagentStop</code></td>
+                    <td>When the runtime thinks the turn can finish.</td>
+                    <td>Stop, continue, or add continuation fragments for another model pass.</td>
+                    <td><code>stop.rs</code> and <code>run_turn_stop_hooks</code>.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The table gives the core intuition: hooks are not a generic loop
+              outside the turn. They sit at precise boundaries. A context-capable
+              slot writes a <code>ContextualUserFragment</code>. A tool slot
+              acts on one tool call. A permission slot answers one permission
+              request.
+            </p>
+
+            <h2>2. Discovery Is Wider Than Runtime Authority</h2>
+            <p>
+              Part VII showed that a plugin manifest can declare
+              <code>hooks</code>. Being declared, however, is not the same as
+              being runnable. Codex separates discovery from execution.
+            </p>
+
+            <p>
+              <code>ClaudeHooksEngine::new</code> receives hook enablement,
+              trust bypass state, the config layer stack, plugin hook sources,
+              plugin hook load warnings, and the command shell. When hooks are
+              enabled, it calls <code>discover_handlers</code>. The discovery
+              result has two different surfaces: <code>HookListEntry</code> for
+              user-visible metadata and <code>ConfiguredHandler</code> for
+              runtime execution.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Structure</th>
+                    <th>What it carries</th>
+                    <th>Reason for the split</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>HookListEntry</code></td>
+                    <td>Event, matcher, command, source, plugin id, enabled state, current hash, trust status.</td>
+                    <td>The UI can show hooks that are disabled, untrusted, or modified.</td>
+                  </tr>
+                  <tr>
+                    <td><code>ConfiguredHandler</code></td>
+                    <td>Event, matcher, command, timeout, source path, source, display order, env.</td>
+                    <td>The runtime only keeps handlers that may execute in this session.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The filter is explicit. Discovery reads config layers and plugin
+              sources, validates matchers, skips empty commands and unsupported
+              async hooks, computes a command hook hash, then combines enablement
+              with <code>HookTrustStatus</code>. Managed hooks can run as managed.
+              Non-managed hooks become runnable only when the current hash
+              matches a trusted hash, unless the runtime has been told to bypass
+              trust.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The protected invariant is practical: <strong>visible automation
+                is not automatically executable automation.</strong> A project or
+                plugin can contribute hook metadata without silently becoming
+                active code.
+              </p>
+            </div>
+
+            <h2>3. A Hook Run Is a Visible Turn Fact</h2>
+            <p>
+              When a hook event fires, Codex does not run the command silently.
+              Each event module follows the same broad shape: preview matching
+              handlers, convert them into <code>HookRunSummary</code>, execute the
+              commands, then parse stdout, stderr, exit code, or JSON output into
+              an event-specific outcome.
+            </p>
+
+            <p>
+              <code>dispatcher::running_summary</code> builds the
+              <code>Running</code> record. <code>hook_runtime</code> emits
+              <code>EventMsg::HookStarted</code>. After command execution,
+              <code>emit_hook_completed_events</code> records telemetry and
+              analytics, then emits <code>EventMsg::HookCompleted</code>. A
+              client does not have to infer hook progress from terminal output;
+              it receives typed events with source, status, timing, and entries.
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>Why preview?</strong>
+                The UI needs to show which hooks are running before a long hook
+                finishes. Without preview, slow automation would look like an
+                unexplained runtime pause.
+              </p>
+            </div>
+
+            <h2>4. Prompt Gate: Before Input Becomes History</h2>
+            <p>
+              Inside <code>run_turn</code>, Codex runs pre-sampling compaction,
+              records context updates, resolves skill/plugin injections, then
+              runs pending session-start hooks and prompt-submit hooks before it
+              samples the model.
+            </p>
+
+            <p>
+              <code>inspect_pending_input</code> builds a
+              <code>UserPromptSubmitRequest</code> with session id, turn id, cwd,
+              transcript path, model, permission mode, and prompt. If the hook
+              stops processing, the input can be rejected before becoming
+              durable conversation history. If the hook adds context,
+              <code>record_additional_contexts</code> converts it into a
+              <code>HookAdditionalContext</code> developer message.
+            </p>
+
+            <p>
+              This is different from skill injection. A skill is selected
+              working guidance that is recorded as turn input. A prompt hook is a
+              gate before user input is accepted; it can annotate or block that
+              input at the boundary.
+            </p>
+
+            <h2>5. Tool Gates: Before, During, and After Approval</h2>
+            <p>
+              Tool hooks are easiest to confuse because several events surround
+              one tool call. The source keeps the layers separate:
+              <code>PreToolUse</code>, <code>PermissionRequest</code>, and
+              <code>PostToolUse</code> answer different questions.
+            </p>
+
+            <h3>5.1 PreToolUse: Local Rewrite or Block Before Execution</h3>
+            <p>
+              In <code>tools/registry.rs</code>, after the invocation payload has
+              passed basic compatibility checks, the registry calls
+              <code>run_pre_tool_use_hooks</code>. The hook request carries the
+              canonical tool name, matcher aliases, tool use id, and tool input.
+              Handler selection can use compatibility aliases, but stdin keeps
+              the canonical <code>tool_name</code> for audit stability.
+            </p>
+
+            <p>
+              <code>PreToolUseOutcome</code> has three meaningful consequences.
+              <code>should_block</code> prevents execution and returns a message
+              to the model. <code>additional_contexts</code> enters model
+              context. <code>updated_input</code> can rebuild the invocation; if
+              the hook blocks, the updated input is ignored.
+            </p>
+
+            <h3>5.2 PermissionRequest: A First Answer in the Approval Path</h3>
+            <p>
+              <code>PermissionRequest</code> fires later. When policy requires
+              approval and this path evaluates permission hooks, the tool
+              orchestrator calls <code>run_permission_request_hooks</code>. This
+              hook does not rewrite input. It returns an approval verdict:
+              <code>Allow</code>, <code>Deny</code>, or no verdict.
+            </p>
+
+            <p>
+              The fold rule is conservative. Any <code>Deny</code> wins. If no
+              handler denies, an <code>Allow</code> can approve the request. If
+              no handler decides, the normal Guardian or user approval path
+              continues. This still does not replace sandboxing. Approval answers
+              whether Codex may attempt the side effect; the execution attempt
+              remains constrained by the permission profile, sandbox, and tool
+              runtime.
+            </p>
+
+            <h3>5.3 PostToolUse: Model-Visible Feedback After Execution</h3>
+            <p>
+              After a successful tool result, the registry may call
+              <code>run_post_tool_use_hooks</code>. The request includes tool
+              input and tool response. A post-tool hook can add context, return
+              feedback, or stop with feedback.
+            </p>
+
+            <p>
+              The important detail is model visibility. If the hook returns
+              feedback, the registry wraps the original result in
+              <code>PostToolUseFeedbackOutput</code>. The original result is
+              preserved inside the output object, but the next model-visible
+              message can become the hook feedback.
+            </p>
+
+            <h2>6. Compact and Stop Are Lifecycle Boundaries Too</h2>
+            <p>
+              Hooks also appear at context pressure and turn completion.
+              Around remote compaction, <code>compact_remote_v2.rs</code> calls
+              <code>run_pre_compact_hooks</code> and
+              <code>run_post_compact_hooks</code>. Their outcome is intentionally
+              narrow: continue, or interrupt compact/turn. They do not invent
+              compaction strategy or rewrite summaries.
+            </p>
+
+            <p>
+              <code>Stop</code> is more subtle. <code>run_turn</code> calls
+              <code>run_turn_stop_hooks</code> only after the model no longer
+              needs follow-up, there is no pending input, and the token state
+              does not force continuation. The runtime is ready to finish, but a
+              stop hook can still return <code>should_block</code> with
+              <code>continuation_fragments</code>.
+            </p>
+
+            <p>
+              If Codex can build a <code>HookPromptFragment</code>, it records a
+              hook prompt message, marks <code>stop_hook_active</code>, and
+              re-enters the model loop. A stop hook sits before completion is
+              finalized; it is the final chance to ask for one more bounded
+              model pass.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The closer a hook sits to a side effect, the narrower and more
+                concrete its authority becomes. The closer it sits to input or
+                completion, the more it affects model context and continuation.
+                Codex turns a broad extension idea into small lifecycle gates.
+              </p>
+            </div>
+
+            <h2>7. Common Misreadings</h2>
+            <p>
+              The main source-reading risk is collapsing adjacent boundaries.
+              Hook, approval, sandbox, and event projection all sit near safety
+              and observability, but they are owned by different runtime layers.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Misreading</th>
+                    <th>Better reading</th>
+                    <th>Consequence</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>The hook list is the runnable handler list.</td>
+                    <td>Entries can be disabled, untrusted, or modified; runtime handlers pass trust filtering.</td>
+                    <td>Confuses discovered automation with executing automation.</td>
+                  </tr>
+                  <tr>
+                    <td><code>PreToolUse</code> is approval.</td>
+                    <td><code>PreToolUse</code> blocks or rewrites input; <code>PermissionRequest</code> returns allow/deny.</td>
+                    <td>Treats validation as authorization.</td>
+                  </tr>
+                  <tr>
+                    <td>Approval bypasses sandboxing.</td>
+                    <td>Approval permits an attempt; sandboxing still constrains the process.</td>
+                    <td>Overstates what an allow decision grants.</td>
+                  </tr>
+                  <tr>
+                    <td><code>PostToolUse</code> only logs.</td>
+                    <td>It can provide model-visible feedback before the next sampling request.</td>
+                    <td>Misses the last interpretation layer after a tool result.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Stop</code> is an after hook.</td>
+                    <td>It runs at the completion boundary and can add continuation fragments.</td>
+                    <td>Misses a final controlled model pass.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>8. Why Performance and Prompt Cache Come Next</h2>
+            <p>
+              With hooks placed on the lifecycle, the first eight parts now form
+              a complete runtime route. User input enters a turn. Context and
+              extensions construct the model-visible view. The tool surface
+              defines what the model may request. Hooks, approval, and sandboxing
+              govern side effects. Events project facts to clients. Compact and
+              stop logic decide how long work continues.
+            </p>
+
+            <p>
+              That is the right point to discuss performance and prompt cache.
+              Codex performance is not one faster function. It depends on which
+              prompt prefix stays stable, which skill and tool descriptions enter
+              only on demand, whether hook-provided context changes the model
+              view, how compaction reshapes history, and whether event projection
+              keeps the user oriented while the turn is still running. The next
+              part can now talk about prompt cache without reducing the system to
+              a single cache-hit number.
+            </p>
+
+            <h2 id="sources">Source References</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">Pinned openai/codex source snapshot</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1164-L1361">EventMsg includes HookStarted and HookCompleted</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1363-L1376">HookEventName event list</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1453-L1488">HookRunSummary, HookStartedEvent, and HookCompletedEvent</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/mod.rs#L42-L138">ConfiguredHandler, HookListEntry, and ClaudeHooksEngine</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/mod.rs#L144-L266">Hook engine preview and run entry points</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/discovery.rs#L63-L150">discover_handlers reads config and plugin hook sources</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/discovery.rs#L441-L540">append_matcher_groups, trust status, and runnable handler filtering</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/dispatcher.rs#L36-L110">Handler selection, running summary, and concurrent execution</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/dispatcher.rs#L142-L153">HookScope for thread and turn events</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L139-L360">Hook call sites inside run_turn</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L430-L456">run_hooks_and_record_inputs checks hooks before recording input</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L101-L154">run_pending_session_start_hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L162-L218">run_pre_tool_use_hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L224-L260">run_permission_request_hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L263-L294">run_post_tool_use_hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L297-L364">run_turn_stop_hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L367-L425">pre/post compact hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L557-L650">run_context_injecting_hook, record_additional_contexts, and hook events</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/session_start.rs#L22-L216">SessionStart and SubagentStart request/outcome</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/user_prompt_submit.rs#L22-L190">UserPromptSubmit request/outcome</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/pre_tool_use.rs#L22-L162">PreToolUse request/outcome and updated input resolution</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/permission_request.rs#L1-L168">PermissionRequest hook contract and deny-wins fold</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/post_tool_use.rs#L22-L143">PostToolUse request/outcome</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/stop.rs#L23-L199">Stop and SubagentStop request/outcome</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/stop.rs#L347-L407">Stop hook continuation fragment aggregation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L494-L638">Tool registry pre/post hook integration</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L501-L540">Tool orchestrator gives permission-request hooks first answer</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact_remote_v2.rs#L129-L164">Hook gates around remote compact</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/manifest.rs#L8-L24">PluginManifest paths include hooks</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/load_outcome.rs#L108-L184">PluginLoadOutcome exposes effective plugin hook sources</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen ? `${base}-${seen + 1}` : base;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          link.dataset.index = index;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (const knownLevel of [2, 3, 4]) {
+            if (knownLevel > level) lastItems.delete(knownLevel);
+          }
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (!visible.length) return;
+            const id = visible[0].target.id;
+            links.forEach((link) => {
+              link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+            });
+          },
+          { rootMargin: "-18% 0px -68% 0px", threshold: 0.01 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

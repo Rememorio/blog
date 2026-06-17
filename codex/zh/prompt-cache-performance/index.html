@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex 源码阅读（九）：性能与 prompt cache，速度来自请求形状</title>
+    <meta
+      name="description"
+      content="沿 OpenAI prompt caching 官方契约和 openai/codex 源码，拆解 Codex 怎样通过稳定前缀、prompt_cache_key、动态尾部、compaction 与 token usage 指标管理体感速度。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex 源码阅读（九）：性能与 prompt cache，速度来自请求形状" />
+    <meta
+      property="og:description"
+      content="从稳定前缀、动态尾部、prompt_cache_key、cached/non-cached token usage 和 compaction，看 Codex 为什么把性能问题落到请求形状。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/prompt-cache-discipline.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/zh/prompt-cache-performance/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/prompt-cache-performance/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/prompt-cache-performance/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(15, 118, 110, 0.32);
+        background: rgba(15, 118, 110, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Codex 系列</a>
+        <a href="../hooks-lifecycle/">上一篇：hooks</a>
+        <a href="../rollout-recovery/">下一篇：恢复</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/prompt-cache-performance/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex 源码阅读 · 第九篇</p>
+            <h1>性能与 prompt cache，速度来自请求形状</h1>
+            <p class="lead">
+              前八篇把一次 turn 的 owner 拆开以后，性能问题终于能落到具体位置：
+              Codex 要反复把规则、工具、历史、上下文更新和最新输入组装成 Responses 请求。
+              如果前缀稳定，OpenAI automatic prefix cache 可以复用已处理的前缀；如果动态信息太早混进来，
+              同一个 thread 也会变成一轮轮重新 prefill。第九篇就看 Codex 怎样把体感速度压回请求形状。
+            </p>
+            <div class="meta-line">
+              <span>项目：openai/codex</span>
+              <span>主题：prompt cache / performance</span>
+              <span>范围：官方文档与公开源码</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/prompt-cache-discipline.png"
+                alt="Codex prompt cache discipline，展示 stable prefix、dynamic tail、prompt_cache_key、cache route 和 usage metrics 的关系"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              写 coding agent 时，慢通常不只来自模型本身。真正让人感到拖沓的，是每一轮都要把一大段工作现场重新交给模型：
+              base instructions、工具 schema、项目规则、权限状态、历史消息、工具结果、最新用户输入，最后还要等模型吐出第一个 token。
+              长任务跑到中后段，这个“重新交现场”的成本会越来越明显。
+            </p>
+
+            <p>
+              OpenAI 的
+              <a href="https://developers.openai.com/api/docs/guides/prompt-caching">prompt caching 文档</a>
+              把合同讲得很清楚：缓存依赖 exact prefix match；静态内容应该放在请求开头，动态内容放在尾部；
+              请求可以通过 <code>prompt_cache_key</code> 影响路由；响应里的
+              <code>usage.prompt_tokens_details.cached_tokens</code> 用来观察命中结果。
+              对 Codex 来说，源码里真正值得看的点就变成：它怎样让请求开头足够稳定，又怎样把会变化的东西推到合适的位置。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这篇的中心判断是：<strong>Codex 的 prompt cache 纪律不是一个 cache 参数，而是一套模型视图纪律。</strong>
+                <code>prompt_cache_key</code> 只负责把相似请求带进同一个缓存域；能不能命中，还要看
+                <code>instructions</code>、<code>tools</code>、<code>input</code>、context update、tool output 和
+                compaction 共同形成的前缀是否稳定。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                OpenAI 官方文档说明 prompt cache 的 provider contract：exact prefix、缓存门槛、路由、retention、
+                <code>prompt_cache_key</code> 和 <code>cached_tokens</code>。Codex 公开源码只能证明客户端如何构造请求、
+                保存历史、触发 compaction、记录 token usage。服务端如何序列化内部 token、如何放置 KV cache、
+                如何调度机器，本文不把它写成 Codex 源码事实。
+              </p>
+            </div>
+
+            <p>第九篇追六个问题：</p>
+            <ol>
+              <li>prompt cache 到底缓存的是哪一层视图？</li>
+              <li><code>prompt_cache_key</code> 在 Codex 里从哪里来，为什么默认跟 thread 绑定？</li>
+              <li>Codex 请求里的 <code>instructions</code>、<code>tools</code>、<code>input</code> 怎样形成稳定前缀？</li>
+              <li>thread settings、环境上下文和工具结果为什么要作为动态尾部处理？</li>
+              <li>compaction 为什么既能减压，也会重写未来的缓存形状？</li>
+              <li>Codex 用哪些指标把 cache 效果和体感速度记录下来？</li>
+            </ol>
+
+            <h2>一、先定坐标：缓存命中的是模型视图，不是聊天窗口</h2>
+            <p>
+              很多性能讨论会直接问“有没有命中缓存”。这个问法太早了。先要问：
+              哪份内容进入了这次 API request？顺序是什么？哪些字段在 provider contract 里会参与 prefix？
+              UI 里显示的历史、磁盘里的 rollout、runtime 临时构造的 request input，这三者不总是同一份东西。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>层</th>
+                    <th>owner</th>
+                    <th>作用</th>
+                    <th>和 prompt cache 的关系</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>可见历史</td>
+                    <td>客户端投影</td>
+                    <td>让用户看到 turn、工具、hook、事件和最终回答。</td>
+                    <td>只提供观察，不等于下一轮完整发给模型。</td>
+                  </tr>
+                  <tr>
+                    <td>持久记录</td>
+                    <td>rollout / thread store</td>
+                    <td>恢复、回放、fork 和审计。</td>
+                    <td>恢复时用来重建 runtime history，但不是 provider cache 本身。</td>
+                  </tr>
+                  <tr>
+                    <td>模型视图</td>
+                    <td><code>Prompt</code> / Responses request</td>
+                    <td>本轮实际交给模型的 <code>instructions</code>、<code>tools</code>、<code>input</code> 和控制字段。</td>
+                    <td>provider 只能在这份有序输入上做 prefix 复用。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              因此，Codex 的性能文章不能只看网络请求耗时。它要先看模型视图怎么构造。
+              <code>Prompt</code> 结构就把这件事拆开了：conversation <code>input</code>、可用 <code>tools</code>、
+              <code>parallel_tool_calls</code>、<code>base_instructions</code>、personality、output schema。
+              到 <code>ModelClient::build_responses_request</code> 时，它们会变成 Responses API 的请求字段：
+              <code>instructions</code>、<code>input</code>、<code>tools</code>、<code>reasoning</code>、<code>text</code>
+              和 <code>prompt_cache_key</code>。
+            </p>
+
+            <pre><code class="language-text">形状示意：
+Responses request
+  instructions: stable base instructions
+  tools:        model-visible tool schemas
+  input:        prior context + dynamic turn tail
+  text:         output schema / verbosity
+  prompt_cache_key: thread-scoped cache domain</code></pre>
+
+            <p>
+              这段示意省略了很多字段，但足够说明本文的读法：先观察 request shape，再解释速度。
+              <code>cached_tokens</code> 只是结果指标；稳定前缀才是 runtime 能主动维护的工程纪律。
+            </p>
+
+            <h2>二、缓存域：<code>prompt_cache_key</code> 默认跟 thread 走</h2>
+            <p>
+              Codex 的 <code>ModelClient</code> 是 session-scoped。源码注释说它持有跨 turn 共享的配置和状态：
+              auth、provider selection、thread id、transport fallback state。这个作用域正好也解释了
+              <code>prompt_cache_key</code> 的默认值。
+            </p>
+
+            <p>
+              <code>ModelClient::prompt_cache_key()</code> 先看 override；没有 override 时，返回 <code>thread_id</code>。
+              <code>build_responses_request</code> 再把这个值放进每次 Responses 请求。换句话说，Codex 默认把一个
+              thread 的连续 turns 放在同一个 cache domain 附近，让相似前缀有机会落到同类路由上。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <code>prompt_cache_key</code> 的位置很容易被高估。它不会声明“缓存到哪一条 message 为止”，
+                也不会修复被动态内容打碎的前缀。它的价值是<strong>稳定请求的缓存域</strong>：
+                同一个 thread 或同一类审查会话，用一致的 key 帮助 provider 找到可能已有的前缀。
+              </p>
+            </div>
+
+            <p>
+              源码里也有一个例外：Guardian review session 可以通过
+              <code>with_prompt_cache_key_override</code> 设置专门的 key。这说明 key 是路由/域的控制点，
+              不属于某个单 turn 的临时状态。它应该跟“哪些请求应共享前缀”这个语义一起变化，而不是跟每条用户输入一起变化。
+            </p>
+
+            <h2>三、稳定前缀：instructions、tools、context base</h2>
+            <p>
+              官方文档建议把静态内容放在开头。Codex 源码里对应三类材料：base instructions、model-visible
+              tool schemas、以及初始上下文或上下文 diff 建立出的 context base。
+            </p>
+
+            <h3>3.1 <code>instructions</code> 要稳定</h3>
+            <p>
+              <code>build_responses_request</code> 直接从 <code>prompt.base_instructions.text</code> 取
+              <code>instructions</code>。prompt caching 测试里，连续两轮请求会断言
+              <code>instructions</code> 保持一致；当某些模型没有把 <code>apply_patch</code> 暴露成 tool 时，
+              源码会追加稳定的 patch 指令，测试也会断言两轮的 instructions 仍然一致。
+            </p>
+
+            <p>
+              这里的关键不是“指令永远不变”。模型、personality、collaboration mode 或配置切换时，它当然会变。
+              关键是普通连续 turn 不应该把临时信息塞进 base instructions。临时信息应该进入后面的 input tail，
+              这样 stable prefix 才有机会复用。
+            </p>
+
+            <h3>3.2 <code>tools</code> 是前缀的一部分</h3>
+            <p>
+              OpenAI 文档明确说 tool definitions 可以被缓存，并计入 1024 token 门槛。
+              Codex 的请求构造也把 <code>prompt.tools</code> 通过 <code>create_tools_json_for_responses_api</code>
+              转成 <code>tools</code> 字段。第 4 篇和第 7 篇讲过：工具表来自 core tools、MCP、dynamic tools、
+              tool_search 暴露的延迟工具，以及 plugin / skill 带来的能力入口。
+            </p>
+
+            <p>
+              这解释了一个常见的体感问题：工具越多，单轮请求越重；但如果工具 schema 足够稳定，
+              它们也更适合成为缓存前缀的一部分。反过来，如果每轮都无谓改变工具列表或工具 schema 顺序，
+              prompt cache 会先在 request shape 上受伤。
+            </p>
+
+            <h3>3.3 context base：一次注入，后续用 diff</h3>
+            <p>
+              第 2 篇讲过 <code>reference_context_item</code>。它是 context diff 的基线：当 runtime 能确认上下文基线还可信时，
+              下一轮只需要发送 settings update；基线被 rollback 或 compaction 打断时，再回到 full reinjection。
+              prompt caching 测试里的 <code>prefixes_context_and_instructions_once_and_consistently_across_requests</code>
+              正好验证了这条纪律：第一轮包含 permissions、cached contextual user prefix 和 user message；
+              第二轮会把第一轮 input 作为前缀保留下来，再追加新的 user message。
+            </p>
+
+            <p>
+              这不是为了让测试好看。它直接保护 prompt cache：把稳定规则和环境上下文作为已确认的前缀，
+              后续变化用新消息追加，而不是每轮重新把同一批上下文改写成另一种形状。
+            </p>
+
+            <h2>四、动态尾部：改变可以发生，但要晚一点发生</h2>
+            <p>
+              动态信息不可避免。用户会改变 cwd、权限、model、reasoning effort；工具会返回新的 stdout/stderr；
+              hooks 可能补 additional context；MCP 工具列表可能刷新；compact 可能替换 history。
+              Codex 的策略不是消灭变化，而是尽量让变化出现在稳定前缀之后。
+            </p>
+
+            <p>
+              prompt caching suite 里有两个直接证据。一个测试把 thread settings 改掉后，断言
+              <code>prompt_cache_key</code> 不变，并且第二次请求以前一次 input 为前缀，再追加新的 permissions
+              message、environment message 和用户消息。另一个测试在 per-turn overrides 下做同样断言：
+              key 仍然稳定，model switch 和环境变化作为后续消息进入 input。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>变化来源</th>
+                    <th>Codex 的处理</th>
+                    <th>保护的性能属性</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>用户新输入</td>
+                    <td>作为新的 user message 追加。</td>
+                    <td>旧 prefix 不被重新排版。</td>
+                  </tr>
+                  <tr>
+                    <td>thread settings override</td>
+                    <td>生成 settings / environment update，接在已有 input 后。</td>
+                    <td>保留前面已经稳定的上下文。</td>
+                  </tr>
+                  <tr>
+                    <td>tool output</td>
+                    <td>记录到 history，再由 <code>for_prompt()</code> 规范化后进入下一次 request。</td>
+                    <td>保证 call/output 成对，不让 malformed history 破坏模型视图。</td>
+                  </tr>
+                  <tr>
+                    <td>hook additional context</td>
+                    <td>变成 contextual fragment 写入 model context。</td>
+                    <td>把策略补充变成可观察的输入变化。</td>
+                  </tr>
+                  <tr>
+                    <td>compaction</td>
+                    <td>用 summary / replacement history 改写后续基线。</td>
+                    <td>降低上下文压力，同时建立新的可恢复前缀。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这也是第 8 篇 hooks 铺垫的原因。hook 如果在 prompt gate 或 post-tool gate 补上下文，
+              它不是“免费附加信息”；它会改变后续模型视图。一个小 hook 是否影响性能，要看它把内容插到哪里、
+              是否每轮变化、是否破坏早期 prefix。
+            </p>
+
+            <h2>五、compaction：减压之后，缓存形状也换了</h2>
+            <p>
+              prompt cache 不能替代 context window。历史越来越长时，Codex 仍然要 compact。
+              <code>ContextManager</code> 会维护 token usage、估算 token count，也会在 history rewrite 时 bump
+              <code>history_version</code>。<code>get_context_remaining</code> 工具则把当前总 token usage
+              和 model context window 相减，让模型能查询剩余窗口。
+            </p>
+
+            <p>
+              到 remote compact v2，源码会先 clone history，拿 base instructions，
+              再调用 <code>trim_function_call_history_to_fit_context_window</code> 对工具输出做本地减压。
+              随后它构造 compact request，并复用普通 Responses 请求里的共享字段。
+              测试 <code>remote_manual_compact_*_reuses_prompt_cache_key</code> 明确断言：
+              compact request 的 <code>prompt_cache_key</code> 和 normal request 一致，并且 compact 请求保留同一套共享请求字段。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                compact 的性能含义有两面：<strong>它减少未来请求需要携带的历史，但也会建立新的前缀形状。</strong>
+                旧前缀不再是后续模型视图的主线；summary、保留的工具结果、重新注入的 initial context，
+                会一起成为新的 cache 候选。
+              </p>
+            </div>
+
+            <p>
+              所以不要把 compact 理解成“触发一次总结就更快”。如果 summary 太粗，语义会丢；
+              如果保留太多，窗口压力还在；如果 compact 后没有稳定的 replacement history，恢复和后续 cache 都会漂。
+              Codex 把 compact 放在 history / rollout / token usage 这一整套机制里，就是为了让减压之后仍然能继续重建同一条工作主线。
+            </p>
+
+            <h2>六、指标：cached、non-cached 和 first token</h2>
+            <p>
+              provider cache 是否命中，最终要靠 usage 观察。Codex 的 <code>TokenUsage</code>
+              里有 <code>input_tokens</code>、<code>cached_input_tokens</code>、<code>output_tokens</code>、
+              <code>reasoning_output_tokens</code> 和 <code>total_tokens</code>。
+              turn 结束时，<code>on_task_finished</code> 会拿本轮开始前的 token usage snapshot，
+              和当前 total token usage 做差，得到这次 turn 的输入、cached input、non-cached input、输出和总量。
+            </p>
+
+            <p>
+              这些值会写进 tracing span、session telemetry histogram 和 analytics event。
+              同一个收尾路径还记录 <code>time_to_first_token_ms</code> 和 turn duration。
+              这使得 Codex 可以把两个层面的性能分开看：一层是 provider 侧有多少输入 tokens 来自 cache；
+              另一层是用户体感的首 token 和整体 turn 时长。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>指标</th>
+                    <th>说明</th>
+                    <th>不要误读成</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>cached_input_tokens</code></td>
+                    <td>provider 报告本轮有多少输入 token 命中 cache。</td>
+                    <td>模型“少看了”这些内容。</td>
+                  </tr>
+                  <tr>
+                    <td><code>non_cached_input()</code></td>
+                    <td>输入 token 中没有命中的部分。</td>
+                    <td>所有非缓存 token 都是浪费。</td>
+                  </tr>
+                  <tr>
+                    <td><code>time_to_first_token_ms</code></td>
+                    <td>用户等待首个可见输出的时间。</td>
+                    <td>只由 prompt cache 决定。</td>
+                  </tr>
+                  <tr>
+                    <td><code>total_tokens</code></td>
+                    <td>本轮 token 总账。</td>
+                    <td>上下文窗口中仍完整保留的语义质量。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这套指标也解释了为什么性能文章要排在 hooks 后面。一个 post-tool hook 可以让模型看见不同反馈；
+              一个 permission hook 可以减少无效审批等待；一个 stop hook 可以让 turn 多跑一次；
+              它们都会影响体感速度，但不一定直接体现在 cached tokens 上。源码里的性能观测必须把 cache、
+              tool loop、事件投影和 turn lifecycle 放在一起看。
+            </p>
+
+            <h2>七、常见误读：把 cache 当成单点开关</h2>
+            <p>
+              到这里可以把几个误读收掉。它们很常见，因为 prompt cache 的 API 字段看起来很简单，
+              但 runtime 真正维护的是一条长请求链。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>误读</th>
+                    <th>更准确的读法</th>
+                    <th>源码里的边界</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>prompt_cache_key</code> 决定命中。</td>
+                    <td>key 影响缓存域和路由，命中还要 exact prefix。</td>
+                    <td><code>ModelClient::prompt_cache_key()</code> 与 request shape 分开。</td>
+                  </tr>
+                  <tr>
+                    <td>聊天历史在，模型就会完整看到。</td>
+                    <td>模型看到的是 <code>for_prompt()</code> 之后的 input。</td>
+                    <td><code>ContextManager::for_prompt()</code> 会规范化、补 call/output、不支持图片时去掉图片。</td>
+                  </tr>
+                  <tr>
+                    <td>工具越少一定越快。</td>
+                    <td>工具 schema 是成本，也是可缓存前缀；关键是稳定和按需暴露。</td>
+                    <td><code>tools</code> 字段由 <code>prompt.tools</code> 构造，测试断言常规工具表稳定。</td>
+                  </tr>
+                  <tr>
+                    <td>compact 之后缓存自然更好。</td>
+                    <td>compact 会换掉未来前缀，需要稳定 replacement history 承接。</td>
+                    <td>remote compact 复用 <code>prompt_cache_key</code>，同时改写 history。</td>
+                  </tr>
+                  <tr>
+                    <td>缓存命中等于用户一定觉得快。</td>
+                    <td>首 token 还受工具循环、审批、网络、compaction 和输出长度影响。</td>
+                    <td>turn 收尾同时记录 token usage、TTFT 和 duration。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>八、下一篇：为什么要回到 rollout 和恢复</h2>
+            <p>
+              prompt cache 把性能问题压到模型视图；但模型视图从哪里来？它来自 history、context updates、
+              compaction replacement、tool results 和 rollout reconstruction。只要这些记录不能稳定恢复，
+              下一轮 request shape 就会漂，cache 分析也会失去参照。
+            </p>
+
+            <p>
+              所以下一篇回到持久化和恢复：Codex 怎样把一次 turn 的过程写进 rollout，怎样从
+              <code>RolloutItem</code> 重建 history，怎样处理 rollback、fork、compact boundary 和 token usage。
+              读完那一篇，性能、恢复和客户端投影才会合成同一条线：用户看到的事实、磁盘保存的事实、
+              模型下一轮看到的事实，必须能互相对齐。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://developers.openai.com/api/docs/guides/prompt-caching">OpenAI Prompt caching guide</a></li>
+              <li><a href="https://developers.openai.com/cookbook/examples/prompt_caching_201">OpenAI Prompt Caching 201</a></li>
+              <li><a href="https://developers.openai.com/api/docs/guides/latest-model">OpenAI latest model guide：reasoning models 与 prompt caching 建议</a></li>
+              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex 固定源码快照</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client_common.rs#L18-L87"><code>Prompt</code> 结构与 <code>get_formatted_input_for_request()</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L207-L236"><code>ModelClient</code> 与 turn-scoped <code>ModelClientSession</code> 注释</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L355-L367"><code>with_prompt_cache_key_override()</code> 与默认 thread id key</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L705-L758"><code>build_responses_request()</code> 构造 instructions、input、tools 与 <code>prompt_cache_key</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/codex-api/src/common.rs#L182-L224"><code>ResponsesApiRequest</code> 与 websocket request 保留 <code>prompt_cache_key</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/session.rs#L1022-L1038">session 初始化 <code>ModelClient</code> 与 Guardian review override</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L145-L225"><code>run_turn</code> 构造 sampling request input 的顺序</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L32-L114"><code>ContextManager</code>、<code>reference_context_item</code> 与 <code>for_prompt()</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L249-L321">token usage 更新与本地估算</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1989-L2024"><code>TokenUsageInfo</code> 与 <code>TokenCountEvent</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tasks/mod.rs#L335-L393">turn start 记录 token usage 起点与 tracing 字段</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tasks/mod.rs#L646-L721">turn stop 计算 cached / non-cached token usage</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tasks/mod.rs#L728-L751">turn 完成事件记录 duration 与 time-to-first-token</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/get_context_remaining.rs#L78-L90"><code>get_context_remaining</code> 计算剩余 context window</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact_remote_v2.rs#L179-L239">remote compact v2 clone history、trim tool outputs、构造 prompt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L455-L485">compact request 复用 <code>prompt_cache_key</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L110-L220">测试：tools 与 instructions 在连续请求中保持稳定</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L304-L399">测试：cached contextual prefix 跨请求复用</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L401-L529">测试：thread settings override 保持 cached prefix 和 key</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L690-L816">测试：per-turn overrides 保持 cached prefix 和 key</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/compact_remote.rs#L727-L743">测试：remote compact request 复用 normal request 的 <code>prompt_cache_key</code></a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen ? `${base}-${seen + 1}` : base;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          link.dataset.index = index;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (const knownLevel of [2, 3, 4]) {
+            if (knownLevel > level) lastItems.delete(knownLevel);
+          }
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (!visible.length) return;
+            const id = visible[0].target.id;
+            links.forEach((link) => {
+              link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+            });
+          },
+          { rootMargin: "-18% 0px -68% 0px", threshold: 0.01 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

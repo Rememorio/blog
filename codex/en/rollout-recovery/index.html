@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes X: Rollout and Recovery</title>
+    <meta
+      name="description"
+      content="A source-guided walk through Codex rollout persistence, JSONL writing, InitialHistory, TurnContextItem, compaction replacement, rollback, resume, and fork recovery."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes X: Rollout and Recovery" />
+    <meta
+      property="og:description"
+      content="Read how Codex turns a thread into replayable evidence: append-only rollout items, reverse scan, forward replay, context baseline, rollback markers, and fork snapshots."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/rollout-recovery-map.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/rollout-recovery/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/rollout-recovery/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/rollout-recovery/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(163, 89, 52, 0.3);
+        background: rgba(163, 89, 52, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Codex series</a>
+        <a href="../prompt-cache-performance/">Previous: performance</a>
+        <a href="../sdk-app-server/">Next: SDK</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/rollout-recovery/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part X</p>
+            <h1>Rollout and Recovery: Continuing Requires Replay</h1>
+            <p class="lead">
+              Part IX placed performance on request shape. A thread also needs
+              to survive process exit, resume from an old session, fork into a
+              new branch, and roll back recent work without leaving stale tool
+              output in the next prompt. Those capabilities all depend on the
+              same thing: Codex must persist a turn as replayable evidence.
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: rollout / recovery</span>
+              <span>Scope: public source</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/rollout-recovery-map.png"
+                alt="Codex rollout recovery showing append-only JSONL, reverse scan, replay suffix, model history, context baseline, and resume fork output"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Imagine a long coding task. The agent has read files, run tools,
+              compacted history, changed model settings, and accumulated enough
+              context that a simple transcript is no longer the whole story. If
+              the process stops, the next runtime must recover more than visible
+              messages. It needs the model-visible history, the current context
+              baseline, session identity, lineage, and the event facts that a
+              client will project back to the user.
+            </p>
+
+            <p>
+              That is the job of rollout. Codex writes an append-only JSONL
+              stream of typed <code>RolloutItem</code>s, keeps write ordering
+              behind a recorder, and reconstructs the runtime state by replaying
+              those items through session logic. The recovery path is not a
+              convenience wrapper around chat history; it is part of the runtime
+              contract.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The central model for this part is: <strong>rollout is the
+                replay ledger of a Codex thread.</strong> It persists enough
+                evidence to rebuild model history, context baselines, token
+                usage, rollback state, and fork starting points.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                This article describes public openai/codex source: rollout
+                schema, recorder behavior, session initialization, resume,
+                fork, rollback, reconstruction, and tests. It does not infer
+                private backend storage behavior or treat local rollout paths as
+                a public interface.
+              </p>
+            </div>
+
+            <p>This part follows six questions:</p>
+            <ol>
+              <li>Why is continuing a thread harder than showing old messages?</li>
+              <li>What does each <code>RolloutItem</code> variant own?</li>
+              <li>How does the writer queue, persist, flush, and recover from failed writes?</li>
+              <li>Why do resume and fork first become <code>InitialHistory</code>?</li>
+              <li>Why does reconstruction scan backward before replaying forward?</li>
+              <li>How do rollback, compaction, and prompt caching meet at this ledger?</li>
+            </ol>
+
+            <h2>1. Continuing Has Three Surfaces</h2>
+            <p>
+              A client needs visible facts. The next model request needs ordered
+              input. The runtime also needs a context baseline: working
+              directory, sandbox, permission profile, model, collaboration mode,
+              and the latest full-context checkpoint. Those surfaces overlap,
+              but they cannot collapse into one saved string.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Recovered surface</th>
+                    <th>Visible layer</th>
+                    <th>Runtime requirement</th>
+                    <th>Rollout role</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Client state</td>
+                    <td>User messages, tool progress, warnings, rollback events.</td>
+                    <td>Event order, turn boundaries, resume/fork source.</td>
+                    <td>Persist <code>EventMsg</code> for projection replay.</td>
+                  </tr>
+                  <tr>
+                    <td>Model history</td>
+                    <td>Messages and tool results the model should see.</td>
+                    <td>Compacted replacement history and surviving suffix.</td>
+                    <td>Persist <code>ResponseItem</code> and <code>CompactedItem</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>Context baseline</td>
+                    <td>cwd, sandbox, permissions, model, collaboration mode.</td>
+                    <td>The last durable full-context baseline.</td>
+                    <td>Persist <code>TurnContextItem</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>Thread identity</td>
+                    <td>Thread id, source, parent and fork lineage.</td>
+                    <td>Resume keeps an id; fork creates a new id with lineage.</td>
+                    <td>Persist <code>SessionMeta</code>.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              This is why rollout connects earlier parts of the series. Client
+              projection, multi-agent spawning, context management, and prompt
+              cache discipline all rely on the same durable evidence chain.
+            </p>
+
+            <h2>2. Five Rollout Items, Five Owners</h2>
+            <p>
+              The protocol defines five rollout variants:
+              <code>SessionMeta</code>, <code>ResponseItem</code>,
+              <code>Compacted</code>, <code>TurnContext</code>, and
+              <code>EventMsg</code>. Each JSONL line also carries a timestamp,
+              so the file can be appended and later read back as a typed stream.
+            </p>
+
+            <pre><code class="language-text">shape-level rollout:
+SessionMeta      thread id / lineage / source / base instructions
+EventMsg         TurnStarted / UserMessage / Tool / ThreadRolledBack / ...
+TurnContext      cwd / sandbox / permissions / model / collaboration mode
+ResponseItem     model-visible messages and tool call results
+Compacted        summary + replacement_history + window_id</code></pre>
+
+            <p>
+              <code>TurnContextItem</code> is easy to miss. Its source comment
+              says it is persisted once per real user turn after model-visible
+              context updates are computed, and again after mid-turn compaction
+              when replacement history re-establishes full context. That is how
+              resume and fork recover the latest durable baseline.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <code>CompactedItem</code> is not only a summary. With
+                <code>replacement_history</code>, it becomes a complete base for
+                future reconstruction. With <code>window_id</code>, it reconnects
+                auto-compaction accounting.
+              </p>
+            </div>
+
+            <h2>3. Writes Queue Before They Become Durable</h2>
+            <p>
+              New and resumed sessions initialize the recorder differently. A
+              new session precomputes rollout path and session metadata, but it
+              can defer file creation until <code>persist()</code>. A resumed
+              session opens the existing rollout for append immediately.
+            </p>
+
+            <p>
+              Actual writes go through a background writer task. The recorder
+              sends <code>AddItems</code>, <code>Persist</code>,
+              <code>Flush</code>, and <code>Shutdown</code> commands. Items live
+              in <code>pending_items</code> until they are written successfully.
+              If I/O fails, the writer drops the file handle, keeps the unwritten
+              suffix, and retries after reopening at the next durability barrier.
+            </p>
+
+            <pre><code class="language-text">writer discipline:
+record_canonical_items(items) -> queue AddItems
+persist()                   -> materialize file + write pending
+flush()                     -> durability barrier for rollback/fork/resume
+shutdown()                  -> final drain before exit</code></pre>
+
+            <p>
+              This explains the flushes in fork and rollback paths. A snapshot
+              is only meaningful if it is based on facts that have reached the
+              durable stream.
+            </p>
+
+            <h2>4. Resume and Fork Enter Through InitialHistory</h2>
+            <p>
+              Session startup normalizes all starting points into
+              <code>InitialHistory</code>: <code>New</code>,
+              <code>Cleared</code>, <code>Resumed(ResumedHistory)</code>, and
+              <code>Forked(Vec&lt;RolloutItem&gt;)</code>. New and cleared sessions
+              defer initial context insertion until the first real turn.
+              Resumed and forked sessions create a default turn context and call
+              <code>apply_rollout_reconstruction</code>.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Start</th>
+                    <th>Thread id</th>
+                    <th>History source</th>
+                    <th>Startup behavior</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>New</code> / <code>Cleared</code></td>
+                    <td>Fresh id</td>
+                    <td>No prior rollout.</td>
+                    <td>Defer initial context to the first real turn.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Resumed</code></td>
+                    <td>Existing id</td>
+                    <td>Items read from rollout path.</td>
+                    <td>Rebuild history, settings, and token usage.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Forked</code></td>
+                    <td>Fresh id</td>
+                    <td>Snapshot items from the source thread.</td>
+                    <td>Rebuild history and copy forked rollout items.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Resume also warns when the last recorded model differs from the
+              current model. Reconstruction can restore the shape of history,
+              but changing models can still change context windows, cache
+              behavior, and runtime performance.
+            </p>
+
+            <h2>5. Reconstruction Scans Backward, Then Replays Forward</h2>
+            <p>
+              <code>reconstruct_history_from_rollout</code> does not replay the
+              whole file from the first line. It first scans newest-to-oldest.
+              The scan looks for the newest surviving replacement-history
+              checkpoint, previous turn settings, reference context item, and
+              window id. Once those are known, older items cannot affect the
+              rebuilt state.
+            </p>
+
+            <p>
+              Rollback becomes a counter during this reverse pass.
+              <code>ThreadRolledBack</code> means “drop the newest N real user
+              turns.” In reverse, that means skipping the next N finalized turn
+              segments that actually contain a user message. Tests cover the
+              distinction: standalone task turns should not consume rollback
+              skips.
+            </p>
+
+            <p>
+              After the checkpoint is found, Codex replays the surviving suffix
+              forward. <code>ResponseItem</code>s are recorded into
+              <code>ContextManager</code>. Compactions with
+              <code>replacement_history</code> replace history. Legacy
+              compactions without replacement history take a compatibility path.
+              <code>ThreadRolledBack</code> applies
+              <code>drop_last_n_user_turns</code>.
+            </p>
+
+            <pre><code class="language-text">reconstruction:
+reverse scan
+  find newest surviving replacement_history
+  recover previous_turn_settings
+  recover reference_context_item
+  account for ThreadRolledBack markers
+
+forward replay
+  seed ContextManager from replacement_history
+  append surviving ResponseItem suffix
+  apply rollback markers to the rebuilt history</code></pre>
+
+            <div class="note key-point">
+              <p>
+                The shape matters. The reverse pass avoids interpreting old log
+                prefixes after a surviving checkpoint. The forward pass preserves
+                the exact ordering semantics of the live tail.
+              </p>
+            </div>
+
+            <h2>6. Rollback Adds a Marker, Then Replay Interprets It</h2>
+            <p>
+              Rollback rejects <code>num_turns == 0</code> and refuses to run
+              while a turn is active. It then requires persisted thread history,
+              flushes pending writes, loads stored history, appends a temporary
+              <code>ThreadRolledBack</code> event, and runs the same
+              reconstruction path. After that, it persists the rollback marker
+              and flushes again.
+            </p>
+
+            <p>
+              The older facts remain in the append-only stream. The current
+              world is the replay result of those facts plus the rollback marker.
+              A later resume sees the same marker and computes the same trimmed
+              history.
+            </p>
+
+            <p>
+              Integration tests check this through compaction. Rolling back a
+              post-compaction turn should keep the first turn and compaction
+              summary visible while removing the edited post-compaction turn.
+              Another test checks that rolled-back context updates do not linger
+              in the next request.
+            </p>
+
+            <h2>7. Fork Copies Replayable History</h2>
+            <p>
+              Fork shares the recovery machinery with resume, but lineage is
+              different. Resume keeps the old thread id. Fork creates a new id
+              while recording <code>forked_from_thread_id</code>. The manager
+              reads rollout-backed history, shapes it with
+              <code>fork_history_from_snapshot</code>, and starts a new thread.
+            </p>
+
+            <p>
+              Subagent spawning makes the durability requirement explicit: it
+              materializes and flushes the source rollout before reading stored
+              history. The child does not inherit a loose in-memory object; it
+              inherits a segment of rollout items that can be interpreted as
+              <code>InitialHistory::Forked</code>.
+            </p>
+
+            <h2>8. The Prompt Cache Connection</h2>
+            <p>
+              Part IX argued that prompt cache hits depend on stable request
+              shape. Recovery preserves the precondition for that stability.
+              <code>TurnContextItem</code> tells the runtime what context has
+              already been established. <code>CompactedItem.replacement_history</code>
+              gives history a new base. Rollback markers trim the tail
+              consistently.
+            </p>
+
+            <p>
+              If recovery were based only on visible transcript text, Codex
+              could re-inject full context as repeated diffs or carry rolled-back
+              tool output into the next model view. That would be a semantic bug
+              and a prompt-cache-shape bug. The compact/resume/fork tests assert
+              that compacted input prefixes remain predictable across recovery.
+            </p>
+
+            <h2>9. What to Carry Forward</h2>
+            <p>
+              Rollout/recovery gives a useful agent-design rule:
+              <strong>a long-running agent should persist replayable facts, not
+              only final state snapshots.</strong>
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Rule</th>
+                    <th>Codex mechanism</th>
+                    <th>Result</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Append facts</td>
+                    <td><code>RolloutLine</code> timestamp plus typed item.</td>
+                    <td>Recovery, audit, and rollback share one evidence chain.</td>
+                  </tr>
+                  <tr>
+                    <td>Separate owners</td>
+                    <td>History, context, session meta, and events are distinct.</td>
+                    <td>Client projection and model view can rebuild differently.</td>
+                  </tr>
+                  <tr>
+                    <td>Checkpoint history</td>
+                    <td><code>replacement_history</code> after compaction.</td>
+                    <td>Long threads can resume from a newer base.</td>
+                  </tr>
+                  <tr>
+                    <td>Use semantic markers</td>
+                    <td><code>ThreadRolledBack</code> as an appended event.</td>
+                    <td>Old facts remain; replay computes the current world.</td>
+                  </tr>
+                  <tr>
+                    <td>Flush before snapshots</td>
+                    <td>Fork, rollback, and shutdown use durability barriers.</td>
+                    <td>Snapshots are based on persisted facts.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The internal loop is now almost complete: requests enter the
+              runtime, context forms the model view, tools create side effects,
+              events project to clients, rollout persists the evidence, and
+              recovery turns that evidence back into a usable next turn. The next
+              part should look at the public edge: how SDK and app-server callers
+              enter the same runtime.
+            </p>
+          </section>
+
+          <section id="sources" class="article-body">
+            <h2>Sources</h2>
+            <ul>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2361-L2374"><code>InitialHistory</code> and <code>ResumedHistory</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2899"><code>RolloutItem</code> and <code>CompactedItem</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2920-L2963"><code>TurnContextItem</code> persistence comment and fields</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L662-L780"><code>RolloutRecorder::new</code> create and resume paths</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L786-L927"><code>record_canonical_items</code>, <code>persist</code>, <code>flush</code>, and rollout loading</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L1409-L1577">writer pending queue, recovery mode, and retry behavior</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L1580-L1641">writer command loop and <code>SessionMeta</code> write</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L1222-L1335"><code>record_initial_history</code> and <code>apply_rollout_reconstruction</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/rollout_reconstruction.rs#L93-L323"><code>reconstruct_history_from_rollout</code> reverse scan and forward replay</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/handlers.rs#L450-L540"><code>thread_rollback</code> and rollback marker persistence</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/thread_manager.rs#L688-L738">resuming a thread from rollout path</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/thread_manager.rs#L861-L969">forking a thread and <code>forked_from_thread_id</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/compact_resume_fork.rs#L128-L282">test: compact / resume / fork preserve model-visible history prefix</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/compact_resume_fork.rs#L421-L509">test: rollback past compaction replays append-only history</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen ? `${base}-${seen + 1}` : base;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          link.dataset.index = index;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (const knownLevel of [2, 3, 4]) {
+            if (knownLevel > level) lastItems.delete(knownLevel);
+          }
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (!visible.length) return;
+            const id = visible[0].target.id;
+            links.forEach((link) => {
+              link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+            });
+          },
+          { rootMargin: "-18% 0px -68% 0px", threshold: 0.01 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
