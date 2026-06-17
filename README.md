@@ -35,6 +35,8 @@ separate mechanisms.
   [Claude Code 源码阅读（二）：上下文快爆了，Claude Code 不是直接总结](https://rememorio.github.io/blog/claude-code/zh/context-management/)
 - Chinese tools:
   [Claude Code 源码阅读（三）：工具调用不是执行命令，而是运行时合约](https://rememorio.github.io/blog/claude-code/zh/tools/)
+- Chinese permissions:
+  [Claude Code 源码阅读（四）：权限不是弹窗，而是副作用刹车](https://rememorio.github.io/blog/claude-code/zh/permissions/)
 
 ### Codex Source Notes
 
@@ -119,6 +121,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/overview/            # Chinese series overview article
 │   ├── zh/context-management/  # Chinese context-management article
 │   ├── zh/tools/               # Chinese tools-runtime article
+│   ├── zh/permissions/         # Chinese permissions article
 │   └── assets/*.png            # Final raster figures
 ├── codex/
 │   ├── index.html              # Language gateway
@@ -178,6 +181,7 @@ Then open:
 - `http://127.0.0.1:4173/claude-code/zh/overview/`
 - `http://127.0.0.1:4173/claude-code/zh/context-management/`
 - `http://127.0.0.1:4173/claude-code/zh/tools/`
+- `http://127.0.0.1:4173/claude-code/zh/permissions/`
 - `http://127.0.0.1:4173/codex/`
 - `http://127.0.0.1:4173/codex/zh/overview/`
 - `http://127.0.0.1:4173/codex/en/overview/`
