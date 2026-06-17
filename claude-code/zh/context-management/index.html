@@ -35,6 +35,11 @@
         color: var(--rose);
       }
 
+      .note.reading-contract {
+        border-color: rgba(31, 119, 123, 0.32);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
       .shape-example {
         margin: 28px 0;
       }
@@ -104,6 +109,8 @@
 
           <section class="article-body">
             <p>
+              <a href="../overview/">上一篇</a>先把一次任务从 CLI、REPL、队列一路跟到 <code>query()</code>。
+              这一篇就停在 <code>query()</code> 每次发模型请求之前和 compact 之后，看 Claude Code 怎样决定“下一次模型到底看见什么”。
               先看一个很普通的场景。你让 Claude Code 修一个线上 bug。它先读项目里的 <code>CLAUDE.md</code>，
               又看 <code>git status</code>，接着 <code>Read</code> 几个文件、<code>Grep</code> 一圈、跑测试、贴日志、
               再改代码。中途你补一句“别改生成文件”。这时上下文窗口越来越满，模型并不是突然“忘了”，而是运行时开始做选择：
@@ -120,6 +127,14 @@
               <p>
                 这篇的核心结论先说出来：Claude Code 的上下文管理不是一把剪刀，而是一条减压流水线。
                 它先构造 model-visible view，再用多层机制降低窗口压力，最后才用 compact 建立新的恢复点。
+              </p>
+            </div>
+
+            <div class="note reading-contract">
+              <p>
+                <strong>阅读契约：</strong>这篇只追踪三组 owner：UI / transcript / runtime / API view 谁拥有哪份历史；
+                tool result、cache edit、compact summary 哪些是有损替换；compact 之后哪些上下文稳定保留、哪些重新加载、哪些只在条件满足时触发。
+                读完应该能回答：下一轮模型请求看到什么，本地还保存什么，什么已经被 summary 或投影改写。
               </p>
             </div>
 
@@ -307,6 +322,39 @@ messages = [
               而是把要删除的 tool result 排成 <code>cache_edits</code>，等 API 层插入请求。
             </p>
 
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>路径</th>
+                    <th>什么时候触发</th>
+                    <th>改哪一层</th>
+                    <th>保护的东西</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>time-based microcompact</td>
+                    <td>距离上次主循环 assistant message 超过阈值，缓存前缀已经偏冷。</td>
+                    <td>直接把旧工具结果正文替换成占位文本。</td>
+                    <td>减少下一次要重写的 prompt 体积。</td>
+                  </tr>
+                  <tr>
+                    <td>cached microcompact</td>
+                    <td>cache editing 可用、模型支持、并且是主线程请求。</td>
+                    <td>本地 message 不变，只把 <code>cache_edits</code> 交给 API 层。</td>
+                    <td>保留热前缀的复用路径，同时让模型视图删除旧工具结果。</td>
+                  </tr>
+                  <tr>
+                    <td>不触发</td>
+                    <td>外部构建、非支持模型、subagent、或没有达到阈值。</td>
+                    <td><code>microcompactMessages()</code> 原样返回 messages。</td>
+                    <td>避免在不确定 owner 的路径上改主线程状态，后续压力交给 auto compact。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
             <div class="note">
               <p>
                 这里有个很容易读错的点：microcompact 不是“把整段会话总结”。它处理的是旧工具结果这种高占用、低语义密度的内容。
@@ -417,6 +465,22 @@ fire-and-forget fork:
               如果 summary 过程中还能调用工具，compact 本身就会制造新的上下文压力，甚至改变当前任务状态。
             </p>
 
+            <figure class="shape-example">
+              <pre><code>shape-level:
+
+compact summary request =
+  stripped conversation messages
+  + compact prompt(no tools)
+
+assistant output =
+  &lt;analysis&gt; ... &lt;/analysis&gt;
+  &lt;summary&gt; ... &lt;/summary&gt;
+
+installed message =
+  compact summary user message</code></pre>
+              <figcaption>这里展示的是 compact summary 的请求契约：summary 文本会被安装成下一轮的恢复消息，工具调用和运行时 marker 不属于同一层。</figcaption>
+            </figure>
+
             <h3>3.3 compact 前会先把不该进 summary 的东西拿掉</h3>
             <p>
               生成 summary 之前，源码还有一些很实际的清洁动作。
@@ -456,6 +520,15 @@ fire-and-forget fork:
   + hookResults</code></pre>
               <figcaption>这个顺序就是下一轮恢复顺序：先知道旧账已结束，再读摘要，再补回必要附件和 hook 结果。</figcaption>
             </figure>
+
+            <p>
+              这里的 <code>messagesToKeep?</code> 是可选保留段，不代表 compact 会把旧历史原样留住。
+              对于需要保留最近后缀的路径，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L349-L367"><code>annotateBoundaryWithPreservedSegment()</code></a>
+              会把保留段的 head、anchor、tail 写进 boundary metadata，方便加载时重新接链。
+              普通 full compact 的主语义仍然是 boundary + summary + attachments + hookResults：
+              先立恢复点，再有限恢复继续工作需要的材料。
+            </p>
 
             <p>
               回到 <code>query()</code>，如果拿到 <code>compactionResult</code>，
