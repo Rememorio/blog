@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Code 源码阅读（五）：命令、Skills 与 MCP，能力是怎样进上下文的</title>
+    <meta
+      name="description"
+      content="沿 Claude Code 公开镜像源码拆解命令、Skills 与 MCP：getCommands、Slash command、SkillTool、MCP 连接、AppState.mcp、assembleToolPool 和每轮 fresh context。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Claude Code 源码阅读（五）：命令、Skills 与 MCP，能力是怎样进上下文的" />
+    <meta
+      property="og:description"
+      content="命令、Skills 和 MCP 不是三套孤立能力，而是先进入目录，再按用户入口或模型入口进入本轮上下文。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/commands-skills-mcp-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/zh/commands-skills-mcp/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/commands-skills-mcp/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/claude-code/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.reading-contract {
+        border-color: rgba(31, 119, 123, 0.32);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .shape-example {
+        margin: 28px 0;
+      }
+
+      .shape-example pre {
+        margin-bottom: 8px;
+      }
+
+      .article-body pre code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .shape-example figcaption {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../permissions/">权限</a>
+        <a href="../">Claude Code</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Claude Code 源码阅读 · 第五篇</p>
+            <h1>命令、Skills 与 MCP，能力是怎样进上下文的</h1>
+            <p class="lead">
+              读到这里，Claude Code 的主线已经有了：用户输入进入队列，query loop 组织模型请求，工具执行受权限系统约束。
+              但还有一个更容易被低估的问题：这些能力从哪来？为什么有的能力是用户敲 <code>/compact</code> 触发，
+              有的能力是模型自己调用 <code>SkillTool</code>，还有的能力来自 MCP 服务器？
+            </p>
+            <div class="meta-line">
+              <span>项目：Claude Code</span>
+              <span>主题：commands / skills / MCP</span>
+              <span>范围：公开镜像源码与官方文档</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/commands-skills-mcp-cover.png"
+                alt="Claude Code commands skills MCP 能力目录图，展示 built-in commands、skills、plugin commands、MCP prompts tools 汇入 command list 和 tool pool，再进入 slash、SkillTool、MCPTool 与下一轮查询"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              <a href="../permissions/">上一篇</a>讲权限时，有个前提一直没展开：权限系统拦的是“工具调用”，
+              可工具调用并不只来自 Claude Code 内置工具。用户自己写的 slash command、项目里的 Skill、插件里的命令、
+              MCP 服务器暴露的 tools / prompts / resources，都会改变模型这一轮能看到什么、能调用什么。
+            </p>
+
+            <p>
+              所以这一篇不把 <code>/</code> 命令、Skills 和 MCP 分成三篇孤立介绍。
+              在源码里，它们更像一套“能力目录系统”的不同入口：<strong>先把能力加载成命令表或工具池，再决定它是用户主动触发，
+              还是模型在回合中主动调用。</strong>
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这一篇的主线可以压成一句话：<code>getCommands()</code> 负责把本地、插件、workflow、skills
+                汇成命令目录；MCP 连接把 tools / commands / resources 写入 <code>AppState.mcp</code>；
+                REPL 在每轮查询前从 store 里重新组装 <code>commands</code>、<code>tools</code> 和 MCP clients。
+                用户敲 <code>/xxx</code> 走 slash command，模型想用 prompt 型能力走 <code>SkillTool</code>，
+                模型想调用外部服务器动作走 MCPTool。
+              </p>
+            </div>
+
+            <div class="note reading-contract">
+              <p>
+                <strong>阅读契约：</strong>这篇只追能力进入上下文的路径：命令目录从哪里加载，slash command
+                怎样把用户输入变成消息或本地动作，SkillTool 为什么只接受 prompt 型能力，MCP 为什么要先进入
+                <code>AppState.mcp</code> 再进入工具池。配置教程、MCP 协议细节和插件市场策略不展开。
+              </p>
+            </div>
+
+            <p>
+              产品层证据来自 Claude Code 的
+              <a href="https://docs.anthropic.com/en/docs/claude-code/slash-commands">slash commands 文档</a>、
+              <a href="https://docs.anthropic.com/en/docs/claude-code/skills">skills 文档</a>、
+              <a href="https://docs.anthropic.com/en/docs/claude-code/mcp">MCP 文档</a>；
+              源码层来自
+              <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
+              本文只把客户端源码可见的加载、过滤、调用和上下文刷新写成事实；MCP server 的内部实现不从客户端代码里硬推。
+            </p>
+
+            <p>这篇回答五个问题：</p>
+            <ol>
+              <li><code>getCommands()</code> 到底加载了哪些来源，为什么不是只有 <code>/commands</code>？</li>
+              <li>用户输入 <code>/xxx</code> 后，什么时候是本地 UI，什么时候是本地 stdout，什么时候会进模型？</li>
+              <li>SkillTool 为什么能让模型主动调用 skill，但又不会把所有 slash command 都暴露出去？</li>
+              <li>MCP 连接后，tools、prompts、resources 怎样写进 <code>AppState.mcp</code>？</li>
+              <li>为什么每轮 query 前都要 fresh read，而不是复用旧 closure 里的工具列表？</li>
+            </ol>
+
+            <h2>一、先分清两张表：命令表和工具池</h2>
+            <p>
+              很多人第一次看 Claude Code 的扩展能力，会下意识把所有东西都叫“工具”。
+              但源码里至少有两张重要的表：一张是 <strong>命令表</strong>，一张是 <strong>工具池</strong>。
+              命令表面向 slash command、skills、prompt expansion；工具池面向模型 API 的 tool schema 和后续 tool_use。
+            </p>
+
+            <p>
+              命令表的入口在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/commands.ts#L353-L398"><code>getSkills()</code></a>
+              和
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/commands.ts#L445-L517"><code>getCommands()</code></a>。
+              工具池的入口在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools.ts#L345-L367"><code>assembleToolPool()</code></a>
+              和
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolPool.ts#L55-L79"><code>mergeAndFilterTools()</code></a>。
+              MCP 同时会影响两边：MCP prompts / skills 可以进命令表，MCP tools 会进工具池。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/command-loading-sources.png"
+                alt="Claude Code getCommands 加载来源图，展示 bundled skills、built-in plugin skills、skills directory、workflow commands、plugin commands、plugin skills、COMMANDS 和 dynamic skills 汇入 loadAllCommands"
+              />
+              <figcaption><code>getCommands()</code> 不是只读一个目录，而是把多种能力来源先汇成命令目录，再按可用性过滤。</figcaption>
+            </figure>
+
+            <h3>1.1 <code>getCommands()</code> 不是只加载 slash commands</h3>
+            <p>
+              <code>loadAllCommands(cwd)</code> 同时拉取 <code>bundledSkills</code>、<code>builtinPluginSkills</code>、
+              <code>skillDirCommands</code>、<code>workflowCommands</code>、<code>pluginCommands</code>、
+              <code>pluginSkills</code> 和内置 <code>COMMANDS()</code>。这就是为什么一个 command 既可能来自源码内置，
+              也可能来自技能目录、插件或 workflow。
+            </p>
+
+            <p>
+              这里有两个细节很有意思。第一，加载本身按 <code>cwd</code> memoize，因为磁盘读取、插件加载和动态 import 都贵。
+              第二，<code>meetsAvailabilityRequirement()</code> 和 <code>isCommandEnabled()</code> 每次调用都重新过滤，
+              因为登录状态、provider、feature gate 可能在会话中变化。也就是说，底层能力列表可以缓存，但“当前用户能不能看见”不能偷懒。
+            </p>
+
+            <h3>1.2 dynamic skills 插在内置命令前面</h3>
+            <p>
+              <code>getCommands()</code> 还会把运行中发现的 dynamic skills 合并进去，并且去重。
+              如果列表里有内置命令，它会把 dynamic skills 插到内置命令前面。
+              这个位置很讲究：动态发现的能力比内置命令更贴近当前项目，但又不能覆盖已有同名 command。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>来源</th>
+                    <th>进入哪张表</th>
+                    <th>用途</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>内置 <code>COMMANDS()</code></td>
+                    <td>命令表</td>
+                    <td>Claude Code 自带的 <code>/help</code>、<code>/compact</code> 等能力。</td>
+                  </tr>
+                  <tr>
+                    <td><code>skills/</code>、bundled skills、plugin skills</td>
+                    <td>命令表，也可能进入 SkillTool 列表</td>
+                    <td>可被用户或模型按条件触发的 prompt 型能力。</td>
+                  </tr>
+                  <tr>
+                    <td>MCP prompts / skills</td>
+                    <td><code>AppState.mcp.commands</code>，再合并进命令视图</td>
+                    <td>来自 MCP server 的 prompt 能力。</td>
+                  </tr>
+                  <tr>
+                    <td>MCP tools</td>
+                    <td>工具池</td>
+                    <td>进入模型 tool schema，作为外部服务器动作被调用。</td>
+                  </tr>
+                  <tr>
+                    <td>MCP resources</td>
+                    <td><code>mcpResources</code></td>
+                    <td>作为可读资源进入上下文或资源读取工具。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>二、Slash command 是用户主动入口</h2>
+            <p>
+              用户敲 <code>/xxx</code> 之后，入口在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/slashCommandParsing.ts#L25-L60"><code>parseSlashCommand()</code></a>
+              和
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/processUserInput/processSlashCommand.tsx#L309-L524"><code>processSlashCommand()</code></a>。
+              这条路径先解析命令名和参数，再查当前 <code>context.options.commands</code>。
+              找不到命令时，源码还会判断它是不是文件路径；如果更像普通输入，就会回到正常 prompt，而不是粗暴报错。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/slash-command-path.png"
+                alt="Claude Code slash command 执行路径图，展示 parseSlashCommand、hasCommand、unknown skill、filepath fallback、local-jsx、local、prompt 三种命令类型"
+              />
+              <figcaption>Slash command 是用户按下的入口：同样是 <code>/xxx</code>，后面可能是 UI、本地输出，也可能是 prompt expansion。</figcaption>
+            </figure>
+
+            <h3>2.1 找到命令以后，分成三类执行</h3>
+            <p>
+              <code>getMessagesForSlashCommand()</code> 根据 command type 分三路：
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/processUserInput/processSlashCommand.tsx#L550-L655"><code>local-jsx</code></a>
+              会加载 Ink UI，让命令自己通过 callback 返回结果；
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/processUserInput/processSlashCommand.tsx#L657-L722"><code>local</code></a>
+              会跑本地函数并把 stdout/stderr 写成 local command message；
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/processUserInput/processSlashCommand.tsx#L723-L760"><code>prompt</code></a>
+              会生成给模型看的 command message，或者在 <code>context: fork</code> 时启动 forked sub-agent。
+            </p>
+
+            <p>
+              这个分类解释了一个常见现象：不是所有 <code>/</code> 命令都会触发模型请求。
+              <code>/help</code> 这类 UI 命令可以只改本地界面，<code>/cost</code> 这类 local 命令可以只显示本地结果，
+              而 prompt 型命令才会把扩展后的内容塞进对话，进入下一轮 query。
+            </p>
+
+            <h3>2.2 Slash command 可以给本轮附带 model、effort、allowedTools</h3>
+            <p>
+              prompt 型 slash command 的返回结果里可以带 <code>allowedTools</code>、<code>model</code> 和 <code>effort</code>。
+              REPL 在真正发起 query 前，会把 slash-command-scoped allowed tools 写进当前回合的 permission context；
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2701-L2726">这段注释</a>
+              说得很直白：它只应该作用在本轮，下一次非 skill 回合会清掉，避免旧 skill 的工具权限漏到新回合。
+            </p>
+
+            <p>
+              所以 slash command 不是简单文本替换。它可以改变本轮模型、思考强度和工具权限，但这些改变都要被限定在一次 query 的边界里。
+            </p>
+
+            <h2>三、SkillTool 是模型主动入口</h2>
+            <p>
+              Slash command 是用户主动按下的入口；<code>SkillTool</code> 则是模型主动调用 prompt 型能力的入口。
+              它本身是一个普通 tool，定义在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/SkillTool/SkillTool.ts#L331-L430"><code>SkillTool.ts</code></a>。
+              模型传入 <code>skill</code> 和可选 <code>args</code>，客户端再查命令表、验证类型、做权限检查、执行 prompt expansion。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/skill-tool-index.png"
+                alt="Claude Code SkillTool 模型主动调用技能图，展示 model sees skill index、SkillTool input、getAllCommands 合并 local commands 和 MCP skills、inline prompt injection、fork runAgent 和 tool_result"
+              />
+              <figcaption><code>SkillTool</code> 把 prompt 型能力变成模型可调用工具；它不是让模型任意执行所有 slash command。</figcaption>
+            </figure>
+
+            <h3>3.1 SkillTool 只接受 prompt 型能力</h3>
+            <p>
+              <code>validateInput()</code> 会先去
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/SkillTool/SkillTool.ts#L77-L94"><code>getAllCommands(context)</code></a>
+              查找命令。这里专门把 <code>context.getAppState().mcp.commands</code> 里 <code>loadedFrom === "mcp"</code>
+              的 prompt command 合进来，因为普通 <code>getCommands()</code> 只覆盖本地和 bundled 侧能力。
+            </p>
+
+            <p>
+              但合进来不等于全都能用。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/SkillTool/SkillTool.ts#L398-L429">校验逻辑</a>
+              会拒绝不存在的 skill、<code>disableModelInvocation</code> 的 skill，以及非 <code>prompt</code> 类型的 command。
+              也就是说，模型能主动调用的是“声明为可模型调用的 prompt 型能力”，不是所有 <code>/</code> 命令。
+            </p>
+
+            <h3>3.2 权限仍然在 SkillTool 上生效</h3>
+            <p>
+              <code>SkillTool.checkPermissions()</code> 不是直接 allow。
+              它先查 SkillTool 自己的 deny rule，再查 allow rule；如果这个 skill 只使用 safe properties，可以自动 allow；
+              否则默认返回 ask，并提供把当前 skill 或前缀写入 local settings 的 suggestion。
+              相关代码在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/SkillTool/SkillTool.ts#L432-L578"><code>checkPermissions()</code></a>。
+            </p>
+
+            <p>
+              这和上一篇权限系统连上了：模型“知道可以用某个 skill”不等于客户端“允许它使用这个 skill”。
+              SkillTool 自己也是一个副作用入口，因为它可能进一步放大到文件读写、Bash、MCP 工具或 forked sub-agent。
+            </p>
+
+            <h3>3.3 inline 和 fork 是两种不同的运行形态</h3>
+            <p>
+              如果 command 声明 <code>context === "fork"</code>，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/SkillTool/SkillTool.ts#L118-L288"><code>executeForkedSkill()</code></a>
+              会准备 forked command context，然后通过 <code>runAgent()</code> 启动子 agent，最后把结果作为 SkillTool 的 tool result 返回。
+              如果不是 fork，则会调用
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/SkillTool/SkillTool.ts#L621-L775"><code>processPromptSlashCommand()</code></a>
+              生成新的 user messages，并通过 <code>contextModifier</code> 把 allowed tools 等限定到本轮。
+            </p>
+
+            <p>
+              这就是 SkillTool 最妙的地方：模型看到的是一个 tool call，客户端执行的却可能是“把 skill prompt 注入本轮”，
+              也可能是“开一个隔离的子 agent 跑完再回填结果”。对模型来说都是工具结果；对 runtime 来说是两套不同的上下文管理。
+            </p>
+
+            <h2>四、MCP 先进入 AppState，再进入工具池</h2>
+            <p>
+              MCP 这条线最容易被理解成“配置一个 server，然后多几个工具”。但从源码看，MCP 不是直接把工具塞到模型请求里。
+              它先建立 client 连接，拉取 tools / commands / resources，再批量写入 <code>AppState.mcp</code>。
+            </p>
+
+            <p>
+              连接管理在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/mcp/useManageMCPConnections.ts#L134-L143"><code>useManageMCPConnections()</code></a>。
+              这段 hook 负责初始化连接、注册生命周期回调、处理重连，并把每个 server 的状态、工具、命令和资源同步回 app state。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/mcp-tool-pool.png"
+                alt="Claude Code MCP 工具池图，展示 stdio SSE HTTP 连接到 MCP Client，拉取 tools、commands prompts、resources，写入 AppState.mcp，再进入 useMergedCommands、assembleToolPool、mcpResources 和 getToolUseContext"
+              />
+              <figcaption>MCP 的关键不是“多一个工具”，而是 server 连接状态先变成 <code>AppState.mcp</code> 里的 tools、commands 和 resources。</figcaption>
+            </figure>
+
+            <h3>4.1 MCP 状态更新是批量写回的</h3>
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/mcp/useManageMCPConnections.ts#L216-L291"><code>flushPendingUpdates()</code></a>
+              会把短时间内到来的 server updates 合并成一次 <code>setAppState</code>。
+              更新时，clients 按名字替换；tools 会先删掉同 server prefix 的旧工具再追加新工具；
+              commands 也会删掉属于同 server 的旧 command；resources 则按 server name 写进 map。
+            </p>
+
+            <p>
+              这说明 MCP 在客户端是一个会变化的运行时状态，而不是启动时一次性静态配置。
+              server 连接、失败、禁用、重连、刷新 prompts/tools，都可能改变下一轮上下文。
+            </p>
+
+            <h3>4.2 MCP tool 是包装过的 Claude Code tool</h3>
+            <p>
+              MCP tool 的基础定义在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/MCPTool/MCPTool.ts#L27-L77"><code>MCPTool</code></a>，
+              但真实工具名、schema、描述和 call 函数会在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/mcp/client.ts#L1743-L2000"><code>fetchToolsForClient()</code></a>
+              里根据 MCP server 返回的 tool 动态生成。源码还会限制描述长度、构造 fully qualified name、处理权限、调用 MCP tool、
+              截断或持久化大输出。
+            </p>
+
+            <p>
+              所以 MCPTool 更像一个模板。每个 server tool 进来以后，才被包装成 Claude Code 统一的 <code>Tool</code> 形状，
+              这样后面的权限、hook、UI 渲染、tool_result 配对才能复用同一条工具执行链路。
+            </p>
+
+            <h2>五、每轮 query 前都要 fresh read</h2>
+            <p>
+              最后把命令表和工具池接回 REPL 主线。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2392-L2437"><code>getToolUseContext()</code></a>
+              里有一段注释很关键：它不要 closure-captured 的旧 app state，而是从 store 里 fresh read。
+              原因也写在注释里：MCP server 可能异步连接，store 里已经有更新的 MCP state，而 React render 时捕获的 closure 可能还是旧的。
+            </p>
+
+            <h3>5.1 工具池先 assemble，再 merge/filter</h3>
+            <p>
+              <code>computeTools()</code> 先调用 <code>assembleToolPool(state.toolPermissionContext, state.mcp.tools)</code>。
+              这个函数会取内置工具、过滤 deny rules 下的 MCP tools、按名字去重，而且内置工具优先。
+              接着 <code>mergeAndFilterTools()</code> 把启动时工具和当前组装工具合并，再按内置/MCP 分区排序。
+            </p>
+
+            <p>
+              这里有个性能细节：排序不是为了好看，而是为了 prompt cache 稳定。
+              源码注释明确提到内置工具要保持连续前缀，避免 MCP tool 排序插进内置工具中间，导致后续 cache key 全部变化。
+              也就是说，能力扩展不仅影响“能不能调用”，还影响“系统提示词和工具 schema 的请求形状是否稳定”。
+            </p>
+
+            <h3>5.2 系统提示词也用 fresh tools 和 fresh MCP clients</h3>
+            <p>
+              真正发起 query 前，REPL 会再次从 <code>toolUseContext.options</code> 里取
+              <code>freshTools</code> 和 <code>freshMcpClients</code>，
+              再调用
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2746-L2772"><code>getSystemPrompt(freshTools, ... freshMcpClients)</code></a>。
+              这保证了系统提示词里的工具描述、MCP client 信息和实际执行时的工具池尽量对齐。
+            </p>
+
+            <p>
+              所以“能力进上下文”不是一个启动时事件，而是每一轮 query 前重新投影一次：
+              这一轮有哪些命令，哪些 tools 被 deny rule 过滤，哪些 MCP server 已经连上，哪些 agent tool 限制生效，
+              都要在这次 query 前重新算。
+            </p>
+
+            <h2>六、把三类入口压成一张对照表</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>入口</th>
+                    <th>谁触发</th>
+                    <th>先查什么</th>
+                    <th>最后进入哪里</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Slash command</td>
+                    <td>用户输入 <code>/xxx</code></td>
+                    <td><code>context.options.commands</code></td>
+                    <td>本地 UI、本地 stdout、prompt message 或 forked sub-agent。</td>
+                  </tr>
+                  <tr>
+                    <td>SkillTool</td>
+                    <td>模型发起 tool_use</td>
+                    <td>local commands + MCP skills</td>
+                    <td>inline prompt injection 或 forked skill result。</td>
+                  </tr>
+                  <tr>
+                    <td>MCPTool</td>
+                    <td>模型发起 tool_use</td>
+                    <td><code>AppState.mcp.tools</code> 组装后的工具池</td>
+                    <td>MCP client 调用外部 server，再回填 tool_result。</td>
+                  </tr>
+                  <tr>
+                    <td>MCP prompts / commands</td>
+                    <td>用户或模型，取决于 command 属性</td>
+                    <td><code>AppState.mcp.commands</code></td>
+                    <td>slash command 视图或 SkillTool skill index。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              到这里再看 Claude Code 的扩展能力，就不容易混在一起了：
+              slash command 是用户主动入口，SkillTool 是模型主动入口，MCP 是外部能力来源。
+              它们之所以能协同，是因为客户端把它们统一成两类运行时投影：命令表和工具池。
+            </p>
+
+            <p>
+              这也解释了为什么前几篇一直强调“模型视图”和“本地运行时”要分开看。
+              一个 skill 写在磁盘上，不代表模型已经看见；一个 MCP server 配好了，不代表工具已经进入本轮请求；
+              一个 command 出现在目录里，也不代表它能绕过权限。能力要真正生效，必须在本轮 query 前被加载、过滤、排序、注入，
+              最后还要穿过权限和工具执行链路。
+            </p>
+
+            <p>
+              后面读 subagent / fork 时，会继续沿着这条线走：当一个能力不是在主线程里执行，而是交给子 agent，
+              哪些上下文会被复制，哪些工具会被重算，哪些 skill 权限会被收窄？那时就会看到，所谓“多 agent”，本质仍然是上下文投影和工具边界的组合。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/claude-code/slash-commands">Claude Code slash commands 文档</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/claude-code/skills">Claude Code skills 文档</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/claude-code/mcp">Claude Code MCP 文档</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/commands.ts#L353-L398">commands.ts：getSkills</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/commands.ts#L445-L517">commands.ts：loadAllCommands and getCommands</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/commands.ts#L547-L579">commands.ts：SkillTool prompt command filter</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/commands.ts#L583-L607">commands.ts：slash command tool skills filter</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/slashCommandParsing.ts#L25-L60">slashCommandParsing.ts：parseSlashCommand</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/processUserInput/processSlashCommand.tsx#L309-L524">processSlashCommand.tsx：slash command dispatch</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/processUserInput/processSlashCommand.tsx#L550-L760">processSlashCommand.tsx：local-jsx, local and prompt command cases</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/SkillTool/SkillTool.ts#L77-L94">SkillTool.ts：getAllCommands including MCP skills</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/SkillTool/SkillTool.ts#L331-L430">SkillTool.ts：schema and validation</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/SkillTool/SkillTool.ts#L432-L578">SkillTool.ts：permission check</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/SkillTool/SkillTool.ts#L621-L775">SkillTool.ts：inline skill execution</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/mcp/useManageMCPConnections.ts#L134-L143">useManageMCPConnections.ts：MCP connection hook</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/mcp/useManageMCPConnections.ts#L216-L291">useManageMCPConnections.ts：batched app state updates</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/mcp/client.ts#L1743-L2000">mcp/client.ts：fetchToolsForClient</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/MCPTool/MCPTool.ts#L27-L77">MCPTool.ts：MCP tool template</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools.ts#L345-L367">tools.ts：assembleToolPool</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolPool.ts#L55-L79">toolPool.ts：mergeAndFilterTools</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2392-L2437">REPL.tsx：fresh tool use context</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2746-L2772">REPL.tsx：fresh tools and MCP clients for system prompt</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        headings.forEach((heading) => {
+          if (!heading.id) {
+            const base = slugify(heading.textContent);
+            const count = counts.get(base) || 0;
+            counts.set(base, count + 1);
+            heading.id = count ? `${base}-${count + 1}` : base;
+          }
+
+          const item = document.createElement("li");
+          item.className = `toc-${heading.tagName.toLowerCase()}`;
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent;
+          item.appendChild(link);
+          list.appendChild(item);
+        });
+        toc.appendChild(list);
+      })();
+    </script>
+  </body>
+</html>
