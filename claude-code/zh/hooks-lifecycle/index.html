@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Code 源码阅读（七）：Hooks 不是脚本回调，而是运行时关口</title>
+    <meta
+      name="description"
+      content="沿 Claude Code 公开镜像源码拆解 hooks 的生命周期位置、匹配规则、输出协议、工具权限交互、SessionStart、Stop 和 Compact 关口。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Claude Code 源码阅读（七）：Hooks 不是脚本回调，而是运行时关口" />
+    <meta
+      property="og:description"
+      content="Hooks 不是简单的 shell 回调，而是嵌在 prompt、tool、stop 和 compact 边界上的运行时关口。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/hook-lifecycle-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/zh/hooks-lifecycle/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/hooks-lifecycle/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/claude-code/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.reading-contract {
+        border-color: rgba(31, 119, 123, 0.32);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .shape-example {
+        margin: 28px 0;
+      }
+
+      .shape-example pre {
+        margin-bottom: 8px;
+      }
+
+      .article-body pre code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .shape-example figcaption {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../subagents-fork/">上一篇：子代理</a>
+        <a href="../">Claude Code</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Claude Code 源码阅读 · 第七篇</p>
+            <h1>Hooks 不是脚本回调，而是运行时关口</h1>
+            <p class="lead">
+              很多人第一次看 Claude Code hooks，会把它理解成“某个事件发生后跑一段脚本”。
+              这个理解只说对了一半。源码里的 hook 不只会打印 stdout，它还能在用户 prompt、工具执行、
+              Stop、Compact、SessionStart 这些边界上改变下一步能不能继续、给模型补上下文、改工具输入，
+              甚至替换 MCP 工具输出。
+            </p>
+            <div class="meta-line">
+              <span>项目：Claude Code</span>
+              <span>主题：Hooks / lifecycle / tool gates</span>
+              <span>范围：公开镜像源码与官方文档</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/hook-lifecycle-cover.png"
+                alt="Claude Code hooks 生命周期总览图，展示 SessionStart、prompt gate、model loop、tool gates、compact 和 Stop gate 与 model context 的关系"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              <a href="../subagents-fork/">上一篇</a>讲 subagent 时，已经碰到 <code>SubagentStart</code>、
+              <code>SubagentStop</code> 这些名字。它们不是孤立功能，而是 hooks 系统的一部分。
+              如果只把 hooks 当成“跑命令”，会错过一个更重要的事实：
+              <strong>hooks 是 Claude Code 在运行时边界上开放出来的可治理插槽。</strong>
+            </p>
+
+            <div class="note key-point">
+              <p>
+                本篇的主线很简单：先看 hook 事件和输入 schema 定义了哪些边界，再看
+                <code>getMatchingHooks()</code> 怎样把 settings、plugin、skill 和 session hooks 归并成待执行列表；
+                然后沿工具调用追 <code>PreToolUse</code> 与 <code>PostToolUse</code>，
+                最后把 <code>UserPromptSubmit</code>、<code>SessionStart</code>、<code>Stop</code>、
+                <code>PreCompact</code> 和 <code>PostCompact</code> 接回一次回合的生命周期。
+              </p>
+            </div>
+
+            <div class="note reading-contract">
+              <p>
+                <strong>阅读契约：</strong>这篇不做 hooks 配置教程，也不枚举所有事件。
+                我们只追四个 owner surface：输入关口、hook 匹配器、工具关口、stop/compact 关口。
+                读完以后，应该能回答三个问题：hook 的输出什么时候会进 model-visible context；
+                hook 的 allow 为什么不是越权通道；Compact 为什么也要跑 SessionStart hooks。
+              </p>
+            </div>
+
+            <p>
+              证据边界先放清楚。产品层契约参考 Claude Code 的
+              <a href="https://docs.anthropic.com/en/docs/claude-code/hooks">hooks 文档</a>；
+              源码层来自
+              <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
+              本文只描述客户端公开源码可见的行为。服务端怎样调度模型、怎样实现更深层安全策略，不在本文推断范围里。
+            </p>
+
+            <h2>一、先把 Hooks 放回一次回合里</h2>
+            <p>
+              Hooks 最容易被误读，是因为名字太像传统回调。回调通常让人想到“事件之后通知我一下”。
+              但 Claude Code 的 hook 事件表不是一串通知名，而是一张运行时边界表。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/entrypoints/sdk/coreSchemas.ts#L355-L383"><code>HOOK_EVENTS</code></a>
+              里同时有 <code>UserPromptSubmit</code>、<code>PreToolUse</code>、<code>PostToolUse</code>、
+              <code>PermissionRequest</code>、<code>SessionStart</code>、<code>Stop</code>、
+              <code>PreCompact</code>、<code>PostCompact</code>、<code>SubagentStart</code> 这些名字。
+              它们分布在一轮任务的不同位置，不是同一种“事后通知”。
+            </p>
+
+            <p>
+              输入 schema 也在强调这一点。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/entrypoints/sdk/coreSchemas.ts#L387-L410"><code>BaseHookInputSchema</code></a>
+              会给每个 hook 带上 <code>session_id</code>、<code>transcript_path</code>、<code>cwd</code>、
+              permission mode 和可选的 <code>agent_id</code> / <code>agent_type</code>。
+              工具类 hook 再追加 <code>tool_name</code>、<code>tool_input</code>、<code>tool_use_id</code>；
+              <code>SessionStart</code> 追加 <code>source</code>，<code>Stop</code> 追加 <code>last_assistant_message</code>，
+              <code>PreCompact</code> / <code>PostCompact</code> 追加 compact trigger 与 summary。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>边界</th>
+                    <th>hook 看到什么</th>
+                    <th>它能影响什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>UserPromptSubmit</code></td>
+                    <td>用户输入完成后的 prompt 文本。</td>
+                    <td>阻断本轮查询，或追加 <code>hook_additional_context</code>。</td>
+                  </tr>
+                  <tr>
+                    <td><code>PreToolUse</code></td>
+                    <td>工具名、工具输入、tool_use id。</td>
+                    <td>改输入、追加上下文、给权限层一个 allow/ask/deny 候选。</td>
+                  </tr>
+                  <tr>
+                    <td><code>PostToolUse</code></td>
+                    <td>工具名、工具输入、工具输出。</td>
+                    <td>追加上下文，或只对 MCP 工具替换输出。</td>
+                  </tr>
+                  <tr>
+                    <td><code>SessionStart</code></td>
+                    <td>启动来源：startup、resume、clear 或 compact。</td>
+                    <td>注入初始上下文、初始用户消息、文件 watch paths。</td>
+                  </tr>
+                  <tr>
+                    <td><code>Stop</code> / <code>Compact</code></td>
+                    <td>回合结束、压缩触发源和 compact summary。</td>
+                    <td>决定是否继续、合并 compact 指令、在压缩后补回上下文。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以第一层心智模型不是“某事件来了，执行脚本”，而是：
+              Claude Code 在关键边界把当前运行时快照交给 hook，hook 返回一份受限输出，
+              runtime 再决定哪些字段能进入下一步。
+            </p>
+
+            <h2>二、Hook 先被归并和匹配，才会执行</h2>
+            <p>
+              能不能跑 hook，第一步不是执行命令，而是归并配置。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1492-L1566"><code>getHooksConfig()</code></a>
+              会从 snapshot、registered hooks、session hooks、session function hooks 里收集当前事件的候选项。
+              policy 开启 managed-only 时，plugin hooks 和 session hooks 会被跳过，避免非受管 hook 绕过策略。
+            </p>
+
+            <h3>2.1 匹配条件来自事件本身</h3>
+            <p>
+              归并后还要匹配。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1603-L1874"><code>getMatchingHooks()</code></a>
+              会先为不同事件提取 <code>matchQuery</code>：工具事件用 <code>tool_name</code>，
+              <code>SessionStart</code> 用 <code>source</code>，compact 事件用 <code>trigger</code>，
+              notification 用 <code>notification_type</code>，subagent 事件用 <code>agent_type</code>。
+              这解释了为什么 hooks 配置里的 matcher 不是统一匹配同一个字段。
+            </p>
+
+            <p>
+              matcher 本身支持精确字符串、管道分隔列表和正则。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1337-L1381"><code>matchesPattern()</code></a>
+              还会兼容 legacy tool name。
+              另外，<a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1385-L1422"><code>if</code> 条件</a>
+              只在工具相关事件里求值，例如 <code>Bash(git *)</code> 这种条件要靠工具的 permission matcher 才能判断。
+            </p>
+
+            <h3>2.2 执行前还有信任与去重</h3>
+            <p>
+              <code>getMatchingHooks()</code> 会按来源去重 command、prompt、agent 和 HTTP hooks；
+              同一个命令在不同 plugin 或 skill 里不会被错误合并，同一来源里的重复项则会收敛。
+              真正执行时，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1952-L2013"><code>executeHooks()</code></a>
+              还会先检查全局禁用、simple mode、workspace trust，再用主 session 或当前 <code>agentId</code> 查匹配列表。
+              这说明 hook 不是绕开运行时的后门，它自己也被运行时治理。
+            </p>
+
+            <h2>三、工具门：PreToolUse 不是 permission 的后门</h2>
+            <p>
+              工具路径最能说明 hooks 的真实位置。
+              模型在流里吐出 <code>tool_use</code> 后，Claude Code 不是立刻调用工具。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L775-L862"><code>checkPermissionsAndCallTool()</code></a>
+              会先准备一个给 hooks 和 permission 使用的输入副本，再执行 <code>runPreToolUseHooks()</code>。
+              这个位置在权限决策之前，所以 PreToolUse 可以改输入、要求阻断、追加上下文，也可以给出一个权限行为候选。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/hook-tool-gate.png"
+                alt="Claude Code 工具调用关口图，展示 tool call 先经过 pre hooks、approval、sandbox、attempt、output，再写入 events 与 history"
+              />
+              <figcaption>PreToolUse 位于工具执行之前，PostToolUse 位于工具输出之后；两者都在工具合约内，而不是工具外的任意脚本。</figcaption>
+            </figure>
+
+            <h3>3.1 Hook allow 不会绕过 settings deny/ask</h3>
+            <p>
+              这里有个很容易误解的点：PreToolUse 返回 <code>allow</code>，不代表一定执行。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolHooks.ts#L321-L433"><code>resolveHookPermissionDecision()</code></a>
+              的注释直接写明了不变量：hook 的 allow 不会绕过 <code>settings.json</code> 里的 deny/ask 规则。
+              如果工具需要用户交互，或者运行时要求走 <code>canUseTool</code>，仍然会进入正常权限流；
+              如果规则检查命中 deny，deny 会覆盖 hook allow；如果命中 ask，仍然要弹权限询问。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/permission-decision-stack.png"
+                alt="Claude Code 权限决策栈图，展示 deny rule、ask rule、tool check、safety check、bypass mode、allow rule 和 final ask 的优先级"
+              />
+              <figcaption>Hook 给的是权限候选，不是最终裁决。最终裁决还要经过权限规则栈。</figcaption>
+            </figure>
+
+            <h3>3.2 PostToolUse 可以补上下文，但替换输出只限 MCP</h3>
+            <p>
+              工具执行结束后，<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolHooks.ts#L39-L190"><code>runPostToolUseHooks()</code></a>
+              会消费 <code>executePostToolHooks()</code> 的结果。它可以产出 blocking error、阻断后续继续、追加
+              <code>hook_additional_context</code>。
+              但 <code>updatedMCPToolOutput</code> 有一个明确限制：只有 <code>isMcpTool(tool)</code> 为真时才会生效。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L1481-L1541">工具执行层</a>
+              也在同一位置把 MCP 输出替换后再写入 tool result。
+            </p>
+
+            <p>
+              这条限制很关键。Hook 可以参与工具结果进入下一轮之前的处理，但不会让普通内置工具随便替换掉自己的输出。
+              运行时在这里守住的是工具结果的来源和可解释性。
+            </p>
+
+            <h2>四、输出协议：stdout 要先被解释</h2>
+            <p>
+              Hook 最后当然要输出东西。但 Claude Code 看的不是“stdout 里有什么字”，而是“stdout 能不能解析成约定输出”。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/types/hooks.ts#L49-L176"><code>syncHookResponseSchema</code> 和 <code>hookJSONOutputSchema</code></a>
+              定义了可被 runtime 识别的字段：<code>continue</code>、<code>stopReason</code>、
+              <code>decision</code>、<code>systemMessage</code>，以及按事件区分的
+              <code>hookSpecificOutput</code>。
+            </p>
+
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L399-L451"><code>parseHookOutput()</code></a>
+              的规则也很直白：stdout trim 后不是 <code>{</code> 开头，就按普通文本处理；
+              是 JSON 才会走 schema 校验。
+              校验后的结构进入
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L489-L737"><code>processHookJSONOutput()</code></a>，
+              再被翻译成 <code>HookResult</code>：阻断继续、permission behavior、updated input、
+              additional context、MCP output replacement、retry 等都在这里生成。
+            </p>
+
+            <p>
+              command hook 还有一个非 JSON 的阻断信号：
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L2499-L2697">执行结果处理</a>
+              会先尝试解析 JSON；如果不是 JSON，状态码 0 走成功，状态码 2 表示 blocking feedback，
+              其他非零状态码则作为 non-blocking error 展示给用户。
+              也就是说，stdout 是载体，JSON 是主要的结构化协议，exit code 2 是命令 hook 的简洁阻断通道。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>输出形态</th>
+                    <th>runtime 怎样看</th>
+                    <th>典型后果</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>普通 stdout</td>
+                    <td>不是 JSON 时，更多是显示和记录材料。</td>
+                    <td>不会自动变成权限决策或输入改写。</td>
+                  </tr>
+                  <tr>
+                    <td>command exit code 2</td>
+                    <td>非 JSON 分支里的 blocking feedback。</td>
+                    <td>生成 <code>blockingError</code>，阻断当前 hook 边界继续。</td>
+                  </tr>
+                  <tr>
+                    <td><code>{"continue": false}</code></td>
+                    <td>被翻译成 <code>preventContinuation</code>。</td>
+                    <td>当前边界阻断后续继续，可携带 <code>stopReason</code>。</td>
+                  </tr>
+                  <tr>
+                    <td><code>PreToolUse.updatedInput</code></td>
+                    <td>进入工具执行前的输入替换路径。</td>
+                    <td>要么跟随 allow/ask，要么以 passthrough 进入正常权限流。</td>
+                  </tr>
+                  <tr>
+                    <td><code>additionalContext</code></td>
+                    <td>聚合成 <code>hook_additional_context</code> attachment。</td>
+                    <td>可以进入后续 model-visible view。</td>
+                  </tr>
+                  <tr>
+                    <td><code>{"async": true}</code></td>
+                    <td>被 async hook 分支识别。</td>
+                    <td>同步边界不等到完整结果，但仍按 hook 执行状态记录。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              多个 hooks 同时命中时，还要聚合。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L2743-L2885"><code>executeHooks()</code> 的结果归并</a>
+              有一条关键优先级：permission behavior 按 <code>deny &gt; ask &gt; allow</code> 处理。
+              所以 hooks 之间不是谁最后输出谁赢，而是运行时按风险优先级归并。
+            </p>
+
+            <h2>五、Prompt、SessionStart、Stop、Compact 都在改边界</h2>
+            <p>
+              工具路径讲清楚后，再回头看非工具 hook，就更容易理解：它们不是工具钩子的旁支，
+              而是在另几个生命周期边界上做同样的事。
+            </p>
+
+            <h3>5.1 UserPromptSubmit 在查询前改输入边界</h3>
+            <p>
+              用户输入先走基础解析，再进入
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/processUserInput/processUserInput.ts#L178-L264"><code>executeUserPromptSubmitHooks()</code></a>。
+              如果 hook 返回 blocking error，源码会返回一个 warning，并把本轮 <code>shouldQuery</code> 设成 false；
+              如果返回 <code>preventContinuation</code>，它会保留原 prompt 在上下文里的位置，但停止查询；
+              如果有 <code>additionalContext</code>，就转成 <code>hook_additional_context</code> message。
+            </p>
+
+            <p>
+              这一步说明 hook 可以在模型看见 prompt 之前改变本轮上下文。它不是“模型回答之后再通知脚本”，
+              而是 prompt gate。
+            </p>
+
+            <h3>5.2 SessionStart 不是只在进程启动时跑</h3>
+            <p>
+              <code>SessionStart</code> 的 source 有 <code>startup</code>、<code>resume</code>、
+              <code>clear</code>、<code>compact</code>。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStart.ts#L34-L175"><code>processSessionStartHooks()</code></a>
+              会加载 plugin hooks，执行 SessionStart hooks，然后收集 <code>additionalContext</code>、
+              <code>initialUserMessage</code> 和 <code>watchPaths</code>。
+              最后，额外上下文会变成一个 <code>hook_additional_context</code> attachment。
+            </p>
+
+            <p>
+              所以 SessionStart 不是狭义“启动回调”。resume、clear 和 compact 后的 session 重新进入可运行状态时，
+              它也可以把需要的上下文补回来。
+            </p>
+
+            <h3>5.3 Stop hook 管的是回合结束，不是工具结束</h3>
+            <p>
+              <code>Stop</code> 发生在回合末尾。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query/stopHooks.ts#L65-L98"><code>handleStopHooks()</code></a>
+              会先构造 <code>REPLHookContext</code>，在主线程查询时保存 cache-safe params。
+              后面它还会启动一些回合结束的后台 bookkeeping，然后调用 <code>executeStopHooks()</code>。
+              Stop hook 如果阻断继续，会生成 <code>hook_stopped_continuation</code>，并把 summary message 回到消息流里。
+            </p>
+
+            <p>
+              这和 PostToolUse 的位置不同。PostToolUse 关心一个工具输出进入下一轮之前是否需要处理；
+              Stop hook 关心这一轮 assistant 已经停住之后，是否允许整个运行时收口。
+            </p>
+
+            <h3>5.4 Compact 前后都有 hook</h3>
+            <p>
+              Compact 更能证明 hooks 是生命周期关口。
+              在 full compact 里，源码先发出 <code>pre_compact</code> progress，
+              然后执行
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L406-L423"><code>executePreCompactHooks()</code></a>，
+              把 hook 产生的新指令合并进 custom instructions。
+              summary 生成完成、文件和工具相关 attachments 恢复后，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L587-L594">它还会以 <code>compact</code> 为 source 执行 SessionStart hooks</a>。
+              最后再执行
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L719-L729"><code>PostCompact</code> hooks</a>。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/compact-recovery-loop.png"
+                alt="Claude Code compact 恢复循环图，展示 trigger、pre hooks、summary fork、ledger、restore files memory tools 和 next turn"
+              />
+              <figcaption>Compact 不是把旧历史一删了事。PreCompact、SessionStart(compact) 和 PostCompact 分别卡在压缩前、恢复后和收尾处。</figcaption>
+            </figure>
+
+            <p>
+              这条链路解释了一个常见疑问：为什么 compact 后还要跑 SessionStart？
+              因为 compact 后的模型视图已经不是原始长历史，而是一份 summary、boundary、恢复 attachments 和 hook messages 组成的新起点。
+              这个新起点需要重新接上 session 级上下文。
+            </p>
+
+            <h2>六、怎么用：把 hook 当运行时关口，不当万能脚本</h2>
+            <p>
+              到这里可以把 hooks 的使用规则压成一张表。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>你想做什么</th>
+                    <th>应该选哪个 hook</th>
+                    <th>要守住的不变量</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>在用户 prompt 进模型前补项目上下文。</td>
+                    <td><code>UserPromptSubmit</code> 或 <code>SessionStart</code>。</td>
+                    <td>补的是 model-visible context，不要伪装成用户原话。</td>
+                  </tr>
+                  <tr>
+                    <td>工具执行前做参数清洗或风险拦截。</td>
+                    <td><code>PreToolUse</code>。</td>
+                    <td>updated input 要继续过工具 schema 和 permission。</td>
+                  </tr>
+                  <tr>
+                    <td>把某个工具输出变成下一轮可读提示。</td>
+                    <td><code>PostToolUse</code>。</td>
+                    <td>追加上下文可以通用；替换工具输出只对 MCP tool 生效。</td>
+                  </tr>
+                  <tr>
+                    <td>权限弹窗前自动给出 allow、ask 或 deny 候选。</td>
+                    <td><code>PreToolUse</code> / <code>PermissionRequest</code>。</td>
+                    <td>allow 不是越权，deny/ask 规则仍优先。</td>
+                  </tr>
+                  <tr>
+                    <td>回合结束时做收尾或阻断继续。</td>
+                    <td><code>Stop</code> / <code>SubagentStop</code>。</td>
+                    <td>这是 turn boundary，不是单个工具 boundary。</td>
+                  </tr>
+                  <tr>
+                    <td>compact 前改总结指令，compact 后补上下文。</td>
+                    <td><code>PreCompact</code>、<code>SessionStart(compact)</code>、<code>PostCompact</code>。</td>
+                    <td>compact 后是新 model view，要重新安装必要上下文。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以，Hooks 的关键不是“能跑脚本”。关键是 Claude Code 把脚本输出收进一份小协议，
+              再在每个生命周期边界只接受它该接受的影响。能补上下文的地方补上下文，
+              能改输入的地方改输入，能阻断继续的地方阻断继续，不能越过权限和工具合约的地方就不会越过去。
+            </p>
+
+            <p>
+              下一篇会继续沿这条“可继续运行”的线往后读：transcript、resume 和 session restore
+              为什么不是把旧聊天重新贴回窗口，而是恢复一套能继续执行的 runtime 状态。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/claude-code/hooks">Claude Code hooks 文档</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/entrypoints/sdk/coreSchemas.ts#L355-L383">coreSchemas.ts：HOOK_EVENTS</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/entrypoints/sdk/coreSchemas.ts#L387-L590">coreSchemas.ts：Hook input schemas</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/types/hooks.ts#L49-L176">types/hooks.ts：hook JSON output schema</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1337-L1422">hooks.ts：matcher and if condition matching</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1492-L1874">hooks.ts：hook config merge and matching</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1952-L2885">hooks.ts：executeHooks and aggregation</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L775-L932">toolExecution.ts：PreToolUse before permission</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolHooks.ts#L321-L433">toolHooks.ts：resolveHookPermissionDecision</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolHooks.ts#L39-L190">toolHooks.ts：PostToolUse hooks</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/processUserInput/processUserInput.ts#L178-L264">processUserInput.ts：UserPromptSubmit hook path</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStart.ts#L34-L175">sessionStart.ts：SessionStart hooks</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query/stopHooks.ts#L65-L210">stopHooks.ts：Stop hook context and execution</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L406-L729">compact.ts：PreCompact, SessionStart(compact), PostCompact</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          item.className = `toc-${heading.tagName.toLowerCase()}`;
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (let deeper = level + 1; deeper <= 4; deeper += 1) {
+            lastItems.delete(deeper);
+          }
+        });
+
+        toc.appendChild(list);
+      })();
+    </script>
+  </body>
+</html>
