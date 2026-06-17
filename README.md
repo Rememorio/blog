@@ -23,7 +23,7 @@ Claude Code Source Notes is a Chinese source-reading series on the public
 [Rememorio/claude-code](https://github.com/Rememorio/claude-code) mirror. It
 starts by following one ordinary task through the runtime path, then drills
 into context management, tools, permissions, MCP, subagents, hooks,
-compaction, and recovery as separate mechanisms.
+transcript recovery, and prompt cache behavior as separate mechanisms.
 
 - Language gateway:
   [rememorio.github.io/blog/claude-code/](https://rememorio.github.io/blog/claude-code/)
@@ -43,6 +43,8 @@ compaction, and recovery as separate mechanisms.
   [Claude Code 源码阅读（六）：Subagent 不是另一个聊天窗口，而是隔离的工具上下文](https://rememorio.github.io/blog/claude-code/zh/subagents-fork/)
 - Chinese hooks and lifecycle:
   [Claude Code 源码阅读（七）：Hooks 不是脚本回调，而是运行时关口](https://rememorio.github.io/blog/claude-code/zh/hooks-lifecycle/)
+- Chinese transcript and resume:
+  [Claude Code 源码阅读（八）：Resume 不是续聊天，而是重建运行时状态](https://rememorio.github.io/blog/claude-code/zh/transcript-resume/)
 
 ### Codex Source Notes
 
@@ -131,6 +133,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/commands-skills-mcp/  # Chinese commands/skills/MCP article
 │   ├── zh/subagents-fork/       # Chinese subagents/fork article
 │   ├── zh/hooks-lifecycle/      # Chinese hooks/lifecycle article
+│   ├── zh/transcript-resume/    # Chinese transcript/resume article
 │   └── assets/*.png            # Final raster figures
 ├── codex/
 │   ├── index.html              # Language gateway
@@ -194,6 +197,7 @@ Then open:
 - `http://127.0.0.1:4173/claude-code/zh/commands-skills-mcp/`
 - `http://127.0.0.1:4173/claude-code/zh/subagents-fork/`
 - `http://127.0.0.1:4173/claude-code/zh/hooks-lifecycle/`
+- `http://127.0.0.1:4173/claude-code/zh/transcript-resume/`
 - `http://127.0.0.1:4173/codex/`
 - `http://127.0.0.1:4173/codex/zh/overview/`
 - `http://127.0.0.1:4173/codex/en/overview/`

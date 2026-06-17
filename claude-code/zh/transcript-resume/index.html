@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Code 源码阅读（八）：Resume 不是续聊天，而是重建运行时状态</title>
+    <meta
+      name="description"
+      content="沿 Claude Code 公开镜像源码拆解 transcript 写入、loadConversationForResume、deserializeMessages、SessionStart(resume)、processResumedConversation、REPL /resume 和 fork resume 边界。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Claude Code 源码阅读（八）：Resume 不是续聊天，而是重建运行时状态" />
+    <meta
+      property="og:description"
+      content="继续会话不是把旧聊天贴回输入框，而是从 transcript 和附属记录恢复一套可继续运行的 runtime。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/resume-surfaces-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/zh/transcript-resume/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/transcript-resume/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/claude-code/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.reading-contract {
+        border-color: rgba(31, 119, 123, 0.32);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .shape-example {
+        margin: 28px 0;
+      }
+
+      .shape-example pre {
+        margin-bottom: 8px;
+      }
+
+      .article-body pre code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .shape-example figcaption {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../hooks-lifecycle/">上一篇：Hooks</a>
+        <a href="../">Claude Code</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Claude Code 源码阅读 · 第八篇</p>
+            <h1>Resume 不是续聊天，而是重建运行时状态</h1>
+            <p class="lead">
+              “继续上次会话”听起来像把旧聊天记录重新塞回窗口。Claude Code 的源码不是这么做的。
+              它要先从 transcript 找回消息链，再把文件历史、内容替换、context collapse、agent、worktree、
+              session metadata、cost state 和 hooks 一层层接回来。否则 UI 看起来是续上了，
+              但下一轮模型请求和工具执行都会站在错误的运行时地基上。
+            </p>
+            <div class="meta-line">
+              <span>项目：Claude Code</span>
+              <span>主题：transcript / resume / session restore</span>
+              <span>范围：公开镜像源码与官方文档</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/resume-surfaces-cover.png"
+                alt="Claude Code 会话表面图，展示 UI、transcript、runtime projection 和 API view 四层之间的关系"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              <a href="../hooks-lifecycle/">上一篇</a>讲 hooks 时，已经看到 resume 会触发
+              <code>SessionStart</code> hooks。这里继续往后追：resume 到底恢复了什么？
+              如果只把它看成“加载旧 messages”，你会解释不了很多源码细节：
+              为什么要 copy plan？为什么要恢复 content replacement？为什么 fork resume 不能 adopt 原 transcript？
+              为什么 compact 后的消息链要特殊处理 parent uuid？
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这篇的结论先说清：<strong>transcript 是恢复账本，不是 model-visible prompt。</strong>
+                Claude Code 写入 transcript 时要维护消息链和附属记录；读取 transcript 时要清洗坏尾巴和未完成 tool_use；
+                真正 resume 时，还要把 transcript 里的状态重新安装回 AppState、session pointer、worktree、
+                agent definition、content replacement state 和 context-collapse store。
+              </p>
+            </div>
+
+            <div class="note reading-contract">
+              <p>
+                <strong>阅读契约：</strong>本篇只追本地会话恢复主线：
+                <code>recordTranscript()</code> 怎样写账，<code>loadConversationForResume()</code>
+                怎样读账，<code>processResumedConversation()</code> 和 REPL 的 <code>/resume</code>
+                怎样恢复运行时状态，以及 <code>--fork-session</code> 为什么不能直接接管原会话文件。
+                远端会话、分享会话和 remote agent 只在必要处点到为止。
+              </p>
+            </div>
+
+            <p>
+              证据边界同前几篇一样：产品概念参考 Claude Code
+              <a href="https://docs.anthropic.com/en/docs/claude-code/overview">官方概览</a>；
+              源码层来自
+              <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
+              本文只描述客户端源码可见的本地持久化和恢复逻辑，不推断服务端会话存储或模型内部状态。
+            </p>
+
+            <h2>一、先分清四个表面</h2>
+            <p>
+              继续会话为什么复杂？因为同一段工作并不只有“聊天记录”一个表面。
+              屏幕上看到的是 UI messages；磁盘里保存的是 transcript 和附属 entry；
+              下一轮运行时看到的是经过恢复、清洗、压缩和工具预算处理后的 runtime view；
+              真正发给模型的又是 provider API 能接收的 request shape。
+            </p>
+
+            <p>
+              这四层不能混。UI 可以隐藏进度、折叠工具输出；transcript 要能恢复链路；
+              runtime view 要保证下一轮工具调用和上下文投影合法；API view 要满足模型和工具协议。
+              这也是 resume 不能简单等于“把 JSONL 里的 messages 读出来”的原因。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>表面</th>
+                    <th>负责什么</th>
+                    <th>resume 时的风险</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>UI</td>
+                    <td>用户看到的消息、进度、工具 JSX 和输入框状态。</td>
+                    <td>看起来续上了，但内部状态可能没恢复。</td>
+                  </tr>
+                  <tr>
+                    <td>Transcript</td>
+                    <td>可持久化消息链、sidechain、metadata、content replacement、collapse commit。</td>
+                    <td>坏尾巴、重复消息、parent 链断裂会污染下一轮。</td>
+                  </tr>
+                  <tr>
+                    <td>Runtime</td>
+                    <td>AppState、session id、worktree、agent、文件历史、工具替换状态。</td>
+                    <td>工具结果、文件快照、agent 定义和工作目录对不上。</td>
+                  </tr>
+                  <tr>
+                    <td>API view</td>
+                    <td>进入模型请求的消息、工具 schema、上下文投影和 cache 形状。</td>
+                    <td>未完成 tool_use、thinking-only 消息或过大工具结果会触发协议错误。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>二、写入 transcript：不是全量覆盖，而是维护消息链</h2>
+            <p>
+              transcript 写入的入口之一在 React 侧。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useLogMessages.ts#L19-L115"><code>useLogMessages()</code></a>
+              会观察当前 messages。正常情况下 messages 是 append-only，所以它只把新增 tail 交给
+              <code>recordTranscript()</code>；如果第一条消息变了，就说明可能经历了 compaction 或
+              <code>/clear</code>，需要让 <code>recordTranscript()</code> 自己做全量去重和 parent 链处理。
+            </p>
+
+            <p>
+              真正落盘在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1400-L1449"><code>recordTranscript()</code></a>。
+              它先用 <code>cleanMessagesForLogging()</code> 清理可记录消息，再读取当前 session 已有的 message set。
+              如果一个消息已经写过，并且它还处在新消息之前的 prefix 里，源码会把它当成 parent hint；
+              如果 compaction 把新的 compact boundary 和 summary 放在前面，后面的旧 messagesToKeep 就不会被错误拿来当 parent。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/context-ledger-cover.png"
+                alt="Claude Code runtime view 图，展示 history 和 tools 进入 stable prefix、runtime view、API view、compact 与 resume"
+              />
+              <figcaption>Transcript 是恢复账本；进入 API 前还会被 runtime 投影成另一种 view。</figcaption>
+            </figure>
+
+            <h3>2.1 附属记录也要跟着写</h3>
+            <p>
+              transcript 里不只有消息。<a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1451-L1499">同一个模块</a>
+              还会记录 sidechain transcript、queue operation、file history snapshot、attribution snapshot 和
+              content replacement。这里最容易漏掉的是 content replacement：
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L365-L392"><code>queryLoop()</code></a>
+              在发模型请求前会执行工具结果预算，如果替换了过大的工具结果，就通过
+              <code>recordContentReplacement()</code> 写入可恢复记录。
+            </p>
+
+            <p>
+              这意味着“旧工具结果被压缩或替换过”不是屏幕状态，而是恢复状态。
+              resume 时如果只加载 messages，不恢复 replacement 记录，下一轮就可能把本该替换的完整工具输出重新送进请求，
+              造成上下文膨胀和 cache 形状变化。
+            </p>
+
+            <h2>三、读取 transcript：先清理坏尾巴，再补 resume hooks</h2>
+            <p>
+              读取主入口是
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/conversationRecovery.ts#L456-L595"><code>loadConversationForResume()</code></a>。
+              它支持几种来源：<code>--continue</code> 时 source 为空，表示找最近会话；
+              <code>--resume</code> 可以给 session id，也可以给已经加载好的 log，或者给 transcript file。
+              找到 log 后，它会复制 plan、复制文件历史、检查 resume consistency，然后进入反序列化。
+            </p>
+
+            <h3>3.1 反序列化不是 JSON.parse</h3>
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/conversationRecovery.ts#L154-L245"><code>deserializeMessagesWithInterruptDetection()</code></a>
+              会先迁移 legacy attachment type，剔除无效 permission mode；
+              再过滤未解决的 tool_use、thinking-only assistant message、只有空白文本的 assistant message。
+              如果检测到中断中的 turn，它会追加一个 meta user message：<code>Continue from where you left off.</code>；
+              如果最后一个有效消息是 user，还会插入一个 synthetic assistant sentinel，保证对话形状合法。
+            </p>
+
+            <p>
+              这一步很像把坏掉的账本尾页修好。不是每条落盘记录都能原样喂回下一轮。
+              未完成工具调用、孤立 thinking block、用户刚提交但模型没响应的半截 turn，都要先归一化成可恢复形状。
+            </p>
+
+            <h3>3.2 resume 会重新跑 SessionStart hooks</h3>
+            <p>
+              <code>loadConversationForResume()</code> 还会在消息加载后执行
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/conversationRecovery.ts#L556-L568"><code>processSessionStartHooks("resume")</code></a>，
+              并把 hook messages 追加到 conversation。
+              这和上一篇能接上：resume 后的 session 是新的运行时起点，需要让 session 级 hooks 有机会补上下文。
+            </p>
+
+            <h2>四、恢复 runtime：切 session，再恢复附属状态</h2>
+            <p>
+              CLI 的 <code>--continue</code> 先清缓存，再调用
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/main.tsx#L3101-L3146"><code>loadConversationForResume()</code> 和 <code>processResumedConversation()</code></a>。
+              <code>--resume</code> 则可以从分享、文件路径或 session id 进入同一套处理路径；
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/main.tsx#L3588-L3690">源码里这些分支</a>
+              最终都会拿到 <code>processedResume</code>，再把 initial messages、file history、content replacements、
+              agent name/color 交给 REPL。
+            </p>
+
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionRestore.ts#L409-L550"><code>processResumedConversation()</code></a>
+              做的是 runtime 恢复，而不是消息恢复。它会匹配 coordinator/normal mode；
+              非 fork resume 会 <code>switchSession()</code> 到旧 session id，并按 transcript path 处理跨目录恢复；
+              然后重命名 asciicast、reset session file pointer、恢复 cost state、恢复 session metadata、
+              恢复 worktree、adopt 已存在的 transcript file，最后恢复 context-collapse store、agent definition 和初始 AppState。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/survival-map.png"
+                alt="Claude Code compact 后生存状态图，展示 stable、reloaded、triggered 三类状态进入 compact 并影响 next turn"
+              />
+              <figcaption>恢复不是只读 messages。稳定信息、重新加载信息和触发式信息会以不同方式回到下一轮。</figcaption>
+            </figure>
+
+            <h3>4.1 <code>adoptResumedSessionFile()</code> 解决的是文件所有权</h3>
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1501-L1534"><code>adoptResumedSessionFile()</code></a>
+              看起来只是把 <code>project.sessionFile</code> 指向 <code>getTranscriptPath()</code>，
+              但注释解释了它为什么重要：恢复后即使用户还没发下一条消息，退出清理也要能把 metadata 写回原 session file。
+              如果还按 fresh session 的懒创建逻辑走，命名、tag、agent 等 metadata 就可能只停留在内存里。
+            </p>
+
+            <p>
+              这就是“恢复文件所有权”的含义。正常 resume 是接管原 session；fork resume 则不能接管，
+              因为 fork 应该写入新 session file。
+            </p>
+
+            <h2>五、交互式 <code>/resume</code> 还要处理当前会话</h2>
+            <p>
+              交互式 <code>/resume</code> 比 CLI 启动时的 resume 更麻烦，因为它发生在一个已经运行的 REPL 里。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L1735-L1945"><code>REPL.resume()</code></a>
+              先反序列化目标 log，再在切换前执行当前 session 的 <code>SessionEnd</code> hooks；
+              然后对目标 session 执行 <code>SessionStart(resume)</code> hooks、恢复文件历史和 attribution、
+              恢复 agent、恢复 standalone agent context、恢复 read file state、切 session、重命名录制文件、恢复 metadata 和 worktree。
+            </p>
+
+            <p>
+              最后它还会恢复 remote agent tasks，重建 content replacement state，清空当前工具 JSX 和输入框，
+              再把 <code>setMessages(() =&gt; messages)</code> 作为新的 UI 起点。
+              所以交互式 resume 是一次“从当前 runtime 切到另一个 runtime”的热切换，不是简单替换数组。
+            </p>
+
+            <h3>5.1 Resume picker 只是入口，恢复逻辑仍然完整</h3>
+            <p>
+              选择器页面也不是只返回一个文件名。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/ResumeConversation.tsx#L180-L305"><code>ResumeConversation</code></a>
+              会检查跨项目 resume，调用 <code>loadConversationForResume()</code>，必要时切 session，
+              恢复 cost、agent、metadata、worktree 和 context-collapse，再把结果作为
+              <code>initialMessages</code>、<code>initialFileHistorySnapshots</code> 和
+              <code>initialContentReplacements</code> 传给 REPL。
+            </p>
+
+            <p>
+              这解释了为什么 session 列表也要 progressive enrich。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L5072-L5105"><code>enrichLogs()</code></a>
+              不是为了展示漂亮列表，而是从轻量 log 扩展出可以 resume 的有效会话，同时过滤掉不该展示的记录。
+            </p>
+
+            <h2>六、普通 resume 和 fork resume 的边界</h2>
+            <p>
+              最后看一个很实用的分叉：普通 resume 和 fork resume。
+              普通 resume 要继续原 session，所以会切到旧 session id，恢复原 metadata/worktree，并 adopt 原 transcript。
+              fork resume 则保留新 session id，不接管原 session file，只复制必要消息和状态。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/compact-recovery-loop.png"
+                alt="Claude Code compact 恢复循环图，展示 trigger、pre hooks、summary fork、ledger、restore files memory tools 和 next turn"
+              />
+              <figcaption>fork 和 compact 都在提醒同一件事：恢复点不是历史本身，而是下一轮能继续的运行时起点。</figcaption>
+            </figure>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>路径</th>
+                    <th>session id</th>
+                    <th>transcript file</th>
+                    <th>为什么这么做</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>普通 <code>--continue</code> / <code>--resume</code></td>
+                    <td>复用被恢复 session。</td>
+                    <td><code>adoptResumedSessionFile()</code> 接管原文件。</td>
+                    <td>后续消息、metadata、cost 和 worktree 都属于同一条会话链。</td>
+                  </tr>
+                  <tr>
+                    <td>交互式 <code>/resume</code></td>
+                    <td>切到目标 session。</td>
+                    <td>退出当前 session 后接管目标文件。</td>
+                    <td>这是热切换，必须先收尾当前 session，再恢复目标 runtime。</td>
+                  </tr>
+                  <tr>
+                    <td><code>--fork-session</code></td>
+                    <td>保留 fresh session。</td>
+                    <td>新文件由 <code>recordTranscript()</code> 写入。</td>
+                    <td>fork 是派生，不应该把新消息写回原 transcript。</td>
+                  </tr>
+                  <tr>
+                    <td>带 content replacement 的 fork</td>
+                    <td>保留 fresh session。</td>
+                    <td>重新写 replacement entry 到新 session。</td>
+                    <td>让新 session 里的 tool_use_id 能找到对应替换记录，避免恢复成完整大输出。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这就是第八篇的核心：resume 不是“续聊天”，而是把旧账本重新变成可运行状态。
+              消息只是其中一层，旁边还有文件历史、内容替换、collapse commit、metadata、agent、worktree、
+              hooks 和 session file ownership。少恢复任何一层，下一轮看起来也许能发出去，
+              但它已经不是原来那条会话了。
+            </p>
+
+            <p>
+              下一篇会把这个问题推进到性能层：为什么同样是恢复和继续，真正影响速度和成本的，是请求形状、
+              prompt cache、稳定前缀和 fork-only suffix。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/claude-code/overview">Claude Code overview</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useLogMessages.ts#L19-L115">useLogMessages.ts：incremental transcript logging</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1400-L1449">sessionStorage.ts：recordTranscript</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1451-L1499">sessionStorage.ts：sidechain and content replacement records</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L365-L392">query.ts：tool result budget and replacement persistence</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/conversationRecovery.ts#L154-L245">conversationRecovery.ts：deserializeMessagesWithInterruptDetection</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/conversationRecovery.ts#L456-L595">conversationRecovery.ts：loadConversationForResume</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/main.tsx#L3101-L3146">main.tsx：--continue resume path</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/main.tsx#L3588-L3690">main.tsx：--resume source branches</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionRestore.ts#L99-L150">sessionRestore.ts：restoreSessionStateFromLog</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionRestore.ts#L409-L550">sessionRestore.ts：processResumedConversation</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1501-L1534">sessionStorage.ts：adoptResumedSessionFile</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L1735-L1945">REPL.tsx：interactive resume</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/ResumeConversation.tsx#L180-L305">ResumeConversation.tsx：resume picker path</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L5072-L5105">sessionStorage.ts：enrichLogs</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          item.className = `toc-${heading.tagName.toLowerCase()}`;
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (let deeper = level + 1; deeper <= 4; deeper += 1) {
+            lastItems.delete(deeper);
+          }
+        });
+
+        toc.appendChild(list);
+      })();
+    </script>
+  </body>
+</html>
