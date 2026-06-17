@@ -45,6 +45,11 @@ in-repo figures may be used only to calibrate the brand treatment's placement,
 paper-card shape, line integration, and `Rememorio / source notes` feel; they
 must not replace the Wine & Chord reference as the overall article-figure style
 authority.
+Before generating or repairing a figure with a brand card, do a short brand
+reference pass: inspect `Eyjafjalla.png` for character identity and inspect one
+or two accepted in-repo source-notes cards only for how the card is integrated
+into the paper, line weight, and layout. The finished card should read as a
+faithful stylized redraw of the same character, not as a new logo concept.
 
 ## Non-Negotiables
 
@@ -130,6 +135,11 @@ Brand mark treatment:
 - Do not use a generic badge, alternate logo, image-model imitation of an
   unrelated mark, generic reading mascot, clover/leaf icon, route-line logo, or
   large avatar badge.
+- Do not accept a brand card merely because it says `Rememorio`. The small
+  character should preserve the canonical cues from `Eyjafjalla.png` in the new
+  hand-drawn style: warm brown hair volume, curled light horns, red eyes, and
+  white/red outfit hints. If those cues are missing, treat the figure as a
+  failed brand treatment even when the mechanism diagram is otherwise usable.
 - Deterministic compositing with the exact `Eyjafjalla.png` asset is an
   exception, not the default. Use it only when the user explicitly requires
   pixel-level brand fidelity or asks to use the exact source image. Before
@@ -307,7 +317,9 @@ inspect the final raster at full size, not only as a contact sheet.
 
 Integrated brand protocol:
 
-1. Include the Rememorio treatment in the figure brief before generation.
+1. Include the Rememorio treatment in the figure brief before generation,
+   naming `Eyjafjalla.png` as the character reference and, when useful, one
+   accepted in-repo figure as the card-integration reference.
 2. Place it as a small bottom-right source-notes card, roughly `10%` to `18%`
    of canvas width, with at least `3%` right and bottom padding.
 3. Derive the tiny character from `Eyjafjalla.png`: brown hair, curled
@@ -382,6 +394,10 @@ Inspect every generated figure before publishing:
   curled horns, red eyes, and white/red outfit hints. No pasted sticker,
   alternate badge, generic icon, generic reading mascot, clover/leaf mark,
   distorted crop, recolor, or competing generated logo is visible.
+- Compare the brand card at full size against `Eyjafjalla.png` and at least
+  one accepted in-repo source-notes card. The comparison should confirm both
+  identity fidelity and visual integration; if it only passes one of those two,
+  regenerate or edit the whole brand area.
 - The published article references the correct local relative URL for each
   generated figure, and the referenced PNG exists in the repository.
 - No private instruction, prompt, unfinished editorial marker, or process note

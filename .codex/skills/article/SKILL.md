@@ -148,6 +148,22 @@ For long source articles, prefer ending with a transferable decision table or
 rule set. It should map content state to runtime handling and the invariant
 protected, so readers can apply the article beyond the named products.
 
+For a new source-reading series, the first public chapter should normally build
+the technical route before drilling into a single mechanism. Follow one
+representative request, turn, job, or runtime cycle across the major owners:
+entry point, request or queue boundary, model-visible view, tool or side-effect
+gate, durable record, recovery path, and the later chapters each layer will
+own. A narrow mechanism such as context management, prompt caching, tools, or
+permissions can be excellent as chapter two or later, but it should not be the
+reader's first map unless the whole series is intentionally scoped to only that
+mechanism.
+
+When an already-written mechanism chapter would make a stronger later chapter,
+preserve it and move the series around it instead of flattening it into an
+overview. Renumber titles and metadata, update the series index, language
+gateway, blog home card, README entry, header navigation, previous/next links,
+and `og:image` so every public route teaches the same reading order.
+
 When a reader question is narrow or out of order, do not mirror the question as
 a random new section. Extract the durable confusion behind it and place the
 answer where the article's natural argument needs it. If the answer is useful
@@ -199,11 +215,11 @@ small note/callout, or a compact comparison table. Keep this restrained and
 reader-facing. Do not turn every paragraph into a card, and do not use emphasis
 for decorative excitement or process notes.
 
-For multi-page technical notes or batch article passes, add a compact reading
-contract before changing deep prose:
+For multi-page technical notes, source-reading series, or batch article passes,
+add a compact reading contract before changing deep prose:
 
-- Landing pages should expose a short reading route that tells readers which
-  system layers to visit first.
+- Landing pages and first chapters should expose a short reading route that
+  tells readers which system layers to visit first.
 - Chapters and reference pages should include a brief "Reading Contract" or
   "阅读契约" near the top, after the title and any hero visual.
 - The contract should name the page's main question, the owners or boundaries
