@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes XI: SDK and app-server</title>
+    <meta
+      name="description"
+      content="A source-guided walk through Codex app-server, JSON-RPC protocol, ClientRequest, thread/start, turn/start, ServerNotification, and the Python / TypeScript SDK entry points."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes XI: SDK and app-server" />
+    <meta
+      property="og:description"
+      content="Read how external clients enter the same Codex runtime through app-server initialization, typed requests, request processors, ThreadManager, Op::UserInput, listener notifications, and SDK routers."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/protocol-event-stream.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/sdk-app-server/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/sdk-app-server/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/sdk-app-server/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(163, 89, 52, 0.3);
+        background: rgba(163, 89, 52, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Codex series</a>
+        <a href="../rollout-recovery/">Previous: recovery</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/sdk-app-server/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part XI</p>
+            <h1>SDK and app-server: How External Clients Enter the Same Runtime</h1>
+            <p class="lead">
+              The first ten chapters stayed inside the Codex runtime: context,
+              tools, permission gates, client projection, extensions, hooks,
+              prompt-cache discipline, and rollout recovery. This final chapter
+              steps outside that runtime. When an IDE, Python program,
+              TypeScript SDK, or in-process host wants to embed Codex, what is
+              it actually embedding?
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: SDK / app-server</span>
+              <span>Scope: public source</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/protocol-event-stream.png"
+                alt="Codex protocol and event stream showing client, TurnStart, Submission, Op, Session, EventMsg, v2 view, rollout, and resume"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              It is tempting to summarize this layer as “the SDK wraps the
+              agent.” The source suggests a narrower and more useful reading.
+              SDKs and app-server are adapter surfaces: they translate external
+              calls into the thread, turn, setting, event, and notification
+              shapes already owned by the Codex runtime. They do not reimplement
+              the context ledger, permission model, or rollout path.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The core idea of this chapter is: <strong>the public interface
+                is a runtime adapter, not a second agent.</strong>
+                app-server turns JSON-RPC requests into typed
+                <code>ClientRequest</code> values, then routes them to request
+                processors. SDKs wrap that protocol into friendlier calls such
+                as <code>Thread.run()</code>, <code>runStreamed()</code>, or CLI
+                JSONL events.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Reading contract.</strong>
+                This chapter tracks only the external entry boundary: transport,
+                initialization, typed requests, thread and turn entry points,
+                notification fanout, and SDK ergonomics. After reading it, you
+                should be able to separate the app-server public contract, the
+                core runtime owner, and the convenience layer added by each SDK.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                Transport, lifecycle, and API surface come from the app-server
+                README. Dispatch, processors, listener projection, and SDK
+                routing come from verified public source. This article does not
+                infer hosted-service internals, remote-control backend behavior,
+                or private storage implementation.
+              </p>
+            </div>
+
+            <h2>1. Start by splitting “embed Codex”</h2>
+            <p>
+              A host application usually wants a simple action: send user input
+              and let Codex continue working. app-server exposes a richer shape
+              than a <code>prompt -&gt; answer</code> call. Its README describes
+              <code>codex app-server</code> as the interface for rich clients,
+              communicates with JSON-RPC-shaped messages over transports such
+              as stdio JSONL, and reduces the public model to three primitives:
+              <code>Thread</code>, <code>Turn</code>, and <code>Item</code>.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>External goal</th>
+                    <th>app-server shape</th>
+                    <th>Runtime owner</th>
+                    <th>Why a prompt API is too small</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Open a conversation.</td>
+                    <td><code>thread/start</code> with cwd, model, permissions, environments, and config.</td>
+                    <td><code>ThreadManager</code> creates a <code>CodexThread</code>.</td>
+                    <td>The runtime must establish identity, authority, rollout, and listeners.</td>
+                  </tr>
+                  <tr>
+                    <td>Send user input.</td>
+                    <td><code>turn/start</code> with input, overrides, and additional context.</td>
+                    <td><code>CodexThread.submit(...)</code> handles <code>Op::UserInput</code>.</td>
+                    <td>The input affects model view, tools, usage, events, and persistence.</td>
+                  </tr>
+                  <tr>
+                    <td>Render progress.</td>
+                    <td><code>turn/started</code>, <code>item/*</code>, and <code>turn/completed</code> notifications.</td>
+                    <td>The listener maps core <code>EventMsg</code> into <code>ServerNotification</code>.</td>
+                    <td>Progress is a stream of facts, not only a final response.</td>
+                  </tr>
+                  <tr>
+                    <td>Resume, fork, or roll back.</td>
+                    <td><code>thread/resume</code>, <code>thread/fork</code>, <code>thread/rollback</code>.</td>
+                    <td>The rollout and recovery ledger from Part X.</td>
+                    <td>Continuation depends on replayable evidence, not only visible messages.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              That is the layer’s central discipline. IDEs, SDKs, CLI surfaces,
+              and in-process hosts can differ in ergonomics. Once they enter the
+              runtime, they should converge on the same typed requests, the same
+              thread and turn owners, and the same event stream.
+            </p>
+
+            <h2>2. app-server turns a transport into an initialized session</h2>
+            <p>
+              The first gate is not <code>turn/start</code>; it is
+              <code>initialize</code>. The lifecycle section in the README says
+              each transport connection must send one <code>initialize</code>
+              request, then an <code>initialized</code> notification. Requests
+              issued before that handshake are rejected. This gives the server a
+              per-connection client identity, capability set, and notification
+              opt-out configuration.
+            </p>
+
+            <p>
+              The source follows that order. <code>process_request</code>
+              deserializes JSON-RPC into a typed <code>ClientRequest</code>.
+              In-process embedders can bypass JSON deserialization through
+              <code>process_client_request</code>, but the comment says that it
+              preserves identical semantics by delegating to
+              <code>handle_client_request</code>. That shared handler treats
+              <code>Initialize</code> specially, then sends all other requests
+              through initialized dispatch.
+            </p>
+
+            <pre><code class="language-text">public edge:
+JSON-RPC request
+  -> serde ClientRequest
+  -> initialize gate
+  -> experimental gate
+  -> serialization scope
+  -> request processor</code></pre>
+
+            <p>
+              Initialized requests also pass through serialization scopes. The
+              protocol macro generates <code>ClientRequest.serialization_scope()</code>;
+              app-server maps those scopes to global, thread, path, command,
+              process, filesystem watch, or OAuth queues. Shared reads can
+              proceed together; mutating work uses exclusive access. The public
+              edge therefore protects request ordering before core state is
+              touched.
+            </p>
+
+            <h2>3. <code>thread/start</code> creates a runtime container</h2>
+            <p>
+              <code>ThreadStartParams</code> carries model, provider, service
+              tier, cwd, workspace roots, approval policy, sandbox, permissions,
+              instructions, personality, environments, dynamic tools, and
+              capability roots. Read together, these fields show that
+              <code>thread/start</code> is not only “create a chat.” It
+              establishes the baseline that later turns will inherit.
+            </p>
+
+            <p>
+              When <code>message_processor</code> sees
+              <code>ClientRequest::ThreadStart</code>, it enters
+              <code>thread_processor.thread_start</code>. The processor rejects
+              incompatible <code>permissions</code> and <code>sandbox</code>
+              fields, parses environments, builds config overrides, then spawns
+              <code>thread_start_task</code>. The task ultimately calls
+              <code>ThreadManager.start_thread_with_options(StartThreadOptions { ... })</code>,
+              passing initial history, dynamic tools, service naming, tracing,
+              environment selection, and extension initialization into core.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The response is only half the startup story. app-server also
+                auto-attaches a conversation listener, updates thread watch
+                state, sends <code>ThreadStartResponse</code>, and then emits
+                <code>thread/started</code>. The caller is subscribed to the
+                event stream from the beginning.
+              </p>
+            </div>
+
+            <h2>4. <code>turn/start</code> becomes <code>Op::UserInput</code></h2>
+            <p>
+              Once a thread exists, <code>turn/start</code> is the entry point
+              that actually drives the agent. <code>TurnStartParams</code>
+              carries the target thread, input items, optional Responses API
+              metadata, additional context, environment and cwd overrides,
+              workspace roots, approval and sandbox choices, permission profile,
+              model and reasoning settings, output schema, personality, and
+              collaboration mode. A turn is therefore not just appended text; it
+              may also update the runtime settings used by following turns.
+            </p>
+
+            <p>
+              <code>turn_start_inner</code> is a compact execution trace. It
+              loads the thread, checks that direct input is allowed, validates
+              input size, maps v2 input into core input items, maps additional
+              context, builds settings overrides, rejects incompatible
+              <code>permissions</code> and <code>sandboxPolicy</code>, and
+              previews overrides before accepting them. Only then does it build
+              <code>Op::UserInput</code> and submit it to <code>CodexThread</code>.
+            </p>
+
+            <pre><code class="language-text">turn/start shape:
+input + overrides + additionalContext
+  -> CoreInputItem[]
+  -> ThreadSettingsOverrides
+  -> Op::UserInput
+  -> CodexThread.submit_user_input_with_client_user_message_id()</code></pre>
+
+            <p>
+              The immediate <code>TurnStartResponse</code> contains an
+              in-progress turn with unloaded items. The interesting facts return
+              later through notifications.
+            </p>
+
+            <h2>5. Progress returns as notifications</h2>
+            <p>
+              A running turn may emit model deltas, tool activity, permission
+              requests, plan updates, token usage, rollback state, thread status
+              changes, and completion. A final response object would be too
+              late for interactive clients and too narrow for approval or
+              interrupt flows.
+            </p>
+
+            <figure class="hero-image">
+              <img
+                src="../../assets/client-projection-fanout.png"
+                alt="Codex client projection fanout from EventMsg into app-server ServerNotification, TUI streaming, rollout, and resume"
+              />
+            </figure>
+
+            <p>
+              The listener path owns this fanout. <code>ensure_conversation_listener</code>
+              gets the thread from <code>ThreadManager</code>, subscribes the
+              connection to thread state, and starts a listener task. The task
+              reads <code>conversation.next_event()</code>, updates thread-local
+              state, finds subscribed connections, and calls
+              <code>apply_bespoke_event_handling</code>. That handler turns
+              <code>EventMsg::TurnStarted</code> into
+              <code>ServerNotification::TurnStarted</code>, item deltas into
+              server notifications through <code>item_event_to_server_notification</code>,
+              and completion into <code>ServerNotification::TurnCompleted</code>.
+            </p>
+
+            <p>
+              SDKs therefore need routing. stdio is one ordered stdout stream
+              containing both JSON-RPC responses and notifications. Python’s
+              <code>MessageRouter</code> gives each in-flight request and each
+              active turn its own queue. It routes responses by request id,
+              turn notifications by turn id, buffers early turn events until the
+              caller starts streaming, and wakes all waiters on transport
+              failure.
+            </p>
+
+            <h2>6. Python SDK wraps app-server stdio</h2>
+            <p>
+              The Python SDK follows app-server most closely. The
+              <code>CodexClient</code> docstring describes a typed JSON-RPC
+              client over stdio. Startup resolves a Codex executable, runs
+              <code>codex app-server --listen stdio://</code>, opens
+              stdin/stdout/stderr, and starts reader and stderr-drain threads.
+              Initialization sends <code>initialize</code> with
+              <code>clientInfo</code> and <code>capabilities.experimentalApi</code>,
+              then sends <code>initialized</code>.
+            </p>
+
+            <p>
+              The low-level client exposes app-server methods such as
+              <code>thread_start</code>, <code>thread_resume</code>,
+              <code>thread_fork</code>, <code>turn_start</code>,
+              <code>turn_interrupt</code>, and <code>turn_steer</code>. The
+              high-level <code>Codex</code> object turns those into application
+              ergonomics: construction starts and initializes the runtime;
+              <code>thread_start()</code> returns a <code>Thread</code>;
+              <code>Thread.turn()</code> builds <code>TurnStartParams</code> and
+              returns a <code>TurnHandle</code>; <code>Thread.run()</code>
+              consumes the stream and collects a <code>TurnResult</code> from
+              completed items, usage, and <code>turn/completed</code>.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>SDK layer</th>
+                    <th>Caller sees</th>
+                    <th>Still backed by</th>
+                    <th>Boundary protected</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>CodexClient</code></td>
+                    <td>Typed requests, notifications, wait and stream helpers.</td>
+                    <td>stdio JSON-RPC plus app-server methods.</td>
+                    <td>One stdout stream is not consumed by competing readers.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Codex</code></td>
+                    <td>Login, account, and thread methods.</td>
+                    <td>A runtime connection initialized during construction.</td>
+                    <td>Callers do not hand-write the handshake.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Thread</code></td>
+                    <td><code>run()</code>, <code>turn()</code>, <code>read()</code>.</td>
+                    <td><code>turn/start</code> plus notification stream.</td>
+                    <td>Synchronous run is event collection, not a new runtime contract.</td>
+                  </tr>
+                  <tr>
+                    <td><code>AsyncCodexClient</code></td>
+                    <td>Async thread, turn, and stream helpers.</td>
+                    <td>The synchronous client executed in worker threads.</td>
+                    <td>Blocking reads do not monopolize the event loop.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>7. TypeScript SDK wraps a lighter CLI route</h2>
+            <p>
+              The TypeScript SDK README is explicit: it wraps the
+              <code>codex</code> CLI from <code>@openai/codex</code>, spawning
+              the CLI and exchanging JSONL events over stdin/stdout. That is a
+              different surface from Python. Python sits next to app-server v2;
+              the TypeScript SDK currently drives <code>codex exec --experimental-json</code>.
+            </p>
+
+            <p>
+              <code>CodexExec.run</code> builds that command: it starts with
+              <code>exec --experimental-json</code>, then appends config
+              overrides, model, sandbox, working directory, additional
+              directories, output schema, reasoning effort, network access, web
+              search, approval policy, and optionally <code>resume &lt;threadId&gt;</code>.
+              It spawns the child process, writes input to stdin, reads stdout
+              line by line, and yields each JSONL line.
+            </p>
+
+            <p>
+              <code>Thread.runStreamedInternal</code> normalizes caller input
+              into prompt text and images, calls <code>CodexExec.run</code>,
+              parses each line as a <code>ThreadEvent</code>, stores the thread
+              id when it sees <code>thread.started</code>, and yields events.
+              <code>run()</code> then buffers <code>item.completed</code> and
+              <code>turn.completed</code> into a final result. The surface is
+              simpler, but it also exposes a narrower contract than app-server
+              v2.
+            </p>
+
+            <h2>8. In-process hosting removes the process boundary, not the protocol boundary</h2>
+            <p>
+              <code>in_process.rs</code> is useful because its file-level
+              comment states the design plainly. The module replaces
+              socket/stdio transports with bounded in-memory channels while
+              still running the existing <code>MessageProcessor</code> and
+              outbound routing. Incoming requests are typed
+              <code>ClientRequest</code> values, but responses still return
+              through the same JSON-RPC result envelope used by stdio and
+              websocket transports.
+            </p>
+
+            <p>
+              <code>start()</code> completes <code>initialize</code> and
+              <code>initialized</code> before returning a handle. Later requests
+              still enter <code>process_client_request</code>, and initialized
+              state, experimental capability, and notification opt-outs are
+              mirrored to outbound state. Even inside one process, Codex keeps
+              the app-server semantics instead of creating a hidden shortcut
+              around the gates.
+            </p>
+
+            <h2>9. What to carry forward</h2>
+            <p>
+              The series now closes where public integration begins. Part I
+              followed one request into the runtime. The middle chapters
+              inspected context, tools, permissions, projection, extensions,
+              hooks, cache discipline, and rollout recovery. This chapter shows
+              how external surfaces enter that same runtime through app-server
+              and SDK adapters.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Integration need</th>
+                    <th>Question to ask</th>
+                    <th>Mechanism</th>
+                    <th>Do not read it as</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>IDE or rich client.</td>
+                    <td>Do you need the full thread, turn, event, and control surface?</td>
+                    <td><code>codex app-server</code> plus JSON-RPC notifications.</td>
+                    <td>A synchronous answer API.</td>
+                  </tr>
+                  <tr>
+                    <td>Python automation.</td>
+                    <td>Do you need app-server v2 methods and typed notifications?</td>
+                    <td>Python SDK over app-server stdio.</td>
+                    <td>Direct chat-text read/write.</td>
+                  </tr>
+                  <tr>
+                    <td>Node or TypeScript task runner.</td>
+                    <td>Is CLI JSONL enough for the workflow?</td>
+                    <td>TypeScript SDK over <code>codex exec --experimental-json</code>.</td>
+                    <td>A full app-server client.</td>
+                  </tr>
+                  <tr>
+                    <td>Same-process host.</td>
+                    <td>Can it preserve app-server semantics?</td>
+                    <td><code>in_process</code> typed requests plus the same result envelope.</td>
+                    <td>A bypass around initialization, queues, and notifications.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              A public interface for an agent runtime should not be only a
+              convenient mouthpiece for the model. It should bring external
+              callers into the runtime’s existing owners, gates, ledger, and
+              event stream. The more the runtime can do, the more valuable that
+              boundary discipline becomes.
+            </p>
+
+            <h2 id="sources">Sources</h2>
+            <ul>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/README.md#L1-L90">app-server README: rich interfaces, transport, primitives, and initialization lifecycle</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/README.md#L131-L167">app-server API overview: thread, turn, rollback, steer, interrupt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-api/src/lib.rs#L1-L86"><code>core-api</code> public facade re-exporting thread and runtime primitives</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L177-L241"><code>ClientRequest</code> macro and serialization scope</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1320-L1345"><code>ServerNotification</code> macro and JSON-RPC notification projection</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L560-L620">JSON-RPC and typed requests enter the same processing path</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L797-L903">initialize gate, experimental gate, and serialization queue dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L1052-L1086"><code>ThreadStart</code>, <code>ThreadResume</code>, and <code>ThreadFork</code> dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L1277-L1296"><code>TurnStart</code>, <code>TurnSteer</code>, and <code>TurnInterrupt</code> dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_serialization.rs#L18-L150">request serialization queue keys and exclusive/shared read access</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L90-L172"><code>ThreadStartParams</code> public shape</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L310-L403"><code>ThreadResumeParams</code> resume variants</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L475-L560"><code>ThreadForkParams</code> fork variants</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L61-L151"><code>TurnStartParams</code> public shape</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/thread_processor.rs#L840-L1245"><code>thread_start_inner</code> and <code>thread_start_task</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L392-L508"><code>turn_start_inner</code> builds <code>Op::UserInput</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L535-L687">turn settings override validation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/thread_lifecycle.rs#L137-L185">conversation listener subscription</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/thread_lifecycle.rs#L212-L390">listener task reads core events and projects them</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L140-L210"><code>TurnStarted</code> and <code>TurnComplete</code> notification handling</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L840-L865">item delta events become <code>ServerNotification</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1324-L1345"><code>TurnCompleted</code> notification emission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/in_process.rs#L1-L39">in-process app-server runtime host design note</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/in_process.rs#L347-L370">in-process start performs initialize / initialized</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/in_process.rs#L452-L481">in-process request still enters <code>process_client_request</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/client.py#L193-L335">Python SDK <code>CodexClient</code> config, app-server startup, and initialization</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/client.py#L430-L463">Python SDK thread start/resume/fork wrappers</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/client.py#L602-L748">Python SDK turn start, wait, and stream helpers</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/_message_router.py#L17-L240">Python SDK <code>MessageRouter</code> routes responses and notifications</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/api.py#L75-L170">Python SDK high-level <code>Codex</code> and <code>thread_start</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/api.py#L534-L606">Python SDK <code>Thread.run</code> / <code>Thread.turn</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/_run.py#L68-L99">Python SDK collects <code>TurnResult</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/README.md#L1-L149">TypeScript SDK README: CLI JSONL wrapper, streaming, and resume</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/src/exec.ts#L63-L153">TypeScript SDK <code>CodexExec.run</code> builds <code>codex exec --experimental-json</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/src/exec.ts#L181-L243">TypeScript SDK spawns CLI and reads stdout lines</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/src/thread.ts#L40-L138">TypeScript SDK <code>Thread.runStreamed</code> / <code>run</code></a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen ? `${base}-${seen + 1}` : base;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          link.dataset.index = index;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (const knownLevel of [2, 3, 4]) {
+            if (knownLevel > level) lastItems.delete(knownLevel);
+          }
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (!visible.length) return;
+            const id = visible[0].target.id;
+            links.forEach((link) => {
+              link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+            });
+          },
+          { rootMargin: "-18% 0px -68% 0px", threshold: 0.01 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

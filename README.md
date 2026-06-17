@@ -22,8 +22,8 @@ pipeline.
 Codex Source Notes is a bilingual source-reading series on
 [openai/codex](https://github.com/openai/codex). It starts by following one
 ordinary user request through the runtime path, then drills into context,
-tools, permissions, client projection, extensions, hooks, prompt caching, and
-recovery as separate mechanisms.
+tools, permissions, client projection, extensions, hooks, prompt caching,
+recovery, and SDK/app-server entry points as separate mechanisms.
 
 - Language gateway:
   [rememorio.github.io/blog/codex/](https://rememorio.github.io/blog/codex/)
@@ -67,6 +67,10 @@ recovery as separate mechanisms.
   [Codex 源码阅读（十）：rollout 与恢复，能继续的前提是能重放](https://rememorio.github.io/blog/codex/zh/rollout-recovery/)
 - English rollout and recovery:
   [Codex Source Notes X: Rollout and Recovery](https://rememorio.github.io/blog/codex/en/rollout-recovery/)
+- Chinese SDK and app-server:
+  [Codex 源码阅读（十一）：SDK 与 app-server，外部调用怎样进入同一套 runtime](https://rememorio.github.io/blog/codex/zh/sdk-app-server/)
+- English SDK and app-server:
+  [Codex Source Notes XI: SDK and app-server](https://rememorio.github.io/blog/codex/en/sdk-app-server/)
 
 ### Hermes Agent
 
@@ -103,6 +107,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/hooks-lifecycle/     # Chinese hooks/lifecycle article
 │   ├── zh/prompt-cache-performance/ # Chinese performance/cache article
 │   ├── zh/rollout-recovery/    # Chinese rollout/recovery article
+│   ├── zh/sdk-app-server/      # Chinese SDK/app-server article
 │   ├── en/index.html           # English series index
 │   ├── en/overview/            # English series overview article
 │   ├── en/context-management/  # English context-management article
@@ -114,6 +119,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── en/hooks-lifecycle/     # English hooks/lifecycle article
 │   ├── en/prompt-cache-performance/ # English performance/cache article
 │   ├── en/rollout-recovery/    # English rollout/recovery article
+│   ├── en/sdk-app-server/      # English SDK/app-server article
 │   └── assets/*.png            # Final raster figures
 ├── hermes-agent/
 │   ├── index.html              # Language gateway
@@ -162,6 +168,8 @@ Then open:
 - `http://127.0.0.1:4173/codex/en/prompt-cache-performance/`
 - `http://127.0.0.1:4173/codex/zh/rollout-recovery/`
 - `http://127.0.0.1:4173/codex/en/rollout-recovery/`
+- `http://127.0.0.1:4173/codex/zh/sdk-app-server/`
+- `http://127.0.0.1:4173/codex/en/sdk-app-server/`
 - `http://127.0.0.1:4173/hermes-agent/`
 
 Use a local server rather than opening files directly when checking relative
