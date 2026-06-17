@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex 源码阅读（十）：rollout 与恢复，能继续的前提是能重放</title>
+    <meta
+      name="description"
+      content="沿 openai/codex 源码拆解 Codex rollout、JSONL writer、InitialHistory、TurnContextItem、compaction replacement、rollback 与 fork 的恢复机制。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex 源码阅读（十）：rollout 与恢复，能继续的前提是能重放" />
+    <meta
+      property="og:description"
+      content="从 append-only rollout、倒序扫描、正序 replay、TurnContext baseline、ThreadRolledBack marker 和 fork snapshot，看 Codex 怎样让一次 thread 可以继续。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/rollout-recovery-map.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/zh/rollout-recovery/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/rollout-recovery/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/rollout-recovery/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(163, 89, 52, 0.3);
+        background: rgba(163, 89, 52, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Codex 系列</a>
+        <a href="../prompt-cache-performance/">上一篇：性能</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/rollout-recovery/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex 源码阅读 · 第十篇</p>
+            <h1>rollout 与恢复，能继续的前提是能重放</h1>
+            <p class="lead">
+              第九篇讲 prompt cache 时，我们把速度落到了请求形状。可一条 thread 不只要跑得快，还要能在进程退出后继续、
+              能从旧会话 resume、能 fork 出新分支，也能在用户撤回几轮以后恢复到合理现场。
+              这些能力的共同前提，是 Codex 把一次运行留下成可重放的证据。
+            </p>
+            <div class="meta-line">
+              <span>项目：openai/codex</span>
+              <span>主题：rollout / recovery</span>
+              <span>范围：公开源码</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/rollout-recovery-map.png"
+                alt="Codex rollout recovery，展示 append-only JSONL、reverse scan、replay suffix、model history、context baseline 和 resume fork 输出"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先把问题放到真实使用里。你让 agent 改一个复杂 bug，跑到一半关掉终端；第二天重新打开，希望它记得已经看过哪些文件、
+              工具跑出过什么、当前模型和权限是什么。或者你想从第三轮 fork 一条新思路，又不希望新 thread 把之前的上下文和 compact
+              结果搞乱。再或者你撤回最近一轮，期待后续请求不要再带上被撤掉的工具结果。
+            </p>
+
+            <p>
+              这些看起来像“保存聊天记录”。源码读下来会发现，聊天记录只是其中一层。Codex 真正要保存的，是之后可以被 runtime
+              重新解释的一串事实：哪些内容进入过模型历史，哪个 compaction 替换了历史，哪一轮的工作目录、sandbox、模型和
+              collaboration mode 是有效基线，哪些事件应该投影给客户端。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                第十篇抓住一个判断：<strong>rollout 是 Codex 的可重放账本。</strong>
+                它按 JSONL 追加 <code>RolloutItem</code>，写入时保持顺序和可重试，恢复时再从这些 item
+                重建模型历史、上下文基线、token usage、rollback 后的可见状态，以及 fork 的起点。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文只描述 openai/codex 公开源码中的 rollout schema、writer、session 初始化、resume/fork/rollback
+                路径和相关测试。它不推断 Codex 后端私有存储，也不把本地文件系统上的具体 rollout 路径写成公共契约。
+              </p>
+            </div>
+
+            <p>这一篇按六个问题走：</p>
+            <ol>
+              <li>为什么“继续一个 thread”比显示旧消息更难？</li>
+              <li><code>RolloutItem</code> 里五类记录分别负责什么？</li>
+              <li>写入路径怎样做到先排队、再落盘、失败后还能重试？</li>
+              <li>resume 和 fork 为什么先进入 <code>InitialHistory</code>？</li>
+              <li>重建算法为什么要倒序扫描，再正序 replay？</li>
+              <li>rollback、compaction、prompt cache 会怎样被同一套账本串起来？</li>
+            </ol>
+
+            <h2>一、先把“继续”拆成三层</h2>
+            <p>
+              客户端看到的是消息列表，模型下一轮需要的是有序 input，runtime 继续工作还要知道上下文基线和权限设置。
+              这三层互相关联，却不能混成一个字段。只保存 UI 文本，后面会丢失工具调用、context diff、compaction
+              replacement、token usage 和 turn 设置；只保存模型 input，又很难恢复客户端事件流。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>恢复对象</th>
+                    <th>读者能看到什么</th>
+                    <th>runtime 还需要什么</th>
+                    <th>rollout 的角色</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>客户端状态</td>
+                    <td>用户消息、工具进度、警告、rollback 事件。</td>
+                    <td>事件顺序、turn 边界、是否是恢复或 fork。</td>
+                    <td>保存 <code>EventMsg</code>，让投影层能重放事实。</td>
+                  </tr>
+                  <tr>
+                    <td>模型历史</td>
+                    <td>下一轮模型应该看到的消息和工具结果。</td>
+                    <td>compaction 后的替换历史，以及 rollback 后剩余的尾部。</td>
+                    <td>保存 <code>ResponseItem</code> 与 <code>CompactedItem</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>上下文基线</td>
+                    <td>工作目录、sandbox、权限、模型、协作模式。</td>
+                    <td>哪一轮已经建立 full context，后续只需要 diff。</td>
+                    <td>保存 <code>TurnContextItem</code>，恢复 reference baseline。</td>
+                  </tr>
+                  <tr>
+                    <td>thread 身份</td>
+                    <td>thread id、来源、父子关系。</td>
+                    <td>resume 继续同一 id，fork 创建新 id 但保留 lineage。</td>
+                    <td>保存 <code>SessionMeta</code>，启动时决定 lineage。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这个拆法能解释为什么第六篇的 client projection、第七篇的多 agent、第九篇的 prompt cache，都会在第十篇重新出现：
+              它们都依赖同一条持久证据链。恢复如果重建错了，UI 可能看起来正常，模型视图却已经偏掉；模型视图如果偏掉，
+              后续 prompt cache 形状也会跟着变。
+            </p>
+
+            <h2>二、RolloutItem：一条 JSONL 里的五类事实</h2>
+            <p>
+              protocol 里 <code>RolloutItem</code> 只有五个 variant：
+              <code>SessionMeta</code>、<code>ResponseItem</code>、<code>Compacted</code>、
+              <code>TurnContext</code>、<code>EventMsg</code>。每一行外层还有一个 timestamp。
+              这让 rollout 文件可以像日志一样追加，也让恢复逻辑按 item 类型重新分派。
+            </p>
+
+            <pre><code class="language-text">shape-level rollout:
+SessionMeta      thread id / lineage / source / base instructions
+EventMsg         TurnStarted / UserMessage / Tool / ThreadRolledBack / ...
+TurnContext      cwd / sandbox / permissions / model / collaboration mode
+ResponseItem     model-visible messages and tool call results
+Compacted        summary + replacement_history + window_id</code></pre>
+
+            <p>
+              这里最容易被低估的是 <code>TurnContextItem</code>。源码注释写得很直接：每个真实用户 turn
+              在计算出模型可见 context updates 后，要持久化一次；中途 compact 如果通过 replacement history
+              重新建立 full context，也要再持久化一次。这样 resume/fork replay 才能找回最新的 durable baseline。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <code>CompactedItem</code> 也不是单纯的一段 summary。它可以带
+                <code>replacement_history</code> 和 <code>window_id</code>。前者给重建算法一个完整基座，
+                后者把 auto compact window 接回当前 session。
+              </p>
+            </div>
+
+            <h2>三、写入路径：先排队，再兑现 durability barrier</h2>
+            <p>
+              新建 session 和恢复 session 的 recorder 初始化路径不一样。新 session 会先预计算 rollout path 和
+              <code>SessionMeta</code>，但文件创建可以延后到显式 <code>persist()</code>；resume 则要立刻打开旧 rollout
+              文件并 append。这个设计让短命 session 不必一启动就落盘，同时又保证恢复出来的 session 继续写在已有证据后面。
+            </p>
+
+            <p>
+              真正写入时，<code>RolloutRecorder</code> 不在调用方线程里同步写文件。它把 <code>AddItems</code>、
+              <code>Persist</code>、<code>Flush</code>、<code>Shutdown</code> 发给后台 writer task。
+              普通 item 先进入 <code>pending_items</code>；只有写成功的前缀会从队列里移除。
+              如果一次 I/O 失败，writer 会丢掉文件句柄进入 recovery mode，下一个 barrier 再重新打开并重试未写完的后缀。
+            </p>
+
+            <pre><code class="language-text">writer discipline:
+record_canonical_items(items) -> queue AddItems
+persist()                   -> materialize file + write pending
+flush()                     -> durability barrier for rollback/fork/resume
+shutdown()                  -> final drain before exit</code></pre>
+
+            <p>
+              这解释了为什么 rollback 和 fork 前都能看到 flush 语义。它们要基于“已经写完的事实”做快照或回放；
+              如果后台队列里还压着 item，后续重建就可能读到缺口。
+            </p>
+
+            <h2>四、恢复入口：先进入 InitialHistory</h2>
+            <p>
+              session 初始化并不直接拿一个 JSONL 文件往 state 里塞。protocol 先把入口统一成
+              <code>InitialHistory</code>：<code>New</code>、<code>Cleared</code>、
+              <code>Resumed(ResumedHistory)</code>、<code>Forked(Vec&lt;RolloutItem&gt;)</code>。
+              新 session 和 clear session 延迟注入 initial context；resume 和 fork 则会创建一个默认 turn context，
+              然后调用 <code>apply_rollout_reconstruction</code>。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>入口</th>
+                    <th>thread id</th>
+                    <th>history 来源</th>
+                    <th>启动后的动作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>New</code> / <code>Cleared</code></td>
+                    <td>新 id</td>
+                    <td>没有旧 rollout。</td>
+                    <td>把 initial context 推迟到第一轮真实 turn。</td>
+                  </tr>
+                  <tr>
+                    <td><code>Resumed</code></td>
+                    <td>沿用旧 id</td>
+                    <td>从 rollout path 读出的完整 item 列表。</td>
+                    <td>重建 history、恢复 previous settings、seed token usage。</td>
+                  </tr>
+                  <tr>
+                    <td><code>Forked</code></td>
+                    <td>新 id</td>
+                    <td>从源 thread snapshot 裁剪后的 item 列表。</td>
+                    <td>重建 history，把 forked rollout items 复制进新 thread。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              resume 还有一个很现实的保护：如果旧 rollout 记录的模型和当前模型不同，会发 warning，提醒这可能影响性能。
+              这和第九篇可以接上。模型变了，provider 行为、context window、prompt cache 形状都可能变化；
+              恢复算法能把历史补回来，但不能保证换模型后的表现完全等价。
+            </p>
+
+            <h2>五、重建算法：倒着找基座，正着补尾巴</h2>
+            <p>
+              <code>reconstruct_history_from_rollout</code> 是这一篇的核心。它没有从第一行一路 replay 到最后。
+              它先倒序扫描，找到足够新的 surviving checkpoint：最新能留下来的 <code>replacement_history</code>、
+              最新的 previous turn settings、最新的 reference context item，以及当前 window id。
+              找到这些以后，旧 item 对当前 history 的影响就可以截断。
+            </p>
+
+            <p>
+              倒序扫描时，rollback 被处理成一个计数器。<code>ThreadRolledBack</code> 表示“丢掉最近 N 个真实用户 turn”；
+              倒序看就是跳过接下来 N 个含 <code>UserMessage</code> 的 turn segment。测试里还专门覆盖了一个细节：
+              没有真实用户消息的 standalone task turn 不应该消耗 rollback 次数。
+            </p>
+
+            <p>
+              倒序找到基座后，算法再正序 replay <code>rollout_suffix</code>：
+              <code>ResponseItem</code> 进入 <code>ContextManager</code>；
+              带 <code>replacement_history</code> 的 compaction 会替换 history；
+              legacy compaction 缺少 replacement history 时，会走兼容重建；
+              <code>ThreadRolledBack</code> 会调用 <code>drop_last_n_user_turns</code>。
+            </p>
+
+            <pre><code class="language-text">reconstruction:
+reverse scan
+  find newest surviving replacement_history
+  recover previous_turn_settings
+  recover reference_context_item
+  account for ThreadRolledBack markers
+
+forward replay
+  seed ContextManager from replacement_history
+  append surviving ResponseItem suffix
+  apply rollback markers to the rebuilt history</code></pre>
+
+            <div class="note key-point">
+              <p>
+                这个“倒着找、正着放”的形状很重要。倒序扫描让恢复不必重新解释很久以前的完整日志；
+                正序 replay 保住了剩余尾部的语义顺序。compact 越早提供完整 replacement history，恢复就越有明确基座。
+              </p>
+            </div>
+
+            <h2>六、rollback：追加 marker，再让 replay 算出当前世界</h2>
+            <p>
+              rollback 的实现很克制。它先拒绝 <code>num_turns == 0</code>，也拒绝 active turn 进行中时 rollback。
+              然后它要求 thread persistence 可用，flush 当前持久化队列，读取存储里的 history，把一个
+              <code>ThreadRolledBack</code> 事件临时接到 item 列表尾部，调用同一套 reconstruction。
+            </p>
+
+            <p>
+              重建完成后，Codex 再把 rollback marker 作为 <code>EventMsg</code> 持久化到 rollout，并 flush。
+              这意味着旧事实还留在 append-only 文件里；当前状态来自“旧事实 + rollback marker”的解释结果。
+              后续 resume 读到同一个 marker，会得到同样的裁剪。
+            </p>
+
+            <p>
+              集成测试也按这个语义检查：rollback 到 compaction 之前时，第一轮仍然可见，compaction summary 仍然保留，
+              被撤掉的 post-compaction turn 不再出现在后续请求里。另一个测试检查 thread settings diff：
+              被撤回 turn 引入的 context update 不应该在下一轮重复残留。
+            </p>
+
+            <h2>七、fork：复制一段可解释的历史，而不是复制进程</h2>
+            <p>
+              fork 和 resume 共享很多恢复入口，但 lineage 不同。resume 沿用旧 thread id；fork 要创建新 thread id，
+              同时记录 <code>forked_from_thread_id</code>。源码里 fork 会先从 rollout path 或 store history 读出
+              <code>InitialHistory</code>，再通过 <code>fork_history_from_snapshot</code> 生成 fork 起点，
+              最后启动一个新 thread。
+            </p>
+
+            <p>
+              subagent fork 还有一个额外细节：它会先确保源 thread rollout materialized，再 flush，之后读取带 history 的
+              stored thread。这样子 agent 继承的是已经进入持久证据的一段 history，而不会依赖父进程里尚未落盘的临时现场。
+            </p>
+
+            <p>
+              这也解释了为什么第七篇的多 agent 能力要和 rollout 放在一起看。fork 出来的 agent 如果要继承历史，
+              它继承的是一段可以被 <code>InitialHistory::Forked</code> 解释的 rollout items，而不是父 agent 的临时变量。
+            </p>
+
+            <h2>八、这和 prompt cache 有什么关系</h2>
+            <p>
+              第九篇说 prompt cache 依赖稳定前缀。第十篇补上一个前提：恢复以后，下一轮请求的前缀也要能回到合理形状。
+              <code>TurnContextItem</code> 帮 runtime 知道哪些 context 已经建立过；<code>CompactedItem.replacement_history</code>
+              给历史一个新的基座；rollback marker 让撤回后的尾部被一致裁剪。
+            </p>
+
+            <p>
+              如果恢复只靠可见聊天文本，runtime 很可能把 context diff 当成 full context 重复塞入，或者把被 rollback
+              的工具结果继续带进模型视图。那样不仅语义错了，prompt cache 的 exact prefix 也会被扰乱。
+              公开测试里的 compact/resume/fork 场景正是在验证：compact 后的输入前缀，在 resume 和 fork 后仍能保持预期关系。
+            </p>
+
+            <h2>九、读完这段源码，可以带走什么</h2>
+            <p>
+              rollout/recovery 给 coding agent 一个很朴素的工程原则：
+              <strong>能长期运行的 agent，必须把“当前状态”写成可重放的事实，而不是只保存一张状态快照。</strong>
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>设计规则</th>
+                    <th>Codex 里的对应做法</th>
+                    <th>带来的结果</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>事件追加</td>
+                    <td><code>RolloutLine</code> 外层 timestamp，内部 <code>RolloutItem</code>。</td>
+                    <td>恢复、审计、rollback 都有同一条证据链。</td>
+                  </tr>
+                  <tr>
+                    <td>类型分层</td>
+                    <td>history、context、session meta、event 各有 owner。</td>
+                    <td>客户端投影和模型视图可以分开重建。</td>
+                  </tr>
+                  <tr>
+                    <td>checkpoint</td>
+                    <td><code>replacement_history</code> 给 compaction 后的恢复基座。</td>
+                    <td>长 thread 不必每次从第一行重新解释。</td>
+                  </tr>
+                  <tr>
+                    <td>marker 语义</td>
+                    <td>rollback 追加 <code>ThreadRolledBack</code>。</td>
+                    <td>旧事实保留，当前世界由 replay 解释出来。</td>
+                  </tr>
+                  <tr>
+                    <td>durability barrier</td>
+                    <td>fork、rollback、shutdown 前 flush。</td>
+                    <td>快照基于已经落盘的事实。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              到这里，Codex 的内部主线已经接近闭环：请求进入 runtime，context 形成模型视图，工具和权限制造副作用，
+              events 投影给客户端，rollout 把过程留下，恢复再把它们变回下一轮可用的现场。
+              下一篇就适合看外部接口：SDK 和 app-server 怎样让其他调用方进入同一套 runtime。
+            </p>
+          </section>
+
+          <section id="sources" class="article-body">
+            <h2>参考源码</h2>
+            <ul>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2361-L2374"><code>InitialHistory</code> 与 <code>ResumedHistory</code> schema</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2899"><code>RolloutItem</code> 与 <code>CompactedItem</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2920-L2963"><code>TurnContextItem</code> 的恢复注释与字段</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L662-L780"><code>RolloutRecorder::new</code> 创建与恢复路径</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L786-L927"><code>record_canonical_items</code>、<code>persist</code>、<code>flush</code> 与 rollout load</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L1409-L1577">writer pending queue、recovery mode 与重试写入</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/rollout/src/recorder.rs#L1580-L1641">writer command loop 与 <code>SessionMeta</code> 写入</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L1222-L1335"><code>record_initial_history</code> 与 <code>apply_rollout_reconstruction</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/rollout_reconstruction.rs#L93-L323"><code>reconstruct_history_from_rollout</code> 倒序扫描与正序 replay</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/handlers.rs#L450-L540"><code>thread_rollback</code> 追加 rollback marker 并重建 history</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/thread_manager.rs#L688-L738">从 rollout path resume thread</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/thread_manager.rs#L861-L969">fork thread 与 <code>forked_from_thread_id</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/compact_resume_fork.rs#L128-L282">测试：compact / resume / fork 后模型可见历史前缀保持</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/compact_resume_fork.rs#L421-L509">测试：rollback 穿过 compaction 后 append-only replay 仍然正确</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen ? `${base}-${seen + 1}` : base;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          link.dataset.index = index;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (const knownLevel of [2, 3, 4]) {
+            if (knownLevel > level) lastItems.delete(knownLevel);
+          }
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (!visible.length) return;
+            const id = visible[0].target.id;
+            links.forEach((link) => {
+              link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+            });
+          },
+          { rootMargin: "-18% 0px -68% 0px", threshold: 0.01 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

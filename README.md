@@ -63,6 +63,10 @@ recovery as separate mechanisms.
   [Codex 源码阅读（九）：性能与 prompt cache，速度来自请求形状](https://rememorio.github.io/blog/codex/zh/prompt-cache-performance/)
 - English performance and prompt cache:
   [Codex Source Notes IX: Performance and Prompt Cache](https://rememorio.github.io/blog/codex/en/prompt-cache-performance/)
+- Chinese rollout and recovery:
+  [Codex 源码阅读（十）：rollout 与恢复，能继续的前提是能重放](https://rememorio.github.io/blog/codex/zh/rollout-recovery/)
+- English rollout and recovery:
+  [Codex Source Notes X: Rollout and Recovery](https://rememorio.github.io/blog/codex/en/rollout-recovery/)
 
 ### Hermes Agent
 
@@ -98,6 +102,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/extensions-agents/   # Chinese extensions/multi-agent article
 │   ├── zh/hooks-lifecycle/     # Chinese hooks/lifecycle article
 │   ├── zh/prompt-cache-performance/ # Chinese performance/cache article
+│   ├── zh/rollout-recovery/    # Chinese rollout/recovery article
 │   ├── en/index.html           # English series index
 │   ├── en/overview/            # English series overview article
 │   ├── en/context-management/  # English context-management article
@@ -108,6 +113,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── en/extensions-agents/   # English extensions/multi-agent article
 │   ├── en/hooks-lifecycle/     # English hooks/lifecycle article
 │   ├── en/prompt-cache-performance/ # English performance/cache article
+│   ├── en/rollout-recovery/    # English rollout/recovery article
 │   └── assets/*.png            # Final raster figures
 ├── hermes-agent/
 │   ├── index.html              # Language gateway
@@ -154,6 +160,8 @@ Then open:
 - `http://127.0.0.1:4173/codex/en/hooks-lifecycle/`
 - `http://127.0.0.1:4173/codex/zh/prompt-cache-performance/`
 - `http://127.0.0.1:4173/codex/en/prompt-cache-performance/`
+- `http://127.0.0.1:4173/codex/zh/rollout-recovery/`
+- `http://127.0.0.1:4173/codex/en/rollout-recovery/`
 - `http://127.0.0.1:4173/hermes-agent/`
 
 Use a local server rather than opening files directly when checking relative
