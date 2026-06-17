@@ -39,6 +39,8 @@ separate mechanisms.
   [Claude Code 源码阅读（四）：权限不是弹窗，而是副作用刹车](https://rememorio.github.io/blog/claude-code/zh/permissions/)
 - Chinese commands, skills, and MCP:
   [Claude Code 源码阅读（五）：命令、Skills 与 MCP，能力是怎样进上下文的](https://rememorio.github.io/blog/claude-code/zh/commands-skills-mcp/)
+- Chinese subagents and fork:
+  [Claude Code 源码阅读（六）：Subagent 不是另一个聊天窗口，而是隔离的工具上下文](https://rememorio.github.io/blog/claude-code/zh/subagents-fork/)
 
 ### Codex Source Notes
 
@@ -125,6 +127,7 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/tools/               # Chinese tools-runtime article
 │   ├── zh/permissions/         # Chinese permissions article
 │   ├── zh/commands-skills-mcp/  # Chinese commands/skills/MCP article
+│   ├── zh/subagents-fork/       # Chinese subagents/fork article
 │   └── assets/*.png            # Final raster figures
 ├── codex/
 │   ├── index.html              # Language gateway
@@ -186,6 +189,7 @@ Then open:
 - `http://127.0.0.1:4173/claude-code/zh/tools/`
 - `http://127.0.0.1:4173/claude-code/zh/permissions/`
 - `http://127.0.0.1:4173/claude-code/zh/commands-skills-mcp/`
+- `http://127.0.0.1:4173/claude-code/zh/subagents-fork/`
 - `http://127.0.0.1:4173/codex/`
 - `http://127.0.0.1:4173/codex/zh/overview/`
 - `http://127.0.0.1:4173/codex/en/overview/`

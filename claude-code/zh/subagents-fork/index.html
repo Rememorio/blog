@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Code 源码阅读（六）：Subagent 不是另一个聊天窗口，而是隔离的工具上下文</title>
+    <meta
+      name="description"
+      content="沿 Claude Code 公开镜像源码拆解 AgentTool、runAgent、fork path、worker tool pool、createSubagentContext、sidechain transcript 和同步/异步 subagent 生命周期。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Claude Code 源码阅读（六）：Subagent 不是另一个聊天窗口，而是隔离的工具上下文" />
+    <meta
+      property="og:description"
+      content="Subagent 不是多开一个聊天窗口，而是把任务投影到一份新的 ToolUseContext；fork path 则故意复制父级前缀来保 prompt cache。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/agent-fork-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/zh/subagents-fork/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/subagents-fork/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/claude-code/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.reading-contract {
+        border-color: rgba(31, 119, 123, 0.32);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .shape-example {
+        margin: 28px 0;
+      }
+
+      .shape-example pre {
+        margin-bottom: 8px;
+      }
+
+      .article-body pre code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .shape-example figcaption {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../commands-skills-mcp/">能力</a>
+        <a href="../">Claude Code</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Claude Code 源码阅读 · 第六篇</p>
+            <h1>Subagent 不是另一个聊天窗口，而是隔离的工具上下文</h1>
+            <p class="lead">
+              前面讲完命令、Skills 和 MCP 后，很自然会问：模型如果觉得一个任务太大，能不能把一部分活交给另一个 agent？
+              Claude Code 的答案不是“开一个新聊天窗口”。源码里的 subagent，更像是把当前任务投影到一份新的
+              <code>ToolUseContext</code>：有自己的系统提示词、工具池、权限模式、transcript 和生命周期。
+            </p>
+            <div class="meta-line">
+              <span>项目：Claude Code</span>
+              <span>主题：AgentTool / subagent / fork</span>
+              <span>范围：公开镜像源码与官方文档</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/agent-fork-cover.png"
+                alt="Claude Code AgentTool 总览图，展示 parent turn 的 Agent tool_use 进入 AgentTool.call 后分成 normal subagent 与 fork path，两条路径返回 agent result 或 async notification"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              <a href="../commands-skills-mcp/">上一篇</a>把能力入口拆成 slash command、SkillTool 和 MCP。
+              这一篇看另一个更高层的能力入口：<code>AgentTool</code>。它不是直接执行一个本地动作，
+              而是启动一个新的 agent 循环，让这个 agent 带着自己的提示词和工具池去完成子任务。
+            </p>
+
+            <p>
+              先说结论：<strong>Claude Code 的 subagent 是“隔离上下文 + 独立 query loop”，不是父会话里的普通函数调用。</strong>
+              普通 subagent 会重新选择 agent definition、重建 worker tool pool；fork path 则反过来，
+              故意复用父级 system prompt、tools、thinking config 和 messages prefix，只在尾部加 fork 指令，
+              目的就是最大化 prompt cache 命中。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                主线可以压成一句话：模型发起 <code>Agent</code> tool_use 后，<code>AgentTool.call()</code>
+                先决定是 teammate、普通 subagent 还是 fork path；普通 subagent 用 <code>assembleToolPool()</code>
+                和 <code>resolveAgentTools()</code> 生成 worker tools；<code>runAgent()</code> 再创建
+                <code>createSubagentContext()</code>，执行独立 <code>query()</code> 循环，并把消息写入 sidechain transcript。
+              </p>
+            </div>
+
+            <div class="note reading-contract">
+              <p>
+                <strong>阅读契约：</strong>这篇只追本地 in-process subagent 和 fork path：
+                Agent 怎么被选中，工具池怎么被收窄，fork 为什么要复用父级前缀，
+                subagent context 默认隔离了哪些状态，同步和异步 agent 为什么有不同生命周期。
+                远端 CCR、tmux teammate 和 swarm 只在必要处点到为止。
+              </p>
+            </div>
+
+            <p>
+              产品层证据来自 Claude Code 的
+              <a href="https://docs.anthropic.com/en/docs/claude-code/sub-agents">sub-agents 文档</a>、
+              <a href="https://docs.anthropic.com/en/docs/claude-code/hooks">hooks 文档</a>；
+              源码层来自
+              <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
+              本文只描述客户端代码能证明的路径，不从客户端代码推断服务端调度策略。
+            </p>
+
+            <h2>一、AgentTool 的输入不是“开新会话”</h2>
+            <p>
+              <code>AgentTool</code> 的 schema 在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L81-L155"><code>AgentTool.tsx</code></a>。
+              基础输入有 <code>description</code>、<code>prompt</code>、可选 <code>subagent_type</code>、可选模型和后台运行标记；
+              feature gate 打开时，还可能有 <code>name</code>、<code>team_name</code>、<code>mode</code>、
+              <code>isolation</code> 和 <code>cwd</code>。这些字段决定的是执行形态，不是简单的聊天窗口参数。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/agent-selection-gates.png"
+                alt="Claude Code AgentTool 选择闸门图，展示 AgentTool input 经过 teammate、fork path、deny filter、required MCP、worktree isolation 和 background policy 后选中 agent 与运行模式"
+              />
+              <figcaption><code>AgentTool.call()</code> 先过选择闸门：能不能 spawn、选哪个 agent、MCP 是否就绪、是否需要隔离工作树。</figcaption>
+            </figure>
+
+            <h3>1.1 先分 teammate、fork 和普通 agent</h3>
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L239-L356"><code>AgentTool.call()</code></a>
+              先读取 app state 和 permission mode，再处理几条分流。
+              如果 <code>team_name + name</code> 成立，它会走 teammate spawn；
+              如果 <code>subagent_type</code> 为空且 fork feature 打开，它会走 fork path；
+              否则才从 <code>agentDefinitions.activeAgents</code> 里找指定 agent。
+            </p>
+
+            <p>
+              选择 agent 前还会过滤 deny rule。源码里支持 <code>Agent(name)</code> 这类权限规则：
+              如果某个 agent 被 deny，调用会直接抛出错误，而不是让模型绕过去。
+              这和前面的权限篇能接上：subagent 的生成本身也是一个需要治理的能力。
+            </p>
+
+            <h3>1.2 required MCP 是启动前置条件</h3>
+            <p>
+              agent definition 可以声明 required MCP servers。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L365-L410">源码会先检查这些 server 是否已经有 tools</a>。
+              如果所需 server 还在 pending，它会最多等待一段时间；如果失败或没有对应工具，就返回错误并提示通过 <code>/mcp</code> 配置或认证。
+            </p>
+
+            <p>
+              这说明 agent 不是“启动后再慢慢发现能力”。有些 agent 的能力边界必须在启动前满足，否则系统提示词、工具池和任务预期都会不一致。
+            </p>
+
+            <h2>二、普通 subagent 会重建 worker tool pool</h2>
+            <p>
+              普通 subagent 的关键不是复制父级工具，而是重建一份 worker 工具池。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L568-L578">这段代码</a>
+              先从父级 app state 拿 <code>toolPermissionContext</code> 和 <code>mcp.tools</code>，
+              再把 mode 改成 <code>selectedAgent.permissionMode ?? "acceptEdits"</code>，
+              最后调用 <code>assembleToolPool()</code>。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/worker-tool-scope.png"
+                alt="Claude Code worker tool pool 图，展示 parent AppState、workerPermissionContext、assembleToolPool、resolveAgentTools 和 workerTools 的过滤过程"
+              />
+              <figcaption>普通 subagent 的工具池会重新组装，并按 agent definition、async 策略和 disallowedTools 收窄。</figcaption>
+            </figure>
+
+            <h3>2.1 <code>resolveAgentTools()</code> 是工具收窄器</h3>
+            <p>
+              工具收窄的共享逻辑在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/agentToolUtils.ts#L70-L225"><code>resolveAgentTools()</code></a>。
+              它会先调用 <code>filterToolsForAgent()</code>，过滤所有 agent 都不能用的工具、自定义 agent 不能用的工具、
+              async agent 不能用的工具；然后再处理 agent definition 里的 <code>tools</code> 和
+              <code>disallowedTools</code>。
+            </p>
+
+            <p>
+              有个细节很重要：MCP tools 默认允许给所有 agent；但非主线程的 Agent tool 会被过滤掉，
+              防止 subagent 无限套娃。主线程例外，因为主线程工具池已经在 REPL 侧按当前 agent 限制过。
+            </p>
+
+            <h3>2.2 普通 agent 有自己的系统提示词</h3>
+            <p>
+              非 fork path 会调用 selected agent 的 <code>getSystemPrompt()</code>，
+              再用
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L906-L932"><code>getAgentSystemPrompt()</code></a>
+              加上环境细节和 enabled tools。它不是把父级系统提示词原样带过去，而是按 agent definition 重新生成。
+            </p>
+
+            <p>
+              这就是普通 subagent 的语义：父 agent 只交代任务，子 agent 用自己的角色、工具和上下文执行。
+              它像一个小型 runtime，不是父会话里的一段 prompt 模板。
+            </p>
+
+            <h2>三、fork path 反过来：为了缓存，故意复制父级前缀</h2>
+            <p>
+              fork path 是另一种设计。它不急着给子 agent 新系统提示词，而是尽量复制父级请求前缀。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L483-L513">注释写得很明确</a>：
+              fork child 继承父级 system prompt，并通过 <code>buildForkedMessages()</code> 克隆父级 assistant message、
+              placeholder tool_results 和 per-child directive。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/fork-cache-prefix.png"
+                alt="Claude Code fork path cache 前缀图，展示 parent query 与 fork child query 共享 system prompt、tools、thinking config、messages prefix，然后在尾部添加 placeholder tool_results、fork directive 和 child task"
+              />
+              <figcaption>fork path 的目标不是隔离出全新角色，而是在父级稳定前缀后面接一个新的任务尾巴。</figcaption>
+            </figure>
+
+            <h3>3.1 exact tools 和 thinking config 都是 cache key 的一部分</h3>
+            <p>
+              fork path 的 <code>runAgentParams</code> 会设置 <code>useExactTools: true</code>，
+              并把 <code>availableTools</code> 设成父级 <code>toolUseContext.options.tools</code>。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L603-L633">源码注释</a>
+              解释了原因：worker tools 如果用不同 permission mode 重建，工具定义序列化会变，prompt cache 就会在第一个差异处失效。
+            </p>
+
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L666-L695"><code>runAgent()</code></a>
+              里也配合了这件事：fork children 继承父级 thinking config；普通 subagent 则默认禁用 thinking 来控制输出成本。
+              所以 fork path 是一个专门为“共享父级上下文前缀”设计的路径。
+            </p>
+
+            <h3>3.2 fork 不能递归 fork</h3>
+            <p>
+              fork child 为了工具定义一致，仍然保留 Agent tool。但
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L318-L335">调用时会做递归 fork guard</a>：
+              如果当前 querySource 已经是 fork agent，或者 messages 里能识别 fork child 标记，就直接拒绝再次 fork。
+              这避免了“为了 cache 保留工具 schema，却允许无限分叉”的矛盾。
+            </p>
+
+            <h2>四、createSubagentContext 默认隔离</h2>
+            <p>
+              真正把 subagent 变成独立运行单元的，是
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/forkedAgent.ts#L253-L462"><code>createSubagentContext()</code></a>。
+              它的注释非常直接：默认隔离所有 mutable state，调用者如果要共享，必须显式 opt-in。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/subagent-context-isolation.png"
+                alt="Claude Code createSubagentContext 隔离图，展示 parent ToolUseContext 生成 subagent ToolUseContext，克隆 read cache、新建 child abort、避免权限提示、UI callback no-op、fresh trigger sets、sidechain transcript"
+              />
+              <figcaption>默认隔离，显式共享：这是 subagent 不污染父级运行时状态的核心。</figcaption>
+            </figure>
+
+            <h3>4.1 默认不让子 agent 控制父 UI</h3>
+            <p>
+              <code>createSubagentContext()</code> 会克隆 <code>readFileState</code>，新建 nested memory / dynamic skill
+              trigger sets，生成新的 <code>agentId</code> 和 query tracking depth。
+              默认情况下，<code>setAppState</code>、<code>setToolJSX</code>、<code>addNotification</code>、
+              <code>setStreamMode</code> 这些父级 UI 或状态回调都是 no-op。
+            </p>
+
+            <p>
+              这不是保守过度，而是避免子 agent 在后台或嵌套执行时随便改父级界面。
+              如果是同步、交互式 subagent，调用方可以选择共享 <code>setAppState</code>、响应长度和 abort controller；
+              如果是异步后台 agent，就倾向于隔离。
+            </p>
+
+            <h3>4.2 无 UI 的 subagent 会避免权限弹窗</h3>
+            <p>
+              如果没有共享父级 abort controller，<code>getAppState()</code> 会被包装成
+              <code>shouldAvoidPermissionPrompts: true</code>。这和权限篇能对上：
+              无法弹窗的后台路径应该先让 hook 决策，没人能决策就 deny，而不是卡死等待用户点击。
+            </p>
+
+            <h2>五、runAgent 是子 agent 的小 query loop</h2>
+            <p>
+              <code>AgentTool.call()</code> 最后会把参数交给
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L248-L260"><code>runAgent()</code></a>。
+              它不是只发一次 API 请求，而是一个 async generator：初始化上下文，执行 hooks，预加载 skills，接上 agent-specific MCP，
+              然后进入 <code>query()</code> 循环，把子 agent 的消息逐条 yield 回父级。
+            </p>
+
+            <h3>5.1 SubagentStart、frontmatter hooks 和 skills 都在 agent 内部展开</h3>
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L520-L646">启动阶段</a>
+              会执行 <code>SubagentStart</code> hooks，把额外上下文作为 attachment message 放进 initial messages；
+              如果 agent frontmatter 有 hooks，会注册到该 agent lifecycle，并把 Stop 转成 SubagentStop；
+              如果有预加载 skills，则把 skill content 作为 meta user message 加进去。
+            </p>
+
+            <p>
+              这说明 agent 的上下文不是只由父级 prompt 决定。agent definition 自己可以带 hooks、skills、MCP 需求和系统提示词。
+              这些都在进入 query loop 前变成子 agent 的 model-visible view。
+            </p>
+
+            <h3>5.2 Sidechain transcript 是子 agent 可恢复的前提</h3>
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L732-L805"><code>runAgent()</code></a>
+              会把 initial messages 写入 sidechain transcript，然后在 query loop 中继续记录 assistant、user、progress
+              和 compact boundary。这个 sidechain 不是 UI 装饰，而是后面查看、恢复和统计 subagent 的基础。
+            </p>
+
+            <p>
+              同步 agent 的进度会以 <code>agent_progress</code> 形式回到父级；异步 agent 则注册 background task，
+              完成后通过 notification / task result 回到主循环。两者都不是“父级继续偷偷执行一段代码”，而是有自己的 agentId、
+              transcript 和清理流程。
+            </p>
+
+            <h2>六、同步、异步、fork 三条路径怎么记</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>路径</th>
+                    <th>系统提示词</th>
+                    <th>工具池</th>
+                    <th>状态关系</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>普通同步 subagent</td>
+                    <td>按 selected agent 生成。</td>
+                    <td>worker permission context + resolveAgentTools。</td>
+                    <td>可共享 setAppState、abort 和响应指标，进度回到父级。</td>
+                  </tr>
+                  <tr>
+                    <td>普通异步 subagent</td>
+                    <td>按 selected agent 生成。</td>
+                    <td>async allowed list 继续收窄。</td>
+                    <td>后台 task，abort controller 不跟父级 ESC 绑定，完成后通知。</td>
+                  </tr>
+                  <tr>
+                    <td>fork child</td>
+                    <td>继承父级 rendered system prompt。</td>
+                    <td>exact parent tools，避免工具定义变化。</td>
+                    <td>复制父级 cache-safe 前缀，在尾部追加 fork directive。</td>
+                  </tr>
+                  <tr>
+                    <td>worktree isolation</td>
+                    <td>按路径覆盖后的上下文生成或追加 notice。</td>
+                    <td>仍走 agent tool 规则。</td>
+                    <td>在独立工作树里执行，结束后按是否有变更决定清理。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              到这里，Claude Code 的 subagent 就不神秘了：它不是“另一个聊天窗口”，也不是“模型自己复制自己”。
+              它是一套可组合的上下文投影：选择一个 agent，决定普通还是 fork，组装工具池，隔离 mutable state，
+              跑独立 query loop，最后把结果、进度或通知回填给父级。
+            </p>
+
+            <p>
+              下一篇读 hooks 时，会继续沿着这个边界看：SessionStart、PreToolUse、PostToolUse、SubagentStart、
+              SubagentStop 这些生命周期插槽，究竟能在哪些地方改变上下文，又不能越过哪些运行时边界。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/claude-code/sub-agents">Claude Code sub-agents 文档</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/claude-code/hooks">Claude Code hooks 文档</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L81-L155">AgentTool.tsx：input and output schema</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L239-L356">AgentTool.tsx：selection and fork routing</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L365-L410">AgentTool.tsx：required MCP servers</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L483-L633">AgentTool.tsx：normal and fork runAgent params</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L686-L765">AgentTool.tsx：async agent launch</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/agentToolUtils.ts#L70-L225">agentToolUtils.ts：resolveAgentTools</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/forkedAgent.ts#L253-L462">forkedAgent.ts：createSubagentContext</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/forkedAgent.ts#L489-L626">forkedAgent.ts：runForkedAgent</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L85-L218">runAgent.ts：agent-specific MCP servers</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L520-L714">runAgent.ts：hooks, skills, MCP and subagent context</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L732-L859">runAgent.ts：query loop, transcript and cleanup</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        headings.forEach((heading) => {
+          if (!heading.id) {
+            const base = slugify(heading.textContent);
+            const count = counts.get(base) || 0;
+            counts.set(base, count + 1);
+            heading.id = count ? `${base}-${count + 1}` : base;
+          }
+
+          const item = document.createElement("li");
+          item.className = `toc-${heading.tagName.toLowerCase()}`;
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent;
+          item.appendChild(link);
+          list.appendChild(item);
+        });
+        toc.appendChild(list);
+      })();
+    </script>
+  </body>
+</html>
