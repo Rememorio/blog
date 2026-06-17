@@ -1,0 +1,725 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Code 源码阅读（一）：上下文快爆了，Claude Code 不是直接总结</title>
+    <meta
+      name="description"
+      content="沿 Claude Code 公开镜像源码拆解上下文管理：基础上下文、model-visible view、query 减压栈、microcompact、auto compact 与 compact 后恢复。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Claude Code 源码阅读（一）：上下文快爆了，Claude Code 不是直接总结" />
+    <meta
+      property="og:description"
+      content="Claude Code 的上下文不是聊天记录，而是会被投影、裁剪、缓存、总结和恢复的运行时账本。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/context-ledger-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/zh/context-management/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/context-management/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/claude-code/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      .shape-example {
+        margin: 28px 0;
+      }
+
+      .shape-example pre {
+        margin-bottom: 8px;
+      }
+
+      .article-body pre code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .shape-example figcaption {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Claude Code 系列</a>
+        <a href="#sources">参考源码</a>
+        <a href="../../../codex/zh/context-management/">Codex 上下文篇</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Claude Code 源码阅读 · 第一篇</p>
+            <h1>上下文快爆了，Claude Code 不是直接总结</h1>
+            <p class="lead">
+              很多人以为 coding agent 的上下文管理就是“聊天记录太长了，找个模型总结一下”。读 Claude Code 的源码会发现，
+              真正的链路更像收拾一张工作台：先把能挪走的工具结果挪走，能投影的投影，实在装不下了，才把旧账本改写成恢复点。
+            </p>
+            <div class="meta-line">
+              <span>项目：Claude Code</span>
+              <span>主题：context management</span>
+              <span>范围：公开镜像源码与官方文档</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../../assets/context-ledger-cover.png"
+                alt="Claude Code 上下文账本总览图，展示 history、tools、runtime view、API view、compact 与 resume 的关系"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先看一个很普通的场景。你让 Claude Code 修一个线上 bug。它先读项目里的 <code>CLAUDE.md</code>，
+              又看 <code>git status</code>，接着 <code>Read</code> 几个文件、<code>Grep</code> 一圈、跑测试、贴日志、
+              再改代码。中途你补一句“别改生成文件”。这时上下文窗口越来越满，模型并不是突然“忘了”，而是运行时开始做选择：
+              哪些东西必须留给模型，哪些只要本地保存，哪些可以被替换成一句“旧工具结果已清理”，哪些必须总结成一段新的恢复上下文。
+            </p>
+
+            <p>
+              这件事如果只用“聊天记录”来理解，很快就会卡住。因为上下文里混着好几类东西：系统提示词、工具 schema、
+              用户消息、工具调用、工具结果、文件快照、项目记忆、技能内容、hook 输出、缓存断点、compact 边界。
+              它们不是同一本账。<strong>保存过，不等于下一次 API 请求一定会原样带上。</strong>
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这篇的核心结论先说出来：Claude Code 的上下文管理不是一把剪刀，而是一条减压流水线。
+                它先构造 model-visible view，再用多层机制降低窗口压力，最后才用 compact 建立新的恢复点。
+              </p>
+            </div>
+
+            <p>
+              先把证据边界放在桌面上。本文的产品层说法来自
+              <a href="https://code.claude.com/docs/en/context-window">Claude Code context window 文档</a>、
+              <a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory 文档</a>、
+              <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic prompt caching 文档</a>
+              和 Messages API 契约；源码层说法来自
+              <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
+              这个镜像不是 Anthropic 官方源码仓库，所以本文只把可见代码写成直接事实；遇到 feature gate、服务端缓存或 provider 内部行为，只描述客户端可见的请求形状和恢复边界。
+            </p>
+
+            <p>这篇只回答五个问题：</p>
+            <ol>
+              <li>Claude Code 到底把哪些东西当成“上下文”？</li>
+              <li>为什么 <code>/context</code> 看的是 API view，而不是 REPL 原始滚动历史？</li>
+              <li><code>query()</code> 在真正调用模型前，按什么顺序给上下文减压？</li>
+              <li>compact 发生时，旧消息被删了吗，还是被替换成了新的恢复记录？</li>
+              <li>compact 之后，<code>CLAUDE.md</code>、文件、技能、工具 schema 这些东西为什么还能回来？</li>
+            </ol>
+
+            <h2>一、先别急着总结，先分清四张桌面</h2>
+            <p>
+              我们先不用源码名词，换个日常比喻：你在桌上修电脑。桌面上有说明书、螺丝刀、刚拆下来的零件、
+              拍过的照片、维修日志和最后写给下一班人的交接单。它们都跟“这次维修”有关，但保存方式完全不同。
+              Claude Code 的上下文也是这样。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/context-surfaces.png"
+                alt="Claude Code 四层上下文表面图，展示 UI、disk、runtime 和 API view 的边界"
+              />
+              <figcaption>同一段会话会落在 UI、磁盘记录、runtime 投影和 API 请求四个表面；后两者才决定模型下一次真正看到什么。</figcaption>
+            </figure>
+
+            <h3>1.1 基础上下文：每轮都要先铺桌布</h3>
+            <p>
+              Claude Code 有两类很早进入请求的基础上下文。第一类是系统侧上下文，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts#L113-L149"><code>getSystemContext()</code></a>
+              会把对话开始时的 git 状态、分支、最近提交等整理出来。代码里明确写着这是一份 snapshot，
+              不是会自动跟着仓库变化的实时状态。第二类是用户侧上下文，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts#L152-L188"><code>getUserContext()</code></a>
+              会收集 <code>CLAUDE.md</code> 这类 memory 文件，再补上当天日期。
+            </p>
+
+            <p>
+              这两类上下文不是普通聊天消息。进入 API 前，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts#L437-L474"><code>appendSystemContext()</code></a>
+              会把 system context 接到系统提示词后面，
+              <code>prependUserContext()</code> 则会生成一个带 <code>&lt;system-reminder&gt;</code> 的 meta user message，
+              放在消息数组最前面。也就是说，模型看到的是一份“这轮可参考的工作环境”，而不是用户真的敲了一段系统说明。
+            </p>
+
+            <figure class="shape-example">
+              <pre><code>shape-level:
+
+system = default system prompt
+       + "gitStatus: ..."
+       + "cacheBreaker: ..."   // feature gated
+
+messages = [
+  meta user: "&lt;system-reminder&gt; ... CLAUDE.md ... currentDate ...",
+  ...runtime projected messages
+]</code></pre>
+              <figcaption>这是形状级示意，不是完整 API payload。重点是：基础上下文被 runtime 注入，而不是从聊天滚动历史里自然长出来。</figcaption>
+            </figure>
+
+            <h3>1.2 原始历史不是模型视图</h3>
+            <p>
+              你在终端里看到的 REPL 历史，和模型下一次收到的 messages，不是一回事。源码里最直白的证据是
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/commands/context/context.tsx#L12-L18"><code>/context</code> 的注释</a>：
+              它要展示 <em>what the model actually sees</em>，而不是 REPL 的 raw history。
+              非交互版本也把这条规则写进
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/commands/context/context-noninteractive.ts#L16-L20"><code>collectContextData()</code></a>：
+              统计前要先经过 compact boundary、context collapse projection 和 microcompact。
+            </p>
+
+            <p>
+              这就像账本和报表的关系：账本里可以保留很多细节，报表只呈现这次决策需要看的那一页。
+              模型每次请求拿到的是报表，不是整本账。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>表面</th>
+                    <th>源码入口</th>
+                    <th>模型是否直接看到</th>
+                    <th>保护的东西</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>UI / REPL 滚动历史</td>
+                    <td><code>messages</code> 与显示组件</td>
+                    <td>不会原样进入 API</td>
+                    <td>用户可见性、交互体验、回看完整过程。</td>
+                  </tr>
+                  <tr>
+                    <td>磁盘 transcript</td>
+                    <td>session storage / resume 路径</td>
+                    <td>恢复时被重新投影</td>
+                    <td>会话可恢复、compact 前细节可追溯。</td>
+                  </tr>
+                  <tr>
+                    <td>runtime view</td>
+                    <td><code>getMessagesAfterCompactBoundary()</code>、<code>projectView()</code></td>
+                    <td>还要继续规整</td>
+                    <td>剥离旧 compact 前缀、应用 collapse 与 snip 规则。</td>
+                  </tr>
+                  <tr>
+                    <td>API view</td>
+                    <td><code>normalizeMessagesForAPI()</code>、<code>addCacheBreakpoints()</code></td>
+                    <td>是请求主体</td>
+                    <td>满足 provider 契约、缓存纪律和工具结果配对。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>1.3 API 边界还会再洗一遍</h3>
+            <p>
+              进入 provider 之前，消息还会经过
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messages.ts#L1989-L2140"><code>normalizeMessagesForAPI()</code></a>。
+              这里会去掉 display-only 的 virtual message、过滤系统消息、合并连续 user message、处理不再可用的 tool reference，
+              还会针对图片或 PDF 过大的错误，把对应 meta user message 里的问题 block 删掉，避免下一次请求反复把同一个大对象发过去。
+            </p>
+
+            <p>
+              这一步的意义很实际：UI 可以为了人类好读保留很多包装，API 却只接受一组合法 message param。
+              Claude Code 不是把本地状态“倒进去”，而是每轮都重新做一次出境检查。
+            </p>
+
+            <h2>二、真正的主线在 <code>query()</code> 里</h2>
+            <p>
+              如果只看 <code>/compact</code> 命令，会误以为“上下文管理 = 手动压缩”。真正的主线在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L250-L307"><code>query()</code></a>。
+              这个函数每次进模型循环时，都会先拿到当前 messages、toolUseContext、模型配置和缓存策略；然后在发请求前，按一串固定顺序处理上下文压力。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/query-pressure-stack.png"
+                alt="Claude Code query 减压栈图，展示 boundary、budget、snip、microcompact、collapse、auto compact 到 API call 的顺序"
+              />
+              <figcaption><code>query()</code> 的减压顺序很重要：越靠前越便宜、越保留细粒度；越靠后越像有损恢复。</figcaption>
+            </figure>
+
+            <h3>2.1 第一步：从最后一个 compact 边界之后开始</h3>
+            <p>
+              <code>query()</code> 先执行
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L365-L367"><code>getMessagesAfterCompactBoundary(messages)</code></a>。
+              这个函数会找到最近的 compact boundary，只保留边界之后的消息；
+              源码注释还提醒，boundary 本身是 system message，之后会被 API normalizer 过滤掉。
+              这一步像翻账本时先找到“上次交接单”，前面的旧页不会直接进入当前报表。
+            </p>
+
+            <p>
+              接着是工具结果预算。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L369-L394"><code>applyToolResultBudget()</code></a>
+              会在 per-message aggregate tool result size 超预算时替换内容。这个状态挂在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/Tool.ts#L285-L299"><code>ToolUseContext.contentReplacementState</code></a>
+              上，注释说它是 per-conversation-thread 的 replacement state；主线程和可恢复 subagent 会持久化记录，短生命周期 fork 则不需要。
+            </p>
+
+            <h3>2.2 第二步：先用小刀，不急着搬家</h3>
+            <p>
+              后面几步就像收拾桌面：先丢掉已经不需要的旧包装，再看需不需要正式搬家。<code>HISTORY_SNIP</code> 打开时，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L396-L410"><code>snipCompactIfNeeded()</code></a>
+              会先运行，并把释放出的 token 差额传给 auto compact。紧接着，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L412-L426"><code>microcompact</code></a>
+              会清理可压缩的工具结果。
+            </p>
+
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L253-L292"><code>microcompactMessages()</code></a>
+              有两个可见路径。一个是 time-based microcompact：如果距离上次 assistant message 的间隔超过配置阈值，
+              就把旧工具结果内容改成
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L36-L50"><code>[Old tool result content cleared]</code></a>
+              这类占位文本，只保留最近若干个工具结果。另一个是 cached microcompact：在 feature gate、模型和主线程条件都满足时，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L295-L399">它不会改本地 message</a>，
+              而是把要删除的 tool result 排成 <code>cache_edits</code>，等 API 层插入请求。
+            </p>
+
+            <div class="note">
+              <p>
+                这里有个很容易读错的点：microcompact 不是“把整段会话总结”。它处理的是旧工具结果这种高占用、低语义密度的内容。
+                总结旧对话是 compact 的职责，发生在更靠后的层。
+              </p>
+            </div>
+
+            <h3>2.3 第三步：context collapse 抢在 auto compact 前面</h3>
+            <p>
+              如果 <code>CONTEXT_COLLAPSE</code> 打开，<code>query()</code> 会在 auto compact 之前调用
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L428-L447"><code>contextCollapse.applyCollapsesIfNeeded()</code></a>。
+              注释解释得很清楚：collapse 是 read-time projection，summary messages 住在 collapse store 里，不在 REPL 的完整历史数组里。
+              这意味着 UI 还可以保留更完整的历史，而 API view 可以先投影成更短的形状。
+            </p>
+
+            <p>
+              为什么它要排在 auto compact 前？因为如果 collapse 已经把上下文压到阈值以下，就没必要把一大段会话压成单一 summary。
+              这是典型的“先保细粒度，再做有损压缩”的策略。
+            </p>
+
+            <h3>2.4 最后才轮到 auto compact</h3>
+            <p>
+              到这里还装不下，才进入
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L453-L467"><code>autoCompactIfNeeded()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/autoCompact.ts#L28-L90"><code>autoCompact.ts</code></a>
+              先计算有效窗口：模型 context window 减掉最多 20k 的 summary 输出保留，再减掉 13k 的 auto compact buffer。
+              当 token 使用量超过阈值，并且用户没有关闭 compact 或 auto compact 时，才会真正 compact。
+            </p>
+
+            <p>
+              这也是为什么“窗口还剩一点点”不代表还能继续随便塞东西。Claude Code 需要给 summary 输出、手动 compact、重试和工具调用留缓冲。
+              如果 auto compact 被关闭，<a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L592-L648">硬阻塞检查</a>
+              会在接近极限时直接返回 prompt-too-long 错误，给用户留一点手动处理空间。
+            </p>
+
+            <h3>2.5 最后组装 API 请求：缓存断点只放一个</h3>
+            <p>
+              真正调用模型发生在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L659-L708"><code>deps.callModel()</code></a>。
+              这时 messages 会先被 <code>prependUserContext()</code> 加上用户上下文，system prompt 会带上 system context，options 里还会传入模型、工具、
+              MCP 工具、agent definitions、task budget、<code>skipCacheWrite</code> 等信息。
+            </p>
+
+            <p>
+              API 层再由
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1500-L1725"><code>paramsFromContext()</code></a>
+              生成实际请求，其中
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3062-L3211"><code>addCacheBreakpoints()</code></a>
+              会给消息加 prompt cache 断点。注释里有个很关键的约束：每次请求只放一个 message-level <code>cache_control</code> marker。
+              普通主线放在最后一条消息；fire-and-forget fork 使用 <code>skipCacheWrite</code> 时，marker 会前移到倒数第二条，也就是共享前缀的尾部。
+            </p>
+
+            <figure class="shape-example">
+              <pre><code>shape-level:
+
+main turn:
+  S + M_last(cache_control)  -> read/write S + M_last
+
+fire-and-forget fork:
+  S(cache_control) + F       -> read S, avoid writing S + F tail</code></pre>
+              <figcaption>这是概念形状，不表示 provider 内部 KV-cache 如何实现。源码能证明的是客户端 marker 放置和 <code>skipCacheWrite</code> 的请求策略。</figcaption>
+            </figure>
+
+            <h2>三、compact 不是删聊天，是立一块恢复碑</h2>
+            <p>
+              compact 真正发生时，Claude Code 做的不是“把前面的聊天记录删掉”。更准确的说法是：
+              它在本地历史里插入一个 compact boundary，再把旧上下文总结成一条可继续工作的 summary user message，
+              同时恢复一些后续工作必需的附件和 hook 结果。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/compact-recovery-loop.png"
+                alt="Claude Code compact 生命周期图，展示 trigger、pre hooks、summary fork、boundary、summary、restore 和 next turn"
+              />
+              <figcaption>compact 的产物是一段新的恢复记录：boundary 标记旧账结束，summary 承接旧账语义，附件和 hook 让下一轮能继续干活。</figcaption>
+            </figure>
+
+            <h3>3.1 手动和自动最终都走向 <code>compactConversation()</code></h3>
+            <p>
+              手动 <code>/compact</code> 的入口在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/commands/compact/compact.ts#L40-L124"><code>commands/compact/compact.ts</code></a>。
+              它会先裁到 compact boundary 之后，再在没有自定义指令时尝试 session memory compaction；
+              如果没有走 session memory，就先跑 microcompact，再调用 <code>compactConversation()</code>。
+              自动 compact 的入口在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/autoCompact.ts#L241-L350"><code>autoCompactIfNeeded()</code></a>，
+              它会先判断阈值、熔断连续失败，再同样尝试 session memory compaction，最后进入 <code>compactConversation()</code>。
+            </p>
+
+            <p>
+              这里的分叉很有意思：session memory compaction 是一条更细的路径；传统 compact 是一条大搬家路径。
+              但不管哪条路，成功以后都会清理失效缓存、标记 post-compaction，并把下一轮运行时指向新的上下文形状。
+            </p>
+
+            <h3>3.2 compact summary 是一次“无工具旁路”</h3>
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L387-L448"><code>compactConversation()</code></a>
+              开始后，先跑 PreCompact hooks，把 hook 给出的指令并入用户自定义指令，然后生成 summary request。
+              summary prompt 本身在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/prompt.ts#L12-L30"><code>prompt.ts</code></a>：
+              它明确要求模型只输出文本，不要调用工具，并要求先用 <code>&lt;analysis&gt;</code> 组织，再给出 <code>&lt;summary&gt;</code>。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/prompt.ts#L293-L303"><code>getCompactPrompt()</code></a>
+              会把这个 no-tools preamble、base compact prompt 和 no-tools trailer 拼起来。
+            </p>
+
+            <p>
+              这段设计保护的是一个很朴素的不变量：compact 是为了把旧上下文变成交接单，不是让模型顺手再读文件、改代码、跑命令。
+              如果 summary 过程中还能调用工具，compact 本身就会制造新的上下文压力，甚至改变当前任务状态。
+            </p>
+
+            <h3>3.3 compact 前会先把不该进 summary 的东西拿掉</h3>
+            <p>
+              生成 summary 之前，源码还有一些很实际的清洁动作。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L133-L200"><code>stripImagesFromMessages()</code></a>
+              会把图片和文档替换成文本 marker，避免 compact 请求本身被媒体内容撑爆；
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L202-L223"><code>stripReinjectedAttachments()</code></a>
+              会过滤掉 compact 后本来会重新注入的 skill discovery / skill listing 附件，避免 summary 被陈旧的技能推荐污染。
+            </p>
+
+            <p>
+              如果 compact 请求自己也遇到 prompt-too-long，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L230-L260"><code>truncateHeadForPTLRetry()</code></a>
+              会按 API round 分组，从最老的组开始丢一部分再重试。这是有损兜底，但比让用户卡死在“连 compact 都 compact 不动”要好。
+            </p>
+
+            <h3>3.4 compact 结果的顺序就是恢复顺序</h3>
+            <p>
+              compact 成功后，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L596-L624"><code>compactConversation()</code></a>
+              会创建 compact boundary 和 summary message。summary message 的内容来自
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/prompt.ts#L337-L373"><code>getCompactUserSummaryMessage()</code></a>：
+              它告诉下一轮“本会话从一个跑出上下文的旧对话继续”，必要时还给出 transcript 路径，并在自动 compact 时要求模型不要寒暄、不要复述、直接从中断处继续。
+            </p>
+
+            <p>
+              最后由
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L325-L338"><code>buildPostCompactMessages()</code></a>
+              统一产出 compact 后的消息数组，顺序是：
+            </p>
+
+            <figure class="shape-example">
+              <pre><code>post compact messages =
+  boundaryMarker
+  + summaryMessages
+  + messagesToKeep?
+  + attachments
+  + hookResults</code></pre>
+              <figcaption>这个顺序就是下一轮恢复顺序：先知道旧账已结束，再读摘要，再补回必要附件和 hook 结果。</figcaption>
+            </figure>
+
+            <p>
+              回到 <code>query()</code>，如果拿到 <code>compactionResult</code>，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L470-L535">它会把这些 post compact messages 逐条 yield 出去</a>，
+              然后把 <code>messagesForQuery</code> 直接替换成 post compact messages，当前这次 query 继续往下走。
+              也就是说，compact 不是下一轮才生效；这次循环里就会改用新的上下文形状继续请求模型。
+            </p>
+
+            <h2>四、哪些东西会留下，哪些只是重新装回去</h2>
+            <p>
+              compact 之后，很多人会问：“那我之前读过的文件、加载过的技能、项目记忆是不是都没了？”
+              答案不是简单的是或否。要看它属于哪种 owner。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../../assets/survival-map.png"
+                alt="Claude Code compact 后上下文保留策略图，展示 stable、reloaded、triggered 三类上下文来源"
+              />
+              <figcaption>compact 后能继续工作，靠的不是“所有旧细节都还在”，而是不同 owner 按自己的规则留下、重载或再次触发。</figcaption>
+            </figure>
+
+            <h3>4.1 系统提示词和工具 schema 不靠聊天历史存活</h3>
+            <p>
+              系统提示词、工具 schema、MCP 工具和 agent definitions，本来就不是靠旧聊天历史存活的。
+              API 请求每次都会从 runtime 重新组装：<code>query()</code> 把 <code>tools</code>、<code>mcpTools</code>、
+              <code>agents</code> 传给 <code>callModel()</code>；
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3213-L3237"><code>buildSystemPromptBlocks()</code></a>
+              也会把系统提示词拆成带 cache_control 的 text blocks。
+            </p>
+
+            <p>
+              这类内容像工具箱，不是维修日志。日志 compact 了，工具箱还在。
+            </p>
+
+            <h3>4.2 <code>CLAUDE.md</code> 和 memory 会重新算一次</h3>
+            <p>
+              <code>CLAUDE.md</code> 这类 memory 文件属于用户上下文。compact 后，
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/postCompactCleanup.ts#L31-L77"><code>runPostCompactCleanup()</code></a>
+              会在主线程 compact 时清掉 <code>getUserContext</code> cache，并 reset memory file cache。
+              注释解释了原因：如果只清内层 <code>getMemoryFiles</code>，下一轮还可能命中外层 <code>getUserContext</code> memoize，
+              导致应该触发的 InstructionsLoaded hook 根本不会跑。
+            </p>
+
+            <p>
+              所以 memory 不是被 summary “完美保存”，而是 compact 后重新按当前规则加载。这个区别很重要：
+              如果项目里的 memory 文件变了，下一轮应该看到新状态；如果它没有变，就会重新注入同样的项目约束。
+            </p>
+
+            <h3>4.3 文件附件和技能内容是“有限恢复”</h3>
+            <p>
+              compact 成功后，Claude Code 会补回一部分文件附件、异步 agent 附件、plan mode 附件和已调用技能附件。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L122-L130">常量</a>
+              写明了几个上限：最多恢复 5 个文件、post-compact 文件 token 预算 50k、单文件最多 5k、技能预算 25k。
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L517-L585">compact 后附件生成</a>
+              会基于 compact 前的 readFileState 和当前工具状态构建这些恢复消息。
+            </p>
+
+            <p>
+              这又是一个容易误读的点：Claude Code 不是保证“读过的每个字都还在”。它恢复的是最近、重要、预算内、继续工作需要的部分。
+              超出预算的文件内容，仍然要靠后续工具调用重新读。
+            </p>
+
+            <h3>4.4 技能列表不会无脑重注入</h3>
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/postCompactCleanup.ts#L12-L20"><code>runPostCompactCleanup()</code></a>
+              注释里专门说，compact 后不会清 invoked skill content，因为技能内容要跨多次 compact 存活；
+              但它也
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/postCompactCleanup.ts#L65-L69">不会重置 sent skill names</a>，
+              因为无脑重发完整 skill listing 只是制造 cache_creation 成本。
+              <code>compactConversation()</code> 里也会保留 invoked skills，并重新宣告 deferred tools、agent listing 和 MCP instruction delta。
+            </p>
+
+            <p>
+              这类设计都是为了同一个目标：compact 后不是“什么都忘了”，也不是“什么都重来一遍”，而是把继续工作必需的能力边界重新摆正。
+            </p>
+
+            <h2>五、把这套机制压成几条规则</h2>
+            <p>
+              读完这条链路，再回头看“上下文快爆了”这个问题，就不该只想着 summary。Claude Code 的实际策略更像四句操作规则。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>遇到的压力</th>
+                    <th>先用的机制</th>
+                    <th>保住的东西</th>
+                    <th>代价或边界</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>旧 compact 前缀太长</td>
+                    <td><code>getMessagesAfterCompactBoundary()</code></td>
+                    <td>恢复点之后的连续工作视图。</td>
+                    <td>compact 前细节只能通过 summary 或 transcript 追溯。</td>
+                  </tr>
+                  <tr>
+                    <td>工具结果占用太多</td>
+                    <td>tool result budget / microcompact</td>
+                    <td>工具调用顺序和必要语义。</td>
+                    <td>旧工具结果正文可能被占位符或 cache edit 替换。</td>
+                  </tr>
+                  <tr>
+                    <td>还有机会保留细粒度历史</td>
+                    <td>context collapse projection</td>
+                    <td>REPL 完整历史和 API view 的分离。</td>
+                    <td>feature gate 下才可见；投影算法细节不能从缺失源码里硬推。</td>
+                  </tr>
+                  <tr>
+                    <td>快到模型窗口极限</td>
+                    <td>auto compact / manual compact</td>
+                    <td>可继续工作的 summary 恢复点。</td>
+                    <td>summary 是有损的，文件和技能只按预算恢复。</td>
+                  </tr>
+                  <tr>
+                    <td>旁路 fork 只想借用前缀</td>
+                    <td><code>skipCacheWrite</code> 调整 cache marker</td>
+                    <td>共享前缀的 prompt cache 稳定性。</td>
+                    <td>fork-only suffix 不写成未来主线会继续的尾巴。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以，Claude Code 的上下文管理不是“记忆力更好”，而是“账本分得更细”。
+              UI 可以保留滚动历史，磁盘可以保留 transcript，runtime 可以重载 <code>CLAUDE.md</code> 和工具 schema，
+              API view 可以裁掉旧前缀、替换旧工具结果、加缓存断点，compact 则负责在必须有损时写出一份交接单。
+            </p>
+
+            <p>
+              这也是后面读工具、权限、MCP、hooks 和 subagent 的前提：只要一个机制会改变模型下一次看到的东西，
+              它就不是“显示层的小功能”，而是在改这本运行时账本。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
+              <li><a href="https://code.claude.com/docs/en/context-window">Claude Code context window 文档</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory 文档</a></li>
+              <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic prompt caching 文档</a></li>
+              <li><a href="https://docs.anthropic.com/en/api/messages">Anthropic Messages API</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts#L113-L188">context.ts：system/user context</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts#L437-L474">utils/api.ts：appendSystemContext / prependUserContext</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L365-L535">query.ts：pre-API context pipeline</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L659-L708">query.ts：callModel request options</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L253-L529">microCompact.ts：microcompact paths</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/autoCompact.ts#L28-L90">autoCompact.ts：threshold calculation</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L325-L338">compact.ts：buildPostCompactMessages</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L387-L748">compact.ts：compactConversation</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/prompt.ts#L12-L373">prompt.ts：compact prompt and summary wrapper</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3062-L3211">claude.ts：addCacheBreakpoints</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/postCompactCleanup.ts#L12-L77">postCompactCleanup.ts：post-compact cleanup</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

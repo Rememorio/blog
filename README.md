@@ -17,6 +17,21 @@ pipeline.
 - English home:
   [rememorio.github.io/blog/en/](https://rememorio.github.io/blog/en/)
 
+### Claude Code Source Notes
+
+Claude Code Source Notes is a Chinese source-reading series on the public
+[Rememorio/claude-code](https://github.com/Rememorio/claude-code) mirror. It
+starts from context management: how stable context, transcript records,
+runtime projections, prompt caching, microcompaction, and compact recovery
+combine into the next model-visible request.
+
+- Language gateway:
+  [rememorio.github.io/blog/claude-code/](https://rememorio.github.io/blog/claude-code/)
+- Chinese index:
+  [rememorio.github.io/blog/claude-code/zh/](https://rememorio.github.io/blog/claude-code/zh/)
+- Chinese context management:
+  [Claude Code 源码阅读（一）：上下文快爆了，Claude Code 不是直接总结](https://rememorio.github.io/blog/claude-code/zh/context-management/)
+
 ### Codex Source Notes
 
 Codex Source Notes is a bilingual source-reading series on
@@ -94,6 +109,11 @@ background review, curator, gateway, cron, and delegation.
 ├── index.html                  # Site language gateway
 ├── zh/index.html               # Chinese blog home page
 ├── en/index.html               # English blog home page
+├── claude-code/
+│   ├── index.html              # Series gateway
+│   ├── zh/index.html           # Chinese series index
+│   ├── zh/context-management/  # Chinese context-management article
+│   └── assets/*.png            # Final raster figures
 ├── codex/
 │   ├── index.html              # Language gateway
 │   ├── zh/index.html           # Chinese series index
@@ -147,6 +167,9 @@ Then open:
 - `http://127.0.0.1:4173/`
 - `http://127.0.0.1:4173/zh/`
 - `http://127.0.0.1:4173/en/`
+- `http://127.0.0.1:4173/claude-code/`
+- `http://127.0.0.1:4173/claude-code/zh/`
+- `http://127.0.0.1:4173/claude-code/zh/context-management/`
 - `http://127.0.0.1:4173/codex/`
 - `http://127.0.0.1:4173/codex/zh/overview/`
 - `http://127.0.0.1:4173/codex/en/overview/`
