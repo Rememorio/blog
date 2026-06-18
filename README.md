@@ -29,6 +29,8 @@ transcript recovery, and prompt cache behavior as separate mechanisms.
   [rememorio.github.io/blog/claude-code/](https://rememorio.github.io/blog/claude-code/)
 - Chinese index:
   [rememorio.github.io/blog/claude-code/zh/](https://rememorio.github.io/blog/claude-code/zh/)
+- English index:
+  [rememorio.github.io/blog/claude-code/en/](https://rememorio.github.io/blog/claude-code/en/)
 - Chinese overview:
   [Claude Code 源码阅读（一）：先跟一次任务走完整条运行主线](https://rememorio.github.io/blog/claude-code/zh/overview/)
 - Chinese context management:
@@ -128,6 +130,7 @@ background review, curator, gateway, cron, and delegation.
 ├── claude-code/
 │   ├── index.html              # Series gateway
 │   ├── zh/index.html           # Chinese series index
+│   ├── en/index.html           # English route map
 │   ├── zh/overview/            # Chinese series overview article
 │   ├── zh/context-management/  # Chinese context-management article
 │   ├── zh/tools/               # Chinese tools-runtime article
@@ -193,6 +196,7 @@ Then open:
 - `http://127.0.0.1:4173/en/`
 - `http://127.0.0.1:4173/claude-code/`
 - `http://127.0.0.1:4173/claude-code/zh/`
+- `http://127.0.0.1:4173/claude-code/en/`
 - `http://127.0.0.1:4173/claude-code/zh/overview/`
 - `http://127.0.0.1:4173/claude-code/zh/context-management/`
 - `http://127.0.0.1:4173/claude-code/zh/tools/`
