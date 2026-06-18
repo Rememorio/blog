@@ -36,20 +36,24 @@ images, explicitly translate the selected references' style and layout roles
 into the prompt and later quality checks.
 
 Adapt the visual system to Rememorio by keeping a restrained, integrated
-bottom-right `Rememorio` source-notes treatment and the article's
-source-accurate labels.
+`Rememorio` source-notes treatment and the article's source-accurate labels.
+The default treatment is a small bottom-right paper card, but a series may
+establish a stronger in-scene guide character or source-notes motif. Once that
+treatment has been accepted, carry it forward instead of forcing every later
+figure back into the default card layout.
 
 For Rememorio brand fidelity, treat the repository-root `Eyjafjalla.png` as
-the canonical character reference for the small source-notes card. Accepted
-in-repo figures may be used only to calibrate the brand treatment's placement,
-paper-card shape, line integration, and `Rememorio / source notes` feel; they
-must not replace the Wine & Chord reference as the overall article-figure style
-authority.
-Before generating or repairing a figure with a brand card, do a short brand
-reference pass: inspect `Eyjafjalla.png` for character identity and inspect one
-or two accepted in-repo source-notes cards only for how the card is integrated
-into the paper, line weight, and layout. The finished card should read as a
-faithful stylized redraw of the same character, not as a new logo concept.
+the canonical character reference for every Rememorio character treatment:
+bottom-right card, in-scene guide, or small source-notes motif. Accepted
+in-repo figures may be used to calibrate placement, paper-card or in-scene
+integration, line weight, and `Rememorio / source notes` feel; they must not
+replace the character reference or the Wine & Chord reference as the overall
+article-figure style authority.
+Before generating or repairing a figure, do a short character/style pass:
+inspect `Eyjafjalla.png` for identity and inspect one or two accepted in-repo
+figures for how the character is integrated into the paper, labels, arrows, and
+mechanism scene. The finished treatment should read as a faithful stylized
+redraw of the same character, not as a new logo concept.
 
 ## Non-Negotiables
 
@@ -58,10 +62,13 @@ faithful stylized redraw of the same character, not as a new logo concept.
 - Use the installed system `imagegen` skill's built-in image generation path by
   default. Do not use local CLI/API workflows unless the user explicitly asks
   for CLI, API, model, or local-key control.
-- Every final figure must carry one integrated `Rememorio` source-notes brand
-  treatment generated as part of the same visual language as the figure. Do not
-  use a pasted-looking logo, generic badge, clover/leaf icon, unrelated mascot,
-  or competing generated mark.
+- Every final standalone figure needs one integrated `Rememorio` source-notes
+  treatment generated as part of the same visual language as the figure. Use
+  the default bottom-right card for new one-off figures. For an established
+  series, preserve the accepted series treatment, including an Eyjafjalla-like
+  guide character drawn into the mechanism scene. Do not use a pasted-looking
+  logo, generic badge, clover/leaf icon, unrelated mascot, or competing
+  generated mark.
 - Every final generated figure must be saved under the relevant article's
   local `assets/` directory before publication. Published article markup should
   use the correct page-relative path for that static page.
@@ -113,20 +120,31 @@ Line and shape:
 
 Brand mark treatment:
 
-- Generate the Rememorio treatment as part of the whole figure by default,
-  usually as a small bottom-right paper note or source-notes card that includes
-  a tiny Eyjafjalla-like character and the word `Rememorio`.
-- Use the repository-root `Eyjafjalla.png` image as the canonical visual
-  reference for the character's broad look: small chibi girl, warm brown hair,
-  curled ram-like horns, red eyes, and white/red outfit cues. The final
-  character must be redrawn into the figure's hand-drawn style; do not paste,
+- For new standalone figures, generate the Rememorio treatment as part of the
+  whole figure, usually as a small bottom-right paper note or source-notes card
+  that includes a tiny Eyjafjalla-like character and the word `Rememorio`.
+  For a series with accepted in-scene character treatment, keep that treatment
+  instead of adding a second card or moving the character to the corner.
+- Resolve the canonical character reference from the current project, commonly
+  repository-root `Eyjafjalla.png` in this blog. If the file is not available,
+  ask for the project-provided character reference rather than inventing a new
+  logo. Accepted in-repo figures are style calibration for placement and line
+  integration, not replacements for the character reference.
+- Preserve Eyjafjalla's identity anchors even after stylization: small chibi
+  girl proportions, warm chestnut-brown hair with rounded volume and loose
+  side locks, segmented pale curled horns, red eyes, small red hair beads or
+  ties where visible, white/red outfit cues, and darker glove or boot accents.
+  At small sizes, prioritize the silhouette, horns, hair mass, and red eyes.
+- Redraw those traits into the figure's hand-drawn paper style; do not paste,
   crop, trace, recolor, or mechanically composite the source image unless the
   user explicitly asks for exact pixel-level fidelity.
-- Keep the brand legible but secondary: roughly `10%` to `18%` of image width,
-  with at least `3%` canvas padding from the right and bottom edges.
-- Ask for the brand area to be naturally integrated into the paper texture,
-  line weight, shadows, and palette of the figure. The note should look drawn
-  with the same hand as the diagram.
+- Keep the brand legible but secondary. A default card is roughly `10%` to
+  `18%` of image width with at least `3%` canvas padding from the right and
+  bottom edges. An in-scene guide character may be larger when it teaches the
+  mechanism, but it must not crowd labels, arrows, or the article's evidence.
+- Ask for the brand area or guide character to be naturally integrated into the
+  paper texture, line weight, shadows, and palette of the figure. It should
+  look drawn with the same hand as the diagram.
 - When revising a figure whose mechanism is otherwise acceptable but the brand
   card drifted, use the current figure as the edit target and regenerate or
   edit the whole image area so the brand remains integrated. Use an accepted
@@ -134,7 +152,8 @@ Brand mark treatment:
   article's existing nodes, labels, and arrows as the mechanism source.
 - Do not use a generic badge, alternate logo, image-model imitation of an
   unrelated mark, generic reading mascot, clover/leaf icon, route-line logo, or
-  large avatar badge.
+  large avatar badge. A cute character is not sufficient; it must still read as
+  a faithful Eyjafjalla-like redraw in the current figure style.
 - Do not accept a brand card merely because it says `Rememorio`. The small
   character should preserve the canonical cues from `Eyjafjalla.png` in the new
   hand-drawn style: warm brown hair volume, curled light horns, red eyes, and
@@ -145,6 +164,30 @@ Brand mark treatment:
   pixel-level brand fidelity or asks to use the exact source image. Before
   choosing that path, note that it can look less integrated than a whole-image
   generation.
+
+Established Eyjafjalla mechanism-scene style:
+
+- When a series has accepted figures where the Eyjafjalla-like character
+  participates in the mechanism scene, treat those figures as the local style
+  authority for that series. In this repository, examples include
+  `claude-code/zh/assets/agent-fork-cover.png`,
+  `claude-code/zh/assets/worker-tool-scope.png`,
+  `claude-code/zh/assets/agent-selection-gates.png`, and other accepted
+  sibling figures when present.
+- The desired look is a warm hand-drawn technical notebook: parchment or
+  off-white paper, slightly rough edges, ink outlines, soft watercolor fills,
+  compact cards, ribbons, shelves, tools, ledgers, gates, arrows, and small
+  source-note scraps that feel drawn into one scene.
+- The character should be useful to the figure: pointing at a gate, standing by
+  a ledger, holding a tool, or visually anchoring the runtime boundary. Add
+  props such as magnifiers, stop signs, scales, boxes, or gears only when the
+  mechanism calls for them. Do not cargo-cult a prop from a previous figure.
+- Chinese-edition figures may use Chinese-majority labels with short English
+  source identifiers. English-edition figures should keep the same composition
+  and replace only the language-bearing labels.
+- Do not drift into a generic mascot, dark tech poster, glossy UI mock,
+  isolated avatar logo, or decorative character sheet. The figure is still a
+  source-code mechanism diagram.
 
 ## Reference Image Roles
 
@@ -244,9 +287,10 @@ For source-code diagrams, keep visible labels short:
 
 - Prefer code identifiers only when short, for example `cache_control`,
   `prompt_cache_key`, `compact_boundary`, `replacement_history`.
-- Prefer concise English labels and source identifiers inside figures, even for
-  Chinese articles. This improves generation reliability and preserves a clean
-  path to later English localization.
+- Prefer concise English labels and source identifiers when they are
+  language-neutral. For Chinese articles whose accepted series style uses
+  Chinese-majority figure text, use short Chinese headings and callouts with
+  English code identifiers rather than over-Englishing the diagram.
 - Avoid long Chinese sentences inside generated images.
 - If Chinese labels are required, keep them short and prefer whole-image
   generation or a built-in edit pass so the lettering stays integrated with the
@@ -263,7 +307,7 @@ For source-code diagrams, keep visible labels short:
   surrounding prose. Do not regenerate a figure solely to translate labels if
   the existing labels are readable and language-neutral.
 
-Prompt pattern:
+New standalone figure prompt pattern:
 
 ```text
 High-resolution 16:9 hand-drawn technical article infographic for Rememorio.
@@ -287,10 +331,70 @@ Keep arrows clean and non-crossing; leave generous margins.
 Professional editorial diagram, not cartoonish, not glossy 3D.
 ```
 
+For a series that already has an accepted in-scene Eyjafjalla treatment, replace
+the bottom-right-card line with this direction:
+
+```text
+Preserve the established series treatment: an Eyjafjalla-like chibi guide
+drawn into the mechanism scene, faithful to the project character reference
+(chestnut-brown hair, segmented curled horns, red eyes, red/white outfit cues)
+and integrated with the same paper, ink, watercolor, shadows, and line weight
+as the diagram. Do not add a separate bottom-right source-notes card unless the
+source figure already has one.
+Use Chinese-majority labels for a Chinese edition when that is the established
+series style, with English retained for source identifiers and product names.
+Use the same layout for English editions and localize only the language-bearing
+labels.
+```
+
+Language-edition edit prompt pattern:
+
+```text
+Use case: text-localization.
+Edit/reference <source-image-path> as the exact visual target.
+Create the <target-language> version of this same figure.
+Preserve the original composition, canvas size, paper texture, character,
+boxes, icons, arrows, palette, shadows, and hand-drawn style.
+Only replace visible <source-language> labels with concise <target-language>
+labels from this list: [label map].
+Keep code identifiers, product names, arrows, numbering, and all non-language
+diagram structure unchanged.
+Do not redesign, crop, simplify, add a new Rememorio card, remove the
+Eyjafjalla-like guide, or change the figure's teaching role.
+```
+
 If exact labels matter, simplify the label list first and iterate with a
 targeted whole-image generation or built-in edit. Use deterministic overlays
 only for small exactness fixes where the result still looks like a single
 finished raster image.
+
+## Figure Localization And Language Editions
+
+Treat a language-only variant of an accepted figure as an edit target, not as a
+fresh illustration brief. The source-language PNG is the authority for layout,
+character placement, colors, arrows, and visual density. The target-language
+figure should read as the same image in another language.
+
+When in-image text differs by language:
+
+- keep mirrored language asset directories according to the article package,
+  for example `<article>/<lang>/assets/` or the repository's established
+  equivalent;
+- keep the same filename set across language directories unless a figure is
+  intentionally language-specific;
+- generate or edit the target-language image from the accepted source-language
+  raster, replacing text only;
+- keep concise English source identifiers unchanged when they are already
+  language-neutral;
+- avoid programmatically rebuilding the diagram from scratch just to translate
+  labels, because it usually drifts in character, layout, and visual style.
+
+After localizing a batch, create a source/target contact sheet and inspect it
+as one family. Then open high-risk figures full size, especially covers and any
+figure with dense CJK or English labels. Fix a localized image when the
+Eyjafjalla-like guide changes identity, a hand gains extra fingers or limbs,
+the layout shifts, or the result feels like a sibling concept instead of the
+same figure.
 
 ## Post-Processing
 
@@ -318,19 +422,21 @@ inspect the final raster at full size, not only as a contact sheet.
 Integrated brand protocol:
 
 1. Include the Rememorio treatment in the figure brief before generation,
-   naming `Eyjafjalla.png` as the character reference and, when useful, one
-   accepted in-repo figure as the card-integration reference.
-2. Place it as a small bottom-right source-notes card, roughly `10%` to `18%`
-   of canvas width, with at least `3%` right and bottom padding.
-3. Derive the tiny character from `Eyjafjalla.png`: brown hair, curled
-   ram-like horns, red eyes, and white/red outfit hints. Redraw those traits in
-   the figure's sketch style instead of compositing the original asset.
-4. Keep the character, wordmark, card paper, line weight, shadows, and palette
-   consistent with the rest of the figure.
-5. If the brand area looks like a pasted sticker, generic icon, clover/leaf
-   badge, unrelated mascot, generic reading mascot, or detached logo,
-   regenerate or use a built-in edit for the whole figure area rather than
-   layering a patch on top.
+   naming the project character reference and, when useful, one accepted
+   in-repo figure as the integration reference.
+2. Choose the treatment deliberately: default bottom-right source-notes card
+   for standalone figures, or the accepted in-scene Eyjafjalla guide for a
+   series that already uses one. Do not mix both unless the source figure
+   already does.
+3. Derive the character from the reference: chestnut-brown hair, curled
+   segmented horns, red eyes, and white/red outfit hints. Redraw those traits
+   in the figure's sketch style instead of compositing the original asset.
+4. Keep the character, wordmark or note if present, paper, line weight,
+   shadows, and palette consistent with the rest of the figure.
+5. If the character or brand area looks like a pasted sticker, generic icon,
+   clover/leaf badge, unrelated mascot, generic reading mascot, detached logo,
+   or a different character with only superficial horns, regenerate or use a
+   built-in edit for the whole figure area rather than layering a patch on top.
 6. Save the final integrated image as the only PNG referenced by the article.
 
 Recommended final asset layout:
@@ -389,15 +495,20 @@ Inspect every generated figure before publishing:
   triggers and permissions differ.
 - The figure matches the article's source claims.
 - The Rememorio treatment is integrated into the bottom-right of the figure and
-  looks drawn with the same paper, line weight, palette, and shadows. The
-  character visibly follows `Eyjafjalla.png`'s broad traits: brown hair,
-  curled horns, red eyes, and white/red outfit hints. No pasted sticker,
-  alternate badge, generic icon, generic reading mascot, clover/leaf mark,
-  distorted crop, recolor, or competing generated logo is visible.
-- Compare the brand card at full size against `Eyjafjalla.png` and at least
-  one accepted in-repo source-notes card. The comparison should confirm both
-  identity fidelity and visual integration; if it only passes one of those two,
-  regenerate or edit the whole brand area.
+  or into the accepted in-scene series treatment, and looks drawn with the same
+  paper, line weight, palette, and shadows. The character visibly follows the
+  project reference's broad traits: chestnut-brown hair, curled segmented
+  horns, red eyes, and white/red outfit hints. No pasted sticker, alternate
+  badge, generic icon, generic reading mascot, clover/leaf mark, distorted
+  crop, recolor, or competing generated logo is visible.
+- Compare the brand card or in-scene guide at full size against the project
+  character reference and at least one accepted in-repo figure with the desired
+  treatment. The comparison should confirm both identity fidelity and visual
+  integration; if it only passes one of those two, regenerate or edit the whole
+  brand area.
+- For localized figures, compare source and target language versions side by
+  side. They should match in layout, character identity, visual density, and
+  teaching role; only the language-bearing text should materially change.
 - The published article references the correct local relative URL for each
   generated figure, and the referenced PNG exists in the repository.
 - No private instruction, prompt, unfinished editorial marker, or process note

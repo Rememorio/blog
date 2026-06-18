@@ -508,20 +508,41 @@ article package already has a separate English source.
 For bilingual standalone articles in this static blog, prefer sibling language
 pages over in-page machine translation:
 
-- use `<article>/cn/` for Chinese and `<article>/en/` for English;
+- use the repository's established language slugs consistently, commonly
+  `<article>/zh/` for Chinese and `<article>/en/` for English in this blog; do
+  not introduce a new slug such as `cn/` when the surrounding package already
+  uses `zh/`;
 - keep `<article>/` as a thin language gateway when both editions exist;
 - preserve old root anchors by redirecting root URLs with a hash to the Chinese
   page while keeping the hash;
 - add `canonical` and `alternate hreflang` links for `zh-CN`, `en`, and
   `x-default`;
-- add visible language switches in each edition's header;
+- add visible language switches in each edition's header, showing both
+  languages such as `中文 / English` rather than only the current language;
+- keep the top navigation, brand link, GitHub link, language switch placement,
+  and active states visually consistent across every sibling article page;
 - update the blog index with explicit entries or labels for each public
   language entry point.
+
+For an article package or series that already has both Chinese and English
+surfaces, treat bilingual delivery as the default unit of work. Creating a new
+chapter, changing the reading order, replacing a cover, or revising a shared
+mechanism normally means updating both `<article>/zh/...` and
+`<article>/en/...` siblings in the same pass, unless the user explicitly asks
+for a single-language draft. Do not leave the English side as a route shell,
+stale chapter list, missing next/previous target, or untranslated copy of the
+Chinese page.
 
 Write each language as a finished article in that language. Do not mechanically
 translate sentence by sentence when the target language needs different
 rhythm, transitions, or terminology. Keep the evidence, figures, source links,
 and claims aligned across editions.
+
+Do not publish an English route map, stub, or placeholder when the user asks
+for an English edition of an article or series. Either create a finished
+sibling article in the target language, or keep the unfinished route
+unpublished until it is ready. A bilingual series should feel like one
+publication surface with two complete reading paths.
 
 Figures may use concise English labels, source identifiers, and product terms
 even inside a Chinese article. This keeps diagrams legible, reduces generated
@@ -539,6 +560,23 @@ are already concise, source-accurate, and language-neutral. Localize alt text,
 captions, headings, navigation, metadata, and surrounding prose. Regenerate a
 figure only when the visual claim, label semantics, or target-language
 readability actually changes.
+
+When figure text must differ by language, mirror the asset layout in the
+language directories and keep filenames aligned. For example, if the article
+package uses `zh/assets/` and `en/assets/`, Chinese pages should read from
+`zh/assets/` and English pages from `en/assets/` with the same figure names
+where the teaching role is the same. Produce the target-language figure by
+editing the accepted source-language raster through the image workflow, not by
+redesigning the diagram from scratch. The localized figure should look like the
+same composition with different text.
+
+Navigation is part of the bilingual article, not surrounding chrome to patch
+later. After adding or moving any bilingual page, check the top tabs/actions,
+brand/home links, `中文 / English` switch, series index cards, previous/next
+links, root gateway, and blog home entry as one graph. Each Chinese page should
+point to the corresponding English sibling, and each English page should point
+back to the corresponding Chinese sibling. Avoid switches that only point to
+the language root unless the sibling article genuinely does not exist.
 
 ## Terminology And Link Semantics
 
@@ -685,9 +723,20 @@ For language-structure changes, also verify:
   intended targets;
 - `hreflang`, canonical URLs, page titles, descriptions, Open Graph metadata,
   and header language switches are present and language-correct;
+- every article page exposes both language options in the same header style,
+  and each switch points to the corresponding sibling page rather than to the
+  series root;
+- top navigation tabs/actions, active states, previous/next links, series index
+  cards, and blog home cards remain visually and semantically consistent across
+  Chinese and English pages;
 - old anchor links either still resolve or redirect to the new language page
   with the hash preserved;
-- relative asset paths are correct from each language subdirectory.
+- relative asset paths are correct from each language subdirectory;
+- language-specific asset directories have matching filename sets when
+  in-image text differs, and each page's `og:image`, cover, captions, and alt
+  text point at the correct language asset;
+- source and target language figure contact sheets have been compared when a
+  batch of localized raster images is added or regenerated.
 
 Before committing public article changes, run the smallest relevant validation
 that covers the edit:
