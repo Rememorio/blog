@@ -19,7 +19,7 @@ pipeline.
 
 ### Claude Code Source Notes
 
-Claude Code Source Notes is a Chinese source-reading series on the public
+Claude Code Source Notes is a bilingual source-reading series on the public
 [Rememorio/claude-code](https://github.com/Rememorio/claude-code) mirror. It
 starts by following one ordinary task through the runtime path, then drills
 into context management, tools, permissions, MCP, subagents, hooks,
@@ -49,6 +49,24 @@ transcript recovery, and prompt cache behavior as separate mechanisms.
   [Claude Code 源码阅读（八）：Resume 不是续聊天，而是重建运行时状态](https://rememorio.github.io/blog/claude-code/zh/transcript-resume/)
 - Chinese performance and prompt cache:
   [Claude Code 源码阅读（九）：Prompt cache 不是开关，速度来自请求形状](https://rememorio.github.io/blog/claude-code/zh/prompt-cache-performance/)
+- English overview:
+  [Claude Code Source Notes I: Follow One Task Through the Runtime](https://rememorio.github.io/blog/claude-code/en/overview/)
+- English context management:
+  [Claude Code Source Notes II: Context Is Not Just a Summary](https://rememorio.github.io/blog/claude-code/en/context-management/)
+- English tools:
+  [Claude Code Source Notes III: Tools Are Runtime Contracts](https://rememorio.github.io/blog/claude-code/en/tools/)
+- English permissions:
+  [Claude Code Source Notes IV: Permissions Are the Side-Effect Brake](https://rememorio.github.io/blog/claude-code/en/permissions/)
+- English commands, skills, and MCP:
+  [Claude Code Source Notes V: Commands, Skills, and MCP](https://rememorio.github.io/blog/claude-code/en/commands-skills-mcp/)
+- English subagents and fork:
+  [Claude Code Source Notes VI: Subagents and Forks](https://rememorio.github.io/blog/claude-code/en/subagents-fork/)
+- English hooks and lifecycle:
+  [Claude Code Source Notes VII: Hooks Are Runtime Gates](https://rememorio.github.io/blog/claude-code/en/hooks-lifecycle/)
+- English transcript and resume:
+  [Claude Code Source Notes VIII: Resume Rebuilds Runtime State](https://rememorio.github.io/blog/claude-code/en/transcript-resume/)
+- English performance and prompt cache:
+  [Claude Code Source Notes IX: Prompt Cache Is Request-Shape Discipline](https://rememorio.github.io/blog/claude-code/en/prompt-cache-performance/)
 
 ### Codex Source Notes
 
@@ -130,7 +148,7 @@ background review, curator, gateway, cron, and delegation.
 ├── claude-code/
 │   ├── index.html              # Series gateway
 │   ├── zh/index.html           # Chinese series index
-│   ├── en/index.html           # English route map
+│   ├── en/index.html           # English series index
 │   ├── zh/overview/            # Chinese series overview article
 │   ├── zh/context-management/  # Chinese context-management article
 │   ├── zh/tools/               # Chinese tools-runtime article
@@ -140,7 +158,17 @@ background review, curator, gateway, cron, and delegation.
 │   ├── zh/hooks-lifecycle/      # Chinese hooks/lifecycle article
 │   ├── zh/transcript-resume/    # Chinese transcript/resume article
 │   ├── zh/prompt-cache-performance/ # Chinese performance/cache article
-│   └── assets/*.png            # Final raster figures
+│   ├── en/overview/            # English series overview article
+│   ├── en/context-management/  # English context-management article
+│   ├── en/tools/               # English tools-runtime article
+│   ├── en/permissions/         # English permissions article
+│   ├── en/commands-skills-mcp/  # English commands/skills/MCP article
+│   ├── en/subagents-fork/       # English subagents/fork article
+│   ├── en/hooks-lifecycle/      # English hooks/lifecycle article
+│   ├── en/transcript-resume/    # English transcript/resume article
+│   ├── en/prompt-cache-performance/ # English performance/cache article
+│   ├── zh/assets/*.png         # Chinese raster figures
+│   └── en/assets/*.png         # English raster figures
 ├── codex/
 │   ├── index.html              # Language gateway
 │   ├── zh/index.html           # Chinese series index
