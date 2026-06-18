@@ -62,6 +62,14 @@ redraw of the same character, not as a new logo concept.
 - Use the installed system `imagegen` skill's built-in image generation path by
   default. Do not use local CLI/API workflows unless the user explicitly asks
   for CLI, API, model, or local-key control.
+- Treat the built-in imagegen output as the visual source of truth. When a
+  generated figure has a visual defect such as bad anatomy, distorted brand
+  treatment, broken layout, or drifting labels, fix it with built-in
+  regeneration or built-in editing. Do not repair published article figures by
+  stitching screenshots, painting over limbs, compositing character patches, or
+  rebuilding the scene with local drawing code. Local scripts may decode,
+  copy, resize, format-convert, or make contact sheets for inspection; they
+  should not create the visual content of the final figure.
 - Every final standalone figure needs one integrated `Rememorio` source-notes
   treatment generated as part of the same visual language as the figure. Use
   the default bottom-right card for new one-off figures. For an established
@@ -182,6 +190,20 @@ Established Eyjafjalla mechanism-scene style:
   a ledger, holding a tool, or visually anchoring the runtime boundary. Add
   props such as magnifiers, stop signs, scales, boxes, or gears only when the
   mechanism calls for them. Do not cargo-cult a prop from a previous figure.
+- Keep the character's action anatomically stable. Avoid poses that require a
+  chibi arm to reach across the canvas, a hand to touch distant cards, or a
+  long pointer to be held at full extension; those often produce oversized
+  hands, stretched arms, detached wrists, or missing limbs. Prefer a short
+  prop held near the body, a notebook in both hands, a nearby tool, or a red
+  highlight/attention mark on the target node. If the mechanism needs emphasis
+  far from the guide character, mark the node in the diagram instead of
+  stretching the character toward it.
+- When the guide character is prominent, specify anatomy in the prompt: both
+  arms visible, elbows near the torso unless the pose truly requires
+  extension, small proportional hands, natural wrist-to-sleeve connection, no
+  extra fingers, no detached hands, and no missing limbs. If imagegen keeps
+  failing a pose, simplify the pose and regenerate the whole figure rather than
+  locally patching the broken body part.
 - Chinese-edition figures may use Chinese-majority labels with short English
   source identifiers. English-edition figures should keep the same composition
   and replace only the language-bearing labels.
@@ -232,6 +254,9 @@ Before generating, write a compact figure brief:
    If the figure includes or revises a Rememorio brand treatment, separately
    name the Eyjafjalla character reference and any accepted in-repo
    source-notes card used only for brand-card integration.
+7. Character action: when a guide character appears, describe a pose that can
+   be drawn with normal proportions, and describe how distant nodes are
+   emphasized without forcing the character to reach across the diagram.
 
 For runtime and protocol figures, prefer lifecycle or before/after layouts over
 generic box clusters. A good figure should make one transition visible:
@@ -341,6 +366,11 @@ drawn into the mechanism scene, faithful to the project character reference
 and integrated with the same paper, ink, watercolor, shadows, and line weight
 as the diagram. Do not add a separate bottom-right source-notes card unless the
 source figure already has one.
+Keep the guide character anatomically stable: short chibi arms, small
+proportional hands, natural wrist-to-sleeve connection, no detached hands, no
+missing limbs, and no extra fingers. If the target node is far away, highlight
+that node in the diagram instead of making the character reach across the
+canvas.
 Use Chinese-majority labels for a Chinese edition when that is the established
 series style, with English retained for source identifiers and product names.
 Use the same layout for English editions and localize only the language-bearing
@@ -388,6 +418,11 @@ When in-image text differs by language:
   language-neutral;
 - avoid programmatically rebuilding the diagram from scratch just to translate
   labels, because it usually drifts in character, layout, and visual style.
+- preserve accepted character anatomy during localization. If the localized
+  edit changes a hand, arm, face, horns, or pose while translating labels, treat
+  the localized image as failed and rerun the built-in text-localization edit
+  with stricter preservation constraints. Do not paste a character region from
+  one language image into another to repair the drift.
 
 After localizing a batch, create a source/target contact sheet and inspect it
 as one family. Then open high-risk figures full size, especially covers and any
@@ -395,6 +430,36 @@ figure with dense CJK or English labels. Fix a localized image when the
 Eyjafjalla-like guide changes identity, a hand gains extra fingers or limbs,
 the layout shifts, or the result feels like a sibling concept instead of the
 same figure.
+
+## Capturing Built-In Imagegen Outputs
+
+The built-in imagegen tool may show the image in the Codex UI before the final
+workspace path is obvious. For project-bound assets, always persist the actual
+imagegen PNG into the article assets directory; do not screenshot the preview
+or substitute a locally rebuilt diagram.
+
+Preferred capture sequence:
+
+1. Add a unique internal asset marker to the prompt, for example
+   `Internal asset id: article-figure-language-date-attempt. Do not render this
+   id.` Keep it portable and free of local absolute paths.
+2. After generation, first look under `$CODEX_HOME/generated_images/` for the
+   matching recent imagegen output.
+3. If the path is not obvious, locate the latest built-in generation event by
+   parsing `$CODEX_HOME/sessions/**/*.jsonl` as JSON and matching the internal
+   asset marker in `payload.revised_prompt` for records whose
+   `payload.type` is `image_generation_call`.
+4. Decode that event's `payload.result` base64 field directly to the target
+   PNG. Do not print the base64 line to the terminal, and do not use broad
+   text searches that dump megabytes of image data.
+5. Open the decoded image at full size before copying or overwriting the
+   article asset. Confirm it is the intended imagegen figure, not a screenshot,
+   contact sheet, browser capture, or unrelated cached image.
+
+Avoid scavenging arbitrary `data:image` blobs across all sessions. If several
+candidates exist, select by the unique internal asset marker and timestamp, then
+visually verify. This keeps the workflow portable across machines while
+preventing accidental replacement with stale or unrelated images.
 
 ## Post-Processing
 
@@ -407,6 +472,11 @@ assembled from layers.
 - Keep the generated figure as the primary visual source.
 - Prefer regenerating or built-in editing when labels, arrows, or the brand
   treatment drift.
+- For character, brand, and layout defects, do not use local compositing,
+  inpainting, masking, or patch assembly as the repair path. Whole-image
+  generation or a built-in edit keeps line weight, paper texture, shadows,
+  anatomy, and text treatment coherent. If a repeated edit makes the character
+  worse, change the composition or pose and regenerate the figure.
 - Use deterministic labels, arrows, or callouts only when exact source
   identifiers require it and the correction remains visually integrated.
 - Use deterministic brand compositing only when the user explicitly requires
@@ -501,6 +571,11 @@ Inspect every generated figure before publishing:
   horns, red eyes, and white/red outfit hints. No pasted sticker, alternate
   badge, generic icon, generic reading mascot, clover/leaf mark, distorted
   crop, recolor, or competing generated logo is visible.
+- Character anatomy is credible at full size: no stretched arms, oversized
+  gloves or hands, missing limbs, detached wrists, duplicate hands, extra
+  fingers, or props that force impossible reach. If a pointing pose creates any
+  of those failures, redesign the pose so the character stays local and the
+  diagram node carries the visual emphasis.
 - Compare the brand card or in-scene guide at full size against the project
   character reference and at least one accepted in-repo figure with the desired
   treatment. The comparison should confirm both identity fidelity and visual
