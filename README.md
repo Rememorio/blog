@@ -34,9 +34,8 @@ stay stable as new essays are added.
 │   └── en/                     # English articles and figures
 ├── codex/                      # Codex series
 │   ├── index.html              # Series language gateway
-│   ├── zh/                     # Chinese articles
-│   ├── en/                     # English articles
-│   └── assets/                 # Shared final figures
+│   ├── zh/                     # Chinese articles and figures
+│   └── en/                     # English articles and figures
 ├── hermes-agent/               # Hermes Agent article
 │   ├── index.html              # Article language gateway
 │   ├── zh/
