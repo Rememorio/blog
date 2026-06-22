@@ -12,28 +12,37 @@ reading.
 
 ## Living Visual Exemplar
 
-The Wine & Chord prompt-cache article is the external visual style and quality
-reference:
+The Rememorio Blog repository's accepted article figures are the visual style
+and quality reference. Before producing a new figure, inspect the repository
+root `Eyjafjalla.png` character reference and a small contact sheet of accepted
+local figures that match the target series and teaching role.
 
-- Public article: `https://www.wineandchord.com/books/prompt-cache/`.
-- Source repository: `https://github.com/WineChord/books`.
-- Reference article artifact: `docs/public/prompt-cache/index.html`.
-- Reference image pack: `docs/public/prompt-cache/assets/*.png`.
+Default accepted mechanism-scene references in this repository:
 
-Before producing any new Rememorio article figure, inspect the Wine & Chord
-reference article and a contact sheet of the prompt-cache image pack. Use the
-reference for visual discipline: warm paper, restrained blue/green palette,
-clean sketched arrows, short labels, visible ownership boundaries, and one
-mechanism per figure. Do not copy the Wine & Chord topic, prose, or image
-content into Rememorio articles.
+- `claude-code/zh/assets/agent-fork-cover.png`
+- `claude-code/zh/assets/worker-tool-scope.png`
+- `claude-code/zh/assets/agent-selection-gates.png`
+- `claude-code/zh/assets/mcp-tool-pool.png`
+- `claude-code/zh/assets/commands-skills-mcp-cover.png`
+- `codex/zh/assets/codex-turn-runtime-overview.png`
+- `codex/zh/assets/context-ledger-cover.png`
+- `codex/zh/assets/tool-runtime-pipeline.png`
+- `codex/zh/assets/protocol-event-stream.png`
 
-Do not use a work-in-progress Rememorio article's current images as the style
-authority for revising that same article. Existing local images are candidates
-to keep, fix, or replace; the Wine & Chord reference is the comparative bar.
-If an image generation tool accepts reference images, use the most relevant
-`1` to `3` Wine-style references by role. If the tool does not accept reference
-images, explicitly translate the selected references' style and layout roles
-into the prompt and later quality checks.
+Use these local references for visual discipline: warm parchment or off-white
+paper, rough but restrained edges, compact mechanism cards, red-brown title
+ribbons, bottom invariant ribbons, clean sketched arrows, short labels, visible
+ownership boundaries, useful desk props, and one mechanism per figure. The
+accepted figures are not clip-art to copy; they are calibration for paper,
+line weight, density, character integration, and mechanism clarity.
+
+Do not use a work-in-progress article's current images as the style authority
+for revising that same article. Existing local images are candidates to keep,
+fix, or replace; accepted local references from this skill are the comparative
+bar. If a figure generation tool accepts reference images, use the most
+relevant `1` to `3` accepted local references by role. If the tool does not
+accept reference images, explicitly translate the selected references' style
+and layout roles into the prompt and later quality checks.
 
 Adapt the visual system to Rememorio by keeping a restrained, integrated
 `Rememorio` source-notes treatment and the article's source-accurate labels.
@@ -47,7 +56,7 @@ the canonical character reference for every Rememorio character treatment:
 bottom-right card, in-scene guide, or small source-notes motif. Accepted
 in-repo figures may be used to calibrate placement, paper-card or in-scene
 integration, line weight, and `Rememorio / source notes` feel; they must not
-replace the character reference or the Wine & Chord reference as the overall
+replace the character reference or the accepted local figures as the
 article-figure style authority.
 Before generating or repairing a figure, do a short character/style pass:
 inspect `Eyjafjalla.png` for identity and inspect one or two accepted in-repo
@@ -100,7 +109,9 @@ Canvas:
   `1672 x 941` or larger.
 - Safe margin: at least `7%` on all sides.
 - Background: warm off-white paper, not pure white.
-- Texture: subtle paper grain; no noisy parchment, stains, or heavy shadows.
+- Texture: subtle paper grain; no noisy parchment, tea-stained antique scroll
+  texture, stains, or heavy shadows. Keep the paper closer to the accepted
+  local figures' cleaner off-white notebook pages than to an aged treasure map.
 
 Palette:
 
@@ -196,9 +207,8 @@ Established Eyjafjalla mechanism-scene style:
   figures when present. Use them as composition and integration references,
   while `Eyjafjalla.png` remains the identity reference. For this established
   mechanism-scene treatment, accepted in-repo figures are the composition
-  authority; the Wine & Chord reference remains the broader quality, paper, and
-  diagram-discipline bar. Do not regress these figures into a generic
-  Wine-style chart plus a bottom-right Rememorio card.
+  authority. Do not regress these figures into a generic chart plus a
+  bottom-right Rememorio card.
 - Use only the named accepted figures in this section as default calibration
   unless the user explicitly identifies newer accepted examples. Do not promote
   experimental, disliked, or merely existing images into style authority just
@@ -256,8 +266,8 @@ Established Eyjafjalla mechanism-scene style:
 
 ## Reference Image Roles
 
-Use the Wine & Chord prompt-cache image pack as a role library. Pick references
-by teaching role, not by filename similarity:
+Use accepted local Rememorio figures as a role library. Pick references by
+teaching role, not by filename similarity or article title:
 
 - Cover or overview: broad system route with one clear thesis.
 - Provider or API contract: two or three lanes with stable/dynamic boundaries.
@@ -276,7 +286,7 @@ Reference selection workflow:
 1. Name the figure's teaching role: cover, overview, contract comparison,
    pressure ladder, lifecycle, persistence path, projection, replacement
    ledger, or final map.
-2. Select the closest `1` to `3` Wine-style references for that role.
+2. Select the closest `1` to `3` accepted local references for that role.
 3. State what each reference contributes: layout, palette, line treatment,
    density, or brand mark.
 4. Do not reuse the reference's subject-specific nodes unless the new article
@@ -293,7 +303,7 @@ Before generating, write a compact figure brief:
    than inferred provider internals.
 5. Caption role: what the surrounding prose will explain so the image can stay
    visually clean.
-6. References: which Wine-style image roles should guide style and layout.
+6. References: which accepted local image roles should guide style and layout.
    If the figure includes or revises a Rememorio brand treatment, separately
    name the Eyjafjalla character reference and any accepted in-repo
    source-notes card used only for brand-card integration.
@@ -382,9 +392,10 @@ New standalone figure prompt pattern:
 
 ```text
 High-resolution 16:9 hand-drawn technical article infographic for Rememorio.
-Use the provided Wine-style article images as style references, especially
-[reference role filenames].
-Warm off-white paper, precise ink sketch lines, subtle watercolor fills.
+Use accepted local Rememorio article figures as style references, especially
+[accepted local reference filenames and what each contributes].
+Warm off-white or parchment paper, precise ink sketch lines, subtle watercolor
+fills.
 Palette: deep navy, Rememorio blue, muted forest green, slate gray, small
 amber highlights.
 Subject: [one precise source-level idea].
@@ -737,8 +748,8 @@ reduce the label. A hand-drawn feel is secondary to legibility and correct
 mechanism flow.
 
 For article batches, create a temporary contact sheet of new figures beside the
-Wine-style reference images and inspect the set as one family. The batch should
-look systematic, not like unrelated one-off diagrams.
+accepted local reference images and inspect the set as one family. The batch
+should look systematic, not like unrelated one-off diagrams.
 
 For any figure with deterministic text overlays, also inspect at least the
 highest-risk images at full size. Contact sheets are useful for family style,
