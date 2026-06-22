@@ -124,15 +124,20 @@ Line and shape:
 - Use Rememorio-style structures when they fit the claim: source-reading route
   maps, layered ownership boards, runtime timelines, durable-ledger views,
   lifecycle loops, tool/file/network side-effect paths, and final comparison
-  maps.
+  maps. For runtime source-reading series, prefer a single paper-desk scene
+  where the diagram, props, shelves, ledgers, ribbons, and guide character all
+  belong to one illustrated workspace instead of a detached chart plus a logo.
 
 Brand mark treatment:
 
 - For new standalone figures, generate the Rememorio treatment as part of the
   whole figure, usually as a small bottom-right paper note or source-notes card
   that includes a tiny Eyjafjalla-like character and the word `Rememorio`.
-  For a series with accepted in-scene character treatment, keep that treatment
-  instead of adding a second card or moving the character to the corner.
+  For a runtime source-reading series with accepted in-scene character
+  treatment, keep that treatment instead of adding a second card or moving the
+  character to the corner. In these series the character is the Rememorio
+  treatment: a small Eyjafjalla-like guide participating in the mechanism scene,
+  not an extra brand logo.
 - Resolve the canonical character reference from the current project, commonly
   repository-root `Eyjafjalla.png` in this blog. If the file is not available,
   ask for the project-provided character reference rather than inventing a new
@@ -143,6 +148,10 @@ Brand mark treatment:
   side locks, segmented pale curled horns, red eyes, small red hair beads or
   ties where visible, white/red outfit cues, and darker glove or boot accents.
   At small sizes, prioritize the silhouette, horns, hair mass, and red eyes.
+  The intended read is the familiar Rememorio little-sheep guide: horned,
+  warm-haired, red-eyed, notebook-sized, and source-aware. It should not become
+  a goat logo, generic horned mascot, robot helper, sheep animal, or unrelated
+  anime character.
 - Redraw those traits into the figure's hand-drawn paper style; do not paste,
   crop, trace, recolor, or mechanically composite the source image unless the
   user explicitly asks for exact pixel-level fidelity.
@@ -180,16 +189,44 @@ Established Eyjafjalla mechanism-scene style:
   authority for that series. In this repository, examples include
   `claude-code/zh/assets/agent-fork-cover.png`,
   `claude-code/zh/assets/worker-tool-scope.png`,
-  `claude-code/zh/assets/agent-selection-gates.png`, and other accepted
-  sibling figures when present.
+  `claude-code/zh/assets/agent-selection-gates.png`,
+  `claude-code/zh/assets/mcp-tool-pool.png`,
+  `codex/zh/assets/codex-turn-runtime-overview.png`,
+  `codex/zh/assets/context-ledger-cover.png`, and other accepted sibling
+  figures when present. Use them as composition and integration references,
+  while `Eyjafjalla.png` remains the identity reference. For this established
+  mechanism-scene treatment, accepted in-repo figures are the composition
+  authority; the Wine & Chord reference remains the broader quality, paper, and
+  diagram-discipline bar. Do not regress these figures into a generic
+  Wine-style chart plus a bottom-right Rememorio card.
+- Use only the named accepted figures in this section as default calibration
+  unless the user explicitly identifies newer accepted examples. Do not promote
+  experimental, disliked, or merely existing images into style authority just
+  because they are nearby in the repository.
 - The desired look is a warm hand-drawn technical notebook: parchment or
   off-white paper, slightly rough edges, ink outlines, soft watercolor fills,
-  compact cards, ribbons, shelves, tools, ledgers, gates, arrows, and small
-  source-note scraps that feel drawn into one scene.
-- The character should be useful to the figure: pointing at a gate, standing by
-  a ledger, holding a tool, or visually anchoring the runtime boundary. Add
-  props such as magnifiers, stop signs, scales, boxes, or gears only when the
-  mechanism calls for them. Do not cargo-cult a prop from a previous figure.
+  compact cards, ribbons, shelves, tools, ledgers, gates, arrows, desk props,
+  open books, folders, stamps, small note scraps, and occasional side shelves
+  that feel drawn into one scene. The figure should look like an illustrated
+  mechanism desk page, not a flat flowchart with a character pasted beside it.
+- The default scene grammar for this treatment is:
+  a red-brown title ribbon at the top; a left-to-right or top-to-bottom
+  mechanism lane in the center; a bottom ribbon or paper strip stating the
+  protected invariant; the Eyjafjalla-like guide placed near a local prop in a
+  lower corner or side margin; and optional shelves, ledgers, tool crates,
+  envelopes, compasses, stop signs, magnifiers, gates, funnels, or workbenches
+  chosen to match the mechanism.
+- The guide is usually a visible full-body or upper-body chibi participant in
+  the workspace, not a tiny corner avatar. Keep it secondary to the mechanism,
+  but large enough that the horns, chestnut hair mass, red eyes, and white/red
+  outfit cues remain readable at article width.
+- The character should be useful to the figure: standing beside a local ledger,
+  holding a notebook, carrying envelopes, sitting by a tool crate, holding a
+  small stop sign, compass, magnifier, wrench, catalog, tag, or instruction
+  card, or visually anchoring the runtime boundary. Add props only when the
+  mechanism calls for them. Do not cargo-cult a prop from a previous figure,
+  and do not repeat the same pose across an entire batch when a mechanism has a
+  more natural local prop.
 - Keep the character's action anatomically stable. Avoid poses that require a
   chibi arm to reach across the canvas, a hand to touch distant cards, or a
   long pointer to be held at full extension; those often produce oversized
@@ -204,6 +241,12 @@ Established Eyjafjalla mechanism-scene style:
   extra fingers, no detached hands, and no missing limbs. If imagegen keeps
   failing a pose, simplify the pose and regenerate the whole figure rather than
   locally patching the broken body part.
+- For stable results, name the character and pose concretely in every prompt:
+  `Eyjafjalla-like chibi guide`, `chestnut-brown hair`, `pale segmented curled
+  horns`, `red eyes`, `white/red outfit cues`, and a local prop held close to
+  the body. Avoid vague phrases such as `cute mascot`, `brand avatar`,
+  `anime helper`, `little sheep logo`, or `Rememorio logo`; they invite the
+  model to freely redesign the character.
 - Chinese-edition figures may use Chinese-majority labels with short English
   source identifiers. English-edition figures should keep the same composition
   and replace only the language-bearing labels.
@@ -257,6 +300,9 @@ Before generating, write a compact figure brief:
 7. Character action: when a guide character appears, describe a pose that can
    be drawn with normal proportions, and describe how distant nodes are
    emphasized without forcing the character to reach across the diagram.
+   Include the local prop and body constraints, for example `holding a small
+   ledger close to the body`, `both arms visible`, `small proportional hands`,
+   and `no long pointing arm`.
 
 For runtime and protocol figures, prefer lifecycle or before/after layouts over
 generic box clusters. A good figure should make one transition visible:
@@ -356,21 +402,79 @@ Keep arrows clean and non-crossing; leave generous margins.
 Professional editorial diagram, not cartoonish, not glossy 3D.
 ```
 
+Eyjafjalla mechanism-scene prompt pattern:
+
+Use this when the article series has adopted the in-scene little-sheep guide
+treatment. Fill every bracket before generation; omitting the character action
+or negative constraints is a common cause of style drift.
+
+```text
+Use case: infographic-diagram
+Asset type: Rememorio technical article figure, 16:9 PNG.
+Create a high-resolution hand-drawn technical notebook infographic in the
+established Rememorio Eyjafjalla mechanism-scene style.
+
+Style references: use the accepted local mechanism-scene figures as composition
+references and the project `Eyjafjalla.png` as the identity reference. Warm
+off-white parchment, rough paper edge, precise ink sketch lines, soft
+watercolor fills, compact mechanism cards, red-brown title ribbon, bottom
+invariant ribbon, clean non-crossing arrows, shelves, ledgers, tools, notes,
+and desk props integrated into one illustrated workspace.
+
+Subject: [one source-level mechanism or invariant].
+Composition: top title ribbon: "[short title]"; center mechanism lane:
+[exact nodes and arrows]; side or rejection lane: [optional]; bottom paper
+ribbon: "[one short invariant]".
+
+Eyjafjalla-like guide: place a recognizable full-body or upper-body chibi guide
+near [local prop] in [lower-left/lower-center/lower-right/side margin],
+integrated into the same paper scene. Faithful stylized redraw of the canonical
+character: chestnut-brown rounded hair with loose side locks, pale segmented
+curled horns, red eyes, white/red outfit cues, dark glove or boot accents.
+The guide holds [small local prop] close to the body; both arms visible, elbows
+near the torso, small proportional hands, natural wrist-to-sleeve connection,
+no long pointing arm, no detached wrists, no missing limbs, no extra fingers.
+
+Visible labels only: [short labels].
+Avoid: flat flowchart with pasted character, generic Rememorio logo/card,
+sheep or goat animal mascot, robot helper, unrelated anime mascot, detached
+badge, missing curled horns, missing red eyes, missing chestnut hair mass,
+guide not participating in the mechanism, glossy 3D, neon gradients, decorative
+blobs, process notes, prompt text, watermark.
+```
+
 For a series that already has an accepted in-scene Eyjafjalla treatment, replace
 the bottom-right-card line with this direction:
 
 ```text
-Preserve the established series treatment: an Eyjafjalla-like chibi guide
-drawn into the mechanism scene, faithful to the project character reference
-(chestnut-brown hair, segmented curled horns, red eyes, red/white outfit cues)
-and integrated with the same paper, ink, watercolor, shadows, and line weight
-as the diagram. Do not add a separate bottom-right source-notes card unless the
-source figure already has one.
-Keep the guide character anatomically stable: short chibi arms, small
-proportional hands, natural wrist-to-sleeve connection, no detached hands, no
-missing limbs, and no extra fingers. If the target node is far away, highlight
-that node in the diagram instead of making the character reach across the
-canvas.
+Use case: infographic-diagram
+Asset type: Rememorio source-reading article figure, 16:9 PNG.
+High-resolution hand-drawn technical notebook infographic in the established
+Rememorio mechanism-scene style.
+Style: warm parchment or off-white paper with rough edges, precise ink sketch
+lines, soft watercolor fills, compact cards, red-brown title ribbon, bottom
+invariant ribbon, clean arrows, small desk props, ledgers, shelves, gates,
+tools, envelopes, funnels, workbenches, or maps chosen to match the mechanism.
+Character: preserve the established in-scene Rememorio treatment: an
+Eyjafjalla-like chibi guide drawn into the mechanism scene, faithful to the
+project character reference: chestnut-brown hair with rounded volume and loose
+side locks, pale segmented curled horns, red eyes, white/red outfit cues, dark
+glove or boot accents. The guide should read as the familiar Rememorio
+little-sheep guide, not a generic mascot, robot, sheep animal, goat logo,
+detached badge, or unrelated anime character.
+Character action: [place the guide near a local prop that belongs to this
+mechanism, for example a ledger, notebook, envelope tray, tool crate, compass,
+small stop sign, magnifier, wrench, catalog, tag, instruction card, or map].
+Keep both arms visible, elbows near the torso, small proportional hands,
+natural wrist-to-sleeve connections, no long pointing arm, no detached hands,
+no missing limbs, and no extra fingers. If the target node is far away,
+highlight that node in the diagram instead of making the character reach across
+the canvas.
+Subject: [one precise source-level idea].
+Composition: [title ribbon; exact nodes and arrows; side lanes; bottom
+invariant ribbon; where the guide and local prop sit].
+Visible labels only: [short label list].
+No process notes, no prompt references, no meta text, no watermark.
 Use Chinese-majority labels for a Chinese edition when that is the established
 series style, with English retained for source identifiers and product names.
 Use the same layout for English editions and localize only the language-bearing
@@ -430,6 +534,15 @@ figure with dense CJK or English labels. Fix a localized image when the
 Eyjafjalla-like guide changes identity, a hand gains extra fingers or limbs,
 the layout shifts, or the result feels like a sibling concept instead of the
 same figure.
+
+For established little-sheep mechanism-scene series, prefer generating the
+source language first, accepting it only after a full-size anatomy and style
+check, and then creating the target-language version from that accepted visual
+target. The target-language image may differ in labels and bottom invariant
+wording, but should preserve the same title-ribbon placement, diagram density,
+guide pose, local prop, shelves, ledgers, arrows, and paper texture. If the
+target language produces a different guide, a new pose, or a redesigned
+workspace, treat it as a failed localization, not as an acceptable variant.
 
 ## Capturing Built-In Imagegen Outputs
 
@@ -571,11 +684,30 @@ Inspect every generated figure before publishing:
   horns, red eyes, and white/red outfit hints. No pasted sticker, alternate
   badge, generic icon, generic reading mascot, clover/leaf mark, distorted
   crop, recolor, or competing generated logo is visible.
+- For the established little-sheep mechanism-scene style, the figure passes
+  only if the guide is part of the mechanism workspace: placed near a local
+  prop, visually secondary to the diagram but clearly present, and consistent
+  with the title ribbon, bottom invariant ribbon, desk props, shelves, ledgers,
+  arrows, and paper texture. Reject images where the guide becomes a corner
+  logo, a standalone character sticker, a generic mascot, a sheep animal, a
+  robot helper, or an unrelated horned character.
+- Reject and regenerate any established little-sheep mechanism-scene figure
+  that reads as a flat flowchart with a pasted character, generic
+  Rememorio/logo card instead of an in-scene guide, sheep or goat animal
+  mascot, unrelated anime mascot, detached badge, missing curled horns, missing
+  red eyes, missing chestnut hair mass, or a guide that does not participate in
+  the mechanism.
 - Character anatomy is credible at full size: no stretched arms, oversized
   gloves or hands, missing limbs, detached wrists, duplicate hands, extra
   fingers, or props that force impossible reach. If a pointing pose creates any
   of those failures, redesign the pose so the character stays local and the
   diagram node carries the visual emphasis.
+- The guide's action matches the mechanism rather than merely copying an old
+  prop: ledgers for context/history, envelopes for events, tool crates or
+  wrenches for tool runtime, stop signs or gates for permissions, funnels for
+  projection, compasses or maps for recovery, notebooks or instruction cards
+  for context assembly. The prop should stay near the body; distant emphasis
+  belongs in the diagram.
 - Compare the brand card or in-scene guide at full size against the project
   character reference and at least one accepted in-repo figure with the desired
   treatment. The comparison should confirm both identity fidelity and visual
