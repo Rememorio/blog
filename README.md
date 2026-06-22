@@ -17,7 +17,7 @@ and GitHub Pages.
 | Claude Code Source Notes | Bilingual source-reading series on the public [Rememorio/claude-code](https://github.com/Rememorio/claude-code) mirror. | [Gateway](https://rememorio.github.io/blog/claude-code/) / [中文](https://rememorio.github.io/blog/claude-code/zh/) / [English](https://rememorio.github.io/blog/claude-code/en/) |
 | Codex Source Notes | Bilingual source-reading series on [openai/codex](https://github.com/openai/codex). | [Gateway](https://rememorio.github.io/blog/codex/) / [中文](https://rememorio.github.io/blog/codex/zh/) / [English](https://rememorio.github.io/blog/codex/en/) |
 | Hermes Agent | Source-grounded walkthrough of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). | [Gateway](https://rememorio.github.io/blog/hermes-agent/) / [中文](https://rememorio.github.io/blog/hermes-agent/zh/) / [English](https://rememorio.github.io/blog/hermes-agent/en/) |
-| Mem0 Memory | Source-grounded Chinese article on [mem0ai/mem0](https://github.com/mem0ai/mem0), temporal reasoning, and memory decay. | [Gateway](https://rememorio.github.io/blog/mem0-memory/) / [中文](https://rememorio.github.io/blog/mem0-memory/zh/) |
+| Mem0 Memory | Bilingual source-grounded article on [mem0ai/mem0](https://github.com/mem0ai/mem0), temporal reasoning, and memory decay. | [Gateway](https://rememorio.github.io/blog/mem0-memory/) / [中文](https://rememorio.github.io/blog/mem0-memory/zh/) / [English](https://rememorio.github.io/blog/mem0-memory/en/) |
 
 Use the public site indexes as the canonical article catalog. The README should
 stay stable as new essays are added.
@@ -45,7 +45,8 @@ stay stable as new essays are added.
 │   └── assets/
 ├── mem0-memory/                # Mem0 memory article
 │   ├── index.html              # Article language gateway
-│   └── zh/
+│   ├── zh/
+│   └── en/
 ├── .codex/skills/              # Local writing and image-generation rules
 ├── Eyjafjalla.png              # Rememorio figure brand asset
 └── LICENSE

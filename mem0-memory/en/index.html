@@ -1,0 +1,630 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Why Mem0 Does Not Overwrite Old Memories: From ADD-only to Temporal Reasoning and Memory Decay</title>
+    <meta
+      name="description"
+      content="A source-grounded walkthrough of Mem0's ADD-only write path, hybrid retrieval, Temporal Reasoning, and Memory Decay."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Why Mem0 Does Not Overwrite Old Memories" />
+    <meta
+      property="og:description"
+      content="Mem0 keeps durable history on write, then builds the current model view at search time with time, access history, and hybrid retrieval signals."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="assets/mem0-memory-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/mem0-memory/en/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/mem0-memory/zh/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/mem0-memory/en/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/mem0-memory/" />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Mem0 Memory</a>
+        <a href="../../en/#posts">Article index</a>
+        <a href="#evidence">Evidence</a>
+        <a href="#write-path">Write</a>
+        <a href="#retrieval">Read</a>
+        <a href="#temporal">Temporal</a>
+        <a href="#decay">Decay</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../zh/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Source Reading · Long-Term Memory</p>
+            <h1>Why Mem0 Does Not Overwrite Old Memories: From ADD-only to Temporal Reasoning and Memory Decay</h1>
+            <p class="lead">
+              Long-running AI applications usually fail not because they forget one fact, but because old facts,
+              new facts, temporary context, and the current answer collapse into one surface. Mem0's public posts
+              and source code point to a cleaner rule: keep history on write, then decide what matters now during retrieval.
+            </p>
+            <div class="meta-line">
+              <span>Project: mem0ai/mem0</span>
+              <span>Topic: agent memory</span>
+              <span>Scope: public source and official contracts</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="assets/mem0-memory-cover.png"
+                alt="Mem0 Memory overview showing a history ledger, memory records, time layer, decay layer, and model view"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Start with a mundane long-term memory case. In January, a user says they prefer vegetarian restaurants.
+              In March, they say they have started eating seafood. In June, they ask, "What kind of place did I usually
+              choose for dinner with friends?" If the system stores only the last preference, it loses January's history.
+              If it puts every remembered fact into the prompt, the model may treat an old preference as current.
+              The real question is not whether to remember. It is <strong>where history is preserved, and where currentness is decided.</strong>
+            </p>
+
+            <p>
+              Several Mem0 posts circle the same boundary:
+              <a href="https://mem0.ai/blog/context-window-is-ram-not-storage-why-most-agent-failures-happen-how-to-fix-them-in-2026">the context window is closer to RAM than storage</a>;
+              <a href="https://mem0.ai/blog/context-window-vs-persistent-memory-why-1m-tokens-isn-t-enough">a larger context window still does not replace persistent memory</a>;
+              and <a href="https://mem0.ai/blog/your-ai-agents-memory-is-just-a-file-thats-the-problem">a memory file</a>
+              tends to mix evidence, preferences, temporary state, and retrieval policy. Temporal Reasoning and Memory Decay
+              are not isolated features in that frame. They are two retrieval-time answers to a long-term memory problem.
+            </p>
+
+            <div id="evidence" class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                This article separates three layers. Mem0's official blogs and docs define the public Platform v3 contract.
+                The public <a href="https://github.com/mem0ai/mem0">mem0ai/mem0</a> source explains the visible OSS and Python SDK paths.
+                Platform service internals are not public, so Temporal Reasoning and Memory Decay are described as documented contracts,
+                not as reconstructed server implementation.
+              </p>
+            </div>
+
+            <p>
+              Read the system with four questions in mind:
+            </p>
+            <ol>
+              <li>Why should long-term memory avoid overwriting old facts by default?</li>
+              <li>What does the visible OSS write path ADD, and what does it deliberately avoid doing?</li>
+              <li>Why is search not a single vector lookup, but a candidate pool followed by multi-signal ranking?</li>
+              <li>Where do Temporal Reasoning and Memory Decay place time and recent usage?</li>
+            </ol>
+
+            <h2>1. Separate Window, Record, and Model View</h2>
+            <p>
+              Three surfaces are easy to conflate. The context window is the model's working area for the current request.
+              A memory record is a durable fact that can be searched later. The model view is the small set of retrieved
+              memories inserted back into the current request. They have different lifetimes, and they should not replace one another.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/context-vs-memory.png"
+                alt="Context versus memory comparison showing current messages in a context window and durable memory retrieved into the model view"
+              />
+              <figcaption>
+                The context window answers "what can the model see now"; persistent memory answers "what can be found later";
+                retrieval answers "which few records should enter this model view."
+              </figcaption>
+            </figure>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Term</th>
+                    <th>Meaning Here</th>
+                    <th>Common Misread</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>context window</td>
+                    <td>The current request working area for short-term reasoning and tool results.</td>
+                    <td>Treating a larger window as durable memory while ignoring cost and lost-in-the-middle effects.</td>
+                  </tr>
+                  <tr>
+                    <td>memory record</td>
+                    <td>A persisted fact extracted from conversation, with payload, metadata, embedding, and history.</td>
+                    <td>Treating the record as "current truth" instead of a fact that may have been true at a point in time.</td>
+                  </tr>
+                  <tr>
+                    <td>model view</td>
+                    <td>The small result set shown to the model after retrieval, filtering, and ranking.</td>
+                    <td>Treating it as the whole memory store, so un-retrieved facts appear nonexistent.</td>
+                  </tr>
+                  <tr>
+                    <td>ranking layer</td>
+                    <td>The layer that turns semantic, keyword, entity, time, and usage signals into result order.</td>
+                    <td>Treating ranking output as if old records had been overwritten.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>1.1 The Later Mem0 Posts Share This Background</h3>
+            <p>
+              Mem0's <a href="https://mem0.ai/blog/why-beam-is-a-good-memory-benchmark-for-ai-agents">BEAM benchmark post</a>
+              and <a href="https://mem0.ai/blog/how-to-test-ai-agent-memory-with-mem0-a-practical-memory-simulation-guide">memory simulation guide</a>
+              both point beyond simple recall. Production memory needs to handle stale facts, contradictions, time conditions,
+              and retrieval drift. Temporal Reasoning and Memory Decay sit in that problem space: they keep history available
+              while making "now", "then", and "recently reinforced" easier to distinguish.
+            </p>
+
+            <h2 id="write-path">2. Why the Write Path Is ADD-only: History Comes First</h2>
+            <p>
+              Mem0's <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm</a>
+              post describes v3 as moving toward an ADD-only memory algorithm. The public OSS path shows the same shape:
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L672-L759"><code>Memory.add()</code></a>
+              prepares inputs, filters, and metadata before calling
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L806-L1070"><code>_add_to_vector_store()</code></a>.
+              In that visible path, the LLM extracts new memories, then the runtime batch-embeds them, deduplicates by hash,
+              inserts vectors, records history ADD events, and links entities.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/add-only-write-path.png"
+                alt="ADD-only write path showing messages, existing memory, fact extraction, hash deduplication, vector insert, history ADD, and a blocked overwrite shortcut"
+              />
+              <figcaption>
+                ADD-only does not mean "duplicates never exist"; it means new facts are not silently written over old facts in place.
+              </figcaption>
+            </figure>
+
+            <h3>2.1 LLM Extraction Processes Evidence; It Is Not the State Judge</h3>
+            <p>
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L468-L760"><code>ADDITIVE_EXTRACTION_PROMPT</code></a>
+              is explicit about the contract: extract memorable facts from new messages; both user and assistant messages can carry information;
+              relative time must be grounded by the observation date; related prior memories are linked with <code>linked_memory_ids</code>,
+              rather than letting the model directly rewrite old records.
+            </p>
+
+            <pre><code class="language-json">{
+  "memory": [
+    {
+      "id": "0",
+      "text": "User switched from almond milk to oat milk lattes after developing an almond sensitivity",
+      "linked_memory_ids": ["existing-memory-id"]
+    }
+  ]
+}</code></pre>
+
+            <p>
+              This shape-level example captures the key idea: the transition itself becomes a new traceable fact.
+              The old preference is not silently deleted. Later retrieval can see both what used to be true and why it changed.
+              That is more useful for long-running agents, because future questions may ask about history rather than only current preference.
+            </p>
+
+            <h3>2.2 The OSS Path Keeps a Hard Boundary Around Platform-only Time Fields</h3>
+            <p>
+              The public source also exposes an important boundary. Passing <code>timestamp</code> to OSS <code>Memory.add()</code>
+              raises a Platform-only error; passing <code>reference_date</code> to OSS <code>Memory.search()</code> does the same.
+              This is a real API boundary, not a missing local detail. Temporal Reasoning belongs to Platform v3, so the server-side ranking
+              behavior has to be discussed as an official contract, not as visible OSS implementation.
+            </p>
+
+            <h2 id="retrieval">3. Read Is Not Pure Vector Search: Build the Pool, Then Rank</h2>
+            <p>
+              If write is ADD-only, read must do more work. In OSS, search starts at
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1248-L1372"><code>Memory.search()</code></a>
+              and flows into
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1488-L1668"><code>_search_vector_store()</code></a>.
+              The query is lemmatized and entity-extracted, embedded, semantically over-fetched, matched by keyword search, and boosted by entity links.
+              Those signals then flow into
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/utils/scoring.py#L1-L130"><code>score_and_rank()</code></a>.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/hybrid-retrieval-stack.png"
+                alt="Hybrid retrieval showing query split into semantic, keyword, and entity signals, then candidate pool, threshold, score fusion, and ranked results"
+              />
+              <figcaption>
+                Mem0's visible OSS search forms a candidate pool and then combines semantic, keyword, and entity signals. It is not a plain vector top-k call.
+              </figcaption>
+            </figure>
+
+            <h3>3.1 Threshold Runs Before Fusion</h3>
+            <p>
+              One ordering detail matters. In <code>score_and_rank()</code>, candidates below the semantic threshold are removed before
+              normalized BM25 and entity boost are added. Keyword or entity signals can improve ordering, but they do not rescue a semantically unrelated candidate.
+              The threshold protects the basic relevance of the model view.
+            </p>
+
+            <pre><code class="language-text">semantic candidates
+  -> threshold gate
+  -> add normalized BM25 when available
+  -> add entity boost when available
+  -> normalize by active signal budget
+  -> return top_k</code></pre>
+
+            <h3>3.2 ADD-only Pushes Currentness Into Retrieval</h3>
+            <p>
+              Once writes do not overwrite, reads have to handle conflict and recency. A user can like A, then switch to B.
+              The memory store should usually keep both records because they answer different questions: "What is likely true now?"
+              and "What changed, and when?" Pure vector retrieval mostly sees text similarity. Temporal Reasoning and Memory Decay add more signals
+              for deciding current relevance.
+            </p>
+
+            <h2 id="temporal">4. Temporal Reasoning: Facts Need an "As Of" View</h2>
+            <p>
+              The <a href="https://mem0.ai/blog/introducing-temporal-reasoning-in-mem0">Temporal Reasoning announcement</a>
+              states the core issue: for long-running agents, "what the user likes" is often not timeless.
+              The <a href="https://docs.mem0.ai/platform/features/temporal-reasoning">Temporal Reasoning docs</a>
+              define the public contract: Platform v3 support, enabled by default; <code>timestamp</code> on add;
+              <code>reference_date</code> on search; and unchanged search result shape.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/temporal-reasoning-layer.png"
+                alt="Temporal layer showing timestamp on add, reference_date on search, a timeline, and ranked answer selection"
+              />
+              <figcaption>
+                The temporal layer does not need to overwrite history. It lets a search ask which point in time should frame the answer.
+              </figcaption>
+            </figure>
+
+            <h3>4.1 Public SDK Shape: Time Enters Platform Requests</h3>
+            <p>
+              The Python Platform client posts add and search requests to v3 endpoints:
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/main.py#L180-L330"><code>/v3/memories/add/</code> and <code>/v3/memories/search/</code></a>.
+              The visible source shows request shape and parameter forwarding. The server-side details of temporal ranking are not public.
+            </p>
+
+            <pre><code class="language-python"># Platform shape, simplified
+client.add(
+    messages=[{"role": "user", "content": "I switched to oat milk."}],
+    user_id="u1",
+    timestamp="2025-03-08T09:30:00Z",
+)
+
+client.search(
+    "What milk did I prefer in February?",
+    filters={"user_id": "u1"},
+    reference_date="2025-02-28",
+)</code></pre>
+
+            <p>
+              The design point is not merely two extra fields. <code>timestamp</code> describes when the memory entered history;
+              <code>reference_date</code> describes the time perspective for this search. That keeps "what is true now" and
+              "what was true then" from competing for one overwritten record.
+            </p>
+
+            <h3>4.2 Temporal Is for Contradictory History, Not Just Filtering</h3>
+            <p>
+              Temporal Reasoning is not just a metadata filter. A filter narrows scope, such as user, agent, run, or business metadata.
+              A temporal query interprets time relationships inside the retained history. Questions such as "what changed in the last three months"
+              and "what did I prefer last year" require multiple historical records, not one latest value.
+            </p>
+
+            <h2 id="decay">5. Memory Decay: Recent Use Changes Rank, Not Storage</h2>
+            <p>
+              If Temporal Reasoning answers "when was this true",
+              <a href="https://mem0.ai/blog/introducing-memory-decay-in-mem0">Memory Decay</a>
+              answers a different question: which memories have been recently used or reinforced, and which ones have gone stale.
+              The <a href="https://docs.mem0.ai/platform/features/memory-decay">Memory Decay docs</a>
+              describe it as search-time soft re-ranking. It does not delete memories or rewrite facts on write; it gently adjusts ordering after basic relevance has been established.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/memory-decay-ranking.png"
+                alt="Memory Decay showing candidate pool, threshold, access history, recent touch boost, stale dampening, and final top_k"
+              />
+              <figcaption>
+                Memory Decay sits late in search: first establish relevance, then use access history to influence the final top-k.
+              </figcaption>
+            </figure>
+
+            <h3>5.1 Project-level Switch and Visible SDK Boundary</h3>
+            <p>
+              The public SDK exposes the project-level switch:
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/project.py#L396-L465"><code>project.update(decay=True)</code></a>
+              adds <code>decay</code> to the project update payload. The source comment also frames it as search-time ranking:
+              recently used memories are boosted, stale ones are gently dampened, and disabling the flag restores pre-decay behavior.
+              The service-side access history store and multiplier calculation are not visible in OSS.
+            </p>
+
+            <pre><code class="language-python"># Platform project setting, simplified
+client.project.update(decay=True)</code></pre>
+
+            <h3>5.2 The Boundaries Matter</h3>
+            <p>
+              The official docs are specific about where decay runs. It applies to Platform v3; it works over a candidate pool larger than final top-k;
+              base relevance thresholding happens before the decay multiplier; public scores are clamped to the normal range; reinforcement is asynchronous.
+              The docs also give scale boundaries: the pool expands to <code>top_k * 3</code> with a floor of 50, and the multiplier is clamped between 0.3x and 1.5x.
+              These details protect one invariant: decay is ranking bias, not fact deletion.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Boundary</th>
+                    <th>Meaning</th>
+                    <th>Misread Avoided</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>search-time</td>
+                    <td>Ranking is adjusted after candidates are retrieved.</td>
+                    <td>Not a write-time rewrite of old facts.</td>
+                  </tr>
+                  <tr>
+                    <td>threshold first</td>
+                    <td>Basic semantic relevance gates the candidate before decay.</td>
+                    <td>Frequent but irrelevant memories do not automatically enter results.</td>
+                  </tr>
+                  <tr>
+                    <td>soft multiplier</td>
+                    <td>Recent use moves records up; staleness moves them down.</td>
+                    <td>Not TTL, and not automatic deletion.</td>
+                  </tr>
+                  <tr>
+                    <td>project opt-in</td>
+                    <td>The project setting enables decay.</td>
+                    <td>Not every Mem0 usage has decay automatically enabled.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>6. Put the Layers Together: Old Facts Stay, New Questions Get a View</h2>
+            <p>
+              Return to the opening example. If a user's preference changes from A to B, simply overwriting A is too lossy.
+              The system may need to answer "what is likely true now" or "when did the switch happen?" ADD-only preserves the evidence;
+              hybrid retrieval builds the pool; Temporal Reasoning supplies the time perspective; Memory Decay lets recent usage influence result order.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/memory-rules-map.png"
+                alt="Memory rules map showing new fact routed through state changed, used often, must be exact, and stable fact paths"
+              />
+              <figcaption>
+                The practical rule is to choose an owner: evidence, currentness, exact policy, and stable background should not collapse into one overwrite action.
+              </figcaption>
+            </figure>
+
+            <h3>6.1 When Mem0 Is Enough, and When the Application Must Own the Rule</h3>
+            <p>
+              Mem0 covers many agent memory and personalization needs, but not every truth-management problem belongs in memory.
+              Payment addresses, permission state, compliance switches, and medical contraindications should be owned by application databases
+              or explicit policy systems. Mem0 can help the model explain and retrieve context; it should not be the final authority for high-stakes state.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Information State</th>
+                    <th>Best Mechanism</th>
+                    <th>Invariant Protected</th>
+                    <th>Failure Boundary</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Preference changed</td>
+                    <td>ADD-only records the transition; temporal query supplies the time view.</td>
+                    <td>Both "then" and "now" remain explainable.</td>
+                    <td>Keeping only the latest value loses history; keeping only the old value answers current queries wrongly.</td>
+                  </tr>
+                  <tr>
+                    <td>Recently reused context</td>
+                    <td>Memory Decay softly re-ranks search results.</td>
+                    <td>Frequently reinforced information is more likely to enter the current model view.</td>
+                    <td>Decay does not replace business priority or hard policy.</td>
+                  </tr>
+                  <tr>
+                    <td>Must be exact</td>
+                    <td>Application database, permission system, or explicit rule.</td>
+                    <td>Probabilistic retrieval does not decide high-risk state.</td>
+                    <td>Authorization, payment, or medical decisions should not be owned by memory search.</td>
+                  </tr>
+                  <tr>
+                    <td>Stable long-term background</td>
+                    <td>Ordinary memory record plus hybrid retrieval.</td>
+                    <td>Repeated questions decrease while personalization remains available.</td>
+                    <td>Without proper filters, user or agent boundaries can blur.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>6.2 The Short Version of Mem0's Route</h3>
+            <p>
+              Mem0's useful lesson is not "make memory a bigger prompt." It is the separation of responsibilities:
+              <strong>the write path preserves evidence, retrieval builds the candidate set, temporal reasoning frames history,
+              decay expresses recent use, and the application owns hard-consistency rules.</strong>
+              With that separation, an agent does not have to choose between overwriting old memory and showing all history forever.
+            </p>
+
+            <h2 id="sources">Sources</h2>
+            <ul class="source-list">
+              <li><a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Introducing the Token-Efficient Memory Algorithm</a></li>
+              <li><a href="https://mem0.ai/blog/introducing-temporal-reasoning-in-mem0">Introducing Temporal Reasoning in Mem0</a></li>
+              <li><a href="https://docs.mem0.ai/platform/features/temporal-reasoning">Mem0 docs: Temporal Reasoning</a></li>
+              <li><a href="https://mem0.ai/blog/introducing-memory-decay-in-mem0">Introducing Memory Decay in Mem0</a></li>
+              <li><a href="https://docs.mem0.ai/platform/features/memory-decay">Mem0 docs: Memory Decay</a></li>
+              <li><a href="https://mem0.ai/blog/context-window-is-ram-not-storage-why-most-agent-failures-happen-how-to-fix-them-in-2026">Memory vs Context Window for LLM and AI Agents 2026</a></li>
+              <li><a href="https://mem0.ai/blog/context-window-vs-persistent-memory-why-1m-tokens-isn-t-enough">Context Window vs Persistent Memory</a></li>
+              <li><a href="https://mem0.ai/blog/your-ai-agents-memory-is-just-a-file-thats-the-problem">Your AI Agent's Memory Is Just a File? That's the Problem</a></li>
+              <li><a href="https://mem0.ai/blog/why-beam-is-a-good-memory-benchmark-for-ai-agents">Why BEAM Is a Good Memory Benchmark for AI Agents</a></li>
+              <li><a href="https://mem0.ai/blog/how-to-test-ai-agent-memory-with-mem0-a-practical-memory-simulation-guide">How to Test AI Agent Memory with Mem0</a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L672-L759">mem0/memory/main.py: <code>Memory.add()</code></a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L806-L1070">mem0/memory/main.py: <code>_add_to_vector_store()</code></a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1248-L1372">mem0/memory/main.py: <code>Memory.search()</code></a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1488-L1668">mem0/memory/main.py: <code>_search_vector_store()</code></a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/utils/scoring.py#L1-L130">mem0/utils/scoring.py: hybrid scoring</a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/main.py#L180-L330">mem0/client/main.py: Platform memory client</a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/project.py#L396-L465">mem0/client/project.py: project settings</a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L468-L760">mem0/configs/prompts.py: additive extraction prompt</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
