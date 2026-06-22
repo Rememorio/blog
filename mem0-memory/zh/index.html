@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mem0 为什么不覆盖旧记忆：从 ADD-only 到 Temporal Reasoning 与 Memory Decay</title>
+    <meta
+      name="description"
+      content="从上下文窗口和文件记忆的失败模式出发，读懂 Mem0 的 ADD-only 写入、hybrid retrieval、Temporal Reasoning 与 Memory Decay。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Mem0 为什么不覆盖旧记忆" />
+    <meta
+      property="og:description"
+      content="Mem0 的长期记忆不是覆盖旧事实，而是在写入保留证据，在检索时用时间、访问历史和多路信号构造当前模型视图。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="assets/mem0-memory-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/mem0-memory/zh/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/mem0-memory/zh/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/mem0-memory/" />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Mem0 Memory</a>
+        <a href="../../zh/#posts">文章目录</a>
+        <a href="#evidence">证据边界</a>
+        <a href="#write-path">写入</a>
+        <a href="#retrieval">读取</a>
+        <a href="#temporal">Temporal</a>
+        <a href="#decay">Decay</a>
+        <a href="#sources">参考资料</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">源码阅读 · 长期记忆</p>
+            <h1>Mem0 为什么不覆盖旧记忆：从 ADD-only 到 Temporal Reasoning 与 Memory Decay</h1>
+            <p class="lead">
+              长期运行的 AI 应用最容易出错的地方，不是“忘记一条事实”，而是把旧事实、新事实、临时上下文和当前答案混成一团。
+              Mem0 的一组官方文章和公开源码给出了一条更稳的路线：写入时保留历史，检索时再决定什么对当前问题最有用。
+            </p>
+            <div class="meta-line">
+              <span>项目：mem0ai/mem0</span>
+              <span>主题：agent memory</span>
+              <span>范围：公开源码与官方文档可见边界</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="assets/mem0-memory-cover.png"
+                alt="Mem0 Memory 总览图，展示 history ledger、memory records、time layer、decay layer 和 model view 的关系"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先看一个很普通的长期记忆场景。用户一月说自己喜欢素食餐厅，三月说最近开始吃海鲜，六月又问“我以前约朋友吃饭一般选什么地方？”。
+              如果系统只保留最后一条偏好，就会丢掉一月的历史；如果系统把所有事实都无差别塞进上下文，又会让模型把过时偏好当成现在偏好。
+              真正的问题不是“要不要记住”，而是：<strong>历史应该怎样保存，当前性应该在哪一层判断。</strong>
+            </p>
+
+            <p>
+              Mem0 官方博客从几个角度反复强调同一件事：
+              <a href="https://mem0.ai/blog/context-window-is-ram-not-storage-why-most-agent-failures-happen-how-to-fix-them-in-2026">context window 更像 RAM，不是长期存储</a>；
+              <a href="https://mem0.ai/blog/context-window-vs-persistent-memory-why-1m-tokens-isn-t-enough">更大的上下文窗口也不能替代持久记忆</a>；
+              <a href="https://mem0.ai/blog/your-ai-agents-memory-is-just-a-file-thats-the-problem">把记忆写成一个文件</a>又会把证据、偏好、临时状态和检索策略糊在一起。
+              这些文章是理解 Temporal Reasoning 和 Memory Decay 的入口：它们不是两个孤立功能，而是在回答同一个长期记忆问题。
+            </p>
+
+            <div id="evidence" class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文把事实分成三层：Mem0 官方博客和文档说明 Platform v3 的公开合约；
+                <a href="https://github.com/mem0ai/mem0">mem0ai/mem0</a> 公开源码说明 OSS 与 Python SDK 可见的调用路径；
+                Platform 服务端内部实现不可见，因此 Temporal Reasoning 和 Memory Decay 的排序细节只按官方合约描述，不写成源码事实。
+              </p>
+            </div>
+
+            <p>
+              读这篇文章可以带着四个问题：
+            </p>
+            <ol>
+              <li>为什么长期记忆不应该默认覆盖旧事实？</li>
+              <li>Mem0 的 OSS 写入路径到底 ADD 了什么，跳过了什么？</li>
+              <li>搜索为什么不是一次纯向量召回，而是多路信号的候选池和排名层？</li>
+              <li>Temporal Reasoning 与 Memory Decay 分别把“时间”和“近期使用”放到了哪一层？</li>
+            </ol>
+
+            <h2>一、先区分窗口、记录和模型视图</h2>
+            <p>
+              长期记忆系统里有三个表面最容易被混用。context window 是本轮模型能看到的工作区；memory record 是持久化后可检索的事实；
+              model view 是检索之后被放回本轮上下文的少量结果。三者的生命周期不同，不能互相替代。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/context-vs-memory.png"
+                alt="Context vs Memory 对比图，展示 context window 的短期消息与 persistent memory 的 durable ledger 通过 search lens 进入 model view"
+              />
+              <figcaption>
+                上下文窗口解决“这一轮看什么”，持久记忆解决“以后还能不能找回来”，检索层解决“当前问题该看哪几条”。
+              </figcaption>
+            </figure>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>术语</th>
+                    <th>本文含义</th>
+                    <th>常见误读</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>context window</td>
+                    <td>本次请求发给模型的工作区，适合短期推理和工具结果。</td>
+                    <td>把窗口变大当成长期记忆，忽略成本、遗忘和 lost-in-the-middle。</td>
+                  </tr>
+                  <tr>
+                    <td>memory record</td>
+                    <td>从对话中抽出的持久事实，带 payload、metadata、embedding 和历史记录。</td>
+                    <td>把它当成“当前真相”，忽略它也可能是过去某一刻的真相。</td>
+                  </tr>
+                  <tr>
+                    <td>model view</td>
+                    <td>检索、过滤、排序后被展示给模型的少量记忆。</td>
+                    <td>把它等同于全部历史，导致没召回的事实被误判为不存在。</td>
+                  </tr>
+                  <tr>
+                    <td>ranking layer</td>
+                    <td>把语义、关键词、实体、时间和访问历史转成当前结果顺序的层。</td>
+                    <td>把排名结果当成写入覆盖的结果。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>1.1 这也是官方后续博客的共同背景</h3>
+            <p>
+              Mem0 的 <a href="https://mem0.ai/blog/why-beam-is-a-good-memory-benchmark-for-ai-agents">BEAM benchmark 文章</a>
+              和 <a href="https://mem0.ai/blog/how-to-test-ai-agent-memory-with-mem0-a-practical-memory-simulation-guide">memory simulation guide</a>
+              都在强调生产记忆评测不能只看“有没有召回”。更关键的是过时事实、矛盾事实、时间条件和检索漂移。
+              Temporal Reasoning 和 Memory Decay 正是在这个问题空间里出现的：它们让系统在保留历史的同时，更清楚地回答“现在、当时、最近常用”。
+            </p>
+
+            <h2 id="write-path">二、写入为什么只 ADD：历史先留下来</h2>
+            <p>
+              Mem0 的 <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm</a>
+              文章把 v3 写入描述为更偏 ADD-only 的路线。公开源码里的 OSS 路径也能看到这个方向：
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L672-L759"><code>Memory.add()</code></a>
+              先处理输入、过滤器和 metadata，再进入
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L806-L1070"><code>_add_to_vector_store()</code></a>。
+              在这条可见路径里，LLM 提取的是新 memory，后续经过 batch embedding、hash 去重、vector insert、history ADD 和 entity linking。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/add-only-write-path.png"
+                alt="ADD-only Write Path 图，展示 messages、existing memory、extract facts、dedup hash、vector insert、history ADD 与被阻断的 overwrite old"
+              />
+              <figcaption>
+                ADD-only 的核心不是“永远没有重复”，而是写入路径不把新事实当成旧事实的原地覆盖。
+              </figcaption>
+            </figure>
+
+            <h3>2.1 LLM 提取是证据处理，不是状态裁判</h3>
+            <p>
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L468-L760"><code>ADDITIVE_EXTRACTION_PROMPT</code></a>
+              的约束很明确：抽取来自新消息的可记忆事实，用户和 assistant 消息都可能包含信息；相对时间要用 observation date 落到具体日期；
+              与旧记忆相关时使用 <code>linked_memory_ids</code>，而不是让模型直接改写旧记录。
+            </p>
+
+            <pre><code class="language-json">{
+  "memory": [
+    {
+      "id": "0",
+      "text": "User switched from almond milk to oat milk lattes after developing an almond sensitivity",
+      "linked_memory_ids": ["existing-memory-id"]
+    }
+  ]
+}</code></pre>
+
+            <p>
+              这个 shape-level 例子说明了关键点：变化本身会成为一条新的、可追溯的事实。旧偏好没有被静默删除；
+              后续检索可以同时看到“曾经喜欢什么”和“后来为什么变了”。这比覆盖更适合长期 agent，因为用户之后可能问的是历史，而不是当前偏好。
+            </p>
+
+            <h3>2.2 OSS 对 Platform-only 时间参数保持硬边界</h3>
+            <p>
+              公开源码里还有一个很重要的边界：
+              <code>Memory.add(timestamp=...)</code> 在 OSS 路径会直接抛出 Platform-only 错误；
+              <code>Memory.search(reference_date=...)</code> 也一样。
+              这不是实现细节缺失，而是 API 层明确把 Temporal Reasoning 切到 Platform v3。
+              文章后面讨论 Temporal 时，只能把它当成官方 Platform 合约，而不能把服务端内部排序算法补成源码事实。
+            </p>
+
+            <h2 id="retrieval">三、读取不是纯向量：候选池先形成，排名再收口</h2>
+            <p>
+              如果写入是 ADD-only，读取就必须承担更多责任。Mem0 OSS 的搜索路径从
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1248-L1372"><code>Memory.search()</code></a>
+              进入 <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1488-L1668"><code>_search_vector_store()</code></a>：
+              先做 query lemmatization 和实体抽取，再做 embedding；语义召回会 over-fetch，关键词搜索会生成 BM25 分数，实体 store 会给相关 memory 加 boost。
+              最后这些信号进入
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/utils/scoring.py#L1-L130"><code>score_and_rank()</code></a>。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/hybrid-retrieval-stack.png"
+                alt="Hybrid Retrieval 图，展示 query 分成 semantic、keyword、entity 三路信号，进入 candidate pool、threshold 和 score fusion 后生成 ranked results"
+              />
+              <figcaption>
+                Mem0 的 OSS 搜索先形成候选池，再把语义、关键词和实体信号合并成排名结果；它不是一次单纯的 vector top-k。
+              </figcaption>
+            </figure>
+
+            <h3>3.1 threshold 在融合前就会生效</h3>
+            <p>
+              <code>score_and_rank()</code> 里有一个容易忽略的顺序：semantic score 低于 threshold 的候选会先被排除，
+              之后才把 normalized BM25 和 entity boost 加进来。这意味着关键词或实体信号可以帮助排序，但不能把一个语义完全不相关的候选强行救回来。
+              这个门槛保护的是 model view 的基本相关性。
+            </p>
+
+            <pre><code class="language-text">semantic candidates
+  -> threshold gate
+  -> add normalized BM25 when available
+  -> add entity boost when available
+  -> normalize by active signal budget
+  -> return top_k</code></pre>
+
+            <h3>3.2 ADD-only 把“当前性”推给 retrieval</h3>
+            <p>
+              一旦写入不覆盖，读取层就必须处理冲突和新旧关系。一个用户可以先说喜欢 A，后来改成 B；
+              memory store 里最好同时保留两条，因为它们分别回答不同问题：“你现在偏好什么？”和“你以前为什么改变？”。
+              纯向量检索通常只知道文本相似，而 Temporal Reasoning 和 Memory Decay 让检索层拥有更多“当前性”信号。
+            </p>
+
+            <h2 id="temporal">四、Temporal Reasoning：让事实带上“何时为真”</h2>
+            <p>
+              <a href="https://mem0.ai/blog/introducing-temporal-reasoning-in-mem0">Temporal Reasoning 官方文章</a>
+              把问题说得很直接：对长期 agent 来说，“用户喜欢什么”经常不是一个无时间条件的事实。
+              <a href="https://docs.mem0.ai/platform/features/temporal-reasoning">Temporal Reasoning 文档</a>
+              给出的公开合约包括：Platform v3 支持，默认启用；写入可以带 <code>timestamp</code>；
+              搜索可以带 <code>reference_date</code>；返回 shape 保持普通 search 结果，不把时间推理暴露成另一种响应对象。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/temporal-reasoning-layer.png"
+                alt="Temporal Layer 图，展示 add 阶段 timestamp 进入 memory time，search 阶段 reference_date 与 as of when 问题在 timeline 上选择 ranked answer"
+              />
+              <figcaption>
+                Temporal layer 不需要覆盖历史，它让检索问题可以表达“站在哪一天看这段历史”。
+              </figcaption>
+            </figure>
+
+            <h3>4.1 public SDK shape：时间进入 Platform 请求</h3>
+            <p>
+              Python SDK 的 Platform client 会把 add/search 请求发到 v3 endpoint：
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/main.py#L180-L330"><code>/v3/memories/add/</code> 和 <code>/v3/memories/search/</code></a>。
+              源码可见的是请求 shape 和参数转发；时间推理怎么在服务端参与 ranking，不在公开源码里。
+            </p>
+
+            <pre><code class="language-python"># Platform shape, simplified
+client.add(
+    messages=[{"role": "user", "content": "I switched to oat milk."}],
+    user_id="u1",
+    timestamp="2025-03-08T09:30:00Z",
+)
+
+client.search(
+    "What milk did I prefer in February?",
+    filters={"user_id": "u1"},
+    reference_date="2025-02-28",
+)</code></pre>
+
+            <p>
+              这里最重要的设计不是多了两个字段，而是把“事实发生时间”和“问题观察时间”分开。
+              <code>timestamp</code> 描述记忆何时进入历史；<code>reference_date</code> 描述这次检索要站在哪个时间点回答。
+              这让“现在是什么”与“当时是什么”不再争抢同一条覆盖记录。
+            </p>
+
+            <h3>4.2 Temporal 解决的是矛盾事实，不是替代过滤器</h3>
+            <p>
+              Temporal Reasoning 不是普通 metadata filter。filter 更像是先限定范围，例如某个 user、agent、run 或业务属性；
+              temporal query 则是在已召回的历史中理解时间关系。比如“过去三个月有哪些变化”和“去年我更喜欢什么”都需要保留多条历史，
+              而不是只保留最新事实。
+            </p>
+
+            <h2 id="decay">五、Memory Decay：近期使用影响排名，但不删除旧记忆</h2>
+            <p>
+              如果 Temporal Reasoning 处理“何时为真”，
+              <a href="https://mem0.ai/blog/introducing-memory-decay-in-mem0">Memory Decay 官方文章</a>
+              处理的是另一类信号：哪类记忆最近被使用、被强化，哪类记忆长期没有再出现。
+              <a href="https://docs.mem0.ai/platform/features/memory-decay">Memory Decay 文档</a>
+              把它描述为 search-time soft re-ranking：它不删除记忆，也不在写入时改写事实，而是在候选集通过基础阈值之后，对排名做温和调整。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/memory-decay-ranking.png"
+                alt="Memory Decay 图，展示 candidate pool 通过 threshold 后，根据 access history 把 recent touch 上调、stale 下调，形成 final top_k"
+              />
+              <figcaption>
+                Memory Decay 的位置在搜索后段：先保证基础相关性，再用访问历史影响最终 top-k。
+              </figcaption>
+            </figure>
+
+            <h3>5.1 项目级开关和可见 SDK 边界</h3>
+            <p>
+              公开 SDK 里能看到项目设置层面的开关：
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/project.py#L396-L465"><code>project.update(decay=True)</code></a>
+              会把 <code>decay</code> 写入项目更新 payload。源码注释也把它限定为 search-time ranking：最近使用的记忆被 boost，stale 记忆被轻微压低；
+              关闭时恢复到 pre-decay behavior。具体访问历史的服务端记录和计算不在公开 OSS 路径里。
+            </p>
+
+            <pre><code class="language-python"># Platform project setting, simplified
+client.project.update(decay=True)</code></pre>
+
+            <h3>5.2 Decay 有几个边界很关键</h3>
+            <p>
+              官方文档把 Memory Decay 的位置讲得很具体：它只适用于 Platform v3；会在比最终 top-k 更大的候选池上工作；
+              基础相关性 threshold 先执行，decay multiplier 后执行；公开返回的 score 会被 clamp 到常规范围；访问历史强化是异步的。
+              文档还给出量级边界：候选池会扩成 <code>top_k * 3</code> 且至少 50 条，decay multiplier 夹在 0.3x 到 1.5x。
+              这些细节都在保护同一个不变量：decay 是排名偏置，不是事实删除。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>边界</th>
+                    <th>含义</th>
+                    <th>避免的误读</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>search-time</td>
+                    <td>候选被召回后再调整排名。</td>
+                    <td>不是写入时把旧记忆衰减成别的事实。</td>
+                  </tr>
+                  <tr>
+                    <td>threshold first</td>
+                    <td>基础语义相关性先过门槛。</td>
+                    <td>不是让频繁访问的无关记忆强行进结果。</td>
+                  </tr>
+                  <tr>
+                    <td>soft multiplier</td>
+                    <td>近期访问上调，长期不用下调。</td>
+                    <td>不是 TTL，也不是自动删除。</td>
+                  </tr>
+                  <tr>
+                    <td>project opt-in</td>
+                    <td>通过项目设置启用。</td>
+                    <td>不是所有 Mem0 使用都会自动开启。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>六、把四层合起来：旧事实不覆盖，新问题有视角</h2>
+            <p>
+              现在可以回到开头的问题。用户偏好从 A 变成 B，不应该简单覆盖 A；
+              因为系统以后可能需要回答“现在更可能是什么”，也可能需要回答“什么时候从 A 变成 B”。ADD-only 保留变化证据；
+              hybrid retrieval 负责形成候选池；Temporal Reasoning 让查询带上时间视角；Memory Decay 让近期使用历史影响结果顺序。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/memory-rules-map.png"
+                alt="Memory Rules 图，展示 new fact 进入 choose owner 后，按 state changed、used often、must be exact、always true 分别走 ADD + time、decay boost、app rule 和 stable fact"
+              />
+              <figcaption>
+                最稳的长期记忆设计，是先选 owner：证据、当前性、精确规则和稳定事实不应该混在一个覆盖动作里。
+              </figcaption>
+            </figure>
+
+            <h3>6.1 什么时候靠 Mem0，什么时候靠应用层</h3>
+            <p>
+              Mem0 解决的是 agent memory 的大部分检索和个性化问题，但不是所有“真相管理”都应该交给记忆系统。
+              支付地址、权限状态、合规开关、医疗禁忌这类必须强一致的事实，应该由业务数据库和应用层规则拥有；
+              Mem0 可以帮助模型解释和召回上下文，但不应该成为最终授权来源。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>信息状态</th>
+                    <th>适合机制</th>
+                    <th>保护的不变量</th>
+                    <th>失败边界</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>偏好发生变化</td>
+                    <td>ADD-only 记录变化，Temporal query 判断时间视角。</td>
+                    <td>保留“以前”和“现在”的证据。</td>
+                    <td>只保留最新值会丢历史，只保留旧值会答错当前。</td>
+                  </tr>
+                  <tr>
+                    <td>近期反复使用</td>
+                    <td>Memory Decay 对 search result 做软排名。</td>
+                    <td>常用信息更容易进入当前模型视图。</td>
+                    <td>它不能替代业务优先级和强规则。</td>
+                  </tr>
+                  <tr>
+                    <td>必须精确执行</td>
+                    <td>应用层数据库、权限系统或显式规则。</td>
+                    <td>不让概率检索决定高风险状态。</td>
+                    <td>把授权、支付、医疗判断放进 memory 会有风险。</td>
+                  </tr>
+                  <tr>
+                    <td>长期稳定背景</td>
+                    <td>普通 memory record 与 hybrid retrieval。</td>
+                    <td>减少重复提问，保持个性化上下文。</td>
+                    <td>如果缺少 filters，跨用户或跨 agent 边界会混乱。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>6.2 一句话总结 Mem0 的路线</h3>
+            <p>
+              Mem0 最值得借鉴的地方，不是把“记忆”做成一个更大的上下文，而是把长期记忆拆成几条责任线：
+              <strong>写入线保留证据，检索线形成候选，时间线解释历史视角，衰减线表达近期使用，应用层拥有强一致规则。</strong>
+              这套分层让 agent 不必在“覆盖旧记忆”和“永远展示全部历史”之间二选一。
+            </p>
+
+            <h2 id="sources">参考资料</h2>
+            <ul class="source-list">
+              <li><a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Introducing the Token-Efficient Memory Algorithm</a></li>
+              <li><a href="https://mem0.ai/blog/introducing-temporal-reasoning-in-mem0">Introducing Temporal Reasoning in Mem0</a></li>
+              <li><a href="https://docs.mem0.ai/platform/features/temporal-reasoning">Mem0 docs: Temporal Reasoning</a></li>
+              <li><a href="https://mem0.ai/blog/introducing-memory-decay-in-mem0">Introducing Memory Decay in Mem0</a></li>
+              <li><a href="https://docs.mem0.ai/platform/features/memory-decay">Mem0 docs: Memory Decay</a></li>
+              <li><a href="https://mem0.ai/blog/context-window-is-ram-not-storage-why-most-agent-failures-happen-how-to-fix-them-in-2026">Memory vs Context Window for LLM and AI Agents 2026</a></li>
+              <li><a href="https://mem0.ai/blog/context-window-vs-persistent-memory-why-1m-tokens-isn-t-enough">Context Window vs Persistent Memory</a></li>
+              <li><a href="https://mem0.ai/blog/your-ai-agents-memory-is-just-a-file-thats-the-problem">Your AI Agent's Memory Is Just a File? That's the Problem</a></li>
+              <li><a href="https://mem0.ai/blog/why-beam-is-a-good-memory-benchmark-for-ai-agents">Why BEAM Is a Good Memory Benchmark for AI Agents</a></li>
+              <li><a href="https://mem0.ai/blog/how-to-test-ai-agent-memory-with-mem0-a-practical-memory-simulation-guide">How to Test AI Agent Memory with Mem0</a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L672-L759">mem0/memory/main.py: <code>Memory.add()</code></a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L806-L1070">mem0/memory/main.py: <code>_add_to_vector_store()</code></a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1248-L1372">mem0/memory/main.py: <code>Memory.search()</code></a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1488-L1668">mem0/memory/main.py: <code>_search_vector_store()</code></a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/utils/scoring.py#L1-L130">mem0/utils/scoring.py: hybrid scoring</a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/main.py#L180-L330">mem0/client/main.py: Platform memory client</a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/project.py#L396-L465">mem0/client/project.py: project settings</a></li>
+              <li><a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L468-L760">mem0/configs/prompts.py: additive extraction prompt</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
