@@ -117,6 +117,11 @@ Before publishing changes:
 - For bilingual changes, verify indexes, language switches, canonical links,
   `hreflang` links, and old hash redirects.
 
+## Acknowledgements
+
+Thanks to [WineChord/books](https://github.com/WineChord/books) for inspiring
+the long-form technical article presentation and source-reading discipline.
+
 ## License
 
 This repository is licensed under the [MIT License](./LICENSE).
