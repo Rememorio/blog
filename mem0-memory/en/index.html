@@ -203,84 +203,101 @@
               </figcaption>
             </figure>
 
-            <h3>1.1 paper mem0: Let the LLM Decide How Old Memory Changes</h3>
+            <h3>1.1 paper mem0: Extract First, Then Decide How to Edit Old Memory</h3>
             <p>
-              In the <a href="https://arxiv.org/html/2504.19413v1">original paper</a>, the mem0 algorithm is straightforward.
-              On each write, it takes the latest user and assistant messages, the previous summary, and recent conversation turns.
-              The LLM extracts new memory candidates. For each new candidate, the system searches similar existing memories,
-              then asks the LLM to choose <code>ADD</code>, <code>UPDATE</code>, <code>DELETE</code>, or <code>NOOP</code>.
-            </p>
-            <p>
-              That design is easy to understand. The memory set stays compact; related facts can be merged; stale or wrong memories can be removed.
-              The cost is also clear: the write path includes an extra old-vs-new decision, and <code>UPDATE</code> or <code>DELETE</code>
-              can weaken historical evidence. If the user later asks why a preference changed last year, the earlier version may no longer be available.
+              Do not start from v3 yet. Read the <a href="https://arxiv.org/html/2504.19413v1">original paper</a>'s mem0 as a write algorithm.
+              Its input is not just one user message. It sees a small conversation state: the latest user and assistant messages,
+              the previous summary, recent turns, and existing memories. The simplified flow looks like this:
             </p>
 
-            <h3>1.2 paper mem0g: Make Entities and Relationships Explicit</h3>
+            <pre><code class="language-text">Input:
+  latest user message + assistant message
+  previous summary
+  recent m messages
+  existing memory store
+
+Write:
+  1. LLM extracts k candidate memories from the new conversation
+  2. For each candidate, find m similar existing memories
+  3. LLM compares the candidate with similar old memories
+  4. LLM outputs ADD / UPDATE / DELETE / NOOP
+  5. Apply that operation to the memory store
+
+Read:
+  query -> vector similarity -> top memories -> current prompt context</code></pre>
+
             <p>
-              The paper also introduces mem0g for a different pressure: text memories plus vector similarity are not great at representing
-              who is connected to whom and how. Mem0g extracts entities and relationships from messages, stores them in a graph database,
-              and adds graph operations to the memory extraction and retrieval flow. For multi-hop relations between people, projects,
-              places, and events, that representation is clearer than isolated text records.
+              The benefit is compactness: related facts can be merged, and stale or wrong records can be removed.
+              The cost comes from the same place. The write path includes an old-vs-new decision, and <code>UPDATE</code> or <code>DELETE</code>
+              can weaken historical evidence. If the user later asks why a preference changed last year, the earlier version may no longer be available.
+              That raises the central question for long-term memory: should write consolidate history into a latest state, or should history be preserved first?
             </p>
+
+            <h3>1.2 paper mem0g: Add a Relationship Graph Beside Memories</h3>
             <p>
-              The tradeoff is system complexity. A graph store has to be operated, entities need merging, relationships need updates,
-              and retrieval has to combine graph results with memory results. A graph can express relationships, but it does not by itself answer
+              Mem0g handles a different pressure: text memories plus vector similarity are not great at representing who is connected to whom and how.
+              It does not only maintain memory records. It also maintains a graph beside them.
+            </p>
+
+            <pre><code class="language-text">Input:
+  conversation messages
+  existing memory store
+  graph store
+
+Write:
+  1. Extract memorable facts from messages
+  2. Explicitly extract entities and relationships
+  3. Store memories in the vector store
+  4. Store entities and relationships in the graph database
+
+Read:
+  query -> retrieve related memories
+        -> extract query entities
+        -> traverse related graph nodes and edges
+        -> merge text memory results with graph results</code></pre>
+
+            <p>
+              This makes multi-hop relationships more natural. If a user keeps switching between a company, a project, and a coworker,
+              the graph is a cleaner way to connect those facts than isolated text records.
+              The tradeoff is system complexity: graph storage has to be operated, entities need merging, relationships need updates,
+              and retrieval has to combine vector results with graph results. A graph can express relationships, but it does not by itself answer
               which historical fact should be used for a time-sensitive question.
             </p>
 
-            <h3>1.3 mem0 v3: Simplify Writes, Move Choice Into Retrieval</h3>
+            <h3>1.3 mem0 v3: Keep Writes ADD-only, Move Choice Into Retrieval</h3>
             <p>
               By April 2026, mem0 v3 is described in the official
               <a href="https://docs.mem0.ai/migration/oss-v2-to-v3">v2-to-v3 migration docs</a>
               and <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm post</a>
-              as a single-pass ADD-only algorithm. The add pipeline no longer asks the LLM to update or delete old memories during extraction.
-              New information becomes a new memory, and <code>linked_memory_ids</code> connects it to related older memories.
-              Part of the relationship work once handled by graph memory becomes built-in entity linking and entity-aware ranking.
+              as single-pass ADD-only. It removes the two heavier parts of the earlier routes:
+              write no longer asks the LLM to <code>UPDATE</code> or <code>DELETE</code> old memories, and OSS users no longer need to operate an external graph store.
             </p>
+
+            <pre><code class="language-text">Input:
+  conversation messages
+  existing memories
+  optional timestamp
+
+Write:
+  1. Use one LLM call to extract new memories
+  2. Do not UPDATE or DELETE old memories during extraction
+  3. Link related old memories with linked_memory_ids
+  4. Batch embedding + hash deduplication + vector insert
+  5. Record history ADD and run built-in entity linking
+
+Read:
+  query -> semantic candidates
+        -> BM25 keyword signal
+        -> entity boost
+        -> time / decay signals
+        -> ranked model view</code></pre>
+
             <p>
               This does not mean records can never be manually deleted, or duplicates can never appear. The key change is narrower:
               add no longer has to decide "which old state should be true now." History is preserved first. Retrieval then uses semantic,
               keyword, entity, time, and access-history signals to decide which memories should enter the current model view.
-              That is why Temporal Reasoning and Memory Decay fit naturally after v3.
+              This first section only describes the algorithm shapes; the later write, read, Temporal Reasoning, and Memory Decay sections unpack how v3 lands.
             </p>
-
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Route</th>
-                    <th>Write Behavior</th>
-                    <th>Read Behavior</th>
-                    <th>What It Solves</th>
-                    <th>Remaining Cost</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>paper mem0</td>
-                    <td>Extract new memory, then ask the LLM to choose ADD/UPDATE/DELETE/NOOP against similar old memories.</td>
-                    <td>Mainly vector similarity over memories.</td>
-                    <td>Keeps the memory set compact and can merge or remove old records.</td>
-                    <td>Write is heavier, and older evidence may be rewritten away.</td>
-                  </tr>
-                  <tr>
-                    <td>paper mem0g</td>
-                    <td>Extract entities and relationships into a graph database.</td>
-                    <td>Combine text memory retrieval with graph traversal.</td>
-                    <td>Makes relationships and multi-hop questions easier to express.</td>
-                    <td>Adds graph storage and relationship-maintenance cost.</td>
-                  </tr>
-                  <tr>
-                    <td>mem0 v3</td>
-                    <td>Single-pass ADD-only extraction; new memories link to older ones with linked_memory_ids.</td>
-                    <td>Rank with semantic, keyword, entity, time, and decay signals.</td>
-                    <td>Preserves more history, shortens writes, and fits time-aware questions.</td>
-                    <td>Retrieval has to do more ranking and explanation work.</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
 
             <h2>2. Separate Window, Record, and Model View</h2>
             <p>

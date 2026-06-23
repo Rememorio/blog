@@ -196,82 +196,98 @@
               </figcaption>
             </figure>
 
-            <h3>1.1 paper mem0：让 LLM 判断该改哪条记忆</h3>
+            <h3>1.1 paper mem0：先抽取，再决定怎么改旧记忆</h3>
             <p>
-              <a href="https://arxiv.org/html/2504.19413v1">原始论文</a>里的 mem0 算法很直观：
-              每次写入时取最新的 user message 和 assistant message，再加上之前的 summary 与最近若干条消息，
-              让 LLM 抽出新的记忆候选。随后系统会拿每条新记忆去已有 memory 里找相似项，再把候选和相似旧记忆交给 LLM，
-              让它决定执行 <code>ADD</code>、<code>UPDATE</code>、<code>DELETE</code> 还是 <code>NOOP</code>。
-            </p>
-            <p>
-              这套做法的好处是容易理解：memory set 不会无限膨胀，旧事实可以被合并，明显过时或错误的内容也能被删掉。
-              但它的问题也很清楚：写入要多做一次“新旧记忆裁决”，而且 <code>UPDATE</code> 和 <code>DELETE</code>
-              会让历史证据变弱。用户后来问“去年我为什么改变偏好”时，被改写或删除的版本未必还在。
+              先不要急着看 v3。把 <a href="https://arxiv.org/html/2504.19413v1">原始论文</a>里的 mem0 当成一个写入算法，
+              它的输入不是单条用户消息，而是一小段对话状态：最新 user/assistant message、之前的 summary、最近若干条消息，以及已有 memory。
+              算法可以简化成下面这个流程：
             </p>
 
-            <h3>1.2 paper mem0g：把实体和关系显式放进图</h3>
+            <pre><code class="language-text">输入：
+  最新 user message + assistant message
+  之前的 summary
+  最近 m 条消息
+  已有 memory store
+
+写入：
+  1. LLM 从新对话里抽取 k 条 candidate memory
+  2. 对每条 candidate，在已有 memory 里找相似的 m 条
+  3. LLM 比较 candidate 和相似旧记忆
+  4. 输出 ADD / UPDATE / DELETE / NOOP
+  5. 按输出修改 memory store
+
+读取：
+  query -> vector similarity -> top memories -> 放回本轮上下文</code></pre>
+
             <p>
-              论文同时给了 mem0g。它面对的是另一个问题：单条文本记忆和向量相似度不擅长表达“谁和谁有什么关系”。
-              所以 mem0g 会从消息里抽取 entity 和 relationship，把关系存到图数据库里，并在记忆提取与检索时引入图操作。
-              对多跳关系、人物/项目/地点之间的联系，这比纯文本 memory 更清楚。
-              比如用户在某家公司、某个项目、某位同事之间反复切换话题时，图结构更容易把这些关系串起来。
-            </p>
-            <p>
-              代价是系统复杂度上升。你要维护图存储，要处理实体合并和关系更新，还要让检索同时理解向量结果与图结果。
-              当记忆主要问题变成“事实会随时间变化”时，图数据库能表达关系，但不自动解决“哪条历史在当前问题下更该被使用”。
+              这套做法的优点是 memory set 比较紧凑：相关事实可以合并，明显过时或错误的内容也能删掉。
+              缺点也来自同一个地方：写入阶段要让 LLM 做一次“新旧记忆裁决”，而 <code>UPDATE</code> 和 <code>DELETE</code>
+              会削弱历史证据。用户后来问“去年我为什么改变偏好”时，被改写或删除的版本未必还在。
+              这就引出后面的核心问题：长期记忆到底应该在写入时整理成一个最新状态，还是先把历史留下来？
             </p>
 
-            <h3>1.3 mem0 v3：把写入简化，把选择放到检索</h3>
+            <h3>1.2 paper mem0g：在记忆旁边加一张关系图</h3>
+            <p>
+              mem0g 解决的是另一个痛点：单条文本记忆和向量相似度不擅长表达“谁和谁有什么关系”。
+              所以它不是只维护一组 memory records，而是在记忆旁边维护一张图。
+            </p>
+
+            <pre><code class="language-text">输入：
+  对话消息
+  已有 memory store
+  graph store
+
+写入：
+  1. 从消息中抽取可记忆事实
+  2. 显式抽取 entity 和 relationship
+  3. memory 写入向量存储
+  4. entity / relationship 写入图数据库
+
+读取：
+  query -> 找相关 memory
+        -> 抽取 query entity
+        -> 在图里找相关节点和关系
+        -> 合并文本记忆与图结果</code></pre>
+
+            <p>
+              这让多跳关系更自然。比如用户在某家公司、某个项目、某位同事之间反复切换话题时，图结构更容易把这些关系串起来。
+              但代价是系统复杂度上升：要维护图存储，要处理实体合并和关系更新，还要让检索同时理解向量结果与图结果。
+              更关键的是，图数据库能表达关系，但不自动回答“哪条历史在当前问题下更该被使用”。
+            </p>
+
+            <h3>1.3 mem0 v3：只追加写入，把选择放到检索</h3>
             <p>
               到 2026 年 4 月的 mem0 v3，官方
               <a href="https://docs.mem0.ai/migration/oss-v2-to-v3">v2 到 v3 迁移文档</a>
               和 <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm 文章</a>
-              都把新算法描述成 single-pass ADD-only：写入阶段不再让 LLM 对旧记忆做 <code>UPDATE</code> 或 <code>DELETE</code>；
-              新信息追加成新 memory，并通过 <code>linked_memory_ids</code> 与相关旧记忆连起来。
-              原来需要外部图数据库承担的一部分关系能力，也改成内置 entity linking 和检索时的 entity boost。
+              都把新算法描述成 single-pass ADD-only。它把前两条路线里的两个重成本都挪开了：
+              不再在写入时让 LLM 决定 <code>UPDATE</code>/<code>DELETE</code> 旧记忆，也不再要求 OSS 用户维护外部 graph store。
             </p>
+
+            <pre><code class="language-text">输入：
+  对话消息
+  existing memories
+  可选 timestamp
+
+写入：
+  1. 单次 LLM 调用抽取新 memory
+  2. 不对旧 memory 做 UPDATE / DELETE
+  3. 用 linked_memory_ids 连接相关旧 memory
+  4. batch embedding + hash 去重 + vector insert
+  5. 记录 history ADD，并做内置 entity linking
+
+读取：
+  query -> semantic candidates
+        -> BM25 keyword signal
+        -> entity boost
+        -> time / decay signals
+        -> ranked model view</code></pre>
+
             <p>
               这不是说旧事实永远不会被人工删除，也不是说重复永远不会出现。关键变化是：add pipeline 不再把“现在该信哪条”
               作为写入时必须完成的状态裁决。历史先留下，检索时再用语义、关键词、实体、时间和访问历史去决定当前问题应该看到哪些记忆。
-              这也是 Temporal Reasoning 与 Memory Decay 能自然接上 v3 的原因。
+              所以第一章只讲算法外形；后面的写入、读取、Temporal Reasoning 和 Memory Decay，都是在拆 v3 这条路线怎样落地。
             </p>
-
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>路线</th>
-                    <th>写入怎么做</th>
-                    <th>读取怎么找</th>
-                    <th>解决了什么</th>
-                    <th>留下的成本</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>paper mem0</td>
-                    <td>抽新 memory，再让 LLM 对相似旧 memory 判定 ADD/UPDATE/DELETE/NOOP。</td>
-                    <td>主要靠向量相似度找相关记忆。</td>
-                    <td>让 memory set 更紧凑，能合并或删除旧记录。</td>
-                    <td>写入路径更重，历史版本可能被改写掉。</td>
-                  </tr>
-                  <tr>
-                    <td>paper mem0g</td>
-                    <td>抽取 entity 与 relationship，并写入图数据库。</td>
-                    <td>结合文本记忆和图关系检索。</td>
-                    <td>关系和多跳问题更容易表达。</td>
-                    <td>多一套图存储与关系维护成本。</td>
-                  </tr>
-                  <tr>
-                    <td>mem0 v3</td>
-                    <td>single-pass ADD-only，新记忆通过 linked_memory_ids 连接旧记忆。</td>
-                    <td>semantic、keyword、entity、time、decay 等信号一起参与排序。</td>
-                    <td>历史更完整，写入更短，适合时间问题。</td>
-                    <td>读取层要承担更多排序和解释责任。</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
 
             <h2>二、再区分窗口、记录和模型可见结果</h2>
             <p>
