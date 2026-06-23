@@ -83,6 +83,25 @@ what problem appears
 -> cache/context consequence
 ```
 
+For mechanism-heavy sections, make the default prose path easy to follow before
+source names appear. A strong section usually moves through this sequence:
+
+```text
+concrete user or runtime situation
+-> what the simpler design would wrongly do
+-> which responsibility moves to which layer
+-> small decision trace or before/after shape
+-> verified source path or official contract
+-> tradeoff, failure boundary, and handoff to the next mechanism
+```
+
+When adjacent sections explain one mechanism family, keep a single
+representative scenario running across them so readers can carry state forward.
+Vary the local details only when a new example clarifies a new boundary; do not
+restart with unrelated examples in every section. Titles should name the
+reader-facing question or tradeoff first, then mention the mechanism when it is
+needed for precision.
+
 Use source names only after the reader has a concrete hook for the concept.
 When a mechanism depends on overloaded terms such as `history`, `prompt`,
 `context`, `baseline`, `projection`, or `replacement`, define the local usage
@@ -193,6 +212,9 @@ record examples at mechanism boundaries:
 - show only fields needed for the concept;
 - avoid invented exact values for hidden provider internals;
 - explain what changed immediately after the code block.
+- when a JSON or API shape is still abstract, precede it with a short
+  plain-language decision trace of `3` to `5` steps that explains what the
+  runtime is deciding and what it deliberately leaves undecided.
 - For branchy mechanisms such as forks, skip-cache modes, fallback paths, or
   resume variants, use minimal sequence examples (`M1 M2 M3 F1`) or compact
   JSON fragments before adding a new diagram. Add a figure only when the
