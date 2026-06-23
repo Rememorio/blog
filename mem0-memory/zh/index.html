@@ -196,10 +196,10 @@
             <figure class="figure">
               <img
                 src="assets/algorithm-evolution.png"
-                alt="Mem0 算法演进图，展示 paper mem0 的 ADD UPDATE DELETE NOOP、paper mem0g 的实体关系图数据库，以及 mem0 v3 的只追加、实体索引和混合检索"
+                alt="Mem0 算法演进图，展示 paper mem0 在写入时裁决旧记忆，paper mem0g 增加文本记忆旁边的关系旁路，mem0 v3 用 ADD-only、linked ids 和融合检索生成 model view"
               />
               <figcaption>
-                三代路线的判断位置在移动：旧版在写入时决定旧记忆怎么改，v3 更倾向于先保留历史，再在检索时判断。
+                这张图按判断发生的位置来读：paper mem0 在写入时改旧记忆，mem0g 增加 graph sidecar，v3 先追加和链接，再由检索层决定本轮 model view。
               </figcaption>
             </figure>
 
@@ -278,10 +278,13 @@
               这就引出后面的核心问题：长期记忆到底应该在写入时整理成一个最新状态，还是先把历史留下来？
             </p>
 
-            <h3>1.2 paper mem0g：在记忆旁边加一张关系图</h3>
+            <h3>1.2 paper mem0g：把“关系”从文本记忆里拆出来</h3>
             <p>
-              mem0g 解决的是另一个痛点：单条文本记忆和向量相似度不擅长表达“谁和谁有什么关系”。
-              所以它不是只维护一组 memory records，而是在记忆旁边维护一张图。
+              paper mem0 已经能维护一组相对紧凑的文本记忆，但它主要依赖向量相似度。这个办法适合找“意思接近”的事实，
+              对关系型问题就不够直接：用户、公司、项目、同事可能分别出现在不同 memory 里，语义相似度能找回相关文本，
+              却不会天然知道这些对象之间是上下级、协作、归属还是依赖关系。mem0g 的改动，是在文本 memory 旁边再放一条结构化路径：
+              memory records 仍然写入向量存储，entity 和 relationship 另外进入 graph store。
+              换句话说，图是实体/关系索引旁路，不是文本 memory 的替代品。
             </p>
 
             <pre><code class="language-text">输入：
@@ -290,35 +293,80 @@
   graph store
 
 写入：
-  1. 从消息中抽取可记忆事实
-  2. 显式抽取 entity 和 relationship
-  3. memory 写入向量存储
-  4. entity / relationship 写入图数据库
+  1. 从消息中抽取 memory facts
+  2. 同时抽取 entities 和 relationships
+  3. memory facts 写入 vector memory store
+  4. entities / relationships 写入 graph store
+  5. 对同名 entity 做合并，对重复或变化的 relationship 做维护
 
 读取：
-  query -> 找相关 memory
-        -> 抽取 query entity
-        -> 在图里找相关节点和关系
-        -> 合并文本记忆与图结果</code></pre>
+  1. query 先通过语义检索召回 memory records
+  2. 从 query 或已召回 memory 中识别 entity
+  3. 沿 graph store 找邻居 entity、relationship 和相关 memory
+  4. 合并 vector memories 与 graph facts，组成本轮上下文</code></pre>
 
             <p>
-              这让多跳关系更自然。比如用户在某家公司、某个项目、某位同事之间反复切换话题时，图结构更容易把这些关系串起来。
-              但代价是系统复杂度上升：要维护图存储，要处理实体合并和关系更新，还要让检索同时理解向量结果与图结果。
-              更关键的是，图数据库能表达关系，但不自动回答“哪条历史在当前问题下更该被使用”。
+              举个例子，用户先说“我在 Acme 做 Hermes 项目”，后来又说“Alice 也在跟 Hermes 的接口”。
+              纯文本记忆会留下两三条事实；graph 路线则能显式得到 <code>用户 - works_on - Hermes</code>、
+              <code>Alice - collaborates_on - Hermes</code>、<code>Hermes - belongs_to - Acme</code> 这样的结构。
+              当用户问“跟 Alice 讨论 Hermes 时要注意什么”时，系统不只是在文本里找相似句子，还可以顺着 Hermes 这个节点把同事、
+              公司和项目关系一起带回来。
             </p>
 
-            <h3>1.3 mem0 v3：只追加写入，把“当前该信什么”留给检索</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>mem0g 新增的东西</th>
+                    <th>解决什么问题</th>
+                    <th>带来的成本</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>entity</td>
+                    <td>给人、组织、项目、地点等对象一个稳定锚点。</td>
+                    <td>需要做实体识别、别名合并和跨轮对齐。</td>
+                  </tr>
+                  <tr>
+                    <td>relationship</td>
+                    <td>把“谁和谁有什么关系”从文本里显式抽出来。</td>
+                    <td>关系可能变化，也可能和旧边冲突，需要维护策略。</td>
+                  </tr>
+                  <tr>
+                    <td>graph store</td>
+                    <td>支持按实体邻接关系、多跳路径和结构化上下文补充检索。</td>
+                    <td>引入额外存储、查询路径和结果合并逻辑。</td>
+                  </tr>
+                  <tr>
+                    <td>vector + graph 合并</td>
+                    <td>让“语义相关”和“关系相连”同时参与上下文选择。</td>
+                    <td>需要处理两种结果的去重、排序和冲突。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
             <p>
-              走到 v3 时，Mem0 要解决的不只是“写得更快”。paper mem0 的写入路径像一次状态裁决：
-              它既要抽取新事实，又要判断旧事实是否该被合并、覆盖或删除。mem0g 再引入图关系后，
-              写入还要维护实体、关系和图存储。问题在于，长期记忆里的很多事实不是绝对对错，
-              而是随时间和问题视角变化：用户曾经喜欢 A，后来改成 B；问“现在喜欢什么”和问“为什么改变”需要不同历史。
+              所以，mem0g 的重点不是把文本记忆替换成图，而是让关系型信息有自己的索引方式。
+              这一步解决了“相关对象怎么串起来”的问题，却没有解决“历史版本该不该被覆盖”的问题。
+              图可以告诉系统 Alice、Hermes 和 Acme 之间有关联，但当用户后来换了项目，或者同一关系在不同时间发生变化时，
+              系统仍然要决定旧事实是更新、删除，还是作为历史保留。这个压力会继续落到下一步。
+            </p>
+
+            <h3>1.3 mem0 v3：把写入做薄，把判断推到读取</h3>
+            <p>
+              前两条路线叠在一起以后，写入路径会变得很重：paper mem0 要在写入时判断 ADD、UPDATE、DELETE、NOOP；
+              mem0g 还要维护实体、关系和图存储。更麻烦的是，长期记忆里的很多变化不是简单的“旧的错了，新的对了”。
+              用户一月喜欢杏仁奶，四月因为过敏改喝燕麦奶；问“现在买什么”应该偏向四月事实，问“为什么换口味”又需要一月事实。
+              如果写入时直接覆盖，当前状态会更干净，但历史解释会变弱。
             </p>
             <p>
-              所以 <a href="https://docs.mem0.ai/migration/oss-v2-to-v3">v2 到 v3 迁移文档</a>
+              <a href="https://docs.mem0.ai/migration/oss-v2-to-v3">v2 到 v3 迁移文档</a>
               和 <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm 文章</a>
-              里说的 single-pass ADD-only，可以理解成一次责任重分配：写入阶段负责提取新的记忆证据、连接相关旧记忆、写入可检索索引；
-              “当前该信哪条”“过时事实还要不要进入 model view”则交给检索、时间和衰减信号处理。
+              里说的 single-pass ADD-only，可以按这个思路理解：写入阶段不再承担“旧事实还算不算数”的最终裁决，
+              它只负责把新的记忆证据写成可检索记录，并把它和相关旧记忆、实体索引连接起来。当前问题应该看哪几条，
+              交给 retrieval、Temporal Reasoning 和 Memory Decay 等读取阶段信号共同决定。
             </p>
 
             <pre><code class="language-text">输入：
@@ -328,10 +376,11 @@
 
 写入：
   1. 单次 LLM 调用抽取新 memory
-  2. 不对旧 memory 做 UPDATE / DELETE
-  3. 用 linked_memory_ids 连接相关旧 memory
-  4. batch embedding + hash 去重 + vector insert
-  5. 记录 history ADD，并做内置 entity linking
+  2. 不在这一步对旧 memory 做 UPDATE / DELETE
+  3. 用 hash / batch embedding 做基础去重与向量化
+  4. 新 memory 作为 ADD 事件写入 vector store
+  5. 用 linked_memory_ids 连接相关旧 memory
+  6. 做内置 entity linking，给检索提供实体信号
 
 读取：
   query -> semantic candidates
@@ -340,10 +389,51 @@
         -> time / decay signals
         -> ranked model view</code></pre>
 
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>v3 机制</th>
+                    <th>接住前面什么问题</th>
+                    <th>新的约束</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>single-pass extraction</td>
+                    <td>减少写入阶段多轮 LLM 裁决带来的成本和延迟。</td>
+                    <td>抽取质量更依赖一次调用的提示词和输入上下文。</td>
+                  </tr>
+                  <tr>
+                    <td>ADD-only</td>
+                    <td>避免把时间变化误写成不可逆覆盖或删除。</td>
+                    <td>重复、冲突和过时事实要在检索层处理。</td>
+                  </tr>
+                  <tr>
+                    <td><code>linked_memory_ids</code></td>
+                    <td>让新旧事实有连接，而不是靠覆盖表达“变化”。</td>
+                    <td>检索和展示时要理解这些连接的含义。</td>
+                  </tr>
+                  <tr>
+                    <td>内置 entity linking</td>
+                    <td>保留 mem0g 的关系线索，但不要求用户维护外部 graph store。</td>
+                    <td>实体信号成为检索排序的一部分，不再是单独图查询的全部答案。</td>
+                  </tr>
+                  <tr>
+                    <td>hybrid retrieval</td>
+                    <td>把语义、关键词、实体、时间和使用历史放到同一个排序问题里。</td>
+                    <td>model view 的质量取决于多信号融合，而不只取决于写入是否“干净”。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
             <p>
-              这个设计真正保护的是两件事：写入阶段少做不可逆判断，历史变化先留下来；读取阶段再按当前问题选择模型应该看到的少量记忆。
-              它不承诺旧事实永远不能删，也不承诺重复永远不会出现。
-              这个选择让 v3 的后续机制有了位置：写入负责留证据，读取负责排顺序，Temporal Reasoning 负责时间视角，Memory Decay 负责近期使用信号。
+              这样看，ADD-only 的优势不只是省 token。它让写入阶段少做不可逆判断，降低误删、误覆盖带来的历史损失；
+              同时通过链接、实体和多信号检索，把“哪条记忆现在更有用”变成读取阶段的问题。
+              它也有代价：旧事实仍在库里，存储会继续增长，检索层要承担去重、冲突排序和过时事实过滤；
+              如果排序信号处理不好，旧事实仍可能被误带回 model view。后面的 Temporal Reasoning 和 Memory Decay，
+              正是继续回答“同一批历史记录，在不同时间问题和近期使用信号下该怎么排”。
             </p>
 
             <h3>1.4 先把三层对象分清：窗口、记录和模型视图</h3>
