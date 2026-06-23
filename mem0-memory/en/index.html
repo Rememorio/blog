@@ -309,13 +309,20 @@ Read:
               which historical fact should be used for a time-sensitive question.
             </p>
 
-            <h3>1.3 mem0 v3: Keep Writes ADD-only, Move Choice Into Retrieval</h3>
+            <h3>1.3 mem0 v3: Keep Writes ADD-only, Let Retrieval Decide What Applies Now</h3>
             <p>
-              By April 2026, mem0 v3 is described in the official
-              <a href="https://docs.mem0.ai/migration/oss-v2-to-v3">v2-to-v3 migration docs</a>
+              By v3, the pressure is not just "make writes faster." The paper mem0 write path behaves like a state judge:
+              it extracts new facts and also decides whether old facts should be merged, overwritten, or deleted.
+              Mem0g then adds entity and relationship maintenance on top of that. The problem is that many long-term memories
+              are not simply true or false forever. A user may like A, then switch to B; "What do they like now?" and
+              "Why did that preference change?" need different parts of the history.
+            </p>
+            <p>
+              The official <a href="https://docs.mem0.ai/migration/oss-v2-to-v3">v2-to-v3 migration docs</a>
               and <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm post</a>
-              as single-pass ADD-only. It removes the two heavier parts of the earlier routes:
-              write no longer asks the LLM to <code>UPDATE</code> or <code>DELETE</code> old memories, and OSS users no longer need to operate an external graph store.
+              describe v3 as single-pass ADD-only. Read that as a shift in responsibility: write extracts new memory evidence,
+              links it to related old memories, and inserts searchable records; retrieval, time, and decay signals decide
+              which records should enter the current model view.
             </p>
 
             <pre><code class="language-text">Input:
@@ -338,17 +345,19 @@ Read:
         -> ranked model view</code></pre>
 
             <p>
-              This does not mean records can never be manually deleted, or duplicates can never appear. The key change is narrower:
-              add no longer has to decide "which old state should be true now." History is preserved first. Retrieval then uses semantic,
-              keyword, entity, time, and access-history signals to decide which memories should enter the current model view.
-              This first section only describes the algorithm shapes; the later write, read, Temporal Reasoning, and Memory Decay sections unpack how v3 lands.
+              This does not mean old records can never be deleted, or duplicates can never appear. The protected invariant is narrower:
+              the write path avoids irreversible state judgment, and the read path chooses a small model view for the current question.
+              That gives the later mechanisms their roles: write preserves evidence, retrieval orders candidates, Temporal Reasoning adds a time view,
+              and Memory Decay adds a recent-use signal.
             </p>
 
-            <h2>2. Separate Window, Record, and Model View</h2>
+            <h3>1.4 Separate Three Objects First: Window, Record, and Model View</h3>
             <p>
-              Three surfaces are easy to conflate. The context window is the model's working area for the current request.
-              A memory record is a durable fact that can be searched later. The model view is the small set of retrieved
-              memories inserted back into the current request. They have different lifetimes, and they should not replace one another.
+              Before following the source and Platform features, separate three objects. The context window is the model's working area
+              for the current request. A memory record is a durable fact that can be searched later. The model view is the small set
+              of retrieved memories inserted back into the current request. ADD-only changes how memory records are written;
+              it does not put the whole history into the context window. Temporal Reasoning and Memory Decay change how the model view
+              is selected; they do not erase old facts in storage.
             </p>
 
             <figure class="figure">
@@ -396,7 +405,7 @@ Read:
               </table>
             </div>
 
-            <h3>2.1 The Later Mem0 Posts Share This Background</h3>
+            <h4>The Later Posts Are About Model View Quality</h4>
             <p>
               Mem0's <a href="https://mem0.ai/blog/why-beam-is-a-good-memory-benchmark-for-ai-agents">BEAM benchmark post</a>
               and <a href="https://mem0.ai/blog/how-to-test-ai-agent-memory-with-mem0-a-practical-memory-simulation-guide">memory simulation guide</a>
@@ -405,10 +414,16 @@ Read:
               while making "now", "then", and "recently reinforced" easier to distinguish.
             </p>
 
-            <h2 id="write-path">3. Why the Write Path Is ADD-only: History Comes First</h2>
+            <h2 id="write-path">2. Why the Write Path Is ADD-only: Remove State Judgment From Write</h2>
+            <p>
+              The older update/delete route is not wrong because <code>UPDATE</code> is always bad. It is risky because it compresses
+              a long-term question into a write-time decision: is the new fact a duplicate, a refinement, a contradiction, or
+              a different truth at a different time? Once that becomes an overwrite or delete, later historical explanation gets harder.
+              v3 first stores the evidence, then lets read decide what matters for the question.
+            </p>
             <p>
               Mem0's <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm</a>
-              post describes v3 as moving toward ADD-only writes. The public OSS path shows the same shape:
+              post frames v3 as ADD-only, and the public OSS path has the same shape:
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L672-L759"><code>Memory.add()</code></a>
               prepares inputs, filters, and metadata before calling
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L806-L1070"><code>_add_to_vector_store()</code></a>.
@@ -426,7 +441,41 @@ Read:
               </figcaption>
             </figure>
 
-            <h3>3.1 LLM Extraction Processes Evidence; It Is Not the State Judge</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Pressure in the Older Route</th>
+                    <th>ADD-only Handling</th>
+                    <th>Advantage</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Write-time <code>UPDATE</code> / <code>DELETE</code> can be wrong</td>
+                    <td>New facts enter the memory store as new records.</td>
+                    <td>Irreversible overwrite is reduced, and evidence remains explainable later.</td>
+                  </tr>
+                  <tr>
+                    <td>The same preference can have different answers at different times</td>
+                    <td>The transition itself can become a memory with time signal.</td>
+                    <td>"Now" and "then" no longer compete for one overwritten record.</td>
+                  </tr>
+                  <tr>
+                    <td>Graph relations add storage and maintenance cost</td>
+                    <td><code>linked_memory_ids</code> and built-in entity linking preserve relationships.</td>
+                    <td>Relationships remain available without forcing OSS users to operate an external graph store.</td>
+                  </tr>
+                  <tr>
+                    <td>Longer write paths increase cost, latency, and failure surface</td>
+                    <td>Single-pass extraction, batch embedding, hash deduplication, then insert.</td>
+                    <td>The write path is shorter, and richer decisions move to retrieval.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>2.1 LLM Extraction Links Evidence; It Is Not the Final State Judge</h3>
             <p>
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L468-L760"><code>ADDITIVE_EXTRACTION_PROMPT</code></a>
               is explicit about the contract: extract memorable facts from new messages; both user and assistant messages can carry information;
@@ -450,7 +499,7 @@ Read:
               That is more useful for long-running agents, because future questions may ask about history rather than only current preference.
             </p>
 
-            <h3>3.2 The OSS Path Keeps a Hard Boundary Around Platform-only Time Fields</h3>
+            <h3>2.2 The OSS Path Keeps a Hard Boundary Around Platform-only Time Fields</h3>
             <p>
               The public source also exposes an important boundary. Passing <code>timestamp</code> to OSS <code>Memory.add()</code>
               raises a Platform-only error; passing <code>reference_date</code> to OSS <code>Memory.search()</code> does the same.
@@ -458,9 +507,14 @@ Read:
               behavior has to be discussed as an official contract, not as visible OSS implementation.
             </p>
 
-            <h2 id="retrieval">4. Read Is Not Pure Vector Search: Build the Pool, Then Rank</h2>
+            <h2 id="retrieval">3. Why Retrieval Needs Fusion: ADD-only Moves Choice Into the Model View</h2>
             <p>
-              If write is ADD-only, read must do more work. In OSS, search starts at
+              ADD-only keeps more historical versions and related facts in the memory store. If read stayed as plain vector top-k,
+              the system could confuse "semantically similar" with "should be used now." Old and new preferences may both be close to the query,
+              but they answer different time views. So the selection removed from write has to happen when the model view is formed.
+            </p>
+            <p>
+              In OSS, search starts at
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1248-L1372"><code>Memory.search()</code></a>
               and flows into
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1488-L1668"><code>_search_vector_store()</code></a>.
@@ -479,7 +533,7 @@ Read:
               </figcaption>
             </figure>
 
-            <h3>4.1 Threshold Runs Before Fusion</h3>
+            <h3>3.1 Semantic Relevance Gates Before Keyword and Entity Fusion</h3>
             <p>
               One ordering detail matters. In <code>score_and_rank()</code>, candidates below the semantic threshold are removed before
               normalized BM25 and entity boost are added. Keyword or entity signals can improve ordering, but they do not rescue a semantically unrelated candidate.
@@ -493,7 +547,7 @@ Read:
   -> normalize by active signal budget
   -> return top_k</code></pre>
 
-            <h3>4.2 ADD-only Pushes "Still Applies Now" Into Retrieval</h3>
+            <h3>3.2 "Still Applies Now" Needs Time and Usage Signals</h3>
             <p>
               Once writes do not overwrite, reads have to handle conflict and recency. A user can like A, then switch to B.
               The memory store should usually keep both records because they answer different questions: "What is likely true now?"
@@ -501,13 +555,15 @@ Read:
               for deciding whether a remembered fact still applies to the present question.
             </p>
 
-            <h2 id="temporal">5. Temporal Reasoning: Facts Need an "As Of" View</h2>
+            <h2 id="temporal">4. Temporal Reasoning: Give Retrieval a Time View</h2>
             <p>
+              The previous section leaves a question: if old and new facts are both retained, how does search know which time point
+              the query is asking from? That is the role of Temporal Reasoning. It does not rewrite old records into new ones.
+              It lets write record when a fact was observed and lets search state the date from which the answer should be framed.
               The <a href="https://mem0.ai/blog/introducing-temporal-reasoning-in-mem0">Temporal Reasoning announcement</a>
-              states the core issue: for long-running agents, "what the user likes" is often not timeless.
-              The <a href="https://docs.mem0.ai/platform/features/temporal-reasoning">Temporal Reasoning docs</a>
-              define the public contract: Platform v3 support, enabled by default; <code>timestamp</code> on add;
-              <code>reference_date</code> on search; and unchanged search result shape.
+              and <a href="https://docs.mem0.ai/platform/features/temporal-reasoning">docs</a> define the public contract:
+              Platform v3 support, enabled by default; <code>timestamp</code> on add; <code>reference_date</code> on search;
+              and unchanged search result shape.
             </p>
 
             <figure class="figure">
@@ -520,7 +576,7 @@ Read:
               </figcaption>
             </figure>
 
-            <h3>5.1 Public SDK Shape: Time Enters Platform Requests</h3>
+            <h3>4.1 Request Shape: Observation Time and Search Time Are Separate</h3>
             <p>
               The Python Platform client posts add and search requests to v3 endpoints:
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/main.py#L180-L330"><code>/v3/memories/add/</code> and <code>/v3/memories/search/</code></a>.
@@ -546,20 +602,22 @@ client.search(
               "what was true then" from competing for one overwritten record.
             </p>
 
-            <h3>5.2 Temporal Is for Contradictory History, Not Just Filtering</h3>
+            <h3>4.2 Temporal Handles Contradictory History; It Does Not Replace Filters</h3>
             <p>
               Temporal Reasoning is not just a metadata filter. A filter narrows scope, such as user, agent, run, or business metadata.
               A temporal query interprets time relationships inside the retained history. Questions such as "what changed in the last three months"
               and "what did I prefer last year" require multiple historical records, not one latest value.
             </p>
 
-            <h2 id="decay">6. Memory Decay: Recent Use Changes Rank, Not Storage</h2>
+            <h2 id="decay">5. Memory Decay: Use Recent Reinforcement to Rank, Not to Clean Storage</h2>
             <p>
-              If Temporal Reasoning answers "when was this true",
+              A time view is still not enough. A long-running agent can collect many facts that are relevant and not obsolete.
+              If one kind of memory has been used repeatedly in recent interactions, it is often more useful in the current model view.
+              That problem should not be solved by deleting old memories, because those old records may still matter for other questions.
               <a href="https://mem0.ai/blog/introducing-memory-decay-in-mem0">Memory Decay</a>
-              answers a different question: which memories have been recently used or reinforced, and which ones have gone stale.
-              The <a href="https://docs.mem0.ai/platform/features/memory-decay">Memory Decay docs</a>
-              describe it as search-time soft re-ranking. It does not delete memories or rewrite facts on write; it gently adjusts ordering after basic relevance has been established.
+              and the <a href="https://docs.mem0.ai/platform/features/memory-decay">Memory Decay docs</a>
+              place this at search-time soft re-ranking. It does not delete memories or rewrite facts on write;
+              it gently adjusts ordering after basic relevance has been established.
             </p>
 
             <figure class="figure">
@@ -572,7 +630,7 @@ client.search(
               </figcaption>
             </figure>
 
-            <h3>6.1 Project-level Switch and Visible SDK Boundary</h3>
+            <h3>5.1 The Project Switch Changes Search-time Ranking</h3>
             <p>
               The public SDK exposes the project-level switch:
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/project.py#L396-L465"><code>project.update(decay=True)</code></a>
@@ -584,9 +642,9 @@ client.search(
             <pre><code class="language-python"># Platform project setting, simplified
 client.project.update(decay=True)</code></pre>
 
-            <h3>6.2 The Boundaries Matter</h3>
+            <h3>5.2 Key Boundary: Relevance First, Decay Second</h3>
             <p>
-              The official docs are specific about where decay runs. It applies to Platform v3; it works over a candidate pool larger than final top-k;
+              The boundaries keep decay from becoming "recently used always wins." It applies to Platform v3; it works over a candidate pool larger than final top-k;
               base relevance thresholding happens before the decay multiplier; public scores are clamped to the normal range; reinforcement is asynchronous.
               The docs also give scale boundaries: the pool expands to <code>top_k * 3</code> with a floor of 50, and the multiplier is clamped between 0.3x and 1.5x.
               These details protect one invariant: decay is ranking bias, not fact deletion.
@@ -626,7 +684,7 @@ client.project.update(decay=True)</code></pre>
               </table>
             </div>
 
-            <h2>7. Put the Layers Together: Old Facts Stay, New Questions Get a View</h2>
+            <h2>6. Put the Layers Together: Old Facts Stay, New Questions Get a View</h2>
             <p>
               Return to the opening example. If a user's preference changes from A to B, simply overwriting A is too lossy.
               The system may need to answer "what is likely true now" or "when did the switch happen?" ADD-only preserves the evidence;
@@ -643,7 +701,7 @@ client.project.update(decay=True)</code></pre>
               </figcaption>
             </figure>
 
-            <h3>7.1 When Mem0 Is Enough, and When the Application Must Own the Rule</h3>
+            <h3>6.1 When Mem0 Is Enough, and When the Application Must Own the Rule</h3>
             <p>
               Mem0 covers many agent memory and personalization needs, but not every source-of-truth problem belongs in memory.
               Payment addresses, permission state, compliance switches, and medical contraindications should be owned by application databases
@@ -689,7 +747,7 @@ client.project.update(decay=True)</code></pre>
               </table>
             </div>
 
-            <h3>7.2 The Short Version of Mem0's Route</h3>
+            <h3>6.2 The Short Version of Mem0's Route</h3>
             <p>
               Mem0's useful lesson is not "make memory a bigger prompt." It is the separation of responsibilities:
               <strong>the write path preserves evidence, retrieval builds the candidate set, temporal reasoning frames history,

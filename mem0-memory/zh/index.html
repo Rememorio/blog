@@ -299,13 +299,18 @@
               更关键的是，图数据库能表达关系，但不自动回答“哪条历史在当前问题下更该被使用”。
             </p>
 
-            <h3>1.3 mem0 v3：只追加写入，把选择放到检索</h3>
+            <h3>1.3 mem0 v3：只追加写入，把“当前该信什么”留给检索</h3>
             <p>
-              到 2026 年 4 月的 mem0 v3，官方
-              <a href="https://docs.mem0.ai/migration/oss-v2-to-v3">v2 到 v3 迁移文档</a>
+              走到 v3 时，Mem0 要解决的不只是“写得更快”。paper mem0 的写入路径像一次状态裁决：
+              它既要抽取新事实，又要判断旧事实是否该被合并、覆盖或删除。mem0g 再引入图关系后，
+              写入还要维护实体、关系和图存储。问题在于，长期记忆里的很多事实不是绝对对错，
+              而是随时间和问题视角变化：用户曾经喜欢 A，后来改成 B；问“现在喜欢什么”和问“为什么改变”需要不同历史。
+            </p>
+            <p>
+              所以 <a href="https://docs.mem0.ai/migration/oss-v2-to-v3">v2 到 v3 迁移文档</a>
               和 <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm 文章</a>
-              都把新算法描述成 single-pass ADD-only。它把前两条路线里的两个重成本都挪开了：
-              不再在写入时让 LLM 决定 <code>UPDATE</code>/<code>DELETE</code> 旧记忆，也不再要求 OSS 用户维护外部 graph store。
+              里说的 single-pass ADD-only，可以理解成一次责任重分配：写入阶段负责提取新的记忆证据、连接相关旧记忆、写入可检索索引；
+              “当前该信哪条”“过时事实还要不要进入 model view”则交给检索、时间和衰减信号处理。
             </p>
 
             <pre><code class="language-text">输入：
@@ -328,15 +333,17 @@
         -> ranked model view</code></pre>
 
             <p>
-              这不是说旧事实永远不会被人工删除，也不是说重复永远不会出现。关键变化是：add pipeline 不再把“现在该信哪条”
-              作为写入时必须完成的状态裁决。历史先留下，检索时再用语义、关键词、实体、时间和访问历史去决定当前问题应该看到哪些记忆。
-              所以第一章只讲算法外形；后面的写入、读取、Temporal Reasoning 和 Memory Decay，都是在拆 v3 这条路线怎样落地。
+              这不是说旧事实永远不能删，也不是说重复永远不会出现。它真正保护的是两件事：
+              写入阶段少做不可逆判断，历史变化先留下来；读取阶段再按当前问题选择模型应该看到的少量记忆。
+              这个选择让 v3 的后续机制有了位置：写入负责留证据，读取负责排顺序，Temporal Reasoning 负责时间视角，Memory Decay 负责近期使用信号。
             </p>
 
-            <h2>二、再区分窗口、记录和模型可见结果</h2>
+            <h3>1.4 先把三层对象分清：窗口、记录和模型视图</h3>
             <p>
-              长期记忆系统里有三个表面最容易被混用。context window 是本轮模型能看到的工作区；memory record 是持久化后可检索的事实；
-              model view 是检索之后被放回本轮上下文的少量结果。三者的生命周期不同，不能互相替代。
+              继续往下看源码和 Platform 功能前，要先分清三个对象。context window 是本轮模型能看到的工作区；
+              memory record 是持久化后可检索的事实；model view 是检索之后放回本轮上下文的少量结果。
+              ADD-only 改的是 memory record 的写入方式，不是把全部历史塞进 context window；Temporal 和 Decay 改的是 model view 的选择方式，
+              也不是在存储层把旧事实抹掉。
             </p>
 
             <figure class="figure">
@@ -383,7 +390,7 @@
               </table>
             </div>
 
-            <h3>2.1 这也是官方后续博客的共同背景</h3>
+            <h4>后续博客共同讨论的是 model view 质量</h4>
             <p>
               Mem0 的 <a href="https://mem0.ai/blog/why-beam-is-a-good-memory-benchmark-for-ai-agents">BEAM benchmark 文章</a>
               和 <a href="https://mem0.ai/blog/how-to-test-ai-agent-memory-with-mem0-a-practical-memory-simulation-guide">memory simulation guide</a>
@@ -391,11 +398,15 @@
               Temporal Reasoning 和 Memory Decay 正是在这个问题空间里出现的：它们让系统在保留历史的同时，更清楚地回答“现在、当时、最近常用”。
             </p>
 
-            <h2 id="write-path">三、写入为什么只 ADD：历史先留下来</h2>
+            <h2 id="write-path">二、写入为什么只 ADD：把状态裁决从写入阶段拿掉</h2>
             <p>
-              前面讲的是 v3 为什么不再在写入时改旧记忆；现在看这个取舍在公开 OSS 路径里怎么落地。
+              旧写法的问题不是 <code>UPDATE</code> 一定错，而是它把一个长期问题压成了写入时的一次判断：
+              新事实和旧事实到底是重复、补充、冲突，还是不同时间点的真相？这个判断一旦落成覆盖或删除，后面再想解释历史就变难。
+              v3 的取舍是先把写入变成证据追加，再让读取阶段根据问题来选。
+            </p>
+            <p>
               Mem0 的 <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm</a>
-              文章给出 single-pass ADD-only 的方向，公开源码里的 OSS 路径也能看到这个方向：
+              文章给出 single-pass ADD-only 的方向，公开 OSS 路径也能看到同样的形状：
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L672-L759"><code>Memory.add()</code></a>
               先处理输入、过滤器和 metadata，再进入
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L806-L1070"><code>_add_to_vector_store()</code></a>。
@@ -412,10 +423,44 @@
               </figcaption>
             </figure>
 
-            <h3>3.1 LLM 提取是证据处理，不是状态裁判</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>旧路线的压力</th>
+                    <th>ADD-only 的处理</th>
+                    <th>得到的优势</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>写入时误判 <code>UPDATE</code> / <code>DELETE</code></td>
+                    <td>新事实作为新记录进入 memory store。</td>
+                    <td>减少不可逆覆盖，保留之后解释历史的证据。</td>
+                  </tr>
+                  <tr>
+                    <td>同一偏好在不同时间有不同答案</td>
+                    <td>变化本身成为记忆，并可带时间信号。</td>
+                    <td>“现在是什么”和“当时是什么”不再抢同一条记录。</td>
+                  </tr>
+                  <tr>
+                    <td>图关系带来额外存储和维护成本</td>
+                    <td>用 <code>linked_memory_ids</code> 和内置 entity linking 保留关联。</td>
+                    <td>仍能表达相关性，但不要求 OSS 用户维护外部 graph store。</td>
+                  </tr>
+                  <tr>
+                    <td>写入链路越长，成本和延迟越难控</td>
+                    <td>单次抽取、batch embedding、hash 去重后写入。</td>
+                    <td>写入路径更短，失败面更小，后续判断集中到检索层。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>2.1 LLM 只做抽取和连接，不做最终状态裁判</h3>
             <p>
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L468-L760"><code>ADDITIVE_EXTRACTION_PROMPT</code></a>
-              的约束很明确：抽取来自新消息的可记忆事实，用户和 assistant 消息都可能包含信息；相对时间要用 observation date 落到具体日期；
+              把 LLM 的职责收在几件事上：抽取来自新消息的可记忆事实，用户和 assistant 消息都可能包含信息；相对时间要用 observation date 落到具体日期；
               与旧记忆相关时使用 <code>linked_memory_ids</code>，而不是让模型直接改写旧记录。
             </p>
 
@@ -434,18 +479,23 @@
               后续检索可以同时看到“曾经喜欢什么”和“后来为什么变了”。这比覆盖更适合长期 agent，因为用户之后可能问的是历史，而不是当前偏好。
             </p>
 
-            <h3>3.2 OSS 对 Platform-only 时间参数保持硬边界</h3>
+            <h3>2.2 OSS 对 Platform-only 时间参数保持硬边界</h3>
             <p>
-              公开源码里还有一个很重要的边界：
+              公开源码里还有一个需要守住的边界：
               <code>Memory.add(timestamp=...)</code> 在 OSS 路径会直接抛出 Platform-only 错误；
               <code>Memory.search(reference_date=...)</code> 也一样。
               这不是实现细节缺失，而是 API 层明确把 Temporal Reasoning 切到 Platform v3。
               文章后面讨论 Temporal 时，只能把它当成官方 Platform 合约，而不能把服务端内部排序算法补成源码事实。
             </p>
 
-            <h2 id="retrieval">四、读取不是纯向量：先召回候选，再融合排序</h2>
+            <h2 id="retrieval">三、读取为什么要混合排序：只追加之后，选择发生在 model view</h2>
             <p>
-              如果写入是 ADD-only，读取就必须承担更多责任。Mem0 OSS 的搜索路径从
+              ADD-only 会让 memory store 保留更多历史版本和相关事实。如果读取仍然只是一次向量 top-k，
+              系统就容易把“语义相似”误当成“当前应该使用”。例如旧偏好和新偏好都和 query 很像，但它们回答的是不同时间点的问题。
+              所以 v3 路线把写入阶段拿掉的选择，放到了 model view 形成阶段。
+            </p>
+            <p>
+              Mem0 OSS 的搜索路径从
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1248-L1372"><code>Memory.search()</code></a>
               进入 <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1488-L1668"><code>_search_vector_store()</code></a>：
               先做 query lemmatization 和实体抽取，再做 embedding；语义召回会 over-fetch，关键词搜索会生成 BM25 分数，实体 store 会给相关 memory 加 boost。
@@ -463,7 +513,7 @@
               </figcaption>
             </figure>
 
-            <h3>4.1 threshold 在融合前就会生效</h3>
+            <h3>3.1 先用语义守门，再融合关键词和实体</h3>
             <p>
               <code>score_and_rank()</code> 里有一个容易忽略的顺序：semantic score 低于 threshold 的候选会先被排除，
               之后才把 normalized BM25 和 entity boost 加进来。这意味着关键词或实体信号可以帮助排序，但不能把一个语义完全不相关的候选带进结果。
@@ -477,20 +527,20 @@
   -> normalize by active signal budget
   -> return top_k</code></pre>
 
-            <h3>4.2 ADD-only 把“现在是否适用”推给 retrieval</h3>
+            <h3>3.2 当前是否适用，需要时间和访问信号</h3>
             <p>
               一旦写入不覆盖，读取层就必须处理冲突和新旧关系。一个用户可以先说喜欢 A，后来改成 B；
               memory store 里最好同时保留两条，因为它们分别回答不同问题：“你现在偏好什么？”和“你以前为什么改变？”。
               纯向量检索通常只知道文本相似，而 Temporal Reasoning 和 Memory Decay 让检索层拥有更多判断“现在是否仍然适用”的信号。
             </p>
 
-            <h2 id="temporal">五、Temporal Reasoning：让事实带上“何时为真”</h2>
+            <h2 id="temporal">四、Temporal Reasoning：给检索一个时间视角</h2>
             <p>
-              <a href="https://mem0.ai/blog/introducing-temporal-reasoning-in-mem0">Temporal Reasoning 官方文章</a>
-              把问题说得很直接：对长期 agent 来说，“用户喜欢什么”经常不是一个无时间条件的事实。
-              <a href="https://docs.mem0.ai/platform/features/temporal-reasoning">Temporal Reasoning 文档</a>
-              给出的公开合约包括：Platform v3 支持，默认启用；写入可以带 <code>timestamp</code>；
-              搜索可以带 <code>reference_date</code>；返回 shape 保持普通 search 结果，不把时间推理暴露成另一种响应对象。
+              上一章留下了一个问题：如果旧事实和新事实都被保留，系统怎么知道这次 query 要站在哪个时间点回答？
+              这正是 Temporal Reasoning 的位置。它不是把旧记录改成新记录，而是让写入记录“何时观察到这个事实”，
+              让搜索表达“以哪一天为观察点”。<a href="https://mem0.ai/blog/introducing-temporal-reasoning-in-mem0">Temporal Reasoning 官方文章</a>
+              和 <a href="https://docs.mem0.ai/platform/features/temporal-reasoning">文档</a> 给出的公开合约包括：Platform v3 支持，默认启用；
+              写入可以带 <code>timestamp</code>；搜索可以带 <code>reference_date</code>；返回 shape 仍是普通 search 结果。
             </p>
 
             <figure class="figure">
@@ -503,7 +553,7 @@
               </figcaption>
             </figure>
 
-            <h3>5.1 SDK 里能看到的请求形态：时间进入 Platform 请求</h3>
+            <h3>4.1 请求形态：写入时间和观察时间分开</h3>
             <p>
               Python SDK 的 Platform client 会把 add/search 请求发到 v3 endpoint：
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/main.py#L180-L330"><code>/v3/memories/add/</code> 和 <code>/v3/memories/search/</code></a>。
@@ -529,20 +579,21 @@ client.search(
               这让“现在是什么”与“当时是什么”不再争抢同一条覆盖记录。
             </p>
 
-            <h3>5.2 Temporal 解决的是矛盾事实，不是替代过滤器</h3>
+            <h3>4.2 Temporal 解决的是矛盾历史，不是替代过滤器</h3>
             <p>
               Temporal Reasoning 不是普通 metadata filter。filter 更像是先限定范围，例如某个 user、agent、run 或业务属性；
               temporal query 则是在已召回的历史中理解时间关系。比如“过去三个月有哪些变化”和“去年我更喜欢什么”都需要保留多条历史，
               而不是只保留最新事实。
             </p>
 
-            <h2 id="decay">六、Memory Decay：近期使用影响排名，但不删除旧记忆</h2>
+            <h2 id="decay">五、Memory Decay：用近期使用调整排名，而不是清理存储</h2>
             <p>
-              如果 Temporal Reasoning 处理“何时为真”，
+              时间视角解决的是“何时为真”，但还不够。长期 agent 会积累很多都相关、都没过期的事实；
+              如果某类信息最近反复被使用，它通常更应该进入当前 model view。这个问题不能靠删除旧记忆解决，
+              因为旧记忆以后仍可能在别的问题里有用。
               <a href="https://mem0.ai/blog/introducing-memory-decay-in-mem0">Memory Decay 官方文章</a>
-              处理的是另一类信号：哪类记忆最近被使用、被强化，哪类记忆长期没有再出现。
-              <a href="https://docs.mem0.ai/platform/features/memory-decay">Memory Decay 文档</a>
-              把它描述为 search-time soft re-ranking：它不删除记忆，也不在写入时改写事实，而是在候选集通过基础阈值之后，对排名做温和调整。
+              和 <a href="https://docs.mem0.ai/platform/features/memory-decay">文档</a>
+              把它定义在 search-time soft re-ranking：不删除记忆，不在写入时改写事实，而是在候选集通过基础阈值之后，对排名做温和调整。
             </p>
 
             <figure class="figure">
@@ -555,7 +606,7 @@ client.search(
               </figcaption>
             </figure>
 
-            <h3>6.1 项目级开关和可见 SDK 边界</h3>
+            <h3>5.1 项目开关只改变 search-time ranking</h3>
             <p>
               公开 SDK 里能看到项目设置层面的开关：
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/project.py#L396-L465"><code>project.update(decay=True)</code></a>
@@ -566,9 +617,9 @@ client.search(
             <pre><code class="language-python"># Platform project setting, simplified
 client.project.update(decay=True)</code></pre>
 
-            <h3>6.2 Decay 有几个边界很关键</h3>
+            <h3>5.2 关键边界：先相关，再衰减</h3>
             <p>
-              官方文档把 Memory Decay 的位置讲得很具体：它只适用于 Platform v3；会在比最终 top-k 更大的候选池上工作；
+              Memory Decay 的几个边界决定了它不会变成“谁最近用过谁就赢”：它只适用于 Platform v3；会在比最终 top-k 更大的候选池上工作；
               基础相关性 threshold 先执行，decay multiplier 后执行；公开返回的 score 会被 clamp 到常规范围；访问历史强化是异步的。
               文档还给出量级边界：候选池会扩成 <code>top_k * 3</code> 且至少 50 条，decay multiplier 夹在 0.3x 到 1.5x。
               这些细节都在保证一件事：decay 是排名偏置，不是事实删除。
@@ -608,7 +659,7 @@ client.project.update(decay=True)</code></pre>
               </table>
             </div>
 
-            <h2>七、把几层合起来：旧事实不覆盖，新问题有视角</h2>
+            <h2>六、把几层合起来：旧事实不覆盖，新问题有视角</h2>
             <p>
               现在可以回到开头的问题。用户偏好从 A 变成 B，不应该简单覆盖 A；
               因为系统以后可能需要回答“现在更可能是什么”，也可能需要回答“什么时候从 A 变成 B”。ADD-only 保留变化证据；
@@ -625,7 +676,7 @@ client.project.update(decay=True)</code></pre>
               </figcaption>
             </figure>
 
-            <h3>7.1 什么时候靠 Mem0，什么时候靠应用层</h3>
+            <h3>6.1 什么时候靠 Mem0，什么时候靠应用层</h3>
             <p>
               Mem0 解决的是 agent memory 的大部分检索和个性化问题，但不是所有强一致状态都应该交给记忆系统。
               支付地址、权限状态、合规开关、医疗禁忌这类必须强一致的事实，应该由业务数据库和应用层规则拥有；
@@ -671,7 +722,7 @@ client.project.update(decay=True)</code></pre>
               </table>
             </div>
 
-            <h3>7.2 一句话总结 Mem0 的路线</h3>
+            <h3>6.2 一句话总结 Mem0 的路线</h3>
             <p>
               Mem0 最值得借鉴的地方，不是把“记忆”做成一个更大的上下文，而是把几件事分开放：
               <strong>写入保留证据，检索形成候选，时间解释历史视角，衰减表达近期使用，应用层负责强一致规则。</strong>
