@@ -90,9 +90,10 @@
             <p class="eyebrow">源码阅读 · 长期记忆</p>
             <h1>Mem0 记忆算法怎么演进：从可更新记忆、图关系，到 ADD-only 写入与多信号检索</h1>
             <p class="lead">
-              Mem0 不是一开始就只追加记忆。论文里的 mem0 先让 LLM 对旧记忆做 ADD、UPDATE、DELETE、NOOP 判断；
-              mem0g 又把实体和关系放进图数据库；到 2026 年 4 月的 v3，路线才转向 single-pass ADD-only、实体索引和多信号检索。
-              这篇文章先讲这条算法演进，再解释 Temporal Reasoning 与 Memory Decay 为什么自然接在后面。
+              Agent 真正开始跨会话工作以后，记忆就不再只是“把聊天记录存下来”。用户偏好要能保留，过时事实不能误导当前回答，
+              历史变化还要能解释。<a href="https://docs.mem0.ai/introduction">Mem0</a> 受关注，正是因为它把这些问题收成一层可接入的 memory layer：
+              从对话里抽取可检索事实，再在需要时把少量相关记忆放回模型上下文。本文沿着这层 memory 的算法演进往下读：
+              从 paper mem0 的可更新记忆，到 mem0g 的图关系，再到 v3 的 ADD-only 写入、多信号检索、Temporal Reasoning 和 Memory Decay。
             </p>
             <div class="meta-line">
               <span>项目：mem0ai/mem0</span>
@@ -111,7 +112,13 @@
             <p>
               先看一个很普通的长期记忆场景。用户一月说自己喜欢素食餐厅，三月说最近开始吃海鲜，六月又问“我以前约朋友吃饭一般选什么地方？”。
               如果系统只保留最后一条偏好，就会丢掉一月的历史；如果系统把所有事实都无差别塞进上下文，又会让模型把过时偏好当成现在偏好。
-              真正的问题不是“要不要记住”，而是：<strong>历史应该怎样保存，现在是否仍然适用又该在哪一层判断。</strong>
+              这个场景把长期记忆拆成两个问题：<strong>历史应该怎样保存，现在是否仍然适用又该在哪一层判断。</strong>
+            </p>
+
+            <p>
+              在工程形态上，Mem0 位于应用和模型之间：应用把对话、用户维度和 agent 维度交给它，
+              它把可长期使用的信息抽成 memory records；模型需要回答时，应用再从 Mem0 搜出少量相关记忆放回上下文。
+              这个位置解释了它为什么容易成为 agent 记忆讨论里的核心组件：它不要求把所有历史塞进 prompt，也不要求每个应用自己重写一套记忆抽取、去重和检索逻辑。
             </p>
 
             <p>
@@ -119,7 +126,8 @@
               <a href="https://mem0.ai/blog/context-window-is-ram-not-storage-why-most-agent-failures-happen-how-to-fix-them-in-2026">context window 更像 RAM，不是长期存储</a>；
               <a href="https://mem0.ai/blog/context-window-vs-persistent-memory-why-1m-tokens-isn-t-enough">更大的上下文窗口也不能替代持久记忆</a>；
               <a href="https://mem0.ai/blog/your-ai-agents-memory-is-just-a-file-thats-the-problem">把记忆写成一个文件</a>又会把证据、偏好、临时状态和检索策略糊在一起。
-              这些文章是理解 v3、Temporal Reasoning 和 Memory Decay 的入口：它们不是几个孤立功能，而是在回答同一个长期记忆问题。
+              这些文章共同指向一个工程判断：memory layer 的价值不只是“多记一些”，而是把保存、检索、时间解释和排名策略分给不同层。
+              v3、Temporal Reasoning 和 Memory Decay 就是在这条线上继续展开。
             </p>
 
             <div id="evidence" class="note">
@@ -145,11 +153,10 @@
 
             <h2 id="evolution">一、先看三代算法怎么一路改过来</h2>
             <p>
-              公开材料没有把这三步直接叫作“v1、v2、v3”：论文里叫 mem0 和 mem0g，迁移材料里讲 mem0 v3。
-              更合适的读法，是把它们看成三次算法取舍：基础 mem0、图版本 mem0g、以及 v3。
-              如果只从 v3 的 ADD-only 看起，Mem0 很容易被误解成“只是不覆盖旧记忆”。实际变化更像三步：
-              先用 LLM 维护一组较小的记忆，再显式引入图关系，最后把写入变简单，把更多判断交给检索和排序。
-              这三步各自解决一个问题，也各自暴露出新的成本。
+              讲 Mem0 演进时，最容易混在一起的是两条命名线：论文里讨论的是 mem0 和 mem0g，
+              产品与 SDK 迁移材料里讨论的是 v2 API 和 v3 行为。本文不把它们硬套成“官方 v1、v2、v3”，
+              而是按算法取舍来读：先用 LLM 维护一组较小的文本记忆，再用图结构表达实体关系，最后把写入变简单，
+              把更多判断交给检索和排序。这样后面谈 ADD-only、Temporal 和 Decay 时，读者能看到它们各自接住了前一代留下的哪部分压力。
             </p>
 
             <div class="table-wrap">
@@ -192,15 +199,16 @@
                 alt="Mem0 算法演进图，展示 paper mem0 的 ADD UPDATE DELETE NOOP、paper mem0g 的实体关系图数据库，以及 mem0 v3 的只追加、实体索引和混合检索"
               />
               <figcaption>
-                三代路线的差别不只是“有没有覆盖”：旧版在写入时判断旧记忆怎么改，v3 更倾向于先保留历史，再在检索时判断。
+                三代路线的判断位置在移动：旧版在写入时决定旧记忆怎么改，v3 更倾向于先保留历史，再在检索时判断。
               </figcaption>
             </figure>
 
             <h3>1.1 paper mem0：先抽取，再决定怎么改旧记忆</h3>
             <p>
-              先不要急着看 v3。把 <a href="https://arxiv.org/html/2504.19413v1">原始论文</a>里的 mem0 当成一个写入算法，
-              它的输入不是单条用户消息，而是一小段对话状态：最新 user/assistant message、之前的 summary、最近若干条消息，以及已有 memory。
-              算法可以简化成下面这个流程：
+              最早的 mem0 先面对一个很实际的目标：memory set 不能无限膨胀，否则每次检索和注入上下文都会变贵；
+              重复事实应该合并，明显错误或过时的信息也应该移出当前记忆。<a href="https://arxiv.org/html/2504.19413v1">原始论文</a>
+              于是把“整理旧记忆”放进写入路径。它看到的也不是单条用户消息，而是一小段对话状态：
+              最新 user/assistant message、之前的 summary、最近若干条消息，以及已有 memory。流程可以简化成这样：
             </p>
 
             <pre><code class="language-text">输入：
@@ -333,17 +341,17 @@
         -> ranked model view</code></pre>
 
             <p>
-              这不是说旧事实永远不能删，也不是说重复永远不会出现。它真正保护的是两件事：
-              写入阶段少做不可逆判断，历史变化先留下来；读取阶段再按当前问题选择模型应该看到的少量记忆。
+              这个设计真正保护的是两件事：写入阶段少做不可逆判断，历史变化先留下来；读取阶段再按当前问题选择模型应该看到的少量记忆。
+              它不承诺旧事实永远不能删，也不承诺重复永远不会出现。
               这个选择让 v3 的后续机制有了位置：写入负责留证据，读取负责排顺序，Temporal Reasoning 负责时间视角，Memory Decay 负责近期使用信号。
             </p>
 
             <h3>1.4 先把三层对象分清：窗口、记录和模型视图</h3>
             <p>
-              继续往下看源码和 Platform 功能前，要先分清三个对象。context window 是本轮模型能看到的工作区；
-              memory record 是持久化后可检索的事实；model view 是检索之后放回本轮上下文的少量结果。
-              ADD-only 改的是 memory record 的写入方式，不是把全部历史塞进 context window；Temporal 和 Decay 改的是 model view 的选择方式，
-              也不是在存储层把旧事实抹掉。
+              读到 ADD-only 时，容易冒出一个误解：既然历史都留下来，是不是所有旧事实都会进入上下文？
+              答案要从三层对象看。context window 是本轮模型能看到的工作区；memory record 是持久化后可检索的事实；
+              model view 是检索之后放回本轮上下文的少量结果。ADD-only 改的是 memory record 的写入方式；
+              Temporal 和 Decay 改的是 model view 的选择方式。两者都不等于把全部历史塞进 context window。
             </p>
 
             <figure class="figure">
@@ -400,9 +408,9 @@
 
             <h2 id="write-path">二、写入为什么只 ADD：把状态裁决从写入阶段拿掉</h2>
             <p>
-              旧写法的问题不是 <code>UPDATE</code> 一定错，而是它把一个长期问题压成了写入时的一次判断：
-              新事实和旧事实到底是重复、补充、冲突，还是不同时间点的真相？这个判断一旦落成覆盖或删除，后面再想解释历史就变难。
-              v3 的取舍是先把写入变成证据追加，再让读取阶段根据问题来选。
+              偏好变化最能说明写入阶段的压力：一月的“喜欢素食餐厅”、三月的“开始吃海鲜”、六月的“以前一般选哪里”
+              同时涉及重复、补充、冲突和时间视角。写入路径如果立刻把旧事实覆盖或删除，当前状态会更干净，
+              但之后要解释历史就更难。v3 的取舍是先把写入变成证据追加，再让读取阶段根据问题来选。
             </p>
             <p>
               Mem0 的 <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm</a>
@@ -419,7 +427,7 @@
                 alt="ADD-only Write Path 图，展示 messages、existing memory、extract facts、dedup hash、vector insert、history ADD 与被阻断的 overwrite old"
               />
               <figcaption>
-                ADD-only 的核心不是“永远没有重复”，而是写入路径不把新事实当成旧事实的原地覆盖。
+                ADD-only 的核心是阻断原地覆盖；它不等于承诺系统永远不会产生重复记忆。
               </figcaption>
             </figure>
 
@@ -459,9 +467,11 @@
 
             <h3>2.1 LLM 只做抽取和连接，不做最终状态裁判</h3>
             <p>
+              写入不再裁判旧事实以后，LLM 仍然有工作要做：它要从新消息里挑出值得长期保存的事实，
+              说明这些事实和哪些旧记忆相关，并把相对时间落到可比较的日期上。
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L468-L760"><code>ADDITIVE_EXTRACTION_PROMPT</code></a>
-              把 LLM 的职责收在几件事上：抽取来自新消息的可记忆事实，用户和 assistant 消息都可能包含信息；相对时间要用 observation date 落到具体日期；
-              与旧记忆相关时使用 <code>linked_memory_ids</code>，而不是让模型直接改写旧记录。
+              正是在约束这些职责：用户和 assistant 消息都可能包含信息；相对时间要用 observation date 落到具体日期；
+              与旧记忆相关时使用 <code>linked_memory_ids</code>，而不是直接改写旧记录。
             </p>
 
             <pre><code class="language-json">{
@@ -481,7 +491,8 @@
 
             <h3>2.2 OSS 对 Platform-only 时间参数保持硬边界</h3>
             <p>
-              公开源码里还有一个需要守住的边界：
+              下一章会谈 Temporal Reasoning，但这里要先把两条可见边界分开：OSS 代码能看到 ADD-only 写入和基础检索，
+              Platform v3 合约才暴露时间推理参数。公开源码里，
               <code>Memory.add(timestamp=...)</code> 在 OSS 路径会直接抛出 Platform-only 错误；
               <code>Memory.search(reference_date=...)</code> 也一样。
               这不是实现细节缺失，而是 API 层明确把 Temporal Reasoning 切到 Platform v3。
@@ -515,8 +526,9 @@
 
             <h3>3.1 先用语义守门，再融合关键词和实体</h3>
             <p>
-              <code>score_and_rank()</code> 里有一个容易忽略的顺序：semantic score 低于 threshold 的候选会先被排除，
-              之后才把 normalized BM25 和 entity boost 加进来。这意味着关键词或实体信号可以帮助排序，但不能把一个语义完全不相关的候选带进结果。
+              关键词和实体 boost 很有用，但它们不能替代基本相关性。否则某个名字频繁出现，就可能把语义无关的记忆推到模型面前。
+              <code>score_and_rank()</code> 的顺序正是在保护这点：semantic score 低于 threshold 的候选会先被排除，
+              之后才把 normalized BM25 和 entity boost 加进来。关键词或实体信号可以帮助排序，但不能把一个语义完全不相关的候选带进结果。
               这个门槛保护的是 model view 的基本相关性。
             </p>
 
@@ -549,12 +561,15 @@
                 alt="Temporal Layer 图，展示 add 阶段 timestamp 进入 memory time，search 阶段 reference_date 与 as of when 问题在 timeline 上选择 ranked answer"
               />
               <figcaption>
-                Temporal layer 不需要覆盖历史，它让检索问题可以表达“站在哪一天看这段历史”。
+                Temporal layer 让检索问题表达“站在哪一天看这段历史”，从而不必靠覆盖来处理时间变化。
               </figcaption>
             </figure>
 
             <h3>4.1 请求形态：写入时间和观察时间分开</h3>
             <p>
+              回到前面的餐厅例子：三月开始吃海鲜是一条事实，六月追问“一月通常去哪”是另一个观察点。
+              如果这两个时间混在一起，系统只能猜“最新事实”是否应该覆盖旧事实。Platform 请求把它们拆开：
+              <code>timestamp</code> 描述记忆进入历史的时间，<code>reference_date</code> 描述本次搜索要站在哪一天回答。
               Python SDK 的 Platform client 会把 add/search 请求发到 v3 endpoint：
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/client/main.py#L180-L330"><code>/v3/memories/add/</code> 和 <code>/v3/memories/search/</code></a>。
               源码可见的是请求 shape 和参数转发；时间推理怎么在服务端参与 ranking，不在公开源码里。
@@ -581,8 +596,9 @@ client.search(
 
             <h3>4.2 Temporal 解决的是矛盾历史，不是替代过滤器</h3>
             <p>
-              Temporal Reasoning 不是普通 metadata filter。filter 更像是先限定范围，例如某个 user、agent、run 或业务属性；
-              temporal query 则是在已召回的历史中理解时间关系。比如“过去三个月有哪些变化”和“去年我更喜欢什么”都需要保留多条历史，
+              filter 先解决“在哪个范围里找”：某个 user、agent、run，或者业务侧 metadata。
+              但在同一个用户范围里，二月事实和三月事实仍然可能同时存在。temporal query 要处理的是这些保留历史内部的时间关系。
+              比如“过去三个月有哪些变化”和“去年我更喜欢什么”都需要保留多条历史，
               而不是只保留最新事实。
             </p>
 
@@ -619,7 +635,9 @@ client.project.update(decay=True)</code></pre>
 
             <h3>5.2 关键边界：先相关，再衰减</h3>
             <p>
-              Memory Decay 的几个边界决定了它不会变成“谁最近用过谁就赢”：它只适用于 Platform v3；会在比最终 top-k 更大的候选池上工作；
+              最近使用只应该影响相关候选之间的顺序，不能让无关事实越过相关性门槛。比如用户最近反复问过报销流程，
+              不代表“报销”相关记忆应该进入一次餐厅偏好的查询。Memory Decay 的边界就是围绕这个风险设计的：
+              它只适用于 Platform v3；会在比最终 top-k 更大的候选池上工作；
               基础相关性 threshold 先执行，decay multiplier 后执行；公开返回的 score 会被 clamp 到常规范围；访问历史强化是异步的。
               文档还给出量级边界：候选池会扩成 <code>top_k * 3</code> 且至少 50 条，decay multiplier 夹在 0.3x 到 1.5x。
               这些细节都在保证一件事：decay 是排名偏置，不是事实删除。
@@ -678,9 +696,9 @@ client.project.update(decay=True)</code></pre>
 
             <h3>6.1 什么时候靠 Mem0，什么时候靠应用层</h3>
             <p>
-              Mem0 解决的是 agent memory 的大部分检索和个性化问题，但不是所有强一致状态都应该交给记忆系统。
-              支付地址、权限状态、合规开关、医疗禁忌这类必须强一致的事实，应该由业务数据库和应用层规则拥有；
-              Mem0 可以帮助模型解释和召回上下文，但不应该成为最终授权来源。
+              有些信息可以靠记忆系统帮助模型理解上下文，比如用户偏好、常用工具、长期项目背景。
+              也有些信息必须精确执行，比如支付地址、权限状态、合规开关、医疗禁忌。后一类信息应该由业务数据库和应用层规则拥有；
+              Mem0 可以帮助模型解释和召回相关上下文，但不应该成为最终授权来源。
             </p>
 
             <div class="table-wrap">
@@ -731,6 +749,7 @@ client.project.update(decay=True)</code></pre>
 
             <h2 id="sources">参考资料</h2>
             <ul class="source-list">
+              <li><a href="https://docs.mem0.ai/introduction">Mem0 docs: Introduction</a></li>
               <li><a href="https://arxiv.org/html/2504.19413v1">Mem0 paper: Building Production-Ready AI Agents with Scalable Long-Term Memory</a></li>
               <li><a href="https://docs.mem0.ai/migration/oss-v2-to-v3">Mem0 docs: OSS v2 to v3 migration</a></li>
               <li><a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Introducing the Token-Efficient Memory Algorithm</a></li>
