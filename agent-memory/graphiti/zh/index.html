@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Graphiti / Zep：把记忆放进 temporal context graph</title>
+    <meta
+      name="description"
+      content="Agent Memory 系列第三篇：从 Graphiti 的 episodes、EntityEdge、valid_at / invalid_at、provenance 和 hybrid retrieval 读懂 temporal context graph。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Graphiti / Zep：把记忆放进 temporal context graph" />
+    <meta
+      property="og:description"
+      content="Graphiti 把长期记忆组织成带时间有效期和来源追踪的 context graph，让事实能失效，也让历史仍然可查。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="assets/graphiti-temporal-graph-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-memory/graphiti/zh/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-memory/graphiti/zh/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-memory/graphiti/en/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-memory/graphiti/" />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.reading-contract {
+        border-color: rgba(15, 118, 110, 0.32);
+        background: rgba(15, 118, 110, 0.08);
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../../zh/">Agent Memory</a>
+        <a href="../../../mem0-memory/zh/">Mem0 篇</a>
+        <a href="../../letta/zh/">Letta 篇</a>
+        <a href="#evidence">证据边界</a>
+        <a href="#need">为什么要图</a>
+        <a href="#episode">Episode</a>
+        <a href="#edge">Fact Edge</a>
+        <a href="#retrieval">检索</a>
+        <a href="#sources">参考资料</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../en/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Agent Memory · Graphiti</p>
+            <h1>Graphiti / Zep：把记忆放进 temporal context graph</h1>
+            <p class="lead">
+              如果 Mem0 的主问题是“怎么把对话沉淀成可检索记忆”，Letta 的主问题是“agent 自己的状态怎样长期存在”，
+              Graphiti 的主问题就更接近现实世界本身：人、项目、偏好和事实都会变化。一个长期工作的 agent 不只要知道
+              “Alice 和 Bob 有关系”，还要知道这段关系什么时候成立、什么时候被新信息替代，以及这条事实来自哪段原始输入。
+            </p>
+            <div class="meta-line">
+              <span>项目：getzep/graphiti</span>
+              <span>相关：Zep context infrastructure</span>
+              <span>主题：temporal context graph</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="assets/graphiti-temporal-graph-cover.png"
+                alt="Graphiti temporal context graph 机制图，展示 episode stream、EpisodicNode valid_at、entity、fact edge、invalid_at、provenance、hybrid retrieval 和 current view 的关系"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先想一个简单问题：用户去年在 A 团队，今年转到 B 团队。agent 如果只保存最新事实，回答“去年他在哪个团队”会出错；
+              如果把两条事实都当作同等当前事实，又会在今天的任务分配里产生冲突。Graphiti 的 temporal context graph 想处理的，
+              正是这种“事实会变化，但历史不能消失”的记忆问题。
+            </p>
+
+            <div class="note reading-contract">
+              <p>
+                <strong>阅读契约。</strong>
+                读完这一篇，应该能回答三件事：Graphiti 为什么把 raw data 称为 episode；
+                <code>EntityEdge</code> 上的 <code>valid_at</code>、<code>invalid_at</code> 和 <code>expired_at</code> 分别在表达什么；
+                hybrid retrieval 为什么要同时看语义、关键词和图遍历。
+              </p>
+            </div>
+
+            <div id="evidence" class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文只使用 <a href="https://github.com/getzep/graphiti">getzep/graphiti</a> 的公开 README 与源码。
+                README 把 Graphiti 描述为 Zep context infrastructure 的开源 temporal context graph engine；
+                Zep 托管服务的规模、治理和低延迟能力按 README 公开定位介绍，不推断私有实现。
+              </p>
+            </div>
+
+            <h2 id="need">一、为什么记忆需要 temporal context graph</h2>
+            <p>
+              Graphiti README 对自己的定位很明确：它用于构建和查询 AI agents 的 temporal context graphs，
+              这些图会追踪 facts 如何随时间变化，保留到 source data 的 provenance，并支持 prescribed 与 learned ontology。
+              README 还把它和传统 RAG 区分开：Graphiti 会持续整合用户交互、结构化与非结构化数据、外部信息，
+              支持 incremental updates、historical queries，并且不需要每次完整重算图。
+              这些说法集中在 <a href="https://github.com/getzep/graphiti/blob/main/README.md#L42-L55">README 的项目介绍</a>。
+            </p>
+
+            <p>
+              更具体地说，Graphiti 的 context graph 由四类东西组成：
+              entities、facts / relationships、episodes 和 custom types。
+              README 的表格把 facts / relationships 定义为带 temporal validity windows 的 triplets；
+              episodes 则是 ingested raw data，也是每条 derived fact 能追溯回去的 ground truth stream。
+              这就把“图”从装饰性的关系视图，变成了一个带时间和来源的事实账本。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>组件</th>
+                    <th>在 Graphiti 里的意义</th>
+                    <th>记忆问题</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Episode</td>
+                    <td>原始输入流，带 source、content、valid_at。</td>
+                    <td>这条事实最早来自哪里？</td>
+                  </tr>
+                  <tr>
+                    <td>Entity</td>
+                    <td>人、项目、文档、地点、概念等节点。</td>
+                    <td>记忆里的对象是谁？</td>
+                  </tr>
+                  <tr>
+                    <td>Fact edge</td>
+                    <td>实体之间的事实关系，带 fact text、embedding、来源 episode 和时间字段。</td>
+                    <td>这段关系什么时候成立，现在还成立吗？</td>
+                  </tr>
+                  <tr>
+                    <td>Current view</td>
+                    <td>按当前时间和查询目标拼出来的上下文子图。</td>
+                    <td>这一轮应该给模型看哪部分？</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <figure class="figure">
+              <img
+                src="assets/graphiti-temporal-graph-cover.png"
+                alt="Graphiti 机制图，展示 episode 进入 EpisodicNode 后抽取 entities 和 fact edges，旧 fact 被 invalid_at 标记失效但仍保留历史"
+              />
+              <figcaption>
+                Graphiti 的关键在于 fact edge 有时间窗口，且能沿 provenance 回到 episode。旧事实失效，不等于删除历史。
+              </figcaption>
+            </figure>
+
+            <h2 id="episode">二、Episode 是原始证据流，不是普通摘要</h2>
+            <p>
+              Graphiti 把输入先落到 <code>EpisodicNode</code>。源码里这个节点保存 <code>source</code>、
+              <code>source_description</code>、<code>content</code>、<code>valid_at</code>、<code>entity_edges</code>
+              和 <code>episode_metadata</code>。其中 <code>valid_at</code> 的描述是原始文档创建时间；
+              保存节点时，<code>content</code>、<code>entity_edges</code>、<code>created_at</code>、<code>valid_at</code>
+              都会作为 episode 数据写入图里。这可以直接看
+              <a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/nodes.py#L318-L350"><code>EpisodicNode</code> 定义</a>。
+            </p>
+
+            <p>
+              这里有一个很容易被忽略的区别：<code>created_at</code> 是这条记录进入系统的时间，
+              <code>valid_at</code> 是原始事实对应的参考时间。用户今天导入一份去年的会议纪要，
+              系统写入时间是今天，但纪要里的事实可能属于去年。长期记忆要能回答历史问题，就不能只看入库时间。
+            </p>
+
+            <p>
+              episode 和 entity 之间通过 <code>EpisodicEdge</code> 相连。
+              <a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/edges.py#L143-L158"><code>EpisodicEdge.save()</code></a>
+              写入的是 <code>episode_uuid</code>、<code>entity_uuid</code>、<code>uuid</code>、<code>group_id</code> 和
+              <code>created_at</code>，也就是“这段原始输入提到了哪个实体”。后面 fact edge 的来源追踪，就是建立在这些 episode 连接之上。
+            </p>
+
+            <h2 id="edge">三、Fact edge 承担事实、来源和有效期</h2>
+            <p>
+              真正表达长期记忆事实的，是 <code>EntityEdge</code>。源码字段非常直白：
+              <code>name</code> 表示关系名，<code>fact</code> 保存事实文本，<code>fact_embedding</code> 用于相似度检索，
+              <code>episodes</code> 保存引用这条关系的 episode ids。
+              时间字段则有三组：<code>valid_at</code> 表示 fact 何时开始为真，<code>invalid_at</code> 表示何时不再为真，
+              <code>expired_at</code> 表示这条边何时被系统 invalidated。
+              这些字段和保存逻辑在 <a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/edges.py#L263-L355"><code>EntityEdge</code></a>
+              里能看到。
+            </p>
+
+            <p>
+              这样设计以后，新信息到来时，系统不必把旧关系抹掉。Graphiti 的边解析流程会把结果拆成
+              <code>resolved_edges</code>、<code>invalidated_edges</code> 和 <code>new_edges</code>。
+              <a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/graphiti.py#L631-L678"><code>_extract_and_resolve_edges()</code></a>
+              的 docstring 写得很清楚：<code>invalidated_edges</code> 是被新信息 invalidated 的旧边，
+              <code>new_edges</code> 是真正新增且不是重复的边。也就是说，Graphiti 的写入路径不是只做追加，也不是简单覆盖；
+              它会把“新事实让旧事实失效”显式记录下来。
+            </p>
+
+            <p>
+              这和 Mem0 v3 的 ADD-only 路线可以放在一起看。Mem0 v3 选择在 memory record 层面保留追加历史，
+              再把时间解释、排序和衰减放到检索与上下文组装阶段。Graphiti 则把时间窗口直接放进 fact edge，
+              让图结构本身携带“现在是否成立”和“曾经是否成立”的信息。两者都在避免把历史直接擦掉，只是一个偏 memory layer，
+              一个偏 temporal graph。
+            </p>
+
+            <h2 id="retrieval">四、检索要组装当前子图</h2>
+            <p>
+              既然事实存在图上，检索也不能只看一条文本相似度。Graphiti README 把 hybrid retrieval 描述为 semantic embeddings、
+              keyword / BM25 和 graph traversal 的组合；源码里的 search config 也对应这三类方法。
+              <a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/search/search_config.py#L32-L129"><code>search_config.py</code></a>
+              定义了 edge、node、episode、community 的搜索方法和 reranker：edge 与 node 都支持 cosine similarity、BM25 和 BFS，
+              reranker 可以用 RRF、node distance、episode mentions、MMR 或 cross encoder。
+            </p>
+
+            <p>
+              查询执行时，如果配置需要 cosine similarity 或 MMR，
+              <a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/search/search.py#L98-L149"><code>search()</code></a>
+              会先为 query 创建 embedding；同一套 search result 里可以返回 edges、nodes、episodes 和 communities。
+              这说明 Graphiti 的 retrieval 目标是一组有关系、有来源、有时间语义的对象，而不是只返回最像 query 的文本片段。
+            </p>
+
+            <p>
+              这也解释了 Zep 和 Graphiti 的关系。README 说 Graphiti 是 Zep context infrastructure 的开源 temporal context graph engine；
+              Zep 则负责规模化管理 context graphs，提供治理、低延迟 retrieval 和 production deployments 所需的上下文组装。
+              对读源码的人来说，可以把 Graphiti 看作可自托管、可改造的图记忆内核，把 Zep 看作围绕这套内核做成的生产上下文平台。
+            </p>
+
+            <h2 id="compare">五、把 Graphiti 放回 Agent Memory 地图</h2>
+            <p>
+              Mem0、Letta 和 Graphiti 的差别，现在可以说得更具体。Mem0 的中心是 memory service：怎样从对话抽取、写入、检索和排序记忆。
+              Letta 的中心是 agent state：memory block、messages、tools、files 和 system prompt 怎样共同重建一个可持续工作的 agent。
+              Graphiti 的中心是 temporal graph：事实之间的关系、时间窗口和来源怎样成为可查询结构。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>项目</th>
+                    <th>谁拥有记忆</th>
+                    <th>最核心的工程问题</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Mem0</td>
+                    <td>外置 memory layer</td>
+                    <td>写入时怎样抽取与去重，读取时怎样排序、解释时间和控制噪声。</td>
+                  </tr>
+                  <tr>
+                    <td>Letta</td>
+                    <td>stateful agent</td>
+                    <td>长期 block、消息窗口、工具和文件视图怎样进入模型可见状态。</td>
+                  </tr>
+                  <tr>
+                    <td>Graphiti</td>
+                    <td>temporal context graph</td>
+                    <td>事实变化时，怎样保留历史、来源和当前可用子图。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以下一篇转到 LangMem / LangGraph，会自然进入另一个问题：如果记忆不是单独服务，也不是 agent 自己的持久状态，
+              而是嵌在工作流运行路径里，那么写入和整理记忆应该发生在 agent 当前推理的 hot path，还是交给后台 manager？
+              这个问题会把长期记忆从“存什么、怎么搜”推进到“什么时候改、由哪条执行路径改”。
+            </p>
+
+            <h2 id="sources">参考资料</h2>
+            <ul>
+              <li><a href="https://github.com/getzep/graphiti/blob/main/README.md#L42-L55">Graphiti README：temporal context graph 定位</a></li>
+              <li><a href="https://github.com/getzep/graphiti/blob/main/README.md#L65-L82">Graphiti README：context graph 的组成</a></li>
+              <li><a href="https://github.com/getzep/graphiti/blob/main/README.md#L84-L93">Graphiti README：Graphiti 与 Zep</a></li>
+              <li><a href="https://github.com/getzep/graphiti/blob/main/README.md#L120-L135">Graphiti README：Temporal Fact Management 与 Hybrid Retrieval</a></li>
+              <li><a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/nodes.py#L318-L350">Graphiti <code>EpisodicNode</code></a></li>
+              <li><a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/edges.py#L143-L158">Graphiti <code>EpisodicEdge</code></a></li>
+              <li><a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/edges.py#L263-L355">Graphiti <code>EntityEdge</code></a></li>
+              <li><a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/graphiti.py#L631-L678">Graphiti edge extraction and invalidation path</a></li>
+              <li><a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/search/search_config.py#L32-L129">Graphiti search config</a></li>
+              <li><a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/search/search.py#L98-L149">Graphiti search execution</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const toc = document.querySelector("#toc");
+        if (!toc) return;
+        const headings = [...document.querySelectorAll(".article-body h2[id]")];
+        for (const heading of headings) {
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent;
+          toc.appendChild(link);
+        }
+      })();
+
+      (() => {
+        const tables = document.querySelectorAll(".table-wrap table");
+        for (const table of tables) {
+          const headers = [...table.querySelectorAll("thead th")].map((header) => header.textContent.trim());
+          const rows = table.querySelectorAll("tbody tr");
+          for (const row of rows) {
+            [...row.children].forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>

@@ -17,7 +17,7 @@ and GitHub Pages.
 | Claude Code Source Notes | Bilingual source-reading series on the public [Rememorio/claude-code](https://github.com/Rememorio/claude-code) mirror. | [Gateway](https://rememorio.github.io/blog/claude-code/) / [中文](https://rememorio.github.io/blog/claude-code/zh/) / [English](https://rememorio.github.io/blog/claude-code/en/) |
 | Codex Source Notes | Bilingual source-reading series on [openai/codex](https://github.com/openai/codex). | [Gateway](https://rememorio.github.io/blog/codex/) / [中文](https://rememorio.github.io/blog/codex/zh/) / [English](https://rememorio.github.io/blog/codex/en/) |
 | Hermes Agent | Source-grounded walkthrough of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). | [Gateway](https://rememorio.github.io/blog/hermes-agent/) / [中文](https://rememorio.github.io/blog/hermes-agent/zh/) / [English](https://rememorio.github.io/blog/hermes-agent/en/) |
-| Agent Memory | Bilingual route map and source notes for memory systems including [mem0ai/mem0](https://github.com/mem0ai/mem0), [letta-ai/letta](https://github.com/letta-ai/letta), [getzep/graphiti](https://github.com/getzep/graphiti), [langchain-ai/langmem](https://github.com/langchain-ai/langmem), [topoteretes/cognee](https://github.com/topoteretes/cognee), and [supermemoryai/supermemory](https://github.com/supermemoryai/supermemory). | [Gateway](https://rememorio.github.io/blog/agent-memory/) / [中文](https://rememorio.github.io/blog/agent-memory/zh/) / [English](https://rememorio.github.io/blog/agent-memory/en/) / [Letta 中文](https://rememorio.github.io/blog/agent-memory/letta/zh/) / [Letta English](https://rememorio.github.io/blog/agent-memory/letta/en/) |
+| Agent Memory | Bilingual route map and source notes for memory systems including [mem0ai/mem0](https://github.com/mem0ai/mem0), [letta-ai/letta](https://github.com/letta-ai/letta), [getzep/graphiti](https://github.com/getzep/graphiti), [langchain-ai/langmem](https://github.com/langchain-ai/langmem), [topoteretes/cognee](https://github.com/topoteretes/cognee), and [supermemoryai/supermemory](https://github.com/supermemoryai/supermemory). | [Gateway](https://rememorio.github.io/blog/agent-memory/) / [中文](https://rememorio.github.io/blog/agent-memory/zh/) / [English](https://rememorio.github.io/blog/agent-memory/en/) / [Letta 中文](https://rememorio.github.io/blog/agent-memory/letta/zh/) / [Letta English](https://rememorio.github.io/blog/agent-memory/letta/en/) / [Graphiti 中文](https://rememorio.github.io/blog/agent-memory/graphiti/zh/) / [Graphiti English](https://rememorio.github.io/blog/agent-memory/graphiti/en/) |
 | Mem0 Memory | Bilingual source-grounded article on [mem0ai/mem0](https://github.com/mem0ai/mem0), algorithm evolution, temporal reasoning, and memory decay. | [Gateway](https://rememorio.github.io/blog/mem0-memory/) / [中文](https://rememorio.github.io/blog/mem0-memory/zh/) / [English](https://rememorio.github.io/blog/mem0-memory/en/) |
 
 Use the public site indexes as the canonical article catalog. The README should
@@ -48,7 +48,8 @@ stay stable as new essays are added.
 │   ├── index.html              # Series language gateway
 │   ├── zh/
 │   ├── en/
-│   └── letta/                  # Letta stateful agent memory chapter
+│   ├── letta/                  # Letta stateful agent memory chapter
+│   └── graphiti/               # Graphiti temporal context graph chapter
 ├── mem0-memory/                # Mem0 memory article
 │   ├── index.html              # Article language gateway
 │   ├── zh/
