@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent 框架源码阅读（三）：ADK Python 为什么把 Agent 和 Workflow 放在一起</title>
+    <meta
+      name="description"
+      content="Agent 框架源码阅读第三篇：从 ADK Python 2.0 的 Agent、Workflow、Runner、Event、Task API 和 graph runtime 看 code-first agent 应用怎样混合自主决策与确定性流程。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Agent 框架源码阅读（三）：ADK Python 为什么把 Agent 和 Workflow 放在一起" />
+    <meta
+      property="og:description"
+      content="ADK Python 2.0 的关键不只是 Agent 类，而是把 Agent autonomy 和 graph control 放进同一条 Runner/session event 执行线。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/adk-runtime-overview.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-framework/zh/adk-runtime/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-framework/zh/adk-runtime/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-framework/en/adk-runtime/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-framework/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(31, 119, 123, 0.34);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      .shape-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin: 18px 0 22px;
+      }
+
+      .shape-box {
+        border: 1px solid rgba(24, 55, 82, 0.14);
+        border-radius: 8px;
+        background: rgba(255, 250, 240, 0.72);
+        padding: 14px;
+      }
+
+      .shape-box h3 {
+        margin-top: 0;
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+
+        .shape-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Agent 框架系列</a>
+        <a href="../agentscope-runtime/">上一篇</a>
+        <a href="#workflow-owner">Workflow</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/adk-runtime/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Agent 框架源码阅读 · 第三篇</p>
+            <h1>ADK Python 为什么把 Agent 和 Workflow 放在一起</h1>
+            <p class="lead">
+              AgentScope 这一篇看到的是一条事件化 agent turn。ADK Python 的角度不同：它把一个 AI agent 应用拆成
+              <code>Agent</code>、<code>Workflow</code>、<code>Runner</code> 和 <code>Event</code>。
+              也就是说，它不是只问“模型下一步做什么”，还问“哪些步骤必须由 graph 决定，哪些步骤可以交给 agent 自主完成”。
+            </p>
+            <div class="meta-line">
+              <span>主题：ADK Python 2.0</span>
+              <span>主线：Agent + Workflow</span>
+              <span>重点：Runner / Event / Task API</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/adk-runtime-overview.png"
+                alt="ADK Runtime 手绘图：Agent、Workflow、Runner、Session Events、Graph Edges、NodeRunner、Join/Route 和 Task API 之间的关系"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              ADK Python 的 README 在 2.0 里把两件事放到最前面：<strong>Workflow Runtime</strong> 和
+              <strong>Task API</strong>。前者用于 routing、fan-out/fan-in、loops、retry、state management、
+              dynamic nodes、human-in-the-loop 和 nested workflows；后者用于结构化 agent-to-agent delegation。
+              这不是文案细节，而是它的框架立场：
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/README.md#L33-L42">2.0 的新增重点</a>
+              已经把“自主 agent”和“确定性流程”并列了。
+            </p>
+
+            <p>
+              Quick Start 也很直白：ADK 应用由两个主类构成，<code>Agent</code> 定义 instruction、tools 和 behavior，
+              <code>Workflow</code> 在 graph-based flow 里编排 agents 和 tasks。
+              这段说明在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/README.md#L60-L92">README Quick Start</a>。
+              顶层包导出也印证了这件事：<code>google.adk</code> 公开导出
+              <code>Agent</code>、<code>Workflow</code>、<code>Runner</code>、<code>Event</code> 和 <code>Context</code>。
+              源码在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/__init__.py#L17-L25"><code>__init__.py</code></a>。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                本篇的结论：<strong>ADK 的核心 owner 是“code-first agent app runtime”。</strong>
+                <code>Agent</code> 管模型、instruction、tools 和 delegation mode；<code>Workflow</code> 管图、路由、join、resume 和 node output；
+                <code>Runner</code> 管 session、event、service、plugin 和 resumability。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                源码引用固定到 Google ADK Python 当前公开快照
+                <code>62b97007378c4da749a1615d0881aba443a32325</code>。本文只基于公开 README、源码和 samples，
+                不推断 Google 内部服务、托管平台或未公开控制台能力。
+              </p>
+            </div>
+
+            <h2>一、Agent 负责自主行为，但不独占整个应用</h2>
+            <p>
+              <code>LlmAgent</code> 里能看到传统 agent owner：model、instruction、tools、planner、callbacks、input/output schema、
+              output_key、code executor 等。更关键的是 <code>mode</code> 字段：
+              <code>chat</code> 是标准聊天 agent，<code>task</code> 是能和用户多轮交互完成任务的 task agent，
+              <code>single_turn</code> 是不和用户聊天、一次性完成任务的 agent。
+              源码在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/agents/llm_agent.py#L306-L380"><code>LlmAgent</code> 字段</a>。
+            </p>
+
+            <p>
+              这说明 ADK 没有把所有“步骤”都包装成一个自主聊天 agent。它会根据位置给 agent 默认 mode：
+              root LLM agent 必须是 chat；workflow node 里的 LLM agent 默认是 single_turn；task mode agent 则会自动加入
+              <code>finish_task</code> 工具，让模型显式声明任务完成。
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/agents/llm_agent.py#L1058-L1080">model_post_init</a>
+              里还会把 single_turn/task 子 agent 包成工具。
+            </p>
+
+            <p>
+              <code>FinishTaskTool</code> 很能说明 Task API 的语义：它用 task agent 的 output schema 校验结果，
+              并把 <code>finish_task</code> 的调用当作“任务完成信号”。这比“让子 agent 最后说 DONE”稳得多。
+              相关源码在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/agents/llm/task/_finish_task_tool.py#L46-L90">工具声明</a>
+              和
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/agents/llm/task/_finish_task_tool.py#L133-L184">执行与校验</a>。
+            </p>
+
+            <h2 id="workflow-owner">二、Workflow 负责确定性 graph owner</h2>
+            <p>
+              <code>Workflow</code> 的文件头直接写了：它把用户可见的 graph definition 和 execution engine 结合起来，
+              <code>Workflow(BaseNode)</code> 的 <code>_run_impl</code> 就是 orchestration loop。
+              类注释把循环拆成 setup、loop、finalize：构建 graph、播种 triggers、调度 ready nodes、处理完成、收集 terminal output。
+              源码在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_workflow.py#L15-L19">文件头</a>
+              和
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_workflow.py#L146-L188"><code>Workflow</code> 定义</a>。
+            </p>
+
+            <p>
+              这里的 graph 不是画图 DSL，而是执行责任。<code>Graph.from_edge_items</code> 可以把显式 Edge、
+              tuple chain、routing map、fan-out tuple 编译成内部 edge list；<code>validate_graph</code> 会检查重复节点名、
+              START、可达性、重复边、默认路由和无条件环。
+              关键入口在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_graph.py#L41-L93">edge item 类型</a>、
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_graph.py#L311-L392">编译与路由</a>
+              和
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_graph.py#L394-L520">graph 校验</a>。
+            </p>
+
+            <p>
+              一个 sample 就能看清它的风格：fan-out/fan-in 里，三个函数从 <code>START</code> 并行触发，
+              再进入 <code>JoinNode</code>，最后交给 <code>aggregate</code>。
+              这不是让模型在 prompt 里“先大写、再计数、再反转”，而是让 graph runtime 拥有拓扑。
+              sample 在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/contributing/samples/workflows/fan_out_fan_in/agent.py#L17-L55">fan_out_fan_in</a>。
+              <code>JoinNode</code> 通过 <code>_requires_all_predecessors</code> 表示它必须等所有前驱完成，
+              源码在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_join_node.py#L47-L77"><code>JoinNode</code></a>。
+            </p>
+
+            <div class="shape-grid">
+              <section class="shape-box">
+                <h3>Agent owner</h3>
+                <ul>
+                  <li>instruction 与 static instruction</li>
+                  <li>tools、toolsets、planner、callbacks</li>
+                  <li><code>chat</code> / <code>task</code> / <code>single_turn</code> mode</li>
+                  <li>output schema 与 output key</li>
+                </ul>
+              </section>
+              <section class="shape-box">
+                <h3>Workflow owner</h3>
+                <ul>
+                  <li>edge、route、fan-out/fan-in、join</li>
+                  <li>node input/output schema</li>
+                  <li>retry、timeout、wait_for_output</li>
+                  <li>resume、interrupt、terminal output</li>
+                </ul>
+              </section>
+            </div>
+
+            <h2>三、BaseNode 和 NodeRunner 是 workflow 的执行颗粒</h2>
+            <p>
+              ADK 把 workflow node 抽成 <code>BaseNode</code>，它负责 name、description、rerun_on_resume、
+              wait_for_output、retry、timeout、input_schema、output_schema 和 state_schema。
+              <code>BaseNode.run</code> 是 public entry point：它调用 <code>_run_impl</code>，把 <code>None</code> 跳过，
+              把 <code>Event</code> 原样传出，把 <code>RequestInput</code> 转成 interrupt event，把任意其他值转成
+              <code>Event(output=value)</code>。
+              源码在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_base_node.py#L39-L123">BaseNode 字段</a>
+              和
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_base_node.py#L196-L247"><code>BaseNode.run</code></a>。
+            </p>
+
+            <p>
+              <code>NodeRunner</code> 是每个 node 的执行器。它创建 child context，驱动 <code>BaseNode.run</code>，
+              把事件放进 invocation event queue，把 output、route、interrupt_ids 写回 child context，再返回给 workflow loop。
+              它还会补 <code>author</code>、<code>invocation_id</code>、<code>node_info.path</code>、branch 和 isolation_scope。
+              这就是 workflow event 能恢复、能归因的原因。
+              源码在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_node_runner.py#L49-L121">NodeRunner 注释</a>
+              和
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_node_runner.py#L319-L420">事件 enrichment</a>。
+            </p>
+
+            <h2>四、Runner 把 Agent 与 Workflow 接到 session event 上</h2>
+            <p>
+              <code>Runner</code> 的类注释说它用于运行 agents，并处理 session、event generation、artifact storage、
+              session management 和 memory 等服务。
+              这在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/runners.py#L132-L168">Runner 属性</a>。
+              它的 <code>run</code> 是方便测试的同步 wrapper，生产路径是 <code>run_async</code>。
+              <code>run_async</code> 会按 root 类型分流：root <code>LlmAgent</code> 走 chat mode，并被包装成 node；
+              root <code>BaseNode</code> 则走 node runtime。
+              源码在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/runners.py#L865-L1040">run / run_async</a>。
+            </p>
+
+            <p>
+              事件消费也很关键。<code>_consume_event_queue</code> 从 invocation queue 里拿事件，运行 plugin callback，
+              生成 output event，非 partial 事件写入 session service，然后 yield 给调用者。
+              这说明 ADK 的事件不是临时日志，而是 session 的持久化材料。
+              源码在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/runners.py#L759-L795"><code>_consume_event_queue</code></a>。
+            </p>
+
+            <p>
+              <code>Event</code> 本身也支持 workflow metadata：<code>NodeInfo.path</code>、<code>output_for</code>、
+              <code>message_as_output</code>、<code>branch</code> 和 <code>isolation_scope</code>。
+              这些字段让 graph node、task delegation、branch history 和可恢复 session 有共同语言。
+              源码在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/events/event.py#L33-L148">Event 与 NodeInfo</a>。
+            </p>
+
+            <h2>五、Task API 是 Agent 和 Workflow 之间的桥</h2>
+            <p>
+              <code>_llm_agent_wrapper</code> 把 LLM agent 作为 workflow node 运行。它给 single_turn agent 准备输入，
+              给 task agent 处理 delegated task 的 function call，把 output_schema 校验后的结果写成 node output。
+              <code>run_llm_agent_as_node</code> 还规定：LLM agent 作为 workflow node 时，默认 mode 是 single_turn；
+              task 和 single_turn 使用 isolation_scope 做上下文隔离，chat agent 则看完整对话。
+              相关源码在
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_llm_agent_wrapper.py#L223-L281">输入输出处理</a>
+              和
+              <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_llm_agent_wrapper.py#L284-L340">run_llm_agent_as_node</a>。
+            </p>
+
+            <p>
+              这就是 ADK 与“纯 workflow”或“纯 agent loop”的不同处。Workflow 可以把 agent 当 node，
+              Agent 也可以把 task/single_turn 子 agent 当工具。两边不是互相取代，而是通过 <code>Event</code>、
+              node output、function call 和 isolation scope 互相接住。
+            </p>
+
+            <h2>六、读 ADK 时先记住这些 invariant</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Invariant</th>
+                    <th>源码事实</th>
+                    <th>工程含义</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Agent 和 Workflow 是并列入口。</td>
+                    <td>顶层导出同时包含 <code>Agent</code>、<code>Workflow</code>、<code>Runner</code>、<code>Event</code>。</td>
+                    <td>ADK 不把业务流程全塞进 prompt，也不把 agent 降级成普通函数。</td>
+                  </tr>
+                  <tr>
+                    <td>Workflow 拥有 graph 执行。</td>
+                    <td><code>_run_impl</code> 自己就是 setup、loop、finalize。</td>
+                    <td>路由、并发、join、resume、terminal output 都有 runtime owner。</td>
+                  </tr>
+                  <tr>
+                    <td>NodeRunner 是事件归因颗粒。</td>
+                    <td>每个 node 事件都会补 path、run_id、branch、isolation_scope。</td>
+                    <td>session 里能重建谁运行过、输出给谁、在哪里暂停。</td>
+                  </tr>
+                  <tr>
+                    <td>Task API 不是 prompt 约定。</td>
+                    <td>task mode 自动加 <code>finish_task</code>，并由 wrapper 处理 output。</td>
+                    <td>多 agent delegation 可以有 schema、完成信号和上下文隔离。</td>
+                  </tr>
+                  <tr>
+                    <td>Runner 是服务边界。</td>
+                    <td>事件进入 queue，经 plugin callback，写入 session service，再 yield。</td>
+                    <td>应用层拿到的是可持久化、可观测、可恢复的执行流。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              下一篇看 Agno。它的阅读角度会从“graph runtime”转到“agent platform”：当 agent 要进入产品，
+              API、storage、tracing、scheduling、RBAC、control plane 这些平台 owner 应该由谁接住。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul>
+              <li><a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/README.md">Google ADK Python README</a></li>
+              <li><a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/__init__.py">ADK public exports</a></li>
+              <li><a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/agents/llm_agent.py">ADK <code>LlmAgent</code></a></li>
+              <li><a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_workflow.py">ADK <code>Workflow</code></a></li>
+              <li><a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_graph.py">ADK workflow graph</a></li>
+              <li><a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_node_runner.py">ADK <code>NodeRunner</code></a></li>
+              <li><a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/runners.py">ADK <code>Runner</code></a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        const headings = [...article.querySelectorAll("h2, h3, h4")];
+        const slugCounts = new Map();
+        const slugify = (text) => {
+          const raw = text
+            .trim()
+            .toLowerCase()
+            .replace(/<[^>]+>/g, "")
+            .replace(/[`"'“”‘’]/g, "")
+            .replace(/[^\p{Script=Han}\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          const base = raw || "section";
+          const count = slugCounts.get(base) || 0;
+          slugCounts.set(base, count + 1);
+          return count ? `${base}-${count + 1}` : base;
+        };
+        const root = document.createElement("ol");
+        root.className = "toc-list";
+        const stack = [{ level: 2, list: root }];
+        headings.forEach((heading) => {
+          if (!heading.id) heading.id = slugify(heading.textContent || "");
+          const level = Number(heading.tagName.slice(1));
+          while (stack.length && level < stack[stack.length - 1].level) stack.pop();
+          if (level > stack[stack.length - 1].level) {
+            const parent = stack[stack.length - 1].list.lastElementChild;
+            const child = document.createElement("ol");
+            child.className = "toc-sublist";
+            if (parent) parent.appendChild(child);
+            stack.push({ level, list: child });
+          }
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent || "";
+          link.className = `toc-link toc-level-${level}`;
+          item.appendChild(link);
+          stack[stack.length - 1].list.appendChild(item);
+        });
+        toc.appendChild(root);
+      })();
+    </script>
+  </body>
+</html>
