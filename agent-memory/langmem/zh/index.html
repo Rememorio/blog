@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LangMem / LangGraph：记忆应该在 hot path，还是交给后台 manager</title>
+    <meta
+      name="description"
+      content="Agent Memory 系列第四篇：从 LangMem memory tools、background memory manager、LangGraph BaseStore 和 checkpointer，读懂工作流里的记忆执行路径。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="LangMem / LangGraph：记忆应该在 hot path，还是交给后台 manager" />
+    <meta
+      property="og:description"
+      content="LangMem 给长期记忆提供两条路径：agent 在 hot path 里用工具主动管理，或 background manager 从对话里自动抽取、合并和更新。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="assets/langmem-hot-background-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-memory/langmem/zh/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-memory/langmem/zh/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-memory/langmem/en/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-memory/langmem/" />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.reading-contract {
+        border-color: rgba(15, 118, 110, 0.32);
+        background: rgba(15, 118, 110, 0.08);
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../../zh/">Agent Memory</a>
+        <a href="../../../mem0-memory/zh/">Mem0 篇</a>
+        <a href="../../letta/zh/">Letta 篇</a>
+        <a href="../../graphiti/zh/">Graphiti 篇</a>
+        <a href="#evidence">证据边界</a>
+        <a href="#paths">两条路径</a>
+        <a href="#hot">Hot Path</a>
+        <a href="#store">Store</a>
+        <a href="#background">后台</a>
+        <a href="#sources">参考资料</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../en/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Agent Memory · LangMem</p>
+            <h1>LangMem / LangGraph：记忆应该在 hot path，还是交给后台 manager</h1>
+            <p class="lead">
+              前面几篇分别看了三种边界：Mem0 把记忆做成外置 memory layer，Letta 把记忆放进 agent state，
+              Graphiti 把事实、时间和来源放进 temporal graph。LangMem / LangGraph 提出的不是又一种存储结构，
+              而是一个很实际的执行问题：记忆是在 agent 正在回答用户时被写入，还是等对话结束或空闲后再由后台流程整理？
+            </p>
+            <div class="meta-line">
+              <span>项目：langchain-ai/langmem</span>
+              <span>相关：langchain-ai/langgraph</span>
+              <span>主题：hot path vs background memory</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="assets/langmem-hot-background-cover.png"
+                alt="LangMem / LangGraph 机制图，展示 hot path 里的 manage_memory 和 search_memory 工具、background manager、BaseStore、checkpointer thread state 与 long-term memory 的边界"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              同样是“用户偏好要长期保存”，放在不同执行路径里，系统性格会完全不同。让 agent 当场调用工具保存，记忆写入可解释、可控，
+              但会占用模型注意力和工具调用预算；让后台 manager 稍后处理，主对话更干净，也更适合合并和去重，但用户可能马上问起刚说过的偏好，
+              这时系统要面对最终一致性。
+            </p>
+
+            <div class="note reading-contract">
+              <p>
+                <strong>阅读契约。</strong>
+                读完这一篇，应该能回答四件事：LangMem 的 hot path memory tools 到底写到哪里；
+                LangGraph 的 <code>store</code> 和 <code>checkpointer</code> 为什么要分开；background manager 如何先检索旧记忆再应用更新；
+                以及在自己的 agent 里，什么时候该选同步工具，什么时候该选后台整理。
+              </p>
+            </div>
+
+            <div id="evidence" class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文只使用 <a href="https://github.com/langchain-ai/langmem">langchain-ai/langmem</a> 与
+                <a href="https://github.com/langchain-ai/langgraph">langchain-ai/langgraph</a> 的公开 README、文档和源码。
+                LangGraph Platform 的托管 store 能力按公开文档描述，不推断私有服务端实现。
+              </p>
+            </div>
+
+            <h2 id="paths">一、LangMem 先把记忆拆成两条执行路径</h2>
+            <p>
+              LangMem README 的关键功能列表直接给出两条路线：一条是 memory management tools，
+              让 agents 在 active conversations 里记录和搜索信息，也就是 hot path；另一条是 background memory manager，
+              自动抽取、合并、更新 agent knowledge；两条路线都能接到 LangGraph 的 Long-term Memory Store。
+              这个定位可以看 <a href="https://github.com/langchain-ai/langmem/blob/main/README.md#L13-L16">README 功能列表</a>。
+            </p>
+
+            <p>
+              README 的 quickstart 也体现了这点。示例先创建带 embedding index 的 <code>InMemoryStore</code>，
+              再把 <code>create_manage_memory_tool</code> 和 <code>create_search_memory_tool</code> 放进
+              <code>create_react_agent</code> 的 tools 里，同时把同一个 <code>store</code> 传给 agent。
+              README 解释说，这些 tools 让 agent 控制保存什么；当用户问起过去交互，LLM 可以调用 search tool 找相似内容。
+              代码和解释分别在 <a href="https://github.com/langchain-ai/langmem/blob/main/README.md#L32-L64">README 创建 agent 示例</a>
+              与 <a href="https://github.com/langchain-ai/langmem/blob/main/README.md#L82-L86">后续说明</a>。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/langmem-hot-background-cover.png"
+                alt="LangMem 机制图，展示 hot path 中 agent 调用 manage_memory / search_memory 写入 BaseStore，以及 background manager 对 conversation history 做抽取和更新"
+              />
+              <figcaption>
+                LangMem 的核心判断是执行路径：谁在什么时候改变长期记忆。hot path 让 agent 当场决定；background path 让 manager 稍后整理。
+              </figcaption>
+            </figure>
+
+            <h2 id="hot">二、Hot path：agent 自己决定要不要记住</h2>
+            <p>
+              Hot path quickstart 一开头就把这条路线说清楚：memory 可以由 agent 在当前路径里“consciously saves notes using tools”，
+              也可以由后台自动抽取。示例里 prompt 函数通过 <code>get_store()</code> 取到当前图运行时配置的 store，
+              先用 <code>store.search(("memories",), query=...)</code> 找相关记忆，再把结果放进 system message 的
+              <code>&lt;memories&gt;</code> 区块。随后 agent 带着 <code>create_manage_memory_tool</code>、
+              <code>store</code> 和 <code>checkpointer</code> 被创建出来。
+              这条完整示例在 <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/hot_path_quickstart.md#L8-L15">hot path 定义</a>
+              和 <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/hot_path_quickstart.md#L35-L89">agent 示例</a>。
+            </p>
+
+            <p>
+              工具源码更直接。<a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L25-L39"><code>create_manage_memory_tool</code></a>
+              的默认 instructions 会在发现新用户偏好、收到明确记忆请求、想记录重要上下文、或发现旧 memory 错误过时时主动调用工具。
+              真正执行时，<a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L271-L303"><code>amanage_memory</code></a>
+              会解析 namespace；delete 走 <code>store.adelete()</code>，create/update 走 <code>store.aput()</code>，
+              value 里保存 JSON 化后的 <code>content</code>。
+            </p>
+
+            <p>
+              读取路径对应 <a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L362-L454"><code>create_search_memory_tool</code></a>。
+              它暴露 <code>query</code>、<code>limit</code>、<code>offset</code> 和 <code>filter</code>，
+              再调用 <code>store.asearch(namespace, query=..., filter=..., limit=..., offset=...)</code>。
+              所以 hot path 的本质是把“写记忆”和“搜记忆”变成模型可调用工具，让 agent 在当前执行路径里自己承担判断。
+            </p>
+
+            <h2 id="store">三、Store 是长期记忆，checkpointer 是线程状态</h2>
+            <p>
+              Hot path quickstart 特别提醒：<code>Store</code> 和 <code>MemorySaver</code> / checkpointer 不是同一个东西。
+              store 可以按 user、agent、organization 等 namespace 保存和检索任意信息，更适合 long-term、cross-thread memory；
+              checkpointer 维护每个 thread 内的 graph state 和 conversation history，用于 durable execution。
+              这段边界说明在 <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/hot_path_quickstart.md#L105-L119">hot path quickstart</a>。
+            </p>
+
+            <p>
+              LangGraph 源码也这样分。<a href="https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint/langgraph/store/base/__init__.py#L700-L713"><code>BaseStore</code></a>
+              被描述为 persistent key-value store，可跨 threads 和 conversations 共享，按 user IDs、assistant IDs 或任意 namespace 分区，
+              部分实现支持 optional semantic search。它的 <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint/langgraph/store/base/__init__.py#L771-L846"><code>search()</code></a>
+              支持 namespace prefix、query、filter、limit、offset；<a href="https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint/langgraph/store/base/__init__.py#L848-L928"><code>put()</code></a>
+              则以 namespace + key 形成完整路径，并可控制索引字段。
+            </p>
+
+            <p>
+              <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/graph/state.py#L1164-L1201"><code>StateGraph.compile()</code></a>
+              里，<code>checkpointer</code> 参数被描述为 fully versioned short-term memory，可暂停、恢复和 replay；
+              同一个 compile 方法还有单独的 <code>store</code> 参数。
+              运行时 <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/runtime.py#L198-L205"><code>Runtime.store</code></a>
+              的注释是 enabling persistence and memory；节点内部也能通过
+              <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/config.py#L32-L52"><code>get_store()</code></a>
+              取到当前图或 entrypoint 配置的 store。把这两层拆开，才能避免把“当前线程可恢复”和“跨线程长期偏好”混在一起。
+            </p>
+
+            <h2 id="background">四、Background manager：把整理记忆移出当前回答</h2>
+            <p>
+              Background quickstart 从另一边切入：agent 正常回答，memory manager 在后台从 conversation history 中抽取和合并记忆。
+              示例创建 <code>create_memory_store_manager(..., namespace=("memories",))</code>，
+              在 <code>@entrypoint(store=store)</code> 的 chat 函数里先调用 LLM 得到 response，
+              再把 user message 和 response 组成 <code>to_process</code>，交给 <code>memory_manager.ainvoke()</code>。
+              文档也提醒，实际活跃对话里可以用 delayed processing 做 debounce，避免每条消息都处理。
+              这些内容在 <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/background_quickstart.md#L8-L15">background 定义</a>、
+              <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/background_quickstart.md#L48-L63">基础示例</a>
+              和 <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/background_quickstart.md#L72-L80">处理说明</a>。
+            </p>
+
+            <p>
+              源码里的 manager 做了三步。第一层
+              <a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L536-L570"><code>create_memory_manager</code></a>
+              会分析 conversation messages 和 existing memories，生成或更新结构化 memory entries，并通过
+              <code>enable_inserts</code>、<code>enable_updates</code>、<code>enable_deletes</code> 控制允许的操作。
+              第二层 <a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L1666-L1723"><code>create_memory_store_manager</code></a>
+              把这个过程接到 BaseStore：自动搜索相关 memories、抽取新信息、更新已有 memories，并维护变更历史。
+              docstring 里的 data flow 写成一条链：Client 给 Manager conversation history，Manager 先找 similar memories，
+              再让 LLM analyze & extract，最后把 changes 应用回 Store。
+            </p>
+
+            <p>
+              执行细节也能印证这条链。<a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L1006-L1039"><code>MemoryStoreManager.ainvoke()</code></a>
+              会先算 namespace，再根据 query generator 或对话窗口并发调用 <code>store.asearch()</code> 找旧记忆；
+              后面会整理 final puts 和 deletes，并通过
+              <a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L1126-L1135"><code>store.aput()</code> / <code>store.adelete()</code></a>
+              应用到 store。换句话说，background manager 会带着旧记忆一起做更新判断，而不是把对话摘要直接塞进存储。
+            </p>
+
+            <h2 id="choice">五、什么时候选哪条路</h2>
+            <p>
+              Hot path 适合那些用户能感知、需要即时生效、最好可解释的记忆动作。用户说“以后都用英文回答我”，agent 当场调用
+              <code>manage_memory</code>，下一轮就能被 prompt 或 search tool 取到；如果写错了，也能在工具轨迹里定位。
+              代价是它会消耗一次工具调用，并且让模型在回答任务和记忆管理之间分配注意力。
+            </p>
+
+            <p>
+              Background manager 适合长对话后的整理、重复事实合并、结构化 profile 更新、低优先级偏好沉淀。
+              它把记忆维护移出主对话，可以减少干扰，也更容易批处理和延迟处理；代价是刚说完的信息未必立刻进入长期 store，
+              系统需要清楚地处理“短期 thread state 已有，但 long-term store 尚未整理完成”的窗口。
+            </p>
+
+            <p>
+              把它放回整个 Agent Memory 系列，LangMem / LangGraph 提供的是执行路径维度的答案。
+              Mem0 更像外置 memory layer，Letta 更像 agent state，Graphiti 更像 temporal graph；
+              LangMem / LangGraph 则提醒我们：长期记忆还要决定由哪条 workflow path 改写。这个问题会直接影响延迟、可观测性、权限、去重策略和用户对“你刚刚不是记住了吗”的预期。
+            </p>
+
+            <h2 id="sources">参考资料</h2>
+            <ul>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/main/README.md#L13-L16">LangMem README：核心功能</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/main/README.md#L32-L64">LangMem README：创建带 memory tools 的 agent</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/hot_path_quickstart.md#L8-L15">LangMem hot path quickstart：两种记忆路径</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/hot_path_quickstart.md#L35-L119">LangMem hot path quickstart：store、tools、checkpointer</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L25-L39">LangMem <code>create_manage_memory_tool</code></a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L271-L303">LangMem <code>manage_memory</code> write path</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L362-L454">LangMem <code>create_search_memory_tool</code></a></li>
+              <li><a href="https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint/langgraph/store/base/__init__.py#L700-L713">LangGraph <code>BaseStore</code></a></li>
+              <li><a href="https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/graph/state.py#L1164-L1201">LangGraph <code>StateGraph.compile()</code></a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/background_quickstart.md#L8-L80">LangMem background quickstart</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L1666-L1740">LangMem <code>create_memory_store_manager</code> data flow</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L1006-L1135">LangMem <code>MemoryStoreManager.ainvoke()</code></a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const toc = document.querySelector("#toc");
+        if (!toc) return;
+        const headings = [...document.querySelectorAll(".article-body h2[id]")];
+        for (const heading of headings) {
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent;
+          toc.appendChild(link);
+        }
+      })();
+
+      (() => {
+        const tables = document.querySelectorAll(".table-wrap table");
+        for (const table of tables) {
+          const headers = [...table.querySelectorAll("thead th")].map((header) => header.textContent.trim());
+          const rows = table.querySelectorAll("tbody tr");
+          for (const row of rows) {
+            [...row.children].forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>
