@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TencentDB Agent Memory：把上下文卸载成符号，把长期记忆做成层级</title>
+    <meta
+      name="description"
+      content="Agent Memory 系列第五篇：源码阅读 TencentDB-Agent-Memory，理解 Context Offload、refs/jsonl/MMD 任务画布，以及 L0-L3 长期记忆管线。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="TencentDB Agent Memory：把上下文卸载成符号，把长期记忆做成层级" />
+    <meta
+      property="og:description"
+      content="TencentDB-Agent-Memory 同时处理两种压力：当前任务里的工具日志太重，以及跨会话的用户记忆太散。它用 Context Offload 和 L0-L3 管线把低层证据与高层结构分开。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="assets/tencentdb-agent-memory-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-memory/tencentdb-agent-memory/zh/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-memory/tencentdb-agent-memory/zh/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-memory/tencentdb-agent-memory/en/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-memory/tencentdb-agent-memory/" />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.reading-contract {
+        border-color: rgba(15, 118, 110, 0.32);
+        background: rgba(15, 118, 110, 0.08);
+      }
+
+      .flow-list {
+        display: grid;
+        gap: 12px;
+        margin: 20px 0 28px;
+      }
+
+      .flow-step {
+        padding: 15px 17px;
+        border: 1px solid rgba(24, 55, 82, 0.14);
+        border-radius: 8px;
+        background: rgba(255, 250, 240, 0.74);
+      }
+
+      .flow-step strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="系列目录">
+        <a href="../../zh/" title="总览">总览</a>
+        <a href="../../../mem0-memory/zh/" title="第一篇：Mem0">Mem0</a>
+        <a href="../../letta/zh/" title="第二篇：Letta">Letta</a>
+        <a href="../../graphiti/zh/" title="第三篇：Graphiti">Graphiti</a>
+        <a href="../../langmem/zh/" title="第四篇：LangMem">LangMem</a>
+        <a href="./" title="第五篇：TencentDB Agent Memory" aria-current="page">TencentDB</a>
+        <a href="../../cognee-supermemory/zh/" title="第六篇：Cognee / Supermemory">Cognee / Supermemory</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../en/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Agent Memory · TencentDB</p>
+            <h1>TencentDB Agent Memory：把上下文卸载成符号，把长期记忆做成层级</h1>
+            <p class="lead">
+              前面读到 LangMem / LangGraph 时，问题已经从“记忆存在哪里”走向“记忆动作在什么时候发生”。
+              TencentDB-Agent-Memory 再往前推了一步：当一次 agent 任务里工具日志越来越厚，很多内容并不是要长期记住，
+              而是要先从当前上下文里卸载出去，同时还要能随时找回原文。它把短期任务上下文和长期用户记忆放在同一个分层哲学里处理。
+            </p>
+            <div class="meta-line">
+              <span>项目：TencentCloud/TencentDB-Agent-Memory</span>
+              <span>主题：Context Offload + L0-L3 Memory</span>
+              <span>定位：本地插件与可追溯记忆层</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="assets/tencentdb-agent-memory-cover.png"
+                alt="TencentDB Agent Memory 机制图，展示 context offload 从 tool logs 到 refs、JSONL、MMD canvas、model view，以及长期记忆 L0 chat、L1 atoms、L2 scenes、L3 persona"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              很多 memory 项目把注意力放在跨会话记忆上，TencentDB-Agent-Memory 的特殊之处，是它同时盯住另一个更短、更急的问题：
+              agent 当前这次任务还没结束，工具结果、报错、搜索输出、文件片段已经把上下文顶满了。直接删会丢证据，直接总结又怕把细节压坏。
+              它的回答是：低层保留原始证据，高层只给模型一张结构图。
+            </p>
+
+            <div class="note reading-contract">
+              <p>
+                <strong>阅读契约。</strong>
+                读完这一篇，应该能回答四件事：Context Offload 到底卸载了什么；
+                refs、offload JSONL、MMD 任务画布如何连起来；L0 到 L3 长期记忆怎样生成和召回；
+                以及它和 Mem0、LangMem、Cognee / Supermemory 分别差在哪里。
+              </p>
+            </div>
+
+            <div id="evidence" class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文使用 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory">TencentCloud/TencentDB-Agent-Memory</a>
+                的 README、插件配置和源码。仓库同时支持 OpenClaw 与 Hermes 生态；本文关注公开仓库里能直接看到的本地插件实现，
+                不推断后端托管服务的私有逻辑。
+              </p>
+            </div>
+
+            <h2 id="position">一、它解决的是两种不同的上下文压力</h2>
+            <h3 id="position-two-pressures">1.1 当前任务太厚，长期历史太散</h3>
+            <p>
+              TencentDB-Agent-Memory 的 README 把设计理念归为“记忆分层”和“符号化记忆”。短期任务侧，
+              底层保存完整工具结果到 <code>refs/*.md</code>，中层写入步骤摘要 <code>jsonl</code>，高层浓缩成带
+              <code>node_id</code> 的 Mermaid 任务画布；长期用户理解侧，则是
+              <code>L0 Conversation</code>、<code>L1 Atom</code>、<code>L2 Scenario</code>、<code>L3 Persona</code>
+              的语义金字塔。这个总纲可以看 README 的
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/README_CN.md#L65-L85">核心技术说明</a>。
+            </p>
+
+            <p>
+              这两条线要分开看。短期 Context Offload 处理的是“这轮任务还在跑，但上下文太满了”；
+              长期 L0-L3 处理的是“下次再见到用户时，系统应该记得什么”。前者更像把工作台上的厚材料搬到带编号的档案柜，
+              桌面只留下任务地图；后者更像把很多次聊天逐层整理成事实、场景和画像。它们用同一句话串起来：
+              <strong>低层保留证据，高层保留结构。</strong>
+            </p>
+
+            <h3 id="position-local">1.2 它更像运行时插件，不是托管 memory API</h3>
+            <p>
+              从实现边界看，TencentDB-Agent-Memory 是 OpenClaw 插件。默认本地存储使用 SQLite + sqlite-vec，
+              README 说明启用后会自动完成对话录制、记忆提取、场景归纳、用户画像生成和下一轮召回；
+              短期 offload 则是独立开关。相关配置在 README 的
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/README_CN.md#L151-L170">快速开始</a>
+              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/openclaw.plugin.json#L146-L164">插件 schema</a> 里都能看到。
+            </p>
+
+            <p>
+              这个定位决定了它和 Supermemory 这类 context API 不一样。Supermemory 更像外部服务来接收内容、处理连接器、返回 context；
+              TencentDB-Agent-Memory 更靠近本机 agent runtime：它能在 <code>after_tool_call</code>、<code>before_prompt_build</code>、
+              <code>llm_input</code> 这些时机改写进入模型的消息数组，也能把本地文件和 SQLite 作为可追溯的证据层。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/tencentdb-agent-memory-cover.png"
+                alt="TencentDB Agent Memory 分层机制图，上方是 context offload，下方是 L0 到 L3 长期记忆"
+              />
+              <figcaption>
+                这篇的主线不是“又多一个记忆库”，而是两条压力如何共用一个分层策略：短期任务先卸载，长期用户记忆再沉淀。
+              </figcaption>
+            </figure>
+
+            <h2 id="offload">二、短期记忆：Context Offload 是可恢复的上下文卸载</h2>
+            <h3 id="offload-storage">2.1 先把厚重工具结果搬离模型视野</h3>
+            <p>
+              Offload 的文件层很直接。<code>storage.ts</code> 的注释说明，不同 agent 使用独立目录，同一 agent 共享
+              <code>mmds/</code>、<code>refs/</code> 和 <code>state.json</code>，每个 session 有自己的
+              <code>offload-&lt;sessionId&gt;.jsonl</code>；路径构造里也能看到默认根目录、<code>refsDir</code>、
+              <code>mmdsDir</code> 与 session JSONL 的关系。看
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/storage.ts#L1-L18"><code>storage.ts</code> 顶部设计说明</a>
+              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/storage.ts#L38-L53">StorageContext 构造</a>。
+            </p>
+
+            <p>
+              这一步的意义不是“省几个 token”这么简单。工具结果最麻烦的地方，是信息密度不均匀：有些行只是执行噪音，
+              有些行却是关键报错、文件位置或设计决策。TencentDB-Agent-Memory 不急着让模型永远背着完整日志走，
+              而是把原文放到外部文件和 JSONL 索引里，让模型当前只看摘要和任务结构。
+            </p>
+
+            <h3 id="offload-l1-l2">2.2 L1 写步骤摘要，L2 把步骤变成任务拓扑</h3>
+            <p>
+              Offload 的 L1 不是长期 memory 的 L1，而是工具结果摘要。<code>l1-prompt.ts</code> 要求 LLM 把 tool call/result
+              合成 JSON 数组，每条包含 <code>tool_call</code>、<code>summary</code>、<code>tool_call_id</code>、时间戳和
+              <code>score</code>。prompt 还要求摘要说清“发现了什么关键线索”“做了什么关键动作”“遇到了什么具体报错”。
+              这可以看 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/local-llm/prompts/l1-prompt.ts#L9-L29">L1 摘要 prompt</a>。
+            </p>
+
+            <p>
+              L2 再把这些 offload entries 组织成 Mermaid flowchart。<code>l2-prompt.ts</code> 不是让 LLM 记流水账，
+              而是要求它用少量节点表达任务状态，合并连续常规动作，保留关键转折和失败路径，并把每个
+              <code>tool_call_id</code> 映射到一个 <code>node_id</code>。同一个文件里还规定了
+              <code>write</code> 和 <code>replace</code> 两种更新方式，以及 4000 字以内的 MMD 控制目标。
+              参考 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/local-llm/prompts/l2-prompt.ts#L9-L54">L2 MMD 生成规则</a>
+              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/local-llm/prompts/l2-prompt.ts#L118-L125">新 offload entries 的输入格式</a>。
+            </p>
+
+            <div class="flow-list" aria-label="Context Offload 流程">
+              <div class="flow-step">
+                <strong>工具原文：<code>refs/*.md</code></strong>
+                <p>保存长日志、报错、搜索结果、文件片段。它不直接塞回模型，但可以按引用路径找回。</p>
+              </div>
+              <div class="flow-step">
+                <strong>步骤索引：<code>offload-*.jsonl</code></strong>
+                <p>记录每次工具调用的摘要、时间、<code>tool_call_id</code>、引用文件和后续 <code>node_id</code> 映射。</p>
+              </div>
+              <div class="flow-step">
+                <strong>任务画布：<code>mmds/*.mmd</code></strong>
+                <p>把许多工具调用压成少量任务节点。模型看结构，必要时再沿 <code>node_id</code> 下钻。</p>
+              </div>
+            </div>
+
+            <h3 id="offload-l3">2.3 L3 真正改写进入模型的上下文</h3>
+            <p>
+              真正发生“卸载”的地方在进入模型前的消息处理。<code>before-prompt-build.ts</code> 顶部把流程分成三段：
+              快速重放已经确认的替换和删除、按 token 阈值做 L3 压缩、最后注入 MMD。代码里会读取 offload entries，
+              把确认可替代的 tool result 换成摘要；如果超过 aggressive 阈值，则删除更老的工具消息，并用历史 MMD 作为补偿；
+              mild 阶段则按分数级联替换。对应源码在
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/hooks/before-prompt-build.ts#L1-L7">三阶段注释</a>
+              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/hooks/before-prompt-build.ts#L70-L230">核心处理逻辑</a>。
+            </p>
+
+            <p>
+              MMD 注入是另一个关键点。<code>mmd-injector.ts</code> 只注入当前活跃的 MMD，历史 MMD 主要在 aggressive 删除后作为丢失上下文的替代。
+              注入时还会按 <code>mmdMaxTokenRatio</code> 计算预算，并把 MMD 作为带标记的 user message 插到合适位置。
+              这样模型看到的是“当前任务图”，不是一串已经滚远的工具日志。可以看
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/mmd-injector.ts#L24-L31">MMD 注入策略</a>
+              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/mmd-injector.ts#L61-L85">注入实现</a>。
+            </p>
+
+            <h2 id="long-term">三、长期记忆：L0 到 L3 是另一条语义金字塔</h2>
+            <h3 id="long-term-l0-l1">3.1 L0 保留对话，L1 抽出结构化事实</h3>
+            <p>
+              长期记忆这边，L0 是原始对话记录，L1 才是结构化 memory。<code>l1-extractor.ts</code> 的文件注释直接写出管线：
+              从 L0 读取近期消息，调用 LLM 做场景切分和 memory extraction，再做批量冲突检测，最后写 L1 JSONL。
+              实现里还会先通过质量过滤，只把值得提取的消息送给 LLM，并把新消息和少量 background messages 分开。
+              源码见 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/record/l1-extractor.ts#L1-L13">L1 extractor 总流程</a>
+              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/record/l1-extractor.ts#L126-L220">过滤、抽取、展平步骤</a>。
+            </p>
+
+            <p>
+              Dedup 也不是全量扫 JSONL。<code>l1-dedup.ts</code> 注释说，v4 移除了 JSONL Jaccard fallback，
+              候选召回主要靠向量搜索，降级到 FTS5 BM25，如果两者都不可用就跳过冲突检测直接写入。这个选择很工程化：
+              避免每次写 memory 都做 O(N) 文件扫描，把“可能冲突的旧记忆”先用检索缩小，再交给 LLM 批量判断 store、skip、update、merge。
+              参考 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/record/l1-dedup.ts#L1-L12">L1 dedup 注释</a>
+              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/record/l1-dedup.ts#L30-L40">三层候选策略</a>。
+            </p>
+
+            <h3 id="long-term-l2-l3">3.2 L2 是场景日记，L3 是用户画像</h3>
+            <p>
+              L2 的场景抽取由 <code>SceneExtractor</code> 完成。它不是把 L1 memory 追加成列表，而是让 LLM 在受限的
+              <code>scene_blocks/</code> 目录里读写 Markdown 场景文件。文件注释写得很明确：先备份和加载 scene index，
+              再用 memories 与 scene context 组装 prompt，随后用开启工具的 runner 在沙箱目录里操作场景文件，最后清理软删除、同步索引、更新导航。
+              看 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/scene/scene-extractor.ts#L1-L17">SceneExtractor 说明</a>。
+            </p>
+
+            <p>
+              L3 的 <code>PersonaGenerator</code> 则读取发生变化的场景内容，生成或增量更新 <code>persona.md</code>。
+              它会剥离旧导航、读取 changed scenes，把 prompt 交给允许文件工具的 runner，最后把工程生成的 scene navigation 追加回 persona。
+              这意味着高层画像不是凭空总结，而是从 L2 场景文件继续向上抽象。相关逻辑可以看
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/persona/persona-generator.ts#L58-L185"><code>generateLocalPersona</code></a>。
+            </p>
+
+            <h3 id="long-term-recall">3.3 召回时，稳定画像和动态记忆分开注入</h3>
+            <p>
+              召回阶段也能看出它的层次。<code>auto-recall.ts</code> 顶部说明：L1 可以按 keyword、embedding、hybrid 搜索；
+              L3 persona 会注入；L2 scene navigation 也会注入，由 LLM 决定是否进一步读取。真正组装上下文时，
+              L3 persona、L2 navigation 和工具使用说明放在 stable system context，L1 relevant memories 则放到当前 user prompt 前缀。
+              这样做的好处是：画像和场景导航变化较慢，适合 prompt cache；L1 命中每轮都不同，放在动态区域更合适。
+              源码见 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/hooks/auto-recall.ts#L1-L10">auto-recall 顶部说明</a>
+              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/hooks/auto-recall.ts#L186-L218">stable/dynamic context 拆分</a>。
+            </p>
+
+            <p>
+              存储层也配合这个策略。<code>sqlite.ts</code> 管理 L1 结构化记忆和 L0 原始对话两层索引：关系表保存 metadata，
+              <code>sqlite-vec</code> 虚表做 cosine similarity；同时还有 FTS5 和中文分词相关逻辑。搜索策略里 hybrid 会优先使用原生 hybrid，
+              否则并行跑 keyword 与 embedding，再用 RRF 合并。可看
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/store/sqlite.ts#L1-L20">SQLite store 设计注释</a>
+              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/hooks/auto-recall.ts#L299-L388">recall 搜索调度</a>。
+            </p>
+
+            <h2 id="compare">四、把它放回 Agent Memory 地图</h2>
+            <p>
+              如果按“谁拥有历史，谁组装模型视图”来看，TencentDB-Agent-Memory 应该放在 LangMem 之后、Cognee / Supermemory 之前。
+              它和 LangMem 一样靠近 agent runtime，但 LangMem 重点讨论 memory 写入是在 hot path 还是 background manager；
+              TencentDB-Agent-Memory 进一步把当前任务的工具历史也纳入管理，用 Context Offload 解决“还在同一轮任务里就已经太长”的问题。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>项目</th>
+                    <th>最核心的问题</th>
+                    <th>TencentDB-Agent-Memory 的区别</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Mem0</td>
+                    <td>外置 memory layer 怎样写入、合并、检索长期记忆。</td>
+                    <td>它不只关心跨会话记忆，还直接处理当前任务的上下文卸载。</td>
+                  </tr>
+                  <tr>
+                    <td>LangMem / LangGraph</td>
+                    <td>记忆动作放在 hot path 还是 background path。</td>
+                    <td>它把工具日志压缩、MMD 任务图和 token 阈值接入运行时消息处理。</td>
+                  </tr>
+                  <tr>
+                    <td>Cognee / Supermemory</td>
+                    <td>记忆如何成为多人、多源、多调用方的平台层。</td>
+                    <td>它更像本地插件和白盒文件系统，而不是外部 context API。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这也是它最值得单独写一篇的原因：很多 memory 讨论默认把“当前上下文”当作已经组装好的输入，
+              只讨论长期记忆怎么召回。TencentDB-Agent-Memory 把这个输入本身拆开了：哪些内容仍应留在模型视野，
+              哪些内容可以替换成摘要，哪些内容可以删掉但由 MMD 任务图代表，哪些内容必须能按 <code>node_id</code> 找回。
+            </p>
+
+            <h2 id="tradeoffs">五、取舍：它把复杂度换成可恢复性</h2>
+            <p>
+              这种设计不轻。它引入了 L1、L1.5、L2、L3，多套文件目录，MMD、JSONL、SQLite、FTS、vector，
+              还依赖 runtime hook 能拿到足够完整的 messages。好处是证据链清楚：短期任务可以从 MMD 下钻到 JSONL 再到 refs；
+              长期画像可以从 persona 下钻到 scene，再到 L1 atom 与 L0 conversation。
+            </p>
+
+            <p>
+              所以它适合长任务、重工具调用、需要白盒追溯的 agent。若只是简单客服问答，接一个 memory API 可能更省事；
+              如果是代码 agent、数据库 agent、研究 agent，工具日志本身就是任务资产，Context Offload 的价值会变得明显。
+              它真正提供的不是“更多记忆”，而是让 agent 在上下文变厚时仍然知道自己做过什么、证据在哪里、下一步该从哪条线继续。
+            </p>
+
+            <h2 id="sources">参考资料</h2>
+            <ul>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory">TencentCloud/TencentDB-Agent-Memory</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/README_CN.md#L65-L85">README_CN：记忆分层、短期卸载、L0-L3 与可恢复链路</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/openclaw.plugin.json#L146-L164">OpenClaw plugin schema：Context Offload 配置</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/storage.ts#L1-L53">Context Offload storage paths</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/local-llm/prompts/l1-prompt.ts#L9-L29">Offload L1 summarization prompt</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/local-llm/prompts/l2-prompt.ts#L9-L54">Offload L2 MMD prompt</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/hooks/before-prompt-build.ts#L1-L230">before_prompt_build L3 compression</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/record/l1-extractor.ts#L1-L220">Long-term L1 extraction pipeline</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/hooks/auto-recall.ts#L1-L388">Auto-recall search and context assembly</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const toc = document.querySelector("#toc");
+        const article = document.querySelector(".article-body");
+        if (!toc || !article) return;
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+
+      (() => {
+        const tables = document.querySelectorAll(".table-wrap table");
+        for (const table of tables) {
+          const headers = [...table.querySelectorAll("thead th")].map((header) => header.textContent.trim());
+          const rows = table.querySelectorAll("tbody tr");
+          for (const row of rows) {
+            [...row.children].forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>
