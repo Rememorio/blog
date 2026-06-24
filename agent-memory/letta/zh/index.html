@@ -125,6 +125,7 @@
             </div>
 
             <h2 id="state">一、Letta 从创建 agent 就开始谈记忆</h2>
+            <h3 id="state-before-retrieval">1.1 先决定 agent 拥有什么，再决定回答时查什么</h3>
             <p>
               Letta README 的 quickstart 很直接：创建 agent 时可以传入 <code>memory_blocks</code>，
               示例里两个 block 分别标成 <code>human</code> 和 <code>persona</code>。这不是回答时临时检索出来的片段，
@@ -135,11 +136,36 @@
             </p>
 
             <p>
+              这个入口很重要。外置 memory layer 的典型问题是“这次 query 应该取回哪些历史片段”；Letta 的第一问更早：
+              这个 agent 被创建时就应该带着哪些长期身份、用户画像和工作约束。前者把记忆当作回答前的候选材料，
+              后者把记忆当作 agent 可恢复状态的一部分。于是同样一句“用户喜欢简洁回答”，在 Mem0 里更像一条可检索 memory record，
+              在 Letta 里更像 <code>human</code> block 或 persona 约束，后续每次重建 agent 时都要重新进入模型视野。
+            </p>
+
+            <pre><code>创建时：
+  1. caller 传入 memory_blocks、model、tools
+  2. server 生成 AgentState
+  3. memory blocks 成为可持久化 state
+
+回答时：
+  1. Memory.compile() 渲染 blocks
+  2. system prompt / model view 获得当前记忆
+  3. step 成功后消息窗口再 checkpoint</code></pre>
+
+            <h3 id="state-surfaces">1.2 AgentState 把记忆、工具和消息窗口放在同一张快照里</h3>
+            <p>
               更关键的是 <code>AgentState</code> 的定义。源码把它描述为“某个时刻的 agent state”，并且说这些信息足以重建一个持久化 agent。
               这个 state 里有 <code>message_ids</code>、system prompt、agent type、model、compaction settings、
               <code>blocks</code>、tools、sources、tags、secrets、identities 等字段。
               换句话说，Letta 的长期记忆并不是单独挂在旁边的一张 facts 表，而是和工具、消息窗口、文件、身份一起进入
               <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/agent.py#L67-L146"><code>AgentState</code></a>。
+            </p>
+
+            <p>
+              这解释了 Letta 为什么读起来不像“记忆插件”。如果一个长期 agent 要连续几周工作，系统要恢复的不是一个 facts list，
+              而是“这个 agent 当时是谁、有哪些工具、当前消息窗口到哪里、哪些上下文块会编译进 prompt、哪些 sources 和 identities 仍然有效”。
+              <code>AgentState</code> 把这些面向恢复的对象放到一起，等于把记忆问题推进到 runtime ownership：
+              记忆不只是被搜到的内容，而是恢复一个 agent 时必须重新装配的材料。
             </p>
 
             <div class="table-wrap">
@@ -177,6 +203,7 @@
             </div>
 
             <h2 id="blocks">二、Block 是上下文里的保留区，不是检索结果</h2>
+            <h3 id="blocks-budget">2.1 Block 有预算、标签和权限，所以它不是普通文本片段</h3>
             <p>
               <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/block.py#L67-L80"><code>Block</code></a>
               在源码注释里被定义为 LLM context window 的 reserved section。它至少有 <code>value</code>、<code>limit</code>、
@@ -186,11 +213,26 @@
             </p>
 
             <p>
+              这几个字段共同保护一个边界：哪些内容可以稳定占用上下文，哪些内容可以被工具或系统改写。
+              <code>limit</code> 让 block 不至于无限膨胀；<code>read_only</code> 让某些 block 更像系统约束；
+              <code>description</code> 给模型或工具解释这个 block 应该放什么；<code>hidden</code> 则给运行时保留“不一定直接显示”的空间。
+              如果把它误解成“向量检索结果”，就会错过 Letta 的核心：block 是上下文里的结构化槽位，槽位本身也有治理规则。
+            </p>
+
+            <h3 id="blocks-compile">2.2 <code>compile()</code> 把 state 变成这一轮的 model view</h3>
+            <p>
               这些 block 最终要进入模型视野。<a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/memory.py#L68-L77"><code>Memory</code></a>
               把它描述为 agent 的 in-context memory，包含带标签的 <code>Block</code> 对象以及编辑这些 block 的工具。
               标准渲染路径会输出 <code>&lt;memory_blocks&gt;</code>，并把每个 block 的 label、description、metadata 和 value 写进去；
               <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/memory.py#L688-L712"><code>compile()</code></a>
               再根据 agent type、模型供应商和 git-backed memory 模式选择渲染方式。
+            </p>
+
+            <p>
+              这一层可以看成 Letta 的“模型视图投影”。持久化 state 里可以保存很多对象，但模型这一轮只能看到被编译出来的视图。
+              所以 Letta 的难点不是“有没有长期存储”，而是每次 step 前如何把 block、sources、tool rules 和消息窗口投影成稳定的 prompt。
+              这也是它和 Mem0 的一个关键差异：Mem0 的 model view 常由检索结果临时注入；Letta 的 model view 先由 agent state 编译出来，
+              再在当前 step 里和新消息、工具调用一起运行。
             </p>
 
             <figure class="figure">
@@ -204,6 +246,7 @@
             </figure>
 
             <h2 id="update">三、为什么更新 block 会牵动 system prompt</h2>
+            <h3 id="update-prompt-affecting">3.1 先判断是不是 prompt-affecting change</h3>
             <p>
               如果 block 是模型上下文里的保留区，那它一旦变化，系统 prompt 也可能需要重建。Letta 的
               <a href="https://github.com/letta-ai/letta/blob/main/letta/services/block_manager.py#L32-L68"><code>BlockManager</code></a>
@@ -212,6 +255,14 @@
               会判断字段是否真的变化；如果是 prompt-affecting change，就重建所有关联 agent 的 system prompt。
             </p>
 
+            <p>
+              这里的判断比“写数据库”多一层含义。修改 block metadata 可能只是后台记录变化；修改 <code>value</code>、<code>label</code> 或
+              <code>limit</code>，则可能改变模型下一轮看到的上下文。Letta 把这类字段单独列出来，等于承认 memory update
+              是 prompt update 的上游。没有这道判断，系统可能出现两种坏结果：数据库里已经是新记忆，但模型仍带着旧 system prompt；
+              或者每个无关字段变化都重建 prompt，造成不必要的写放大。
+            </p>
+
+            <h3 id="update-rebuild-checkpoint">3.2 重建 prompt 和 checkpoint 消息窗口是两件事</h3>
             <p>
               这一步是 Letta 和“外置检索层”的明显分水岭。Mem0 更像在回答前检索一组可注入事实；
               Letta 的 block 更新则会改变 agent 的基底视图。旧系统消息里有没有当前 memory string，
@@ -228,7 +279,37 @@
               说明 block、工具和 system instructions 这一层也有自己的容量边界。
             </p>
 
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>动作</th>
+                    <th>改变的对象</th>
+                    <th>如果混在一起会怎样</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>更新 block</td>
+                    <td>长期 state 和后续 system prompt 投影。</td>
+                    <td>把它当普通消息，会丢掉“长期槽位”语义。</td>
+                  </tr>
+                  <tr>
+                    <td>重建 memory / system prompt</td>
+                    <td>模型下一轮看到的基底上下文。</td>
+                    <td>如果不重建，state 和 model view 会分叉。</td>
+                  </tr>
+                  <tr>
+                    <td>checkpoint messages</td>
+                    <td>当前 step 成功后的消息窗口和恢复位置。</td>
+                    <td>如果把所有历史都当 block，prompt 会快速膨胀。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
             <h2 id="code">四、Letta Code 把记忆推进到本地长期工作</h2>
+            <h3 id="code-memfs">4.1 MemFS 把上下文资产变成可版本化文件</h3>
             <p>
               Letta Code README 把自己称为 stateful agent harness：agent 有 memory、identity 和随时间积累的 experience。
               它的功能表里有两项和这一篇最相关：
@@ -239,6 +320,13 @@
             </p>
 
             <p>
+              这一步把 Letta 的 state ownership 又往前推了一格。普通 memory block 解决的是“长期信息怎样进入 agent state”；
+              MemFS 解决的是“这些上下文资产怎样随着工作积累、被审计、被回滚、被其他机制读取”。如果一个 agent 会长期写代码、总结经验、
+              调整技能，那么 memory 不再只是用户画像，而会变成一组工作资产：prompt、skills、notes、文件化的上下文和它们的版本历史。
+            </p>
+
+            <h3 id="code-rendering">4.2 git-backed rendering 让文件和 prompt 之间有明确投影</h3>
+            <p>
               Letta 本体里也能看到 git-backed memory 的形状。
               <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/memory.py#L205-L330"><code>_render_memory_blocks_git</code></a>
               会把 <code>system/persona</code> 渲染成 <code>&lt;self&gt;</code>，
@@ -248,7 +336,15 @@
               所以 MemFS 不是“顺手把文本放进 git”，而是在把 agent 的上下文资产变成可投影、可版本化、可被 prompt 编译读取的文件系统。
             </p>
 
+            <p>
+              这里也有边界：git-backed memory 并不意味着模型可以任意改写所有上下文，也不意味着文件内容天然适合进 prompt。
+              关键仍然是投影规则：哪些 block 变成 <code>&lt;self&gt;</code>，哪些进入 <code>&lt;memory&gt;</code>，
+              哪些 skills 被列入可用能力。Letta Code 的价值，是把长期上下文从“一团 prompt 文本”拆成可管理资产；
+              真正进入模型的一轮视图，仍然由编译路径决定。
+            </p>
+
             <h2 id="compare">五、和 Mem0 放在一起看</h2>
+            <h3 id="compare-owner">5.1 选型时先问：记忆是服务拥有，还是 agent 自己拥有</h3>
             <p>
               Mem0 和 Letta 都在解决长期记忆，但它们的主问题不同。Mem0 适合回答“应用怎样把跨会话事实交给一层 memory service 管”；
               Letta 适合回答“一个 agent 怎样带着自己的状态、工具、消息窗口和可编辑记忆持续工作”。

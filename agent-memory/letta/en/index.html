@@ -129,6 +129,7 @@
             </div>
 
             <h2 id="state">1. Letta Starts Memory At Agent Creation</h2>
+            <h3 id="state-before-retrieval">1.1 Decide What The Agent Owns Before Deciding What To Retrieve</h3>
             <p>
               The Letta README creates a stateful agent with <code>memory_blocks</code> right in the quickstart.
               The example labels two blocks as <code>human</code> and <code>persona</code>, in the same create call that
@@ -139,11 +140,38 @@
             </p>
 
             <p>
+              That entry point changes the question. An external memory layer usually asks which historical snippets should
+              be retrieved for this query. Letta asks an earlier question: which long-lived identity, user profile, and work
+              constraints should this agent own when it is created and later restored? In Mem0, “the user likes concise
+              answers” is closer to a searchable memory record. In Letta, it is closer to a <code>human</code> block or persona
+              constraint that must re-enter the model view whenever the agent is reconstructed.
+            </p>
+
+            <pre><code>At creation:
+  1. caller passes memory_blocks, model, tools
+  2. server builds AgentState
+  3. memory blocks become durable state
+
+At answer time:
+  1. Memory.compile() renders blocks
+  2. system prompt / model view receives current memory
+  3. successful step checkpoints the message window</code></pre>
+
+            <h3 id="state-surfaces">1.2 AgentState Keeps Memory, Tools, And The Message Window In One Snapshot</h3>
+            <p>
               <code>AgentState</code> makes that boundary explicit. The source describes it as the state of an agent at a
               given time, persisted in the database backend, with the information needed to recreate a persisted agent.
               The fields include <code>message_ids</code>, the system prompt, agent type, model settings, compaction settings,
               <code>blocks</code>, tools, sources, tags, secrets, identities, and more. Letta memory therefore lives next to
               the runtime objects that make the agent work, not in a separate facts table.
+            </p>
+
+            <p>
+              That is why Letta does not read like a memory plugin. If a long-running agent has to keep working for weeks,
+              the system must restore who the agent was, which tools it had, where the active message window stopped, which
+              context blocks compile into the prompt, and which sources or identities still apply. <code>AgentState</code> puts
+              those restoration surfaces together. Memory is not only content to be found; it is material required to rebuild
+              the agent.
             </p>
 
             <div class="table-wrap">
@@ -181,6 +209,7 @@
             </div>
 
             <h2 id="blocks">2. Blocks Are Reserved Context, Not Search Hits</h2>
+            <h3 id="blocks-budget">2.1 A Block Has Budget, Label, And Permissions</h3>
             <p>
               Letta's <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/block.py#L67-L80"><code>Block</code></a>
               is documented as a reserved section of the LLM context window. It has a <code>value</code>, <code>limit</code>,
@@ -190,12 +219,29 @@
             </p>
 
             <p>
+              Those fields protect a context boundary. <code>limit</code> prevents an always-visible block from expanding without
+              restraint. <code>read_only</code> makes some blocks behave more like constraints. <code>description</code> tells the
+              model or tools what belongs in the slot. Hidden state leaves room for runtime-owned material that is not
+              necessarily shown in the same way. If blocks are reduced to “retrieval hits,” the main design is missed:
+              a block is a governed slot in the context, and the slot itself has rules.
+            </p>
+
+            <h3 id="blocks-compile">2.2 <code>compile()</code> Projects State Into The Current Model View</h3>
+            <p>
               The blocks become model-visible through <code>Memory</code>. The source describes
               <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/memory.py#L68-L77"><code>Memory</code></a>
               as in-context memory that contains labelled <code>Block</code> objects and tools to edit them. The standard renderer
               emits <code>&lt;memory_blocks&gt;</code> and writes each block's label, description, metadata, and value. Then
               <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/memory.py#L688-L712"><code>compile()</code></a>
               chooses the rendering mode based on agent type, model provider, and whether git-backed memory is enabled.
+            </p>
+
+            <p>
+              This is Letta's model-view projection. Durable state may contain many objects, but the model only sees the
+              compiled view for this step. The hard problem is therefore not just “is there long-term storage,” but how blocks,
+              sources, tool rules, and the message window become a stable prompt before a step runs. Mem0 commonly injects a
+              retrieved set into the current answer. Letta first compiles agent-owned state, then runs the current step with
+              that base view.
             </p>
 
             <figure class="figure">
@@ -210,6 +256,7 @@
             </figure>
 
             <h2 id="update">3. Block Updates Can Rebuild The System Prompt</h2>
+            <h3 id="update-prompt-affecting">3.1 First Decide Whether The Change Affects The Prompt</h3>
             <p>
               If a block is reserved context, changing it can change the system prompt. Letta's
               <a href="https://github.com/letta-ai/letta/blob/main/letta/services/block_manager.py#L32-L68"><code>BlockManager</code></a>
@@ -220,6 +267,15 @@
               prompt-affecting updates.
             </p>
 
+            <p>
+              That check means more than writing a database row. Changing block metadata may be bookkeeping. Changing
+              <code>value</code>, <code>label</code>, or <code>limit</code> can change what the model sees next turn.
+              Letta lists those fields explicitly because a memory update can be upstream of a prompt update. Without the
+              check, durable state and model view can diverge, or every harmless field edit can trigger unnecessary prompt
+              rebuilds.
+            </p>
+
+            <h3 id="update-rebuild-checkpoint">3.2 Rebuilding Memory And Checkpointing Messages Are Separate Responsibilities</h3>
             <p>
               That is the sharpest difference from an external retrieval layer. Mem0 retrieves memories before an answer.
               Letta block edits can change the agent's base view. The
@@ -236,7 +292,37 @@
               which is a reminder that blocks, tools, and system instructions have a separate capacity boundary.
             </p>
 
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Action</th>
+                    <th>Object Changed</th>
+                    <th>What Breaks If It Is Blurred</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Update block</td>
+                    <td>Long-term state and later system-prompt projection.</td>
+                    <td>Treating it as an ordinary message loses the state-slot semantics.</td>
+                  </tr>
+                  <tr>
+                    <td>Rebuild memory / system prompt</td>
+                    <td>The base context visible to the next model call.</td>
+                    <td>If skipped, durable state and model view can disagree.</td>
+                  </tr>
+                  <tr>
+                    <td>Checkpoint messages</td>
+                    <td>The post-step message window and recovery position.</td>
+                    <td>If all history becomes blocks, the prompt grows without a useful boundary.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
             <h2 id="code">4. Letta Code Turns State Into Long-Running Work</h2>
+            <h3 id="code-memfs">4.1 MemFS Turns Context Assets Into Versioned Files</h3>
             <p>
               Letta Code describes itself as a stateful agent harness: agents have memory, identity, and experience over
               time. Its feature table is the practical surface of the same model. Self-improvement says agents can rewrite
@@ -244,6 +330,14 @@
               blocks, is tracked through git.
             </p>
 
+            <p>
+              That pushes Letta's ownership model one level further. Ordinary memory blocks answer how long-lived information
+              enters agent state. MemFS asks how those context assets accumulate, can be audited, can be rolled back, and can
+              be read by other runtime mechanisms. A coding agent that learns over time is not only carrying a user profile;
+              it is carrying prompts, skills, notes, file-backed context, and version history.
+            </p>
+
+            <h3 id="code-rendering">4.2 Git-Backed Rendering Keeps Files And Prompt Projection Separate</h3>
             <p>
               The Letta source shows how that becomes prompt-visible. In git-backed memory,
               <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/memory.py#L205-L330"><code>_render_memory_blocks_git</code></a>
@@ -254,7 +348,16 @@
               versioned agent context that can be projected into the model view.
             </p>
 
+            <p>
+              The boundary still matters. Git-backed memory does not mean the model can freely rewrite every context object,
+              and it does not mean every file belongs in the prompt. The projection rule remains the owner: which blocks
+              become <code>&lt;self&gt;</code>, which enter <code>&lt;memory&gt;</code>, and which skills are exposed as usable
+              capabilities. Letta Code's design turns long-lived context from one prompt blob into manageable assets; the
+              current model view is still produced by the compile path.
+            </p>
+
             <h2 id="compare">5. Put It Next To Mem0</h2>
+            <h3 id="compare-owner">5.1 Start With Ownership: Memory Service Or Agent-Owned State</h3>
             <p>
               Mem0 and Letta are both memory systems, but they answer different questions. Mem0 asks how an application
               can delegate cross-session facts to a memory service. Letta asks how a long-running agent owns its own

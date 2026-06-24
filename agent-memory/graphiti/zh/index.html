@@ -126,6 +126,7 @@
             </div>
 
             <h2 id="need">一、为什么记忆需要 temporal context graph</h2>
+            <h3 id="need-vector-fails">1.1 向量检索能找相似句子，但不擅长回答“当时是否成立”</h3>
             <p>
               Graphiti README 对自己的定位很明确：它用于构建和查询 AI agents 的 temporal context graphs，
               这些图会追踪 facts 如何随时间变化，保留到 source data 的 provenance，并支持 prescribed 与 learned ontology。
@@ -134,6 +135,13 @@
               这些说法集中在 <a href="https://github.com/getzep/graphiti/blob/main/README.md#L42-L55">README 的项目介绍</a>。
             </p>
 
+            <p>
+              如果只做向量检索，系统可以找到“用户在 A 团队”和“用户在 B 团队”两段相似事实，却很难自己判断哪条是历史、哪条是当前状态。
+              直接覆盖旧事实会让“去年在哪个团队”无从回答；两条都保留但不加时间窗口，又会让今天的任务分配产生冲突。
+              Graphiti 的图不是为了把向量库画得更漂亮，而是把事实、实体、来源和时间有效期放进同一套查询结构。
+            </p>
+
+            <h3 id="need-ledger">1.2 context graph 更像事实账本，而不是普通知识图谱截图</h3>
             <p>
               更具体地说，Graphiti 的 context graph 由四类东西组成：
               entities、facts / relationships、episodes 和 custom types。
@@ -187,6 +195,7 @@
             </figure>
 
             <h2 id="episode">二、Episode 是原始证据流，不是普通摘要</h2>
+            <h3 id="episode-two-times">2.1 先分清入库时间和事实时间</h3>
             <p>
               Graphiti 把输入先落到 <code>EpisodicNode</code>。源码里这个节点保存 <code>source</code>、
               <code>source_description</code>、<code>content</code>、<code>valid_at</code>、<code>entity_edges</code>
@@ -202,6 +211,17 @@
               系统写入时间是今天，但纪要里的事实可能属于去年。长期记忆要能回答历史问题，就不能只看入库时间。
             </p>
 
+            <pre><code>用户今天导入去年的会议纪要：
+  created_at = 今天，系统何时看到这份资料
+  valid_at   = 去年，资料里的事实从哪个时间点开始成立
+
+回答“现在属于哪个团队”：
+  需要看当前有效的 fact edge
+
+回答“去年属于哪个团队”：
+  需要按历史时间窗口回看旧 edge</code></pre>
+
+            <h3 id="episode-provenance">2.2 Episode edge 让事实可以回到原始输入</h3>
             <p>
               episode 和 entity 之间通过 <code>EpisodicEdge</code> 相连。
               <a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/edges.py#L143-L158"><code>EpisodicEdge.save()</code></a>
@@ -209,7 +229,13 @@
               <code>created_at</code>，也就是“这段原始输入提到了哪个实体”。后面 fact edge 的来源追踪，就是建立在这些 episode 连接之上。
             </p>
 
+            <p>
+              provenance 在长期记忆里不是附加信息，而是纠错入口。用户或系统后来发现某条事实不对时，需要知道它来自哪次对话、
+              哪个文档、哪个外部源。否则图里只剩下“节点之间有关系”，却没有办法解释这段关系为什么出现、什么时候出现、该不该撤回。
+            </p>
+
             <h2 id="edge">三、Fact edge 承担事实、来源和有效期</h2>
+            <h3 id="edge-window">3.1 关系边同时保存事实文本、向量和时间窗口</h3>
             <p>
               真正表达长期记忆事实的，是 <code>EntityEdge</code>。源码字段非常直白：
               <code>name</code> 表示关系名，<code>fact</code> 保存事实文本，<code>fact_embedding</code> 用于相似度检索，
@@ -220,6 +246,14 @@
               里能看到。
             </p>
 
+            <p>
+              这几个字段解决的是不同问题。<code>fact</code> 负责给模型读，<code>fact_embedding</code> 负责召回相似事实，
+              <code>episodes</code> 负责追溯来源，<code>valid_at</code> / <code>invalid_at</code> 负责回答时间问题，
+              <code>expired_at</code> 则记录系统何时把旧边判为失效。Graphiti 不是在“文本记忆旁边放一张图”，而是让一条边同时成为检索对象、
+              事实对象和时间对象。
+            </p>
+
+            <h3 id="edge-invalidate">3.2 invalidation 不是删除，而是把当前视图和历史视图分开</h3>
             <p>
               这样设计以后，新信息到来时，系统不必把旧关系抹掉。Graphiti 的边解析流程会把结果拆成
               <code>resolved_edges</code>、<code>invalidated_edges</code> 和 <code>new_edges</code>。
@@ -237,6 +271,7 @@
             </p>
 
             <h2 id="retrieval">四、检索要组装当前子图</h2>
+            <h3 id="retrieval-fanout">4.1 搜索对象不止一类，所以召回也要分路</h3>
             <p>
               既然事实存在图上，检索也不能只看一条文本相似度。Graphiti README 把 hybrid retrieval 描述为 semantic embeddings、
               keyword / BM25 和 graph traversal 的组合；源码里的 search config 也对应这三类方法。
@@ -245,6 +280,13 @@
               reranker 可以用 RRF、node distance、episode mentions、MMR 或 cross encoder。
             </p>
 
+            <p>
+              这比“向量 + BM25”多了一层图语义：query 可能先命中某条 fact edge，也可能先命中某个 entity，再沿图找到相邻关系；
+              还可能需要 episode 来解释来源。不同搜索方法的结果最后要进入同一个上下文组装步骤，所以 Graphiti 的检索更像“先找候选子图”，
+              再决定哪些边、节点和 episode 该进入模型视图。
+            </p>
+
+            <h3 id="retrieval-current-view">4.2 当前回答需要的是被时间和关系过滤后的子图</h3>
             <p>
               查询执行时，如果配置需要 cosine similarity 或 MMR，
               <a href="https://github.com/getzep/graphiti/blob/main/graphiti_core/search/search.py#L98-L149"><code>search()</code></a>
@@ -259,6 +301,7 @@
             </p>
 
             <h2 id="compare">五、把 Graphiti 放回 Agent Memory 地图</h2>
+            <h3 id="compare-ownership">5.1 Graphiti 的答案是：记忆由时间图拥有</h3>
             <p>
               Mem0、Letta 和 Graphiti 的差别，现在可以说得更具体。Mem0 的中心是 memory service：怎样从对话抽取、写入、检索和排序记忆。
               Letta 的中心是 agent state：memory block、messages、tools、files 和 system prompt 怎样共同重建一个可持续工作的 agent。
