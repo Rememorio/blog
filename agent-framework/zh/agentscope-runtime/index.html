@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent 框架源码阅读（二）：跟 AgentScope 的 reply_stream 走一遍</title>
+    <meta
+      name="description"
+      content="Agent 框架源码阅读第二篇：沿 AgentScope 的 reply_stream、事件流、工具权限和 OpenAI Responses / Chat Completions 适配层，看它怎样把单 agent runtime 产品化。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Agent 框架源码阅读（二）：跟 AgentScope 的 reply_stream 走一遍" />
+    <meta
+      property="og:description"
+      content="AgentScope 的核心不是一个 while loop，而是一条事件化、可暂停、可治理、可服务化的 agent runtime。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/agentscope-runtime-overview.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-framework/zh/agentscope-runtime/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-framework/zh/agentscope-runtime/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-framework/en/agentscope-runtime/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-framework/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(31, 119, 123, 0.34);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      .shape-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin: 18px 0 22px;
+      }
+
+      .shape-box {
+        border: 1px solid rgba(24, 55, 82, 0.14);
+        border-radius: 8px;
+        background: rgba(255, 250, 240, 0.72);
+        padding: 14px;
+      }
+
+      .shape-box h3 {
+        margin-top: 0;
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+
+        .shape-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Agent 框架系列</a>
+        <a href="../overview/">上一篇</a>
+        <a href="#responses-vs-chat">API 差异</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/agentscope-runtime/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Agent 框架源码阅读 · 第二篇</p>
+            <h1>跟 AgentScope 的 reply_stream 走一遍</h1>
+            <p class="lead">
+              第一篇说要先选 runtime owner。AgentScope 很适合作为第二篇样本，因为它把一个单 agent
+              的回复过程拆成了公开事件、内部状态、模型适配、工具权限、外部执行和服务化会话。它不像纯 workflow
+              框架那样先画图，也不像只包装模型客户端那样只暴露一次调用；它先拥有一条能跑完、能暂停、能恢复的 agent runtime。
+            </p>
+            <div class="meta-line">
+              <span>主题：AgentScope runtime</span>
+              <span>主线：reply_stream</span>
+              <span>重点：Responses API vs Chat Completions</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/agentscope-runtime-overview.png"
+                alt="AgentScope Runtime 手绘图：reply_stream 进入 Model Input，经 API Adapter 分成 Responses Items 和 Chat Messages，再归一为 Event Stream、Tool Gate 和 Context Ledger"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              读 AgentScope 不要从目录树开始。更直接的方式，是跟一次 <code>Agent.reply_stream</code> 走到结束：
+              用户消息先进状态，模型输入被统一准备，OpenAI 适配层把内部消息翻译成 provider wire shape，
+              流式结果被还原成 content block 和 typed event，工具调用再经过 schema、权限和外部执行边界，最后写回上下文。
+            </p>
+
+            <p>
+              这条路径和 Claude Code、Codex 的阅读经验是同一种问题：coding agent 关心命令权限、sandbox、事件转发和 resume；
+              AgentScope 关心工具权限、MCP、workspace、message bus、team 和 service app。名字不同，压力相同：
+              模型只是提出下一步，runtime 必须决定这一步能不能执行、如何展示、怎么记录，以及下一轮模型能看到什么。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                本篇的主结论是：<strong>AgentScope 的价值不在于替你调用模型，而在于把模型调用包进一条事件化的回复主线。</strong>
+                这条主线对外是 <code>AgentEvent</code>，对内是 <code>Msg</code>、content block、tool state 和 context ledger。
+                OpenAI Responses API 与 Chat Completions 的差别，被隔离在 formatter 和 model adapter 里。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                源码引用固定到 AgentScope 当前公开快照
+                <code>ae9819017d6c195967a8f17b0ab4e70ff803f5a3</code>。OpenAI API 语义引用官方
+                <a href="https://developers.openai.com/api/docs/guides/migrate-to-responses">Responses 迁移指南</a>。
+                文中“账本”“权限门”“服务平面”是对公开代码的工程归纳，不推断闭源控制台或模型 provider 内部实现。
+              </p>
+            </div>
+
+            <p>这一篇只回答六个问题：</p>
+            <ol>
+              <li><code>reply_stream</code> 到底承诺了什么，为什么它返回事件而不是最终字符串？</li>
+              <li>AgentScope 的内部账本是什么形状，<code>Msg</code> 和 content block 解决什么问题？</li>
+              <li>模型调用前，system prompt、summary、context 和 tool schema 怎样进入统一输入？</li>
+              <li>工具调用为什么不是普通函数调用，而是一段可暂停的 lifecycle？</li>
+              <li id="responses-vs-chat">AgentScope 支持 OpenAI Responses API 与 Chat Completions API 时，差异到底在哪里？</li>
+              <li>为什么一个 example service 就能看出它不是脚本框架？</li>
+            </ol>
+
+            <h2>一、reply_stream 是公开事件契约</h2>
+            <p>
+              <code>reply_stream</code> 的公开实现很薄：
+              它接收 <code>Msg</code>、消息列表、<code>UserConfirmResultEvent</code>、<code>ExternalExecutionResultEvent</code>
+              或 <code>None</code>，然后把 <code>_reply</code> 里不是最终 <code>Msg</code> 的对象持续 yield 出去。
+              这看起来简单，真正的含义是：应用层不需要等 agent 完成，UI、SSE、日志和控制台可以订阅一串 typed event。
+              源码在
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/agent/_agent.py#L190-L212">这里</a>。
+            </p>
+
+            <p>
+              真正的状态推进在 <code>_reply_impl</code>。它先判断这次输入是不是上一轮等待中的确认或外部执行结果；
+              如果不是，就处理新消息、生成新的 <code>reply_id</code>、把迭代计数清零，并发出 <code>ReplyStartEvent</code>。
+              接着进入 reasoning/acting 循环：没有待执行工具时先推理，有工具时按顺序或并发执行；如果遇到用户确认或外部执行，
+              这一轮直接暂停，返回一个“等待中”的 assistant message；如果超过最大迭代数，则发出 <code>ExceedMaxItersEvent</code>
+              和 <code>ReplyEndEvent</code>。这段主线在
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/agent/_agent.py#L541-L699"><code>_reply_impl</code></a>。
+            </p>
+
+            <p>
+              这就是 AgentScope 的第一个 owner：它拥有“回复过程”的生命周期，而不是只把模型输出转发出来。
+              <code>EventType</code> 也证明了这点：事件覆盖 reply、model call、text/data/thinking block、tool call、tool result、
+              max iters、用户确认和外部执行结果。
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/event/_event.py#L20-L60">事件枚举</a>
+              不是 UI 装饰，而是 runtime 对外的稳定边界。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>外部看到</th>
+                    <th>内部同时发生</th>
+                    <th>为什么重要</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>ReplyStartEvent</code></td>
+                    <td>写入新的 <code>reply_id</code>，重置迭代计数。</td>
+                    <td>UI、日志和持久化能按一次 reply 聚合事件。</td>
+                  </tr>
+                  <tr>
+                    <td><code>ModelCallStart/End</code></td>
+                    <td>准备消息、工具 schema，收集 usage。</td>
+                    <td>模型调用不再是黑盒，可以计量和追踪。</td>
+                  </tr>
+                  <tr>
+                    <td><code>Text/Thinking/ToolCall</code> block events</td>
+                    <td>把 provider streaming delta 还原成 content blocks。</td>
+                    <td>前端能流式展示，后端能保存完整结构。</td>
+                  </tr>
+                  <tr>
+                    <td><code>RequireUserConfirm</code></td>
+                    <td>工具状态先标记为 asking，再暂停循环。</td>
+                    <td>用户确认不是弹窗逻辑，而是 agent 状态的一部分。</td>
+                  </tr>
+                  <tr>
+                    <td><code>RequireExternalExecution</code></td>
+                    <td>外部工具状态先标记为 submitted，再等待结果事件。</td>
+                    <td>浏览器、远端 worker、异步系统可以接管执行。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>二、内部账本不是聊天字符串，而是 Msg 与 content blocks</h2>
+            <p>
+              AgentScope 的 <code>Msg</code> 类保存 sender name、role、content block 列表、message id、metadata、创建/完成时间和 usage。
+              角色还会约束可用 block：user 只能是 text/data，system 只能是 text，assistant 才能携带更多结构。
+              这比“role + content string”的普通聊天记录重，但正是它让 text、thinking、tool call、tool result 和 data
+              可以在同一个上下文账本里保持结构。
+              证据见
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/message/_base.py#L66-L97"><code>Msg</code></a>。
+            </p>
+
+            <p>
+              模型调用前，<code>_prepare_model_input</code> 会把 system prompt、压缩 summary、当前 context 拼成 <code>messages</code>，
+              再从 <code>Toolkit</code> 取当前激活 tool groups 的 JSON schemas，返回 <code>{ messages, tools }</code>。
+              这里还没有区分 OpenAI Responses 或 Chat Completions。Agent runtime 先产生 provider-neutral 的内部输入，
+              具体 wire shape 交给模型适配层。
+              源码在
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/agent/_agent.py#L2007-L2035"><code>_prepare_model_input</code></a>。
+            </p>
+
+            <p>
+              <code>Toolkit</code> 也不是一个函数列表。它负责注册和管理 tool functions、MCP clients、Agent skills 和 tool groups；
+              它能从 docstring 或模型扩展生成 schema，也能通过统一 streaming interface 执行工具。
+              这解释了为什么 AgentScope 会把工具 schema 作为 runtime 输入，而不是让业务代码每次模型调用前手写。
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/tool/_toolkit.py#L66-L86">Toolkit 注释</a>
+              已经把这几个 owner 写得很直接。
+            </p>
+
+            <h2>三、工具调用是一段可治理的 lifecycle</h2>
+            <p>
+              模型返回工具调用后，AgentScope 不会直接 <code>call_tool</code>。<code>_execute_tool_call</code> 先检查工具是否可用，
+              再用 schema 解析和校验 JSON 输入；失败时会把错误作为 tool result 写回上下文，让 agent 能在下一轮看到。
+              成功后才进入 <code>PermissionEngine</code>。这段入口在
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/agent/_agent.py#L1293-L1383"><code>_execute_tool_call</code></a>。
+            </p>
+
+            <p>
+              权限引擎有独立模式。默认模式的顺序是 deny rules、ask rules、tool 自身权限检查、安全 ask、allow rules、最后默认 ask；
+              <code>EXPLORE</code> 模式则把只读作为硬边界，修改类调用直接拒绝。它不是“是否弹确认框”的 UI 参数，
+              而是一套会参与执行决策的 policy dispatcher。
+              对应源码在
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/permission/_engine.py#L76-L187">默认模式</a>
+              和
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/permission/_engine.py#L189-L249">EXPLORE 模式</a>。
+            </p>
+
+            <p>
+              如果决策是 ask 或 passthrough，AgentScope 会先把 tool call state 改成 asking，再 yield
+              <code>RequireUserConfirmEvent</code> 并返回。如果是 deny，则生成 denied tool result。如果 allow，
+              它发出 <code>ToolResultStartEvent</code>，外部工具会转成 <code>RequireExternalExecutionEvent</code>；
+              本地工具才进入 <code>_acting</code>，然后把流式 chunk 转成 tool result events，最后把压缩或截断后的结果写回 context。
+              这段 lifecycle 在
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/agent/_agent.py#L1388-L1540">权限处理和工具结果回写</a>。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这里可以看出 AgentScope 和简单 function calling demo 的差异：demo 关心“模型要调用哪个函数”，AgentScope 关心“这个函数调用处于哪个状态，谁批准，在哪里执行，结果如何被流式展示，最后怎样变成下一轮上下文”。
+              </p>
+            </div>
+
+            <h2>四、Responses API 和 Chat Completions 的差别在哪里</h2>
+            <p>
+              OpenAI 官方迁移文档把 Responses API 描述成新的 typed-item 形状：输入是 <code>input</code>，输出是 <code>output</code>
+              里的 item；item 可以是 <code>message</code>、<code>reasoning</code>、<code>function_call</code>、
+              <code>function_call_output</code> 等。Chat Completions 则仍是 <code>messages</code> 和
+              <code>choices[0].message</code> / streaming <code>choices[0].delta</code>。
+              AgentScope 同时支持两者，但没有把差异泄漏到 <code>_reply_impl</code>，而是隔离到两个模型类和两个 formatter。
+            </p>
+
+            <div class="shape-grid">
+              <section class="shape-box">
+                <h3>Responses API 的输入形状</h3>
+                <pre><code>{
+  "input": [
+    {"role": "user", "content": [{"type": "input_text", "text": "..."}]},
+    {"type": "reasoning", "id": "rs_...", "summary": []},
+    {"type": "function_call", "id": "fc_...", "call_id": "call_...", "name": "read_file", "arguments": "{}"},
+    {"type": "function_call_output", "call_id": "call_...", "output": "..."}
+  ],
+  "tools": [{"type": "function", "name": "read_file", "parameters": {...}}]
+}</code></pre>
+              </section>
+              <section class="shape-box">
+                <h3>Chat Completions 的输入形状</h3>
+                <pre><code>{
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "..."}]},
+    {"role": "assistant", "tool_calls": [{"id": "call_...", "type": "function", "function": {...}}]},
+    {"role": "tool", "tool_call_id": "call_...", "content": "..."}
+  ],
+  "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {...}}}]
+}</code></pre>
+              </section>
+            </div>
+
+            <p>
+              AgentScope 的 Responses 适配器 <code>OpenAIResponseModel</code> 调用的是
+              <code>client.responses.create</code>，请求字段是 <code>input</code>，最大输出 token 字段是
+              <code>max_output_tokens</code>，reasoning 参数被包装成 <code>{"effort": ...}</code>。
+              它还会剔除 Chat Completions 风格的 <code>modalities</code> 和 <code>audio</code> 参数，因为这个 adapter
+              当前不支持 Responses 的音频输入输出路径。证据见
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/model/_openai_response/_model.py#L29-L35">类注释</a>
+              和
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/model/_openai_response/_model.py#L183-L230">API 调用</a>。
+            </p>
+
+            <p>
+              Chat 适配器 <code>OpenAIChatModel</code> 则调用 <code>client.chat.completions.create</code>，
+              请求字段是 <code>messages</code>，最大输出 token 字段是 <code>max_tokens</code>，thinking 参数名是
+              <code>reasoning_effort</code>。它还保留了 Chat Completions 的语音路径：设置 <code>voice</code> 时自动填
+              <code>audio</code> 和 <code>modalities</code>，streaming 时用 <code>stream_options.include_usage</code>。
+              源码在
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/model/_openai_chat/_model.py#L181-L274"><code>OpenAIChatModel._call_api</code></a>。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>维度</th>
+                    <th>Responses API adapter</th>
+                    <th>Chat Completions adapter</th>
+                    <th>AgentScope 为什么要分开</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>请求入口</td>
+                    <td><code>client.responses.create(input=...)</code></td>
+                    <td><code>client.chat.completions.create(messages=...)</code></td>
+                    <td>wire field 不同，不能共用 formatter。</td>
+                  </tr>
+                  <tr>
+                    <td>历史格式</td>
+                    <td>typed input items：<code>input_text</code>、<code>input_image</code>、<code>function_call</code>、<code>function_call_output</code>。</td>
+                    <td>chat messages：<code>content</code>、<code>tool_calls</code>、<code>role: tool</code>。</td>
+                    <td>同一个 <code>Msg</code> 账本要翻译成两套 provider 形状。</td>
+                  </tr>
+                  <tr>
+                    <td>reasoning</td>
+                    <td><code>reasoning</code> 是 output item；有 <code>reasoning_item_id</code> 时需要回放。</td>
+                    <td>读 <code>reasoning_content</code> 或 <code>reasoning</code> 字段，历史里静默跳过 thinking block。</td>
+                    <td>Responses 把 reasoning 当 item，Chat 把它当 message/chunk 字段。</td>
+                  </tr>
+                  <tr>
+                    <td>工具调用 id</td>
+                    <td>区分 item <code>id</code> 与匹配结果用的 <code>call_id</code>。</td>
+                    <td>主要使用 <code>tool_call_id</code> 对齐 assistant tool call 和 tool message。</td>
+                    <td>Responses 的 <code>function_call_output</code> 必须能匹配正确 call。</td>
+                  </tr>
+                  <tr>
+                    <td>streaming</td>
+                    <td>处理 <code>response.output_text.delta</code>、<code>response.output_item.added</code>、<code>response.function_call_arguments.delta</code>、<code>response.completed</code>。</td>
+                    <td>处理 <code>choices[0].delta.content</code>、<code>delta.tool_calls</code>、audio delta 和 usage chunk。</td>
+                    <td>两边都归一成 <code>ChatResponse</code>，上层事件转换才能共用。</td>
+                  </tr>
+                  <tr>
+                    <td>音频路径</td>
+                    <td>当前 adapter 明确跳过/剔除音频相关参数。</td>
+                    <td>支持 voice/audio，并把音频包装成 <code>DataBlock</code>。</td>
+                    <td>能力差异在 adapter 层暴露，上层 runtime 不需要误以为完全等价。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              formatter 的差异更关键。<code>OpenAIResponseFormatter</code> 明确写了几个转换：
+              文本块变 <code>input_text</code>，图片块变 <code>input_image</code>，assistant tool-call message
+              变顶层 <code>function_call</code> item，tool result 变 <code>function_call_output</code> item，
+              带 <code>reasoning_item_id</code> 的 thinking block 会被原样回放。
+              源码在
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/formatter/_openai_response_formatter.py#L88-L101">formatter 注释</a>、
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/formatter/_openai_response_formatter.py#L194-L249">reasoning 与 function_call</a>
+              和
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/formatter/_openai_response_formatter.py#L272-L283">function_call_output</a>。
+            </p>
+
+            <p>
+              <code>OpenAIChatFormatter</code> 走另一条路：文本是 <code>{"type": "text"}</code>，
+              tool call 放进 assistant message 的 <code>tool_calls</code>，tool result 变成 <code>role: "tool"</code>
+              的消息，thinking block 在聊天历史里被静默跳过。这在
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/formatter/_openai_formatter.py#L189-L366"><code>OpenAIChatFormatter</code></a>
+              里很清楚。
+            </p>
+
+            <p>
+              streaming 解析也分两种。Responses 适配器直接处理 typed event，把 <code>response.output_text.delta</code>
+              转成 <code>TextBlock</code>，把 <code>response.output_item.added</code> 里的 <code>function_call</code>
+              初始化成工具调用，把 <code>response.function_call_arguments.delta</code> 追加到参数里，最后在
+              <code>response.completed</code> 汇总 usage 和 reasoning item id。
+              源码见
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/model/_openai_response/_model.py#L232-L381">Responses streaming parser</a>。
+              Chat 适配器则从 <code>choices[0].delta</code> 读 text、reasoning、tool_calls 和 audio，最后同样产出
+              <code>ChatResponse</code>。
+              源码见
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/model/_openai_chat/_model.py#L297-L506">Chat streaming parser</a>。
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>一个容易误读的点。</strong>
+                OpenAI Responses API 支持通过 <code>previous_response_id</code> 和 <code>store</code> 使用服务端上下文，也支持把 reasoning / function call
+                作为 typed output item 管理。AgentScope 这条 agent 主线里，显式 owner 仍是自己的 <code>Msg</code> context：
+                <code>_prepare_model_input</code> 先收集内部消息和工具，再由 Responses adapter 翻译成 <code>input</code>。
+                额外参数可以透传给 API，但 AgentScope 没有把 runtime 状态完全外包给 provider。
+              </p>
+            </div>
+
+            <h2>五、模型差异被归一回 ChatResponse，再变成 AgentEvent</h2>
+            <p>
+              上一节讲了两套 wire shape，真正让上层保持稳定的是 <code>ChatResponse</code>。在 <code>_reasoning_impl</code> 里，
+              AgentScope 先发 <code>ModelCallStartEvent</code>，调用 <code>_prepare_model_input</code> 和 <code>_call_model</code>；
+              如果结果是 async generator，就逐个 chunk 转成事件；如果是完整 <code>ChatResponse</code>，也走同一套
+              <code>_convert_chat_response_to_event</code>。最后它发出 block end events、<code>ModelCallEndEvent</code>，
+              把 completed response 写入 context；如果没有 tool call，才返回最终 <code>AssistantMsg</code>。
+              这段在
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/agent/_agent.py#L777-L879"><code>_reasoning_impl</code></a>。
+            </p>
+
+            <p>
+              换句话说，AgentScope 的 OpenAI Responses 支持不是“把 URL 换成 Responses 端点”。
+              它要保存 Responses 的 reasoning item id 和 function call <code>call_id</code>，要把 typed event 变成内部 content block，
+              还要保证下一轮 context 回放时 API 能接受。Chat Completions 支持也不是旧版 fallback，
+              它仍覆盖 OpenAI-compatible provider、audio-capable chat models 和传统 <code>messages</code> 生态。
+            </p>
+
+            <h2>六、service example 暴露的是服务平面</h2>
+            <p>
+              如果 AgentScope 只是一个本地脚本库，第二篇到这里就可以结束。但它的 example service 直接把
+              <code>create_app</code>、<code>RedisStorage</code>、<code>InMemoryMessageBus</code>、<code>LocalWorkspaceManager</code>、
+              默认 MCP、subagent template、CORS middleware 接起来。自定义 explorer 子 agent 还带了
+              <code>PermissionMode.EXPLORE</code>，也就是“只读 agent”不是 prompt 约定，而是权限上下文的一部分。
+              这段在
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/examples/agent_service/main.py#L39-L108">agent_service example</a>。
+            </p>
+
+            <p>
+              这解释了为什么第一篇把 AgentScope 放在“事件化 agent runtime、权限、workspace、服务化 session”这一格。
+              它不是最轻的 API 封装，也不是先让你画 workflow graph；它更像一个把单 agent turn 做完整、再往 service 和 team 扩展的框架。
+            </p>
+
+            <h2>七、读完 AgentScope 先记住这些 invariant</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Invariant</th>
+                    <th>对应源码事实</th>
+                    <th>工程含义</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>公开输出是事件，不只是文本。</td>
+                    <td><code>reply_stream</code> 过滤最终 <code>Msg</code>，持续 yield <code>AgentEvent</code>。</td>
+                    <td>前端、日志、控制台和服务端恢复都能跟踪中间态。</td>
+                  </tr>
+                  <tr>
+                    <td>内部状态是结构化消息账本。</td>
+                    <td><code>Msg.content</code> 是 content block list，context 由 agent 自己维护。</td>
+                    <td>模型历史、工具结果、thinking、data 不会退化成一坨字符串。</td>
+                  </tr>
+                  <tr>
+                    <td>工具调用先被治理，再被执行。</td>
+                    <td><code>_execute_tool_call</code> 先 schema 校验和 permission check，再进入 <code>_acting</code>。</td>
+                    <td>副作用边界能被审计、暂停、拒绝或交给外部系统。</td>
+                  </tr>
+                  <tr>
+                    <td>Responses 与 Chat 的差异在 adapter 层。</td>
+                    <td>两个 model class、两个 formatter，最后都产出 <code>ChatResponse</code>。</td>
+                    <td>上层 agent loop 不依赖某一个 provider 的 wire shape。</td>
+                  </tr>
+                  <tr>
+                    <td>服务化不是后补 demo。</td>
+                    <td>example service 同时接 storage、message bus、workspace、MCP 和 subagent templates。</td>
+                    <td>AgentScope 的设计目标明显包含多人产品和长期 session。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              下一篇会离开 AgentScope，转向 Google ADK Python。我们会看它为什么把 Agent 和 Workflow 放在一起，
+              以及当业务逻辑需要确定性分支、循环和状态转移时，workflow graph 应该拥有哪些责任。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul>
+              <li><a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/agent/_agent.py">AgentScope <code>Agent</code> runtime</a></li>
+              <li><a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/event/_event.py">AgentScope <code>EventType</code></a></li>
+              <li><a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/message/_base.py">AgentScope <code>Msg</code></a></li>
+              <li><a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/tool/_toolkit.py">AgentScope <code>Toolkit</code></a></li>
+              <li><a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/permission/_engine.py">AgentScope <code>PermissionEngine</code></a></li>
+              <li><a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/model/_openai_response/_model.py">AgentScope <code>OpenAIResponseModel</code></a></li>
+              <li><a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/src/agentscope/model/_openai_chat/_model.py">AgentScope <code>OpenAIChatModel</code></a></li>
+              <li><a href="https://developers.openai.com/api/docs/guides/migrate-to-responses">OpenAI Responses API migration guide</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        const headings = [...article.querySelectorAll("h2, h3, h4")];
+        const slugCounts = new Map();
+        const slugify = (text) => {
+          const raw = text
+            .trim()
+            .toLowerCase()
+            .replace(/<[^>]+>/g, "")
+            .replace(/[`"'“”‘’]/g, "")
+            .replace(/[^\p{Script=Han}\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          const base = raw || "section";
+          const count = slugCounts.get(base) || 0;
+          slugCounts.set(base, count + 1);
+          return count ? `${base}-${count + 1}` : base;
+        };
+        const root = document.createElement("ol");
+        root.className = "toc-list";
+        const stack = [{ level: 2, list: root }];
+        headings.forEach((heading) => {
+          if (!heading.id) heading.id = slugify(heading.textContent || "");
+          const level = Number(heading.tagName.slice(1));
+          while (stack.length && level < stack[stack.length - 1].level) stack.pop();
+          if (level > stack[stack.length - 1].level) {
+            const parent = stack[stack.length - 1].list.lastElementChild;
+            const child = document.createElement("ol");
+            child.className = "toc-sublist";
+            if (parent) parent.appendChild(child);
+            stack.push({ level, list: child });
+          }
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent || "";
+          link.className = `toc-link toc-level-${level}`;
+          item.appendChild(link);
+          stack[stack.length - 1].list.appendChild(item);
+        });
+        toc.appendChild(root);
+      })();
+    </script>
+  </body>
+</html>
