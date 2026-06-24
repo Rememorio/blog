@@ -181,7 +181,10 @@ When an already-written mechanism chapter would make a stronger later chapter,
 preserve it and move the series around it instead of flattening it into an
 overview. Renumber titles and metadata, update the series index, language
 gateway, blog home card, README entry, header navigation, previous/next links,
-and `og:image` so every public route teaches the same reading order.
+overview and chapter figures, alt text, and `og:image` so every public route
+teaches the same reading order. If a series overview image is a route map, its
+project count, labels, and ordering must match the visible chapter list unless
+the prose clearly frames the image as a partial historical snapshot.
 
 When a reader question is narrow or out of order, do not mirror the question as
 a random new section. Extract the durable confusion behind it and place the
@@ -555,6 +558,10 @@ for a single-language draft. Do not leave the English side as a route shell,
 stale chapter list, missing next/previous target, or untranslated copy of the
 Chinese page.
 
+Equivalence is structural as well as textual: titles, metadata, header tabs,
+language switches, source lists, figures, alt text, home cards, and route-map
+references should describe the same public chapter set in both languages.
+
 Write each language as a finished article in that language. Do not mechanically
 translate sentence by sentence when the target language needs different
 rhythm, transitions, or terminology. Keep the evidence, figures, source links,
@@ -699,6 +706,10 @@ Images must be useful for readers who see them and readers who rely on text:
 
 - Every public `img` needs informative `alt` text that names the concept, not
   generic text such as "diagram" or "image".
+- When a figure is a series overview, route map, comparison grid, or chapter
+  map, its alt text should name the same entries, ordering, or scope that the
+  visible figure and surrounding prose present. Update alt text whenever the
+  figure's inventory changes.
 - Use a visible caption when the figure's interpretation is not already clear
   from the surrounding paragraph.
 - It is acceptable to use Rememorio style without explicit `figcaption` when
@@ -735,9 +746,13 @@ For any article change:
 3. Keep filenames stable unless the semantic role of a figure changes.
 4. Update `og:image` if the cover changes.
 5. Check the generated table of contents after heading changes.
-6. Verify desktop and mobile widths for overflow, cramped figures, and broken
+6. For series additions, removals, or reordering, verify that overview pages,
+   route-map figures, cover images, alt text, chapter numbers, navigation
+   tabs, home cards, README entries, and language gateways all expose the same
+   sequence.
+7. Verify desktop and mobile widths for overflow, cramped figures, and broken
    code/table scrolling.
-7. Keep the README public index current for new public entry points.
+8. Keep the README public index current for new public entry points.
 
 For language-structure changes, also verify:
 
@@ -759,6 +774,8 @@ For language-structure changes, also verify:
   text point at the correct language asset;
 - source and target language figure contact sheets have been compared when a
   batch of localized raster images is added or regenerated.
+- overview and route-map images have been rechecked against both language
+  chapter lists, especially after adding one page to an established series.
 
 Before committing public article changes, run the smallest relevant validation
 that covers the edit:
