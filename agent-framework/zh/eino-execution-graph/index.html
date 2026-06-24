@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent 框架源码阅读（七）：Eino 把 agent 应用收束成 Go 的可组合执行图</title>
+    <meta
+      name="description"
+      content="Agent 框架源码阅读第七篇：从 Eino 的 Component、Runnable、compose Graph、checkpoint、callback、ADK Runner、ChatModelAgent 和 AgentTool 读懂 Go 版 agent runtime 的执行边界。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Agent 框架源码阅读（七）：Eino 把 agent 应用收束成 Go 的可组合执行图" />
+    <meta
+      property="og:description"
+      content="Eino 的中心不是团队角色，也不是托管平台，而是 typed components、Runnable、compose graph 和 ADK Runner 组成的 Go 执行图。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/eino-execution-graph.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-framework/zh/eino-execution-graph/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-framework/zh/eino-execution-graph/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-framework/en/eino-execution-graph/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-framework/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(31, 119, 123, 0.34);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      .compare-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin: 18px 0 22px;
+      }
+
+      .compare-card {
+        border: 1px solid rgba(24, 55, 82, 0.14);
+        border-radius: 8px;
+        background: rgba(255, 250, 240, 0.72);
+        padding: 14px;
+      }
+
+      .compare-card h3 {
+        margin-top: 0;
+      }
+
+      @media (max-width: 900px) {
+        .compare-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Agent 框架系列</a>
+        <a href="../crewai-crews-flows/">上一篇</a>
+        <a href="#compose-runtime">compose</a>
+        <a href="#adk-runner">ADK Runner</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/eino-execution-graph/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Agent 框架源码阅读 · 第七篇</p>
+            <h1>Eino 把 agent 应用收束成 Go 的可组合执行图</h1>
+            <p class="lead">
+              CrewAI 用 Agent、Task、Crew 和 Flow 让应用先说清团队流程。Eino 换了一个入口：
+              它先定义 Go 组件接口，再把组件编译成 <code>Runnable</code> 和 <code>compose Graph</code>，
+              最后让 ADK Runner、ChatModelAgent 和 AgentTool 复用同一套流式、回调、中断和恢复边界。
+            </p>
+            <div class="meta-line">
+              <span>主题：Eino</span>
+              <span>主线：typed components + runnable graph</span>
+              <span>重点：compose / ADK / interrupt</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/eino-execution-graph.png"
+                alt="Eino Go Execution Graph 手绘图：Components 包含 ChatModel、Tool、Retriever、Prompt、Schema、Message 和 AgenticMessage；compose Graph 包含 START、Node、Branch、END、State、Callbacks、Checkpoint 和 Runnable 的 Invoke、Stream、Collect、Transform；ADK Runner 包含 ChatModelAgent、Message ReAct loop、AgenticMessage single shot、ToolsNode、AgentTool、AsyncIterator、Interrupt 和 Resume"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Eino README 的第一句定位是：Eino 是一个 Golang 的 LLM application development framework，吸收 LangChain、Google ADK
+              等框架经验，同时遵循 Golang conventions。它提供四块东西：Components、Agent Development Kit、Composition 和 Examples。
+              证据在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/README.md#L15-L23">Eino README overview</a>。
+            </p>
+
+            <p>
+              更短的源码注释把边界说得更像工程内核：根包提供 agent workflows、tools 和 composable graph utilities；
+              <code>compose</code> 包提供 graph 与 workflow primitives，用来构建 composable、interruptible execution pipelines，并支持 callback。
+              证据在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/doc.go#L17-L18"><code>doc.go</code></a>
+              和
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/doc.go#L17-L18"><code>compose/doc.go</code></a>。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                本篇结论：<strong>Eino 的核心 owner 是 Go 类型化执行图。</strong>
+                它不是先给你一个“团队”或“平台”抽象，而是先把 ChatModel、Tool、Retriever、Prompt、schema 等组件放进
+                <code>Runnable[I, O]</code> 与 <code>compose.Graph[I, O]</code>。ADK 的 agent 循环只是这套 graph runtime 上的一层 agent 语义。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                Eino 源码固定到 <code>e8832e223b93a7f45b1cc3d491239c14f94717c0</code>。
+                本文只基于公开 README 与源码；“Go 类型化执行图”是对公开抽象 owner 的工程归纳，不是 Eino 官方术语。
+              </p>
+            </div>
+
+            <h2>一、组件层先把模型、工具和消息形状封住</h2>
+            <p>
+              Eino 的组件接口很 Go。<code>BaseModel[M]</code> 用 sealed type constraint 限定消息类型只能是
+              <code>*schema.Message</code> 或 <code>*schema.AgenticMessage</code>，并暴露 <code>Generate</code> 和 <code>Stream</code> 两种交互。
+              <code>BaseChatModel</code> 是 <code>*schema.Message</code> 的别名，输入是 conversation history；旧的 <code>ChatModel.BindTools</code>
+              被标为 deprecated，因为它会原地修改实例并在并发时引入 race；新的 <code>ToolCallingChatModel.WithTools</code>
+              返回不可变 variant。<code>AgenticModel</code> 则是 <code>*schema.AgenticMessage</code> 的别名，工具通过 request option 传入。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/components/model/interface.go#L25-L109"><code>components/model/interface.go</code></a>。
+            </p>
+
+            <p>
+              工具接口也被拆成元数据和执行面。<code>BaseTool.Info</code> 返回 name、description 和参数 JSON schema；
+              真正执行时才需要 <code>InvokableTool</code>、<code>StreamableTool</code>，或能返回 multimodal result 的 enhanced variants。
+              这个拆分让模型可见的 tool schema 与 runtime 真实副作用保持分层。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/components/tool/interface.go#L25-L78"><code>components/tool/interface.go</code></a>。
+            </p>
+
+            <div class="compare-grid" aria-label="Eino Message 与 AgenticMessage 的差异">
+              <section class="compare-card">
+                <h3><code>schema.Message</code></h3>
+                <p>
+                  role 是 system / user / assistant / tool；assistant message 可以带 <code>ToolCalls</code>，
+                  tool message 通过 <code>ToolCallID</code> 回填结果。它更像 chat completions 时代的 conversation history。
+                </p>
+              </section>
+              <section class="compare-card">
+                <h3><code>schema.AgenticMessage</code></h3>
+                <p>
+                  内容是 <code>ContentBlock</code> 列表，块类型包含 reasoning、function tool、server tool、MCP call、
+                  MCP approval request / response 等。它更适合 provider 原生 agentic 事件。
+                </p>
+              </section>
+            </div>
+
+            <p>
+              这不是文档层命名差异。<code>schema.Message</code> 明确定义 role、tool call、multimodal part、response meta 和 reasoning content；
+              <code>schema.AgenticMessage</code> 则把 reasoning、assistant generated media、server tool call、MCP tool call 和 approval request
+              都建模成 content blocks。证据在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/schema/message.go#L108-L145"><code>Message</code> role and tool call</a>、
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/schema/message.go#L318-L337">chat message parts</a>、
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/schema/message.go#L458-L528"><code>Message</code> struct</a>
+              和
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/schema/agentic_message.go#L38-L173"><code>AgenticMessage</code> blocks</a>。
+            </p>
+
+            <h2 id="compose-runtime">二、<code>Runnable</code> 是 compose runtime 的最小执行契约</h2>
+            <p>
+              Eino 的关键抽象不是“graph 有一个 run 方法”，而是 <code>Runnable[I, O]</code> 同时承诺四种数据流：
+              <code>Invoke</code> 是普通输入到普通输出，<code>Stream</code> 是普通输入到流式输出，
+              <code>Collect</code> 是流式输入到普通输出，<code>Transform</code> 是流式输入到流式输出。
+              源码注释直接说 graph 和 chain 都会编译成 Runnable，并且 Eino 会对四种 data flow patterns 做 downgrade compatibility。
+              证据在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/runnable.go#L28-L37"><code>Runnable</code> interface</a>。
+            </p>
+
+            <p>
+              这个设计解决一个实际问题：不同组件天然支持的流形态不同，框架不能要求每个组件都手写四套实现。
+              所以 <code>runnablePacker</code> 会把用户给的 invoke / stream / collect / transform 包成 <code>composableRunnable</code>，
+              做输入、输出、option 的类型检查；默认转换函数再用 stream concat 或 single-element stream 在四种形态之间转换。
+              证据在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/runnable.go#L100-L155">runnable packing</a>
+              和
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/runnable.go#L182-L280">default flow conversion</a>。
+            </p>
+
+            <p>
+              <code>Graph[I, O]</code> 是把这些 Runnable 组织起来的 typed graph。<code>NewGraph</code> 可以带 local state generator；
+              <code>AddEdge</code> 明确要求上一节点输出类型匹配下一节点输入类型；<code>Compile</code> 把 graph 编译成 Runnable，
+              于是编译后的 graph 同样支持 <code>Invoke / Stream / Collect / Transform</code>。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/generic_graph.go#L35-L72"><code>NewGraph</code> and state</a>、
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/generic_graph.go#L97-L124"><code>AddEdge</code> and <code>Compile</code></a>。
+            </p>
+
+            <p>
+              graph 内部同时记录 control edges、data edges、branches、start nodes、end nodes、state type、expected input / output type、
+              handlers 和 compiled 标记。<code>graphRunType</code> 里有 Pregel 与 DAG 两种运行模式：Pregel 支持环和 AnyPredecessor，
+              DAG 面向有向无环图并配合 AllPredecessor。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/graph.go#L36-L89"><code>graph</code> fields and run types</a>。
+            </p>
+
+            <h2>三、执行循环把 channel、task、checkpoint 和 interrupt 串起来</h2>
+            <p>
+              编译后的 runner 保存了 channel subscription、successors、data / control predecessors、input channels、eager / dag 标记、
+              graph compile options、stream filters、handler managers、checkpoint pointer、interruptBefore / interruptAfter nodes 和 fan-in merge configs。
+              这说明运行时接管的不只是拓扑，而是数据流、控制流、状态恢复和观测切面。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/graph_run.go#L43-L84"><code>runner</code> fields</a>。
+            </p>
+
+            <p>
+              <code>runner.run</code> 的前半段先确定是 <code>Invoke</code> 还是 <code>Transform</code>，初始化 channel manager 和 task manager，
+              解析 max steps、node options、checkpoint id 和 subgraph path。然后它要么从 context / store 恢复 checkpoint，
+              要么从 START 节点计算第一批 tasks。如果第一批 tasks 命中 interrupt-before 节点，会立即构造 interrupt。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/graph_run.go#L109-L235"><code>runner.run</code> setup</a>。
+            </p>
+
+            <p>
+              主循环则是固定三步：submit next tasks，wait completed tasks，calculate next tasks。它会处理 context cancellation、
+              max steps、subgraph interrupt、rerun nodes、interrupt-before 与 interrupt-after，再在到达 END 时返回 result。
+              DAG 模式不能设置 max run steps，非 DAG 模式必须有正数 max steps。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/graph_run.go#L240-L380">main execution loop</a>。
+            </p>
+
+            <p>
+              恢复的关键是 checkpoint 里保存的不只是“下一步节点”。<code>restoreCheckPointState</code> 会恢复 channels，
+              应用 state modifier，把 checkpoint state 挂回 context；<code>handleInterrupt</code> 会复制 state、记录待执行 inputs、
+              建立 interrupt id 到 address / state 的持久化映射，必要时写 checkpoint store。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/graph_run.go#L382-L421">restore checkpoint state</a>
+              和
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/graph_run.go#L502-L568">handle interrupt</a>。
+            </p>
+
+            <p>
+              公开 interrupt API 也对应这条执行链。编译时可以声明 <code>WithInterruptBeforeNodes</code> 或
+              <code>WithInterruptAfterNodes</code>；普通组件用 <code>Interrupt</code>，需要保存组件内部状态时用
+              <code>StatefulInterrupt</code>，复合节点例如 ToolsNode 则用 <code>CompositeInterrupt</code> 把多个子中断压成一个可恢复信号。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/interrupt.go#L30-L42">interrupt compile options</a>、
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/interrupt.go#L102-L137"><code>Interrupt</code> and <code>StatefulInterrupt</code></a>
+              和
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/interrupt.go#L139-L237"><code>CompositeInterrupt</code></a>。
+            </p>
+
+            <h2>四、callback 是 aspect，不是随便插日志</h2>
+            <p>
+              Eino 的 callback API 把观测也当成 runtime 边界。<code>RunInfo</code> 描述触发 callback 的实体，
+              包括用户可读 name、实现 type 和 component category；注释提醒 handler 应该根据 RunInfo 过滤，而不是假定不同 handlers 有固定执行顺序。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/callbacks/interface.go#L23-L40"><code>RunInfo</code></a>。
+            </p>
+
+            <p>
+              <code>Handler</code> 统一了 <code>OnStart</code>、<code>OnEnd</code>、<code>OnError</code>、stream input start 和 stream output end。
+              同一个 handler 的 context 可以沿 timing 传递，但不同 handlers 之间没有顺序保证；stream handler 拿到的是复制出来的
+              <code>StreamReader</code>，必须 close，否则原 stream 无法释放；同时注释明确禁止 mutate input / output，因为下游节点和 handlers
+              共享同一指针，会引发并发图里的 data race。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/callbacks/interface.go#L62-L85"><code>Handler</code> contract</a>。
+            </p>
+
+            <h2 id="adk-runner">五、ADK Runner 是 agent 层入口，但仍然走 flowAgent 边界</h2>
+            <p>
+              README 的 Quick Start 很短：创建 ChatModel，再创建 <code>adk.NewChatModelAgent</code>，交给
+              <code>adk.NewRunner</code>，最后通过 <code>runner.Query</code> 得到 event iterator。加 tools 时，tools 放进
+              <code>ToolsConfig</code> 里的 <code>compose.ToolsNodeConfig</code>；README 说明 agent 会内部处理 ReAct loop。
+              证据在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/README.md#L29-L69">ChatModelAgent quick start</a>。
+            </p>
+
+            <p>
+              源码上，<code>TypedRunner</code> 的注释说它是执行 Agent 的 primary entry point，负责 start、resume 和 checkpoint；
+              更重要的是，execution always goes through the <code>flowAgent</code> pipeline，用来处理 multi-agent orchestration、callbacks、
+              agent naming、run paths 和 cancellation。<code>Run</code> 和 <code>Query</code> 返回 <code>AsyncIterator</code>；
+              <code>Resume</code> 与 <code>ResumeWithParams</code> 则从 checkpoint 继续执行，并允许按 address 提供 resume data。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/runner.go#L50-L154"><code>TypedRunner</code></a>。
+            </p>
+
+            <p>
+              Runner 的实现也保留了类型分层：如果消息类型是 <code>*schema.Message</code>，会把 agent 转成 legacy-compatible 的 flowAgent；
+              否则走 typed flowAgent。恢复时，checkpoint 里保存的 streaming mode 是 source of truth，而不是新建 Runner 时传入的值。
+              事件处理循环遇到 interrupted action 时，会把内部 interrupt signal 转成公开 interrupt contexts，并在有 checkpoint id 时保存 checkpoint。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/runner.go#L156-L203">runner run implementation</a>、
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/runner.go#L205-L269">runner resume implementation</a>
+              和
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/runner.go#L271-L342">runner event handling</a>。
+            </p>
+
+            <h2>六、ChatModelAgent 是 graph 上的 agent 循环</h2>
+            <p>
+              <code>ToolsConfig</code> 继承 <code>compose.ToolsNodeConfig</code>，再增加 ReturnDirectly 和 EmitInternalEvents。
+              注释强调：agent tool 的内部事件可以转发给父 agent 的 AsyncGenerator，但不会记录进父 agent state 或 checkpoint；
+              Interrupted 例外，它会通过 CompositeInterrupt 传播，以便跨 agent 边界恢复。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/chatmodel.go#L136-L156"><code>ToolsConfig</code></a>。
+            </p>
+
+            <p>
+              <code>TypedChatModelAgentConfig</code> 里可以看到 agent 层真正关心的东西：Name、Description、Instruction、Model、
+              ToolsConfig、GenModelInput、Exit、OutputKey、MaxIterations、Middlewares、Handlers、retry 和 failover。
+              其中 handler 注释很长，因为模型调用、工具调用、事件发送、状态重写、动态工具列表和 prompt cache 都会被 handler 顺序影响。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/chatmodel.go#L259-L425"><code>TypedChatModelAgentConfig</code></a>。
+            </p>
+
+            <p>
+              这里最值得和 AgentScope 的 OpenAI Responses API 分析放在一起看。Eino 不是在 adapter 里简单判断一个 endpoint，
+              而是在类型层把两类消息分开：<code>*schema.Message</code> 使用完整 ReAct loop，即 model 到 tool calls 再到 model；
+              <code>*schema.AgenticMessage</code> 使用 single-shot chain，因为 agentic models 自己处理工具调用。源码注释直接写在
+              <code>TypedChatModelAgent</code> 上；真正构建 run function 时，<code>buildReActRunFunc</code> 对两种消息类型做 type switch。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/chatmodel.go#L419-L425"><code>TypedChatModelAgent</code> mode split</a>
+              和
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/chatmodel.go#L1079-L1089"><code>buildReActRunFunc</code></a>。
+            </p>
+
+            <p>
+              普通 <code>Message</code> 分支会创建 <code>newReact</code> graph，再用 <code>compose.NewChain</code> 先把 agent input 转成
+              react input，然后 <code>AppendGraph(g, WithNodeName("ReAct"))</code>，最后用 graph name、checkpoint store、serializer 和 max steps
+              编译成 runnable。运行时根据 EnableStreaming 调 <code>runnable.Stream</code> 或 <code>runnable.Invoke</code>。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/chatmodel.go#L1097-L1228">message ReAct run function</a>。
+            </p>
+
+            <p>
+              <code>AgenticMessage</code> 分支也会构建 graph 和 chain，但源头是 <code>newAgenticReact</code>，输入是
+              <code>*schema.AgenticMessage</code>，模型类型是 <code>model.AgenticModel</code>。这让 provider 原生 agentic content blocks
+              和传统 chat history 在 Go 类型层、graph 编译层、事件层都保持分离。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/chatmodel.go#L1236-L1305">agentic run function</a>。
+            </p>
+
+            <p>
+              Agent 真正运行时还会先 <code>buildRunFunc</code> 冻结默认执行函数；如果有 handler 在 BeforeAgent 阶段修改 tools 或 instruction，
+              <code>getRunFunc</code> 可以按 runtime exec context 重新构图。<code>Run</code> 会创建 AsyncIterator / AsyncGenerator，
+              追加 bridge checkpoint id，把 tool infos 通过 <code>model.WithTools</code> 传进 compose options，再在 goroutine 里执行 run。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/chatmodel.go#L1366-L1516"><code>ChatModelAgent.Run</code></a>。
+            </p>
+
+            <h2>七、AgentTool 把多 agent 协作收束成工具边界</h2>
+            <p>
+              README 里 DeepAgent 被描述成能拆分复杂任务、委派给 sub-agents、跟踪进度，并可配置 shell、Python、web search 等工具。
+              同一 README 的 Composition 例子还展示了 graph 可以包装成 tool，再交给 agent 判断什么时候使用。
+              这两段说明 Eino 对 multi-agent 和 deterministic workflow 的连接方式不是另起一个 bus，而是继续回到 tool 与 graph。
+              证据在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/README.md#L71-L130">DeepAgent and Composition</a>。
+            </p>
+
+            <p>
+              <code>NewAgentTool</code> 的注释把边界讲得很直接：被包装的 agent 必须有非空 Name 和 Description，因为它们会成为 tool name
+              和 description；内部事件可以转发给父 agent 的用户侧事件流，但不会记录到父 state 或 checkpoint。Exit、TransferToAgent、
+              BreakLoop 这些 action 都被限制在 agent tool 内部；只有 Interrupted 会通过 CompositeInterrupt 跨边界传播。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/agent_tool.go#L69-L93"><code>NewAgentTool</code></a>。
+            </p>
+
+            <p>
+              运行时，<code>InvokableRun</code> 会判断当前 tool 是否从 interrupt state 恢复。如果不是恢复，它会根据参数或 full chat history
+              构造 agent input，创建 runner，并带上 bridge checkpoint id 运行；如果是恢复，则创建 resume bridge store 并调用
+              <code>runner.Resume</code>。事件循环会关闭上一条 stream，必要时转发内部事件；最终如果最后一个 event 是 Interrupted，
+              就从 bridge store 取 checkpoint data，再返回 <code>tool.CompositeInterrupt</code>。
+              源码在
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/agent_tool.go#L133-L214">agent tool setup and resume</a>
+              和
+              <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/agent_tool.go#L216-L279">agent tool event loop</a>。
+            </p>
+
+            <h2>八、和前几篇放在一起看</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>框架</th>
+                    <th>先读的 owner</th>
+                    <th>最容易误读的点</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>AgentScope</td>
+                    <td>agent turn ledger 与 OpenAI API 适配。</td>
+                    <td>Responses API 不是 Chat Completions 的字段别名，而是事件化、item 化的输出模型。</td>
+                  </tr>
+                  <tr>
+                    <td>ADK Python</td>
+                    <td>code-first Agent + Workflow + Runner。</td>
+                    <td>不是只有 graph DSL，自主 agent 和确定性 workflow 共用运行边界。</td>
+                  </tr>
+                  <tr>
+                    <td>Agno</td>
+                    <td>AgentOS platform control plane。</td>
+                    <td>不是更大的 agent dataclass，而是 API、storage、approval、RBAC 和 interface 平台层。</td>
+                  </tr>
+                  <tr>
+                    <td>AutoGen / MAF</td>
+                    <td>message runtime 到 production orchestration。</td>
+                    <td>AutoGen 进入 maintenance mode 后，新项目应该从 MAF 的 Agent、Workflow、Hosting 读起。</td>
+                  </tr>
+                  <tr>
+                    <td>CrewAI</td>
+                    <td>Agent / Task / Crew / Flow。</td>
+                    <td>不要先找底层 bus；它先把团队自治和生产控制建模给应用开发者。</td>
+                  </tr>
+                  <tr>
+                    <td>Eino</td>
+                    <td>Component / Runnable / compose Graph / ADK Runner。</td>
+                    <td>不要把它只看成 Go 版 ReAct；ReAct agent 是 typed runnable graph 上的一层。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这一组框架放完，路线就清楚了：如果你要看 provider item 与 turn ledger，读 AgentScope；要看 code-first agent / workflow，
+              读 ADK；要看平台化 control plane，读 Agno；要看消息 runtime 到生产 orchestrator 的迁移，读 AutoGen 和 MAF；
+              要看团队流程，读 CrewAI；要看 Go 生态里怎样把组件、流、中断和 agent 循环收束成可组合图，读 Eino。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/README.md">Eino README</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/doc.go">Eino root package docs</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/doc.go">Eino compose package docs</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/components/model/interface.go">Eino model interfaces</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/components/tool/interface.go">Eino tool interfaces</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/schema/message.go">Eino <code>schema.Message</code></a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/schema/agentic_message.go">Eino <code>schema.AgenticMessage</code></a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/runnable.go">Eino <code>Runnable</code></a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/generic_graph.go">Eino generic graph</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/graph.go">Eino graph internals</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/graph_run.go">Eino graph runner</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/interrupt.go">Eino interrupt API</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/callbacks/interface.go">Eino callbacks</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/runner.go">Eino ADK Runner</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/chatmodel.go">Eino ChatModelAgent</a></li>
+              <li><a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/agent_tool.go">Eino AgentTool</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        const headings = [...article.querySelectorAll("h2, h3, h4")];
+        const slugCounts = new Map();
+        const slugify = (text) => {
+          const raw = text
+            .trim()
+            .toLowerCase()
+            .replace(/<[^>]+>/g, "")
+            .replace(/[`"'“”‘’]/g, "")
+            .replace(/[^\p{Script=Han}\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          const base = raw || "section";
+          const count = slugCounts.get(base) || 0;
+          slugCounts.set(base, count + 1);
+          return count ? `${base}-${count + 1}` : base;
+        };
+        const root = document.createElement("ol");
+        root.className = "toc-list";
+        const stack = [{ level: 2, list: root }];
+        headings.forEach((heading) => {
+          if (!heading.id) heading.id = slugify(heading.textContent || "");
+          const level = Number(heading.tagName.slice(1));
+          while (stack.length && level < stack[stack.length - 1].level) stack.pop();
+          if (level > stack[stack.length - 1].level) {
+            const parent = stack[stack.length - 1].list.lastElementChild;
+            const child = document.createElement("ol");
+            child.className = "toc-sublist";
+            if (parent) parent.appendChild(child);
+            stack.push({ level, list: child });
+          }
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent || "";
+          link.className = `toc-link toc-level-${level}`;
+          item.appendChild(link);
+          stack[stack.length - 1].list.appendChild(item);
+        });
+        toc.appendChild(root);
+      })();
+    </script>
+  </body>
+</html>
