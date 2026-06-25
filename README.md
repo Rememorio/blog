@@ -106,6 +106,8 @@ For bilingual work, keep each edition as a sibling page:
 Each edition should have its own title, metadata, table of contents, language
 switch, canonical link, `hreflang` links, and localized alt text. Shared figures
 are preferred when labels are concise and language-neutral.
+For series pages, both languages should expose the same public chapter set,
+route order, overview image, and navigation graph.
 
 ## Figure Conventions
 
@@ -118,7 +120,10 @@ Figures should:
 - make ownership boundaries, lifecycles, or state ledgers visible;
 - keep labels short and readable at article width;
 - avoid misleading arrows, crowded callouts, and overlapping text;
-- include exactly one deterministic Rememorio brand treatment;
+- include one integrated Rememorio treatment; established series should preserve
+  the in-scene Eyjafjalla guide rather than replacing it with a generic card;
+- keep series overview or route-map figures aligned with the published chapter
+  list, ordering, labels, and alt text;
 - be checked at both desktop and mobile widths before publication.
 
 When prose changes alter a lifecycle, side path, state boundary, or comparison,
@@ -136,6 +141,9 @@ Before publishing changes:
 - Sample-check representative GitHub source links.
 - For bilingual changes, verify indexes, language switches, canonical links,
   `hreflang` links, and old hash redirects.
+- For series changes, verify chapter navigation, overview images, route-map alt
+  text, home cards, README entries, and language gateways all describe the same
+  sequence.
 
 ## Acknowledgements
 
