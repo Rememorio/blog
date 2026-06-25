@@ -110,8 +110,8 @@
             <h1>Eino 把 agent 应用收束成 Go 的可组合执行图</h1>
             <p class="lead">
               CrewAI 用 Agent、Task、Crew 和 Flow 让应用先说清团队流程。Eino 换了一个入口：
-              它先定义 Go 组件接口，再把组件编译成 <code>Runnable</code> 和 <code>compose Graph</code>，
-              最后让 ADK Runner、ChatModelAgent 和 AgentTool 复用同一套流式、回调、中断和恢复边界。
+              它先把模型、工具、检索器和 prompt 做成 Go 组件，再把它们编译成 <code>Runnable</code> 和
+              <code>compose Graph</code>。ReAct agent 不是起点，而是这套执行图上的一层用法。
             </p>
             <div class="meta-line">
               <span>主题：Eino</span>
@@ -127,6 +127,12 @@
           </section>
 
           <section class="article-body">
+            <p>
+              先想一个 Go 团队的真实处境：公司已有订单服务、风控服务和搜索服务都在 Go 里，团队想加一个能查资料、调用工具、
+              流式返回、必要时中断恢复的 agent。如果方案要求单独拉一个 Python agent 服务，系统边界会变复杂。
+              Eino 的选择是：先把这些能力做成 Go 组件和可组合执行图，再把 agent loop 放到图上运行。
+            </p>
+
             <p>
               Eino README 的第一句定位是：Eino 是一个 Golang 的 LLM application development framework，吸收 LangChain、Google ADK
               等框架经验，同时遵循 Golang conventions。它提供四块东西：Components、Agent Development Kit、Composition 和 Examples。
@@ -145,9 +151,10 @@
 
             <div class="note key-point">
               <p>
-                本篇结论：<strong>Eino 的核心 owner 是 Go 类型化执行图。</strong>
-                它不是先给你一个“团队”或“平台”抽象，而是先把 ChatModel、Tool、Retriever、Prompt、schema 等组件放进
-                <code>Runnable[I, O]</code> 与 <code>compose.Graph[I, O]</code>。ADK 的 agent 循环只是这套 graph runtime 上的一层 agent 语义。
+                <strong>阅读契约。</strong>
+                这篇只抓一条线：Eino 先解决“Go 组件怎样组合、流式运行、中断和恢复”，再在这条线上实现 ADK Runner、
+                ChatModelAgent 和 AgentTool。读它时不要先找团队协作抽象，也不要只找 ReAct loop；
+                先看 <code>Runnable[I, O]</code> 和 <code>compose.Graph[I, O]</code>。
               </p>
             </div>
 
@@ -161,11 +168,11 @@
 
             <h2>一、组件层先把模型、工具和消息形状封住</h2>
             <p>
-              Eino 的组件接口很 Go。<code>BaseModel[M]</code> 用 sealed type constraint 限定消息类型只能是
-              <code>*schema.Message</code> 或 <code>*schema.AgenticMessage</code>，并暴露 <code>Generate</code> 和 <code>Stream</code> 两种交互。
-              <code>BaseChatModel</code> 是 <code>*schema.Message</code> 的别名，输入是 conversation history；旧的 <code>ChatModel.BindTools</code>
-              被标为 deprecated，因为它会原地修改实例并在并发时引入 race；新的 <code>ToolCallingChatModel.WithTools</code>
-              返回不可变 variant。<code>AgenticModel</code> 则是 <code>*schema.AgenticMessage</code> 的别名，工具通过 request option 传入。
+              Eino 的组件接口很 Go：先把类型边界收紧，再谈 agent 行为。<code>BaseModel[M]</code> 用 sealed type constraint
+              限定消息类型只能是 <code>*schema.Message</code> 或 <code>*schema.AgenticMessage</code>，并暴露 <code>Generate</code>
+              和 <code>Stream</code> 两种交互。旧的 <code>ChatModel.BindTools</code> 被标为 deprecated，
+              因为它会原地修改实例并在并发时引入 race；新的 <code>ToolCallingChatModel.WithTools</code> 返回不可变 variant。
+              这就是 Go 风格：并发安全和类型边界先行。
               源码在
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/components/model/interface.go#L25-L109"><code>components/model/interface.go</code></a>。
             </p>
@@ -216,6 +223,45 @@
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/runnable.go#L28-L37"><code>Runnable</code> interface</a>。
             </p>
 
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>数据流</th>
+                    <th>输入</th>
+                    <th>输出</th>
+                    <th>适合什么组件</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>Invoke</code></td>
+                    <td>普通值</td>
+                    <td>普通值</td>
+                    <td>一次性分类、格式化、同步工具调用。</td>
+                  </tr>
+                  <tr>
+                    <td><code>Stream</code></td>
+                    <td>普通值</td>
+                    <td>流</td>
+                    <td>LLM token streaming 或流式搜索结果。</td>
+                  </tr>
+                  <tr>
+                    <td><code>Collect</code></td>
+                    <td>流</td>
+                    <td>普通值</td>
+                    <td>把上游多个 chunk 汇总成最终结构。</td>
+                  </tr>
+                  <tr>
+                    <td><code>Transform</code></td>
+                    <td>流</td>
+                    <td>流</td>
+                    <td>边接收边改写，例如流式脱敏、过滤或转换。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
             <p>
               这个设计解决一个实际问题：不同组件天然支持的流形态不同，框架不能要求每个组件都手写四套实现。
               所以 <code>runnablePacker</code> 会把用户给的 invoke / stream / collect / transform 包成 <code>composableRunnable</code>，
@@ -245,12 +291,40 @@
 
             <h2>三、执行循环把 channel、task、checkpoint 和 interrupt 串起来</h2>
             <p>
-              编译后的 runner 保存了 channel subscription、successors、data / control predecessors、input channels、eager / dag 标记、
-              graph compile options、stream filters、handler managers、checkpoint pointer、interruptBefore / interruptAfter nodes 和 fan-in merge configs。
-              这说明运行时接管的不只是拓扑，而是数据流、控制流、状态恢复和观测切面。
+              Graph 编译完之后，runner 接管的不只是“节点之间怎么连”。它还要管四件事：数据从哪个 channel 来、下一个 task 怎么算、
+              checkpoint 怎么恢复、interrupt 发生时怎样把状态交还给调用方。这样一个 Go graph 才能既支持流式输出，也支持中断和恢复。
               源码在
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/graph_run.go#L43-L84"><code>runner</code> fields</a>。
             </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>runner 接管的层</th>
+                    <th>它解决什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>channel / predecessors / successors</td>
+                    <td>数据流和控制流不是临时 callback，而是由 graph runtime 调度。</td>
+                  </tr>
+                  <tr>
+                    <td>task manager</td>
+                    <td>每一轮该跑哪些节点、哪些已经完成，由 runner 统一计算。</td>
+                  </tr>
+                  <tr>
+                    <td>checkpoint pointer</td>
+                    <td>恢复时能找回 channel、state 和待执行节点。</td>
+                  </tr>
+                  <tr>
+                    <td>interruptBefore / interruptAfter</td>
+                    <td>人机确认或外部等待可以成为 graph 的正式暂停点。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
 
             <p>
               <code>runner.run</code> 的前半段先确定是 <code>Invoke</code> 还是 <code>Transform</code>，初始化 channel manager 和 task manager，
@@ -337,7 +411,9 @@
 
             <h2>六、ChatModelAgent 是 graph 上的 agent 循环</h2>
             <p>
-              <code>ToolsConfig</code> 继承 <code>compose.ToolsNodeConfig</code>，再增加 ReturnDirectly 和 EmitInternalEvents。
+              <code>ChatModelAgent</code> 不是跳出 graph runtime 自己写一套 agent loop。它仍然把 tools 放进 <code>ToolsNode</code>，
+              把模型调用、工具调用、checkpoint 和 interrupt 放回 compose 边界里。<code>ToolsConfig</code> 继承
+              <code>compose.ToolsNodeConfig</code>，再增加 ReturnDirectly 和 EmitInternalEvents。
               注释强调：agent tool 的内部事件可以转发给父 agent 的 AsyncGenerator，但不会记录进父 agent state 或 checkpoint；
               Interrupted 例外，它会通过 CompositeInterrupt 传播，以便跨 agent 边界恢复。
               源码在
@@ -345,9 +421,10 @@
             </p>
 
             <p>
-              <code>TypedChatModelAgentConfig</code> 里可以看到 agent 层真正关心的东西：Name、Description、Instruction、Model、
-              ToolsConfig、GenModelInput、Exit、OutputKey、MaxIterations、Middlewares、Handlers、retry 和 failover。
-              其中 handler 注释很长，因为模型调用、工具调用、事件发送、状态重写、动态工具列表和 prompt cache 都会被 handler 顺序影响。
+              <code>TypedChatModelAgentConfig</code> 里的配置可以分成四组：身份说明（Name、Description、Instruction）、
+              执行核心（Model、ToolsConfig、GenModelInput）、停止与输出（Exit、OutputKey、MaxIterations），以及运行切面
+              （Middlewares、Handlers、retry、failover）。其中 handler 注释很长，因为模型调用、工具调用、事件发送、
+              状态重写、动态工具列表和 prompt cache 都会被 handler 顺序影响。
               源码在
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/chatmodel.go#L259-L425"><code>TypedChatModelAgentConfig</code></a>。
             </p>
