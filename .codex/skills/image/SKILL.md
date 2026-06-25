@@ -17,6 +17,10 @@ and quality reference. Before producing a new figure, inspect the repository
 root `Eyjafjalla.png` character reference and a small contact sheet of accepted
 local figures that match the target series and teaching role.
 
+For a series that has already established an in-scene Eyjafjalla guide, inspect
+one accepted sibling figure from that series before writing the prompt and
+treat the guide's presence, scale, and role as part of the figure contract.
+
 Default accepted mechanism-scene references in this repository:
 
 - `claude-code/zh/assets/agent-fork-cover.png`
@@ -86,6 +90,11 @@ redraw of the same character, not as a new logo concept.
   guide character drawn into the mechanism scene. Do not use a pasted-looking
   logo, generic badge, clover/leaf icon, unrelated mascot, or competing
   generated mark.
+- In an established in-scene guide series, a mechanism diagram that omits the
+  Eyjafjalla-like guide is not acceptable even if the mechanism itself is
+  otherwise correct. Regenerate or edit the whole figure so the guide appears
+  as a recognizable participant in the workspace, not as an optional decoration
+  to drop under layout pressure.
 - Every final generated figure must be saved under the relevant article's
   local `assets/` directory before publication. Published article markup should
   use the correct page-relative path for that static page.
@@ -281,6 +290,11 @@ A new article about memory should use ledger, snapshot, and before/after roles.
 A runtime article should use lifecycle, ownership-board, and recovery roles.
 A source comparison should use contract lanes and final route maps.
 
+For a series overview or final map, the visual inventory must match the public
+series inventory. If a chapter is added, removed, renamed, or reordered, update
+the route-map figure, labels, alt text, and social image together, or keep the
+old figure only if it remains explicitly framed as a partial snapshot.
+
 Reference selection workflow:
 
 1. Name the figure's teaching role: cover, overview, contract comparison,
@@ -307,7 +321,11 @@ Before generating, write a compact figure brief:
    If the figure includes or revises a Rememorio brand treatment, separately
    name the Eyjafjalla character reference and any accepted in-repo
    source-notes card used only for brand-card integration.
-7. Character action: when a guide character appears, describe a pose that can
+7. Character contract: say whether this figure belongs to an established
+   in-scene guide series. If yes, the guide is mandatory and must remain large
+   enough to identify the horns, chestnut hair mass, red eyes, and white/red
+   outfit cues at article width.
+8. Character action: when a guide character appears, describe a pose that can
    be drawn with normal proportions, and describe how distant nodes are
    emphasized without forcing the character to reach across the diagram.
    Include the local prop and body constraints, for example `holding a small
@@ -656,7 +674,9 @@ Static blog publication protocol:
    the source first, then render or mirror the generated page.
 5. Update captions, alt text, cover references, and social metadata when the
    image's role changes.
-6. Verify the rendered page locally for broken image paths, overflow, and
+6. For series overview images, verify that project counts, labels, ordering,
+   alt text, and surrounding route lists describe the same public series.
+7. Verify the rendered page locally for broken image paths, overflow, and
    mobile readability before considering the figure published.
 
 ## Figure Density
@@ -702,6 +722,10 @@ Inspect every generated figure before publishing:
   arrows, and paper texture. Reject images where the guide becomes a corner
   logo, a standalone character sticker, a generic mascot, a sheep animal, a
   robot helper, or an unrelated horned character.
+- In an established in-scene guide series, reject any generated figure where
+  the guide is missing entirely, cropped away, too small to identify, or
+  replaced by a generic `Rememorio` card. Presence of the character is a style
+  invariant, not an optional enhancement.
 - Reject and regenerate any established little-sheep mechanism-scene figure
   that reads as a flat flowchart with a pasted character, generic
   Rememorio/logo card instead of an in-scene guide, sheep or goat animal
