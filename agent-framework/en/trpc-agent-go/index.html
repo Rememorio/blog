@@ -241,58 +241,200 @@
               The long-context design later in this chapter is a collaboration between Runner, Session, Summary, Memory, and request processors.
             </p>
 
-            <h2>2. Graph, Skill, CodeExecutor, Artifact, And AG-UI</h2>
+            <h2>2. Three Runtime Paths Worth Reading Closely</h2>
             <p>
-              The names are easy to flatten, so read their ownership carefully. <code>Graph</code> is not asking the model to "make a plan."
-              <code>AddNode</code>, <code>AddEdge</code>, <code>AddConditionalEdges</code>, <code>AddMultiConditionalEdges</code>, and <code>Compile</code>
-              turn a workflow into executable Go structure. <code>GraphAgent</code> then puts that compiled graph back behind the common <code>agent.Agent</code> interface.
-              Sources:
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L600-L775"><code>AddNode</code> / LLM / tools / agent nodes</a>,
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L820-L1039">edges and compile</a>,
-              and
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/graphagent/graph_agent.go#L102-L174"><code>GraphAgent.Run</code></a>.
+              This section does not try to give every package equal weight. The useful first pass is to follow three paths that change how application code is written:
+              Graph moves workflow control out of prompts, Skill / CodeExecutor / Artifact turns capabilities into a controlled workspace, and AG-UI makes the frontend
+              protocol more than a text-stream wrapper. Together, they show why tRPC-Agent-Go is a runtime: it owns state, concurrency, files, cancellation,
+              recovery, and event translation.
+            </p>
+
+            <h3>2.1 GraphAgent: A Workflow Graph Returns Through The Agent Interface</h3>
+            <p>
+              Start with the simpler design that would fail in production: put "run A, then B, maybe in parallel, then summarize" into a system prompt.
+              That can work in a demo, but it cannot guarantee routing, branch completion, interrupt recovery, or how LLM nodes, tool nodes, and sub-agent nodes
+              write events back into one session.
             </p>
 
             <p>
-              <code>Skill</code> is not just a prompt-snippet library either. A skill is a folder with <code>SKILL.md</code> plus optional docs and scripts.
-              <code>FSRepository</code> scans, refreshes, and loads skills by name. LLMAgent then registers progressive-disclosure tools such as
-              <code>skill_load</code>, <code>skill_list_docs</code>, and <code>skill_select_docs</code>, plus the compatibility execution path with
-              <code>skill_run</code> / <code>skill_exec</code> when configured.
-              Sources:
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/skill/repository.go#L112-L165"><code>NewFSRepository</code> / <code>Refresh</code></a>,
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/option.go#L974-L990">skill tool profiles</a>,
+              tRPC-Agent-Go moves that control into Go. <code>StateGraph</code> uses <code>AddNode</code> to wrap ordinary functions and create trigger channels.
+              <code>AddLLMNode</code>, <code>AddToolsNode</code>, and <code>AddAgentNode</code> lift models, tools, and sub-agents into graph nodes.
+              <code>AddEdge</code> creates normal transitions. <code>AddJoinEdge</code> creates a barrier for multiple predecessors.
+              <code>AddConditionalEdges</code> and <code>AddMultiConditionalEdges</code> create single-branch and multi-branch routing, and <code>Compile</code>
+              validates the graph before execution. The source is concentrated in
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L600-L775">node registration</a>
               and
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/load.go#L86-L124"><code>skill_load</code></a>.
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L820-L1039">edges, joins, conditions, and compile</a>.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Product pressure</th>
+                    <th>Runtime action</th>
+                    <th>Invariant protected</th>
+                    <th>Source</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>The app needs a reproducible multi-step workflow.</td>
+                    <td><code>StateGraph</code> compiles nodes, edges, conditional routing, and joins into an executable graph.</td>
+                    <td>The workflow shape is validated by Go code instead of being left to model compliance.</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L600-L1039"><code>state_graph.go</code></a></td>
+                  </tr>
+                  <tr>
+                    <td>The app still wants to call the graph like an agent.</td>
+                    <td><code>New</code> passes the graph, channel buffer, concurrency, checkpoint saver, and execution engine to the executor.</td>
+                    <td>Graph does not become a separate product surface; it still follows the common <code>agent.Agent</code> run semantics.</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/graphagent/graph_agent.go#L51-L99"><code>graphagent.New</code></a>, <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/executor.go#L190-L240"><code>NewExecutor</code></a></td>
+                  </tr>
+                  <tr>
+                    <td>One request must bring session history, summary, filters, and parent-agent metadata into the graph.</td>
+                    <td><code>GraphAgent.Run</code> builds the initial state; <code>createInitialState</code> reuses the content processor for messages, summary, branches, and history filters.</td>
+                    <td>Graph nodes see the same model-visible history rules as a normal LLMAgent.</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/graphagent/graph_agent.go#L102-L174"><code>GraphAgent.Run</code></a>, <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/graphagent/graph_agent.go#L420-L507"><code>createInitialState</code></a></td>
+                  </tr>
+                  <tr>
+                    <td>Execution needs concurrency, checkpointing, resume, barrier events, and error handling.</td>
+                    <td><code>Executor.Execute</code> creates an <code>ExecutionContext</code> per run, filters completion and barrier events, prepares checkpoints and pending writes, then enters the DAG or BSP loop.</td>
+                    <td>The executor can be reused safely; mutable per-run state does not leak into the next run.</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/executor.go#L263-L352"><code>Execute</code></a>, <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/executor.go#L428-L520"><code>executeGraph</code></a></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              So <code>GraphAgent</code> is not merely another way to write an agent. It owns workflow control: the model generates content and tool arguments,
+              while the runtime owns routing, concurrency, joins, checkpoints, resume, and graph events. That boundary matters later: summary and session history
+              are not add-ons outside the graph; they are projected into the initial state by the same processor used by the rest of the runtime.
+            </p>
+
+            <h3>2.2 Skill + CodeExecutor + Artifact: Capabilities Become A Workspace</h3>
+            <p>
+              <code>Skill</code> is easy to misread as a prompt-snippet library. The stronger reading is that a skill is a packaged capability:
+              instructions, optional docs, optional scripts, and a controlled workspace. The model should not read every supporting file up front, and it should not
+              receive arbitrary shell access.
             </p>
 
             <p>
-              <code>CodeExecutor</code> and <code>Artifact</code> separate "run code" from "store generated files." The executor owns
-              <code>ExecuteCode</code> and code-block delimiters. The artifact service owns save, load, list, version, and delete under app/user/session/filename.
-              <code>SaveArtifactHelper</code> and <code>LoadArtifactHelper</code> let the code-execution layer find the artifact service through context,
-              so generated images, reports, and intermediate files do not need to be inlined into model text.
-              Sources:
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/codeexecutor/codeexecutor.go#L23-L42"><code>CodeExecutor</code></a>,
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/codeexecutor/artifacts.go#L20-L43"><code>LoadArtifactHelper</code></a>,
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/codeexecutor/artifacts.go#L109-L156"><code>SaveArtifactHelper</code></a>,
+              The first layer is discovery and loading. <code>FSRepository</code> scans folders that contain <code>SKILL.md</code> and builds skill metadata.
+              <code>skill_load</code> validates that the skill exists, then records loaded skills, available docs, and selected docs as session state delta.
+              Its main job is progressive disclosure, not dumping every instruction into the prompt. Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/skill/repository.go#L112-L165"><code>FSRepository.Refresh</code></a>
               and
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/artifact/service.go#L14-L78"><code>artifact.Service</code></a>.
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/load.go#L126-L205"><code>skill_load</code></a>.
             </p>
 
             <p>
-              The protocol layer is part of the same story. <code>server/agui</code> wraps a Runner into an AG-UI runner, resolves frontend run input,
-              app/user/state/run options, and translates internal events into AG-UI events. <code>server/a2a</code> builds an AgentCard and message processor.
-              <code>server/openai</code> exposes a Runner through a <code>/v1/chat/completions</code> style HTTP handler.
+              The second layer is tool-surface composition. <code>LLMAgent</code> first collects user tools, toolsets, knowledge, time tools, and related surfaces.
+              It then decides whether a workspace registry is needed from skills and executors, and appends <code>workspace_exec</code> plus skill tools to the same
+              tool surface. Skill profiles decide how much is exposed: knowledge-only mode provides loading and document selection, while the execution path adds
+              <code>skill_run</code>, <code>skill_exec</code>, <code>skill_stdin</code>, <code>skill_poll</code>, and <code>skill_kill</code>.
               Sources:
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L53-L109">AG-UI runner</a>,
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L340-L410">AG-UI run input</a>,
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/a2a/server.go#L76-L161">A2A processor</a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L780-L830">tool-surface construction</a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/option.go#L974-L990">skill profiles</a>,
               and
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/openai/server.go#L73-L117">OpenAI server</a>.
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L953-L1031"><code>appendSkillToolsWithRepoAndFlags</code></a>.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Runtime step</th>
+                    <th>What the runtime does</th>
+                    <th>Why this is not prompt concatenation</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>The model decides it needs a skill.</td>
+                    <td><code>skill_load</code> records loaded state and optional docs, without running scripts.</td>
+                    <td>Capability instructions can be opened gradually, and the session can track what was loaded.</td>
+                  </tr>
+                  <tr>
+                    <td>The model needs to run the skill.</td>
+                    <td><code>skill_run</code> may require prior loading, applies artifact-save overrides, prepares a workspace, executes the program, and collects outputs and manifests.</td>
+                    <td>The execution path has state, arguments, files, and artifact references. It is not a paragraph of advice.</td>
+                  </tr>
+                  <tr>
+                    <td>The script needs a writable directory.</td>
+                    <td><code>stageSkill</code> creates a writable copy; command policy uses allow / deny lists and <code>CleanEnv</code>.</td>
+                    <td>The runtime can separate skill source files, working copies, and process environment.</td>
+                  </tr>
+                  <tr>
+                    <td>The run produces a report, image, or intermediate file.</td>
+                    <td><code>workspace_save_artifact</code> persists an existing workspace file, returns an <code>artifact://</code> reference, and records it in state delta.</td>
+                    <td>Large files do not need to be inlined into model messages; later UI, sessions, and tools can dereference them.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              This is where <code>CodeExecutor</code> and <code>Artifact</code> become separate owners. <code>CodeExecutor</code> defines how code blocks execute.
+              Workspace tools connect directories, loaded skills, and execution engines. The artifact service turns files into durable app/user/session-scoped outputs.
+              The path can be read through
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L468-L544"><code>skill_run</code></a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L918-L935"><code>stageSkill</code></a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L1180-L1223">command policy</a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L1415-L1463"><code>WithLoadedSkills</code></a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/workspace_exec.go#L159-L170"><code>workspace_exec</code> dependencies</a>,
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/save_artifact.go#L61-L160"><code>workspace_save_artifact</code></a>.
+            </p>
+
+            <h3>2.3 AG-UI: The Frontend Protocol Owns Input, Runs, And Event Translation</h3>
+            <p>
+              The protocol layer is easy to underestimate. A plain text stream only has to emit assistant deltas. AG-UI has to handle user messages, tool-result
+              messages, multimodal content, external tools, cancellation, runtime state, graph interrupts, artifacts, reasoning, tool-call lifecycle, and the final
+              completion event. This server adapter is therefore a runtime boundary, not example glue code.
+            </p>
+
+            <p>
+              <code>server/agui.New</code> wraps the underlying <code>runner.Runner</code> as a service and HTTP handler, with path, cancellation, and snapshot options.
+              Before execution reaches the runtime, the adapter uses the AG-UI SDK's <code>RunAgentInput</code>. <code>inputMessagesFromRunAgentInput</code>
+              requires the last incoming message to be a user or tool message, handles multimodal input, and groups trailing tool-result messages as inputs for this run.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/agui.go#L25-L105"><code>server/agui.New</code></a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/service/service.go#L15-L20">service wrapper</a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/adapter/adapter.go#L17-L18"><code>RunAgentInput</code> alias</a>,
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L189-L240">input parsing</a>.
+            </p>
+
+            <p>
+              Then <code>Runner.Run</code> resolves user ID, run options, external tools, app name, and runtime state. It rewrites tool-result messages,
+              registers the execution for cancellation, and creates a translator. During the run it emits <code>RunStarted</code>, translates incoming tool results
+              into frontend-visible events, emits a resume event for graph interrupt recovery when needed, calls the underlying runner, and passes each internal
+              agent event through <code>handleAgentEvent</code>. Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L340-L430"><code>Runner.Run</code></a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L433-L513"><code>runner.run</code></a>.
+            </p>
+
+            <p>
+              The translator is the object worth reading closely. It keeps per-run seen IDs, tool-call deltas, graph lifecycle flags, reasoning streams,
+              and artifact state, then translates internal events into AG-UI graph, text, reasoning, tool-call, tool-result, artifact, queued-user-message,
+              and <code>RunFinished</code> events. Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go#L36-L89"><code>Translator</code> state</a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go#L122-L221">event translation</a>,
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go#L232-L257">source metadata finalization</a>.
+            </p>
+
+            <p>
+              That is why the protocol layer is not just an HTTP shell. UI-visible run IDs, tool-call IDs, graph activity, artifact references, external tool results,
+              and final completion are not naturally present in model text. The AG-UI adapter translates runtime events into a protocol the frontend can consume reliably.
             </p>
 
             <div class="note key-point">
               <p>
                 <strong>Map the runtime first, then memory makes sense.</strong>
+                Graph, skill workspaces, and AG-UI all show the same boundary: the model is not the runtime.
                 Summary and memory are not isolated features. They appear naturally once Runner persists events, processors build model requests,
                 tool surfaces expose recall, and server adapters keep sessions alive.
               </p>
@@ -587,11 +729,18 @@
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/agent.go">agent interface</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/graphagent/graph_agent.go">graph agent</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go">state graph builder</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/executor.go">graph executor</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/tool.go">tool interface</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go">LLMAgent tool surface</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/skill/repository.go">skill repository</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go">skill run tool</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/workspace_exec.go">workspace exec tool</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/save_artifact.go">workspace artifact save tool</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/codeexecutor/codeexecutor.go">code executor</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/artifact/service.go">artifact service</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/agui.go">AG-UI server</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go">AG-UI runner</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go">AG-UI translator</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go">runner runtime</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/session.go">session model</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/summarizer.go">session summarizer</a></li>

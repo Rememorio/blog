@@ -255,59 +255,201 @@
               这些 owner 合作出来的结果。
             </p>
 
-            <h2>二、Graph、Skill、CodeExecutor、Artifact、AG-UI 分别解决什么</h2>
+            <h2>二、挑三条主线细读：Graph、Skill / CodeExecutor / Artifact、AG-UI</h2>
             <p>
-              先把几个容易被名字带偏的模块讲白。<code>Graph</code> 不是让模型“想一个计划”，而是用
-              <code>AddNode</code>、<code>AddEdge</code>、<code>AddConditionalEdges</code>、<code>AddMultiConditionalEdges</code>、<code>Compile</code>
-              这些 Go API 把流程图变成可执行结构；<code>GraphAgent</code> 再把这张图塞回统一的 <code>agent.Agent</code> 接口。
-              源码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L600-L775"><code>AddNode</code> / LLM / tools / agent node</a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L820-L1039">edges and compile</a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/graphagent/graph_agent.go#L102-L174"><code>GraphAgent.Run</code></a>。
+              这一节不平均介绍每个包。真正值得先读的，是三条会改变应用写法的运行路径：Graph 让流程控制离开 prompt，
+              Skill / CodeExecutor / Artifact 让能力进入受控工作区，AG-UI 让前端协议不再只是“把模型字流出来”。
+              它们共同说明一件事：tRPC-Agent-Go 的核心不是多几个工具函数，而是把生产级 agent 的状态、并发、文件、取消、恢复和事件翻译交给 runtime。
+            </p>
+
+            <h3>2.1 GraphAgent：流程图先落成状态机，再回到 Agent 接口</h3>
+            <p>
+              先想一个最朴素的做法：让模型在 system prompt 里“按 A、B、C 步执行，必要时并行，最后汇总”。这个做法在 demo 里可行，
+              但上线后会碰到几个硬问题：条件分支谁保证只走该走的路？并行分支什么时候算结束？中断之后如何恢复？
+              工具节点、LLM 节点、子 agent 节点的事件怎样回到同一条 session 里？
             </p>
 
             <p>
-              <code>Skill</code> 也不是 prompt 片段库。它把一个能力做成包含 <code>SKILL.md</code> 和可选 docs/scripts 的文件夹，
-              由 <code>FSRepository</code> 扫描、刷新、按名读取；LLMAgent 再按 profile 注册 <code>skill_load</code>、
-              <code>skill_list_docs</code>、<code>skill_select_docs</code>，以及兼容路径里的 <code>skill_run</code> / <code>skill_exec</code>。
-              这样模型先加载说明，再按受控执行入口跑命令，而不是把整套脚本都塞进提示词。
-              证据在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/skill/repository.go#L112-L165"><code>NewFSRepository</code> / <code>Refresh</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/option.go#L974-L990">skill tool profiles</a>
+              tRPC-Agent-Go 的做法是把这部分控制权从 prompt 里拿出来。<code>StateGraph</code> 用
+              <code>AddNode</code> 包装普通函数节点并创建触发 channel；<code>AddLLMNode</code>、<code>AddToolsNode</code>、
+              <code>AddAgentNode</code> 把模型、工具和子 agent 也变成图节点；<code>AddEdge</code> 建普通边，
+              <code>AddJoinEdge</code> 建等待多个前驱的 barrier，<code>AddConditionalEdges</code> 和
+              <code>AddMultiConditionalEdges</code> 建单路或多路条件分发，最后 <code>Compile</code> 做图结构校验。
+              这部分源码集中在
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L600-L775">节点注册</a>
               和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/load.go#L86-L124"><code>skill_load</code></a>。
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L820-L1039">边、join、条件路由、compile</a>。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>产品问题</th>
+                    <th>runtime 动作</th>
+                    <th>保护的不变量</th>
+                    <th>源码入口</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>业务想要一个可复现的多步流程。</td>
+                    <td><code>StateGraph</code> 把节点、边、条件分支和 join 编译成可执行图。</td>
+                    <td>流程结构由 Go 代码验证，不靠模型临场遵守提示词。</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L600-L1039"><code>state_graph.go</code></a></td>
+                  </tr>
+                  <tr>
+                    <td>应用仍希望像普通 agent 一样调用这张图。</td>
+                    <td><code>New</code> 把 <code>StateGraph</code>、channel buffer、并发、checkpoint saver 和 execution engine 交给 executor。</td>
+                    <td>Graph 不变成另一套入口；它仍实现统一的 <code>agent.Agent</code> 运行语义。</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/graphagent/graph_agent.go#L51-L99"><code>graphagent.New</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/executor.go#L190-L240"><code>NewExecutor</code></a></td>
+                  </tr>
+                  <tr>
+                    <td>一轮请求要带着 session 历史、summary、filter、父 agent 信息进入图。</td>
+                    <td><code>GraphAgent.Run</code> 创建初始 state；<code>createInitialState</code> 复用 content processor，把消息、summary、分支和历史过滤接进来。</td>
+                    <td>图内节点看到的上下文，和普通 LLMAgent 的模型可见上下文保持同一套历史规则。</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/graphagent/graph_agent.go#L102-L174"><code>GraphAgent.Run</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/graphagent/graph_agent.go#L420-L507"><code>createInitialState</code></a></td>
+                  </tr>
+                  <tr>
+                    <td>图执行要支持并发、checkpoint、resume、barrier 事件和错误收束。</td>
+                    <td><code>Executor.Execute</code> 为每次运行创建 <code>ExecutionContext</code>，过滤完成 / barrier 事件，准备 checkpoint 和 pending writes，再进入 DAG 或 BSP 执行循环。</td>
+                    <td>executor 可以被重复调用；每次运行的可变状态不会泄漏到下一次运行。</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/executor.go#L263-L352"><code>Execute</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/executor.go#L428-L520"><code>executeGraph</code></a></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以 <code>GraphAgent</code> 不是“多一种 agent 写法”。它真正解决的是流程所有权：模型负责生成内容和工具参数，
+              runtime 负责路由、并发、join、checkpoint、resume 和图事件。这个边界一旦清楚，后面看长上下文就更自然：
+              summary 和 session history 不是图外面的附属品，而是在图初始 state 里被同一套 processor 投影进去。
+            </p>
+
+            <h3>2.2 Skill + CodeExecutor + Artifact：把能力变成可执行工作区</h3>
+            <p>
+              再看 <code>Skill</code>。如果把它理解成“prompt 片段库”，就会错过框架里最有价值的一层：它把一套能力拆成说明、
+              可选文档、可选脚本和可执行工作区。模型不需要一开始读完所有材料，也不应该直接拿到任意 shell 权限。
             </p>
 
             <p>
-              <code>CodeExecutor</code> 和 <code>Artifact</code> 则把“执行代码”和“保存结果文件”分开。前者定义
-              <code>ExecuteCode</code> 和 code block delimiter，后者定义按 app/user/session/filename 保存、加载、列版本、删除 artifact。
-              <code>SaveArtifactHelper</code> / <code>LoadArtifactHelper</code> 让代码执行层能通过 context 找到 artifact service，
-              所以工具生成图片、报告或中间文件时，不必把大文件内联进模型输出。
-              源码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/codeexecutor/codeexecutor.go#L23-L42"><code>CodeExecutor</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/codeexecutor/artifacts.go#L20-L43"><code>LoadArtifactHelper</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/codeexecutor/artifacts.go#L109-L156"><code>SaveArtifactHelper</code></a>
+              第一层是发现和加载。<code>FSRepository</code> 扫描每个包含 <code>SKILL.md</code> 的目录，建立 skill 元数据；
+              <code>skill_load</code> 校验 skill 是否存在，然后把“已加载 skill、可用 docs、选中的 docs”写成 session state delta。
+              它的重点不是把所有说明一次性塞进 prompt，而是让模型按需打开能力说明。源码在
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/skill/repository.go#L112-L165"><code>FSRepository.Refresh</code></a>
               和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/artifact/service.go#L14-L78"><code>artifact.Service</code></a>。
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/load.go#L126-L205"><code>skill_load</code></a>。
             </p>
 
             <p>
-              协议层也值得讲。<code>server/agui</code> 会把 Runner 包成 AG-UI runner，解析前端 run input，解析 app/user/state/run options，
-              再用 translator 把内部事件翻译成 AG-UI 事件；<code>server/a2a</code> 可以从 agent 信息生成 AgentCard 并构造 A2A message processor；
-              <code>server/openai</code> 则把 Runner 接成 <code>/v1/chat/completions</code> 风格的 HTTP handler。
-              这意味着同一套 agent runtime 可以服务前端、其他 agent 和 OpenAI-compatible 客户端。
-              源码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L53-L109">AG-UI runner</a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L340-L410">AG-UI run input</a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/a2a/server.go#L76-L161">A2A processor</a>
+              第二层是工具面组合。<code>LLMAgent</code> 会先收集用户传入的 tools、toolsets、knowledge、时间工具等，
+              再根据 skills 和 executor 判断是否需要 workspace registry，并把 <code>workspace_exec</code> 和 skill tools 接到同一个工具面。
+              skill profile 也会影响暴露范围：knowledge-only 只给加载和文档选择；完整执行路径才会加上 <code>skill_run</code>、
+              <code>skill_exec</code>、<code>skill_stdin</code>、<code>skill_poll</code>、<code>skill_kill</code>。
+              对应源码在
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L780-L830">tool surface 构建</a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/option.go#L974-L990">skill profiles</a>
               和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/openai/server.go#L73-L117">OpenAI server</a>。
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L953-L1031"><code>appendSkillToolsWithRepoAndFlags</code></a>。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>一步运行</th>
+                    <th>runtime 在做什么</th>
+                    <th>为什么不是 prompt 拼接</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>模型决定需要某个 skill。</td>
+                    <td><code>skill_load</code> 记录加载状态和可选文档，而不是执行脚本。</td>
+                    <td>能力说明可以渐进展开，session 里也能看到“加载过什么”。</td>
+                  </tr>
+                  <tr>
+                    <td>模型要真正运行 skill。</td>
+                    <td><code>skill_run</code> 可要求先 load，再应用 artifact 保存覆盖，准备 workspace，执行程序，收集输出和 manifests。</td>
+                    <td>执行入口有状态、参数、输出文件和 artifact 引用，不是自然语言里的一段建议。</td>
+                  </tr>
+                  <tr>
+                    <td>脚本需要一个可写目录。</td>
+                    <td><code>stageSkill</code> 创建可写工作副本；命令策略用 allow / deny 和 <code>CleanEnv</code> 控制执行环境。</td>
+                    <td>runtime 能区分 skill 源文件、工作副本和进程环境，避免把仓库目录当临时目录乱写。</td>
+                  </tr>
+                  <tr>
+                    <td>运行产生报告、图片或中间文件。</td>
+                    <td><code>workspace_save_artifact</code> 把已有 workspace 文件保存成 artifact，返回 <code>artifact://</code> 引用，并在 state delta 里记录。</td>
+                    <td>大文件不需要内联进模型消息；后续 UI、会话或工具可以按引用取回。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这条链路里，<code>CodeExecutor</code> 和 <code>Artifact</code> 的分工也就清楚了。<code>CodeExecutor</code>
+              定义“怎样执行代码块”；workspace tools 负责把工作目录、加载后的 skills 和执行引擎接起来；artifact service
+              负责把文件变成有 app/user/session 归属的持久产物。具体实现可以从
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L468-L544"><code>skill_run</code> 的执行入口</a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L918-L935"><code>stageSkill</code></a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L1180-L1223">命令策略</a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L1415-L1463"><code>WithLoadedSkills</code></a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/workspace_exec.go#L159-L170"><code>workspace_exec</code> 的服务依赖</a>
+              和
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/save_artifact.go#L61-L160"><code>workspace_save_artifact</code></a>
+              串起来读。
+            </p>
+
+            <h3>2.3 AG-UI：前端协议不是壳子，它重新定义输入、运行和事件翻译边界</h3>
+            <p>
+              前端接 agent 时，最容易低估协议层。一个文本流接口只要把 assistant delta 往外推就行；
+              但 AG-UI 还要处理用户消息、tool result 消息、多模态内容、外部工具、运行取消、runtime state、graph interrupt、
+              artifact、reasoning、tool call lifecycle 和最终完成事件。这里的 server adapter 不是示例 glue code，而是运行时边界。
+            </p>
+
+            <p>
+              <code>server/agui.New</code> 先把底层 <code>runner.Runner</code> 包成 service 和 HTTP handler，
+              配上 path、cancel、snapshot 等选项。真正进入运行时之前，adapter 使用 AG-UI SDK 的 <code>RunAgentInput</code>；
+              <code>inputMessagesFromRunAgentInput</code> 要求最后一条输入是 user 或 tool message，并且会把连续的 trailing tool results
+              归成这次 run 的输入结果。源码入口在
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/agui.go#L25-L105"><code>server/agui.New</code></a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/service/service.go#L15-L20">service wrapper</a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/adapter/adapter.go#L17-L18"><code>RunAgentInput</code> alias</a>
+              和
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L189-L240">输入消息解析</a>。
+            </p>
+
+            <p>
+              接着 <code>Runner.Run</code> 解析 userID、run options、外部 tools、appName、runtimeState，
+              重写 tool result messages，注册 execution 以支持取消，并创建 translator。真正跑起来时，它会先发
+              <code>RunStarted</code>，把输入里的 tool result 也翻译成前端可见事件；如果图处在 interrupt resume 场景，
+              还会补一段 resume event，然后才调用底层 runner，把内部 agent event 逐个交给 <code>handleAgentEvent</code>。
+              对应源码在
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L340-L430"><code>Runner.Run</code></a>
+              和
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L433-L513"><code>runner.run</code></a>。
+            </p>
+
+            <p>
+              translator 是 AG-UI 这层最值得看的对象。它保存一次 run 内的 seen IDs、tool call deltas、graph lifecycle flags、
+              reasoning stream 和 artifact 状态，然后把内部事件翻译成 AG-UI 的 graph、text、reasoning、tool call、tool result、
+              artifact、queued user message、RunFinished 等事件。源码在
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go#L36-L89"><code>Translator</code> state</a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go#L122-L221">事件翻译主线</a>
+              和
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go#L232-L257">source metadata finalize</a>。
+            </p>
+
+            <p>
+              这就是为什么协议层不能只看成 HTTP 外壳：UI 看到的 run id、tool call id、graph 活动状态、artifact 引用、
+              外部 tool result 和最终完成信号，都不是模型文本天然携带的东西。AG-UI adapter 把这些运行时事件翻译成前端能稳定消费的协议事件。
             </p>
 
             <div class="note key-point">
               <p>
                 <strong>先有 runtime 地图，再看 memory 才不会偏。</strong>
+                Graph、Skill 工作区和 AG-UI 都在说明同一个边界：模型不是 runtime。
                 summary 和 memory 不是孤立功能，而是 Runner 持久化事件、processor 组装模型请求、tool surface 暴露召回入口、
                 server 层持续承接会话之后，才自然冒出来的长上下文 owner。
               </p>
@@ -611,11 +753,18 @@
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/agent.go">agent interface</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/graphagent/graph_agent.go">graph agent</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go">state graph builder</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/executor.go">graph executor</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/tool.go">tool interface</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go">LLMAgent tool surface</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/skill/repository.go">skill repository</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go">skill run tool</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/workspace_exec.go">workspace exec tool</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/save_artifact.go">workspace artifact save tool</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/codeexecutor/codeexecutor.go">code executor</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/artifact/service.go">artifact service</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/agui.go">AG-UI server</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go">AG-UI runner</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go">AG-UI translator</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go">runner runtime</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/session.go">session model</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/summarizer.go">session summarizer</a></li>
