@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Framework Source Notes, Part 8: tRPC-Agent-Go Splits Long Context Into Summary And Memory Ledgers</title>
+    <meta
+      name="description"
+      content="Part 8 of the Agent Framework source-reading series: read tRPC-Agent-Go runner, session summary, memory, preload, and session_load as a Go agent long-context runtime."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Agent Framework Source Notes, Part 8: tRPC-Agent-Go Splits Long Context Into Summary And Memory Ledgers" />
+    <meta
+      property="og:description"
+      content="tRPC-Agent-Go memory and summary are not one memory switch. They split current-session compression from durable cross-session facts."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/trpc-agent-go-memory-summary.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-framework/en/trpc-agent-go/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-framework/zh/trpc-agent-go/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-framework/en/trpc-agent-go/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-framework/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(31, 119, 123, 0.34);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      @media (max-width: 760px) {
+        html,
+        body {
+          max-width: 100%;
+          overflow-x: hidden;
+        }
+
+        .article-shell,
+        .article-main,
+        .toc-panel {
+          min-width: 0;
+          max-width: 100%;
+        }
+
+        .article-hero,
+        .article-body {
+          width: calc(100vw - 20px);
+          min-width: 0;
+          max-width: calc(100vw - 20px);
+        }
+
+        .article-card {
+          min-width: 0;
+          width: 100%;
+          max-width: calc(100vw - 20px);
+          overflow: hidden;
+        }
+
+        .article-hero h1,
+        .lead,
+        .meta-line span {
+          overflow-wrap: anywhere;
+        }
+
+        .article-hero h1 {
+          font-size: 32px;
+        }
+
+        .hero-image {
+          width: 100%;
+          min-width: 0;
+          max-width: 100%;
+          overflow: hidden;
+        }
+
+        .hero-image img {
+          min-width: 0;
+          width: 100%;
+          max-width: 100%;
+        }
+
+        .meta-line {
+          align-items: stretch;
+        }
+
+        .meta-line span {
+          white-space: normal;
+        }
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Agent Framework series</a>
+        <a href="../eino-execution-graph/">Previous</a>
+        <a href="#summary-lifecycle">summary</a>
+        <a href="#memory-lifecycle">memory</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/trpc-agent-go/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Agent Framework Source Notes · Part 8</p>
+            <h1>tRPC-Agent-Go Splits Long Context Into Summary And Memory Ledgers</h1>
+            <p class="lead">
+              The Eino chapter read how a Go agent can live inside a composable execution graph. tRPC-Agent-Go moves to the next service-runtime problem:
+              a session can run for a long time, raw events cannot stay in the model context forever, and users still expect durable memory.
+              This chapter follows Rememorio's memory and summary work in that code path.
+            </p>
+            <div class="meta-line">
+              <span>Topic: tRPC-Agent-Go</span>
+              <span>Author route: Rememorio memory / summary</span>
+              <span>Focus: summary / memory / session_load</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/trpc-agent-go-memory-summary.png"
+                alt="Hand-drawn tRPC-Agent-Go memory ledger diagram: Session events pass through summary into summary store and model view; Memory facts and tools feed memory store, preload/search, and model view; session_load recovers hidden raw history. Bottom invariant says summary compresses; memory persists."
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Imagine an internal support agent that helps the same user over several days. On day one it reads logs. On day two it calls ticketing tools.
+              On day three the user says, "the same error as yesterday." If the framework only sends the latest turns, the model forgets.
+              If it sends every raw event, the context explodes. If it calls all of that memory, short-term compression and long-term facts become one confused bucket.
+            </p>
+
+            <p>
+              tRPC-Agent-Go avoids that collapse by separating three ledgers. Current-session raw events remain the durable session record.
+              <code>summary</code> is a lossy compression of that current session. <code>memory</code> stores durable facts and episodes across sessions.
+              They have different lifetimes, triggers, and model-visibility paths.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <strong>Reading contract.</strong>
+                This chapter does not turn the source into a long field list. It asks one practical question:
+                when an agent conversation keeps growing, who owns raw events, current-session compression, durable facts, model projection, and hidden-history recall?
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                Source links are pinned to public snapshot <code>d3b50fd90d60b4ece8a78e89cf890a4f06d78235</code>.
+                Terms such as ledger, projection, and long-context owner are engineering summaries over the public runner, session, summary, memory, and processor code.
+              </p>
+            </div>
+
+            <h2>1. Start With Three Ledgers</h2>
+            <p>
+              Many agent frameworks expose a feature called memory. The word is too broad. In tRPC-Agent-Go, the source is clearer if you read three ledgers first:
+              session events, session summary, and durable memory.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Ledger</th>
+                    <th>What it stores</th>
+                    <th>How it reaches the model</th>
+                    <th>First source</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Session events</td>
+                    <td>User messages, assistant events, tool results, state deltas, and tracks for one session.</td>
+                    <td>Normally appended in event order; after summary, only events after the cutoff are appended.</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/session.go#L60-L88"><code>Session</code> fields</a></td>
+                  </tr>
+                  <tr>
+                    <td>Session summary</td>
+                    <td>A compressed text record for old events under a filter key, plus the included boundary.</td>
+                    <td>The content processor injects the summary and then appends only post-cutoff messages.</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/session.go#L60-L88"><code>Summaries</code></a>, <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/processor/content.go#L731-L787"><code>appendSessionMessages</code></a></td>
+                  </tr>
+                  <tr>
+                    <td>Memory</td>
+                    <td>Cross-session facts and episodes scoped by app and user, with kind, time, topics, and metadata.</td>
+                    <td>It can be preloaded into context or fetched on demand through <code>memory_search</code> and <code>memory_load</code>.</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L155-L196"><code>memory.Service</code></a>, <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L202-L236"><code>Memory</code> / <code>Entry</code></a></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The core distinction is simple: <strong>summary is not long-term memory, and memory is not a chat transcript summary.</strong>
+              Summary keeps the current session runnable. Memory carries stable facts into future sessions.
+            </p>
+
+            <h2>2. Runner Connects The Ledgers To The Runtime</h2>
+            <p>
+              The runner is not a thin caller around the agent. During <code>Run</code>, it gets or creates a session, attaches the current user message,
+              session service, memory service, agent, run options, and plugins to the invocation, then lets the agent execute.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L510-L754"><code>Run</code></a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L756-L793"><code>newRunInvocation</code></a>.
+            </p>
+
+            <p>
+              After events are persisted, the runner decides which background ledgers need work. <code>handleEventPersistence</code> writes eligible events to the session
+              and queues summary work by event filter key. When the runner completion event is handled, it queues auto-memory extraction as well.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L2419-L2519"><code>handleEventPersistence</code></a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L2849-L2856">runner completion</a>.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <strong>The runtime collects the ledgers automatically.</strong>
+                Application code does not have to write a manual "if context is long, summarize, and maybe extract memories" branch after every turn.
+              </p>
+            </div>
+
+            <h2 id="summary-lifecycle">3. Summary Compresses The Current Session</h2>
+            <p>
+              Summary starts with a gate. The public summarizer interface exposes <code>ShouldSummarize</code> and <code>Summarize</code>, with a context-aware variant for invocation-aware decisions.
+              Source:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/summary.go#L22-L58"><code>SessionSummarizer</code></a>.
+            </p>
+
+            <h3>Thresholds First</h3>
+            <p>
+              The gate can combine event count, token count, elapsed time, and context-window pressure. Static options include token, event, and time thresholds;
+              <code>WithContextThreshold</code> can inspect invocation context, model information, and context size dynamically.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/options.go#L129-L172">threshold options</a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/options.go#L267-L302"><code>WithContextThreshold</code></a>.
+            </p>
+
+            <p>
+              When async summary is configured, jobs go into a hash-routed worker queue. If the queue or worker path cannot take the job, the service can fall back to synchronous summary.
+              Source:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/summary/async.go#L120-L164"><code>AsyncSummaryWorker.EnqueueJob</code></a>.
+            </p>
+
+            <h3>Summarize Only The Delta</h3>
+            <p>
+              The internal summary path takes a per-session/filter lock, reads the previous summary, computes the delta after the previous boundary,
+              prepends the previous summary as context, and builds a temporary filtered session for the summarizer. That avoids repeatedly summarizing the whole ledger.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/summary/summary.go#L163-L228"><code>SummarizeSession</code></a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/summary/summary.go#L307-L330"><code>buildSummaryInput</code></a>,
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/summary/summary.go#L404-L486">summary lock</a>.
+            </p>
+
+            <p>
+              The summarizer then filters events, skips recent turns when configured, extracts user/assistant content, tool calls, and tool results into conversation text,
+              and asks the model for the compressed record.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/summarizer.go#L307-L374"><code>Summarize</code></a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/summarizer.go#L417-L446"><code>filterEventsForSummary</code></a>,
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/summarizer.go#L581-L650"><code>extractConversationText</code></a>.
+            </p>
+
+            <h3>Inject Summary, Keep Raw Events</h3>
+            <p>
+              The resulting summary is written back to the session summary store with a boundary. On the next model request, the content processor injects the summary,
+              then appends only messages after the cutoff. It does not delete the raw session events.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/summary/summary.go#L354-L372"><code>writeSummary</code></a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/processor/content.go#L824-L846"><code>appendSummaryContext</code></a>,
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/processor/content.go#L869-L890"><code>sessionMessagesAfterCutoff</code></a>.
+            </p>
+
+            <h3>Cache-Safe Forking Protects Request Shape</h3>
+            <p>
+              A normal summary request can use a standalone summary prompt. Cache-safe forking is more careful: if a parent model request is available,
+              <code>WithCacheSafeForking</code> clones that request and appends a compacting user message. This preserves provider-facing request shape when prompt caches,
+              reasoning fields, tools, or headers matter. Without a parent request, it falls back to the standalone prompt.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/options.go#L62-L85"><code>WithCacheSafeForking</code></a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/cache_safe_fork.go#L19-L182">request clone helpers</a>.
+            </p>
+
+            <p>
+              Pre-LLM context compaction follows the same runtime idea. Before a model call, the flow can detect context pressure, create a summary synchronously,
+              attach the parent request to the summary context, and rebuild the model request.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/llmflow/llmflow.go#L1435-L1492"><code>maybeCompactContextBeforeLLM</code></a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/llmflow/llmflow.go#L1494-L1600"><code>runContextCompaction</code></a>.
+            </p>
+
+            <h2 id="memory-lifecycle">4. Memory Persists Durable Facts</h2>
+            <p>
+              Memory has a different contract. <code>memory.Service</code> exposes Add, Update, Delete, Clear, Read, Search, Tools, EnqueueAutoMemoryJob, and Close.
+              Entries are facts or episodes scoped by app and user. They are not a compressed copy of the current session transcript.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L155-L196"><code>Service</code></a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L202-L236"><code>Kind</code> / <code>Entry</code></a>.
+            </p>
+
+            <h3>Tools Are Explicit</h3>
+            <p>
+              Built-in memory tools are named <code>memory_add</code>, <code>memory_update</code>, <code>memory_delete</code>, <code>memory_clear</code>,
+              <code>memory_search</code>, and <code>memory_load</code>. Tool implementations fetch the memory service, app name, and user id from invocation context.
+              Search and load return structured entries rather than dumping every memory into the prompt.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L22-L30">tool names</a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/tool/tool.go#L249-L364"><code>memory_search</code> / <code>memory_load</code></a>,
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/tool/tool.go#L472-L517">context lookup</a>.
+            </p>
+
+            <p>
+              Search is deliberately shaped as retrieval, not prompt stuffing. <code>SearchOptions</code> supports kind, time windows, result count,
+              similarity threshold, ordering, dedupe, hybrid search, and RRF.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L266-L309"><code>SearchOptions</code></a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/tool/tool.go#L537-L571"><code>buildSearchOptions</code></a>.
+            </p>
+
+            <h3>Auto Memory Runs After The Turn</h3>
+            <p>
+              Auto memory is queued when the runner completes, not on every individual sentence. If a memory service and extractor are configured,
+              the runner hands the session to the auto-memory worker.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L3898-L3908"><code>enqueueAutoMemoryJob</code></a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/inmemory/service.go#L58-L105"><code>NewMemoryService</code></a>.
+            </p>
+
+            <p>
+              The worker reads the last extraction point, scans only the delta, keeps user and assistant text, excludes tool messages and tool calls, then checks thresholds.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/internal/memory/auto.go#L264-L333"><code>AutoMemoryWorker.EnqueueJob</code></a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/internal/memory/auto.go#L675-L721"><code>scanDeltaSince</code></a>.
+            </p>
+
+            <p>
+              Extraction is also retrieval-aware. The worker builds a query from user messages, searches relevant existing memories, asks the extractor model for add/update/delete/clear operations,
+              reconciles operations, and executes only enabled actions.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/internal/memory/auto.go#L391-L468"><code>createAutoMemory</code></a>,
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/extractor/memory.go#L110-L183"><code>Extract</code></a>,
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/internal/memory/auto.go#L537-L627"><code>executeOperation</code></a>.
+            </p>
+
+            <h3>Preload Gives The Model A Small Durable Background</h3>
+            <p>
+              Preload memory is another model-visibility path. The content processor can format selected memories into a prompt block with usage guidance.
+              It does not mean the entire memory store is appended to every request.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/processor/content.go#L362-L394"><code>WithPreloadMemory</code></a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/processor/preload_memory_prompt.go#L19-L74">preload memory prompt</a>.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <strong>Memory is durable knowledge, not session compression.</strong>
+                Current-session compression belongs to summary. Durable facts and episodes belong to memory.
+              </p>
+            </div>
+
+            <h2>5. session_search And session_load Recover Hidden History</h2>
+            <p>
+              Once summary takes effect, the main model context contains summary plus the post-cutoff delta. The raw old events are still in the session ledger.
+              <code>session_search</code> can search current visible history, current hidden history, and other scopes. The <code>current_hidden</code> path uses the summary boundary
+              to search old events hidden by summary.
+              Source:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/session/tool/recall/search.go#L166-L235"><code>searchCurrentHidden</code></a>.
+            </p>
+
+            <p>
+              <code>session_load</code> then loads a raw event window around the selected anchor. The window is built from ordered events, so the model can recover exact local detail
+              rather than guessing from the summary.
+              Sources:
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/session/tool/recall/load.go#L118-L153"><code>resolveLoadAnchorEventID</code></a>
+              and
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/window/window.go#L22-L88"><code>EventWindowFromOrderedEvents</code></a>.
+            </p>
+
+            <h2>6. Place tRPC-Agent-Go Back On The Series Map</h2>
+            <p>
+              Eino asks how Go components, streams, interrupts, and agent loops become a composable graph. tRPC-Agent-Go asks the next service-runtime question:
+              after the Go agent becomes a long-running session system, who owns session events, compression, durable memory, model projection, and hidden-history recall?
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Misread</th>
+                    <th>Better reading</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Memory means summarizing the chat transcript.</td>
+                    <td>Summary compresses the current session; memory persists cross-session facts and episodes.</td>
+                  </tr>
+                  <tr>
+                    <td>Once summary exists, old events can be deleted.</td>
+                    <td>Summary changes the main model view. Raw events still serve session_search and session_load.</td>
+                  </tr>
+                  <tr>
+                    <td>Auto memory writes every sentence into long-term memory.</td>
+                    <td>It runs after completion, scans deltas, checks thresholds, retrieves existing memories, then extracts operations.</td>
+                  </tr>
+                  <tr>
+                    <td>Long-context models make summary unnecessary.</td>
+                    <td>Summary still governs cost, cache shape, tool transcripts, and recovery boundaries.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The short conclusion: <strong>tRPC-Agent-Go's long-context owner is not one memory switch. It is two ledgers plus a recall path.</strong>
+              Summary keeps the current session runnable, memory preserves durable facts, and session_load can recover raw history hidden by summary.
+            </p>
+
+            <h2 id="sources">Sources</h2>
+            <ul>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/tree/d3b50fd90d60b4ece8a78e89cf890a4f06d78235">tRPC-Agent-Go repository snapshot</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go">runner runtime</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/session.go">session model</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/summarizer.go">session summarizer</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/summary/summary.go">internal summary orchestration</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/processor/content.go">content request processor</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/llmflow/llmflow.go">LLM flow compaction</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go">memory API</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/internal/memory/auto.go">auto memory worker</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/session/tool/recall/search.go">session search recall tool</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/session/tool/recall/load.go">session load recall tool</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        const headings = [...article.querySelectorAll("h2, h3, h4")];
+        const slugCounts = new Map();
+        const slugify = (text) => {
+          const raw = text
+            .trim()
+            .toLowerCase()
+            .replace(/<[^>]+>/g, "")
+            .replace(/[`"'“”‘’]/g, "")
+            .replace(/[^\p{Script=Han}\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          const base = raw || "section";
+          const count = slugCounts.get(base) || 0;
+          slugCounts.set(base, count + 1);
+          return count ? `${base}-${count + 1}` : base;
+        };
+        const root = document.createElement("ol");
+        root.className = "toc-list";
+        const stack = [{ level: 2, list: root }];
+        headings.forEach((heading) => {
+          if (!heading.id) heading.id = slugify(heading.textContent || "");
+          const level = Number(heading.tagName.slice(1));
+          while (stack.length && level < stack[stack.length - 1].level) stack.pop();
+          if (level > stack[stack.length - 1].level) {
+            const parent = stack[stack.length - 1].list.lastElementChild;
+            const child = document.createElement("ol");
+            child.className = "toc-sublist";
+            if (parent) parent.appendChild(child);
+            stack.push({ level, list: child });
+          }
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent || "";
+          link.className = `toc-link toc-level-${level}`;
+          item.appendChild(link);
+          stack[stack.length - 1].list.appendChild(item);
+        });
+        toc.appendChild(root);
+      })();
+    </script>
+  </body>
+</html>
