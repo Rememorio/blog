@@ -110,11 +110,22 @@
 
           <section class="article-body">
             <p>
-              Start with a mundane long-term memory case. In January, a user says they prefer vegetarian restaurants.
-              In March, they say they have started eating seafood. In June, they ask, "What kind of place did I usually
-              choose for dinner with friends?" If the system stores only the last preference, it loses January's history.
-              If it puts every remembered fact into the prompt, the model may treat an old preference as current.
-              The case splits long-term memory into two questions: <strong>where history is preserved, and where "still true now" is decided.</strong>
+              Start with a concrete case. A restaurant-booking agent talks with the same user for half a year:
+              in January, the user lives in Beijing and usually chooses vegetarian restaurants with friends;
+              in March, they say they have started eating seafood; in April, they move to Paris; in June, they ask,
+              "Find a restaurant for this weekend, and remember my current situation"; in July, they ask,
+              "What kind of place did I usually choose with friends before?" The agent cannot just replay chat history.
+              It has to know which facts describe the current preference, which facts are historical, and which changes
+              are worth preserving as changes.
+            </p>
+
+            <p>
+              Three direct designs are tempting. Put the whole half-year conversation into the prompt: it works briefly,
+              then costs too much and lets old facts distract the answer. Maintain a single user profile and overwrite old values:
+              the current state looks clean, but historical questions lose their evidence. Store every fact in a vector database and retrieve top-k:
+              implementation is simple, but duplicates, conflicts, relationships, and time still need handling. Mem0 is interesting because
+              it does not treat those designs as the endpoint. It turns memory into a separate layer: extract searchable facts from conversation,
+              then return a small set of relevant memories to the model before answering.
             </p>
 
             <p>
@@ -122,11 +133,7 @@
               user scope, and agent scope into Mem0; Mem0 turns durable information into memory records; when the model answers,
               the app retrieves a small set of relevant memories and places them back into context. That position explains why it became a central
               memory-layer option for agents: teams do not have to stuff all history into the prompt or rebuild extraction, deduplication,
-              and retrieval logic from scratch.
-            </p>
-
-            <p>
-              Several Mem0 posts circle the same boundary:
+              and retrieval logic from scratch. Several Mem0 posts circle the same boundary:
               <a href="https://mem0.ai/blog/context-window-is-ram-not-storage-why-most-agent-failures-happen-how-to-fix-them-in-2026">the context window is closer to RAM than storage</a>;
               <a href="https://mem0.ai/blog/context-window-vs-persistent-memory-why-1m-tokens-isn-t-enough">a larger context window still does not replace persistent memory</a>;
               and <a href="https://mem0.ai/blog/your-ai-agents-memory-is-just-a-file-thats-the-problem">a memory file</a>
@@ -147,24 +154,20 @@
             </div>
 
             <p>
-              Read the system with five questions in mind:
+              The rest of the article keeps returning to this restaurant case. First, paper mem0 decides ADD, UPDATE, DELETE,
+              or NOOP during write. Then mem0g explains why entities and relationships became a graph path. Then v3 moves toward
+              ADD-only writes, entity indexing, and hybrid retrieval. Temporal Reasoning and Memory Decay follow naturally:
+              one asks which date frames the history, and the other asks whether recently reused memories deserve a softer ranking boost.
             </p>
-            <ol>
-              <li>Are the informal v1, v2, v3 labels the same as paper mem0 and mem0g?</li>
-              <li>Why did paper mem0 ask the LLM to choose ADD, UPDATE, DELETE, or NOOP?</li>
-              <li>What problem did mem0g solve with a graph, and what cost did that add?</li>
-              <li>Why did v3 move toward ADD-only writes, entity linking, and hybrid retrieval?</li>
-              <li>Where do Temporal Reasoning and Memory Decay place time and recent usage?</li>
-            </ol>
 
-            <h2 id="evolution">1. Start With the Algorithm Evolution</h2>
+            <h2 id="evolution">1. One Problem, Three Memory Routes</h2>
             <p>
               Two naming lines are easy to mix together. The paper talks about mem0 and mem0g;
               product and SDK migration material talks about the older v2 surface and v3 behavior.
               This article does not force them into an official "v1, v2, v3" sequence. It reads them as algorithmic tradeoffs:
-              first keep a compact text-memory set with LLM-managed updates, then make entity relationships explicit with a graph,
-              then simplify writes and move more selection work into retrieval and ranking. That route makes ADD-only,
-              Temporal Reasoning, and Memory Decay easier to place.
+              if a user's preferences and location change over time, when should the system merge old facts, when should it preserve
+              relationships explicitly, and when should it append new evidence first? Once that route is clear, ADD-only,
+              Temporal Reasoning, and Memory Decay become layers answering the same problem rather than isolated feature names.
             </p>
 
             <div class="table-wrap">
@@ -212,129 +215,190 @@
               </figcaption>
             </figure>
 
-            <h3>1.1 paper mem0: Extract First, Then Decide How to Edit Old Memory</h3>
+            <h3>1.1 paper mem0: Clean Up Old Memory During Write</h3>
             <p>
-              The earliest mem0 path starts from a practical goal: the memory set cannot grow without bound, because retrieval
-              and context injection become more expensive. Duplicate facts should be merged, and stale or wrong facts should leave
-              the active memory set. The <a href="https://arxiv.org/html/2504.19413v1">original paper</a> puts that cleanup work
-              inside the write path. Its input is not one user message; it sees a small conversation state: the latest user and assistant messages,
-              the previous summary, recent turns, and existing memories. The simplified flow looks like this:
-            </p>
-
-            <pre><code class="language-text">Input:
-  latest user message + assistant message
-  previous summary
-  recent m messages
-  existing memory store
-
-Write:
-  1. LLM extracts k candidate memories from the new conversation
-  2. For each candidate, use embedding / vector similarity to retrieve m similar existing memories
-  3. LLM compares the candidate with similar old memories
-  4. LLM outputs ADD / UPDATE / DELETE / NOOP
-  5. Apply that operation to the memory store
-
-Read:
-  query -> vector similarity -> top memories -> current prompt context</code></pre>
-
-            <p>
-              So retrieval in 1.1 should not be read as today's hybrid retrieval path. In paper mem0, similarity is mainly
-              embedding / vector similarity: the candidate is embedded and compared with existing memory vectors so the system can bring back
-              old records worth checking. There is no BM25, RRF, or tokenizer-first keyword fusion at this layer. Keyword and entity signals
-              become explicit later in the v3 search path.
-            </p>
-            <p>
-              "Similar" also has two separate jobs here. The first job is recall: vector search only brings back old records that may matter.
-              The second job is decision-making: those similar records are only candidates shown to the LLM, not a rule that says a high
-              similarity score must become <code>UPDATE</code>. The visible OSS
-              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L176-L324"><code>DEFAULT_UPDATE_MEMORY_PROMPT</code></a>
-              frames this step as comparing newly retrieved facts with existing memory and choosing ADD, UPDATE, DELETE, or NONE.
-              <code>NONE</code> is the same no-op idea that the paper-level description and this article call <code>NOOP</code>.
+              Focus on one event first: in March, the user says, "I have also started eating seafood." The store already has
+              "the user usually chooses vegetarian restaurants with friends." Should the new fact be added as a separate memory?
+              Should it update the old preference? Should the old preference remain because it is historical evidence?
+              Paper mem0 answers by cleaning up old memory during write so the memory set stays compact.
             </p>
 
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>Relation between new fact and old memory</th>
-                    <th>Expected operation</th>
-                    <th>Intuition</th>
+                    <th>Before Write</th>
+                    <th>New Conversation</th>
+                    <th>Question paper mem0 Tries to Answer</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr>
-                    <td>The old memory does not contain this fact</td>
-                    <td><code>ADD</code></td>
-                    <td>Old: user is a software engineer. New: user's name is John.</td>
+                    <td>User usually chooses vegetarian restaurants with friends.</td>
+                    <td>User recently started eating seafood.</td>
+                    <td>Is this a new preference, an extension, or a replacement?</td>
                   </tr>
                   <tr>
-                    <td>Same fact, different wording</td>
-                    <td><code>NOOP</code> / <code>NONE</code></td>
-                    <td>Old: likes cheese pizza. New: loves cheese pizza.</td>
+                    <td>User lives in Beijing.</td>
+                    <td>User moved to Paris in April.</td>
+                    <td>Should the old location update, or remain as history?</td>
                   </tr>
                   <tr>
-                    <td>Same subject or preference, but the new fact is more specific or the value changed</td>
-                    <td><code>UPDATE</code></td>
-                    <td>Old: likes cricket. New: likes playing cricket with friends.</td>
-                  </tr>
-                  <tr>
-                    <td>The new fact contradicts the old fact, or the user explicitly asks to remove it</td>
-                    <td><code>DELETE</code></td>
-                    <td>Old: likes cheese pizza. New: dislikes cheese pizza.</td>
+                    <td>User likes quiet small restaurants.</td>
+                    <td>User dislikes noisy bars.</td>
+                    <td>Is this the same preference made more specific, or a separate fact?</td>
                   </tr>
                 </tbody>
               </table>
             </div>
 
             <p>
-              The benefit is compactness: related facts can be merged, and stale or wrong records can be removed.
-              But this is not a hard deduplication algorithm. If vector retrieval does not bring back the right old memory, or if the LLM treats
-              a repeated fact as new, the system can still duplicate an <code>ADD</code>. The cost comes from the same place.
-              The write path includes an old-vs-new decision, and <code>UPDATE</code> or <code>DELETE</code>
-              can weaken historical evidence. If the user later asks why a preference changed last year, the earlier version may no longer be available.
-              That raises the central question for long-term memory: should write consolidate history into a latest state, or should history be preserved first?
+              The base algorithm in the <a href="https://arxiv.org/html/2504.19413v1">original paper</a> has two main steps.
+              First, the LLM extracts candidate memories from the latest conversation and recent context. Second, for each candidate,
+              the system retrieves similar existing memories, then asks the LLM to compare old and new facts and choose
+              <code>ADD</code>, <code>UPDATE</code>, <code>DELETE</code>, or <code>NOOP</code>.
+              Similarity is not the final decision; it is how the system brings likely related old memories in front of the LLM.
+            </p>
+
+            <pre><code class="language-text">paper mem0 write path:
+
+new conversation
+  -> LLM extracts candidate memories
+  -> embed each candidate
+  -> vector search retrieves similar existing memories
+  -> LLM compares candidate with those old memories
+  -> ADD / UPDATE / DELETE / NOOP changes the memory store</code></pre>
+
+            <p>
+              "Similar" has two responsibilities. Vector search handles recall: the candidate becomes an embedding, and vector similarity
+              brings back old memories that may matter. Those recalled records are still only candidates. The LLM makes the actual decision:
+              duplicate, more specific, contradictory, or new. The visible OSS
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L176-L324"><code>DEFAULT_UPDATE_MEMORY_PROMPT</code></a>
+              follows the same shape: compare new facts with existing memory, then choose one of four operations.
+              Its <code>NONE</code> is the same no-op idea this article calls <code>NOOP</code>.
+            </p>
+
+            <pre><code class="language-text">DEFAULT_UPDATE_MEMORY_PROMPT, simplified:
+
+new fact + similar existing memories
+  -> ADD     the old memory does not contain the fact
+  -> UPDATE  the same subject changed, or the new fact is richer
+  -> DELETE  the new fact negates old memory, or the user asks to remove it
+  -> NONE    already present, irrelevant, or not worth writing</code></pre>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Relation Between New Fact and Old Memory</th>
+                    <th>Operation</th>
+                    <th>Restaurant-case Reading</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>The old memory does not contain this fact</td>
+                    <td><code>ADD</code></td>
+                    <td>The old memory only has restaurant preference; the new fact is the move to Paris.</td>
+                  </tr>
+                  <tr>
+                    <td>Same fact, different wording</td>
+                    <td><code>NOOP</code> / <code>NONE</code></td>
+                    <td>Old: likes quiet restaurants. New: prefers places that are not noisy.</td>
+                  </tr>
+                  <tr>
+                    <td>Same subject or preference, but the new fact is richer or the value changed</td>
+                    <td><code>UPDATE</code></td>
+                    <td>Old: usually eats vegetarian. New: now also accepts seafood.</td>
+                  </tr>
+                  <tr>
+                    <td>The new fact explicitly negates old memory, or the user asks to remove it</td>
+                    <td><code>DELETE</code></td>
+                    <td>Old: likes seafood. New: do not recommend seafood anymore.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The <code>UPDATE</code> row is important. Paper mem0 is trying to keep the memory set compact,
+              so it may fold a preference extension or change into the same preference memory. v3 takes a different route:
+              do not fold too early; preserve the change as new evidence first.
+            </p>
+
+            <p>
+              This naturally answers why a highly similar fact is not automatically a duplicate <code>ADD</code>.
+              Paper mem0 first uses embeddings to retrieve similar old memories, then lets the LLM decide whether to add, update, delete,
+              or do nothing. That is still not a database-level uniqueness guarantee. If vector search misses the right old memory,
+              or if the LLM misreads a paraphrase as a new fact, duplicate <code>ADD</code> can happen.
+              The upside is a compact memory set. The cost is that write-time <code>UPDATE</code> and <code>DELETE</code>
+              can weaken historical evidence. If the user later asks why they used to choose vegetarian restaurants more often,
+              an overwritten or deleted version may no longer be available.
             </p>
 
             <h3>1.2 paper mem0g: Pull Relationships Out of Text Memories</h3>
             <p>
-              Paper mem0 can maintain a relatively compact set of text memories, but it still leans on vector similarity.
-              That works for finding facts with nearby meaning. It is less direct for relationship-heavy questions:
-              a user, company, project, and coworker may appear in different memories, and semantic similarity does not naturally say
-              whether those objects are connected by ownership, collaboration, reporting, or dependency. Mem0g adds a structured path beside text memory:
-              memory records still go into the vector store, while entities and relationships also go into a graph store.
-              In other words, the graph is an entity/relationship index sidecar, not a replacement for text memory.
+              Add a relationship problem to the same restaurant case. The user says, "I often eat out with Alice."
+              Later they say, "Alice is allergic to shellfish." Later still they ask, "What should I avoid when booking dinner
+              with Alice in Paris this weekend?" Text memories can store those sentences, and vector similarity can retrieve some nearby content.
+              But it has no built-in object map: who Alice is, how she relates to the user, and how shellfish allergy should affect seafood recommendations
+              are all buried in separate text records. Mem0g adds a structured path beside text memory: memory records still go into the vector store,
+              while entities and relationships also go into a graph store. The graph is not a replacement for text memory; it is an index for
+              "which objects are connected."
             </p>
 
-            <pre><code class="language-text">Input:
-  conversation messages
-  existing memory store
-  graph store
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Step</th>
+                    <th>Text-memory Path</th>
+                    <th>Graph Path</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Write</td>
+                    <td>Extract facts such as "user often eats with Alice" and "Alice is allergic to shellfish" into the vector memory store.</td>
+                    <td>Also extract entities such as <code>Alice</code>, <code>shellfish allergy</code>, and <code>Paris</code>, plus relationship edges.</td>
+                  </tr>
+                  <tr>
+                    <td>Read</td>
+                    <td>Use semantic similarity to retrieve memory records related to the query.</td>
+                    <td>Start from entities in the query or recalled memories, then traverse graph neighbors and relationships.</td>
+                  </tr>
+                  <tr>
+                    <td>Merge</td>
+                    <td>Place semantically relevant text facts into the candidate context.</td>
+                    <td>Add structured facts about Alice and dietary constraints to the same candidate context.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
 
-Write:
-  1. Extract memory facts from messages
-  2. Also extract entities and relationships
-  3. Store memory facts in the vector memory store
-  4. Store entities and relationships in the graph store
-  5. Merge aliases and maintain repeated or changed relationships
+            <pre><code class="language-text">mem0g can be read as two parallel write paths:
 
-Read:
-  1. Use semantic retrieval to recall memory records
-  2. Identify entities from the query or recalled memories
-  3. Traverse graph neighbors, relationships, and linked memories
-  4. Merge vector memories with graph facts for the prompt context</code></pre>
+message
+  -> memory facts -----------------> vector memory store
+  -> entities + relationships -----> graph store
+
+search(query)
+  -> vector memories
+  -> graph neighbors around matched entities
+  -> merged context for the model</code></pre>
+
+            <pre><code class="language-text">Minimal graph example:
+
+User  --eats_with----> Alice
+Alice --allergic_to--> shellfish
+User  --located_in---> Paris</code></pre>
 
             <p>
-              For example, a user first says, "I work on Hermes at Acme," and later says, "Alice also works on the Hermes integration."
-              Text memories can store those facts as separate records. The graph route can also make structures such as
-              <code>user - works_on - Hermes</code>, <code>Alice - collaborates_on - Hermes</code>, and
-              <code>Hermes - belongs_to - Acme</code> explicit. When the user asks what to discuss with Alice about Hermes,
-              retrieval can follow the Hermes node instead of relying only on sentence-level similarity.
-            </p>
-            <p>
-              This is not BM25-style full-text retrieval either. Mem0g handles a different recall failure: two sentences may not be
-              close in embedding space, but they share an entity or relationship path. Read can first recall text memories semantically,
-              then use entity recognition and graph traversal to add adjacent objects to the context. The graph expands object connectivity;
-              it does not replace vector similarity with keyword scoring.
+              This handles a different recall failure: two facts may not be close as sentences, but they should appear together because
+              they share an entity or relationship path. "Alice is allergic to shellfish" and "the user wants a seafood restaurant in Paris"
+              are not paraphrases, yet a recommendation should consider both. The graph route lets retrieval follow the Alice node to the
+              allergy constraint and merge it with restaurant preference. It expands object connectivity; it does not replace vector similarity
+              with keyword scoring.
             </p>
 
             <div class="table-wrap">
@@ -374,26 +438,25 @@ Read:
             <p>
               The point is not to replace text memory with a graph. It is to give relationship-heavy information its own index.
               That solves the "how do these objects connect?" problem, but it does not solve the historical-version problem.
-              The graph can say Alice, Hermes, and Acme are related; when the user later changes projects, or when a relationship changes over time,
+              The graph can say Alice, shellfish allergy, and Paris restaurants are related; when the user later changes dinner companions,
+              or when a relationship changes over time,
               the system still has to decide whether the old fact should be updated, deleted, or preserved as history.
             </p>
 
             <h3>1.3 mem0 v3: Make Writes Thin, Move Judgment Into Read</h3>
             <p>
-              Once the first two routes are combined, the write path carries a lot of work: paper mem0 decides ADD, UPDATE, DELETE, or NOOP;
-              mem0g also maintains entities, relationships, and a graph store. The harder issue is that many long-term memories are not simply
-              "old is wrong, new is right." A user says in January, "I currently live in Beijing," and then says in April,
-              "I currently live in Paris." "Where do I live now?" should prefer the April fact; "where did I live before March?"
-              still needs the January fact.
-              If write overwrites history immediately, the current state looks cleaner, but later explanation gets weaker.
+              Paper mem0 makes the write path behave like an editor: when a new fact arrives, immediately decide whether the old memory
+              should be updated, deleted, or preserved. Mem0g adds relationship maintenance beside that. The benefit is a cleaner memory set
+              and more explicit relations; the downside is that write starts acting like the final judge. Long-term memory is often harder than
+              factual correction. If the user lived in Beijing in January and Paris in April, Beijing is not simply wrong.
+              It was true in January; Paris is true in April. Immediate overwrite may simplify current answers while weakening historical explanation.
             </p>
             <p>
               The official <a href="https://docs.mem0.ai/migration/oss-v2-to-v3">v2-to-v3 migration docs</a>
               and <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm post</a>
-              describe v3 as single-pass ADD-only. The useful way to read that is a responsibility shift:
-              write no longer makes the final call on whether an old fact still counts. It writes new memory evidence as searchable records
-              and connects those records to related old memories and entity indexes. Retrieval, Temporal Reasoning, and Memory Decay decide
-              which records should enter the current model view.
+              describe v3 as single-pass ADD-only. A useful reading is: reduce irreversible decisions during write.
+              Write should extract durable facts from the new conversation, store them with deduplication, links, and entity indexes,
+              then leave "which fact should this answer trust?" to retrieval and ranking.
             </p>
 
             <pre><code class="language-text">Changing state, shape-level example:
@@ -414,33 +477,33 @@ search("Where did the user live before March?", reference_date="2025-03-01")
   -> can still recover Beijing</code></pre>
 
             <p>
-              This is not the exact public API response shape; it is a responsibility boundary. ADD-only preserves both Beijing and Paris
+              This is not the exact public API response shape; it shows the responsibility boundary. ADD-only preserves both Beijing and Paris
               as evidence. <code>linked_memory_ids</code> says the two records are about the same changing state. Platform
-              <code>timestamp</code> and <code>reference_date</code> let search say which date should frame the answer.
-              Public source shows the extraction prompt grounding relative time with an observation date, and it shows OSS treating
-              <code>timestamp</code> / <code>reference_date</code> as Platform-only boundaries. The server-side ranking details for
-              current-state temporal selection are not public.
+              <code>timestamp</code> and <code>reference_date</code> let search say which date frames the answer.
+              Write does not rush to invalidate Beijing; read decides which record should rank higher for this question.
             </p>
 
-            <pre><code class="language-text">Input:
-  conversation messages
-  existing memories
-  optional timestamp
+            <p>
+              The public OSS
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L806-L1070"><code>_add_to_vector_store()</code></a>
+              is easier to read in that order. It gathers recent messages and similar existing memories, makes a single LLM extraction call,
+              then batch-embeds, hash-deduplicates, inserts vectors, records history <code>ADD</code> events, and links entities.
+              Existing memories are still consulted, but for deduplication and linking, not as a source of new facts and not as records to overwrite here.
+            </p>
 
-Write:
-  1. Use one LLM call to extract new memories
-  2. Do not UPDATE or DELETE old memories during this step
-  3. Use hash / batch embedding for basic deduplication and vectors
-  4. Insert new memories as ADD events in the vector store
-  5. Connect related old memories with linked_memory_ids
-  6. Run built-in entity linking for retrieval signals
+            <pre><code class="language-python"># _add_to_vector_store(), simplified shape
+last_messages = db.get_last_messages(...)
+existing_results = vector_store.search(..., top_k=10)
 
-Read:
-  query -> semantic candidate pool
-        -> BM25 keyword boost when available
-        -> entity boost through linked_memory_ids
-        -> Platform temporal / decay signals when enabled
-        -> ranked model view</code></pre>
+extracted = llm.generate_response(ADDITIVE_EXTRACTION_PROMPT, ...)
+embeddings = embedding_model.embed_batch(memory_texts, "add")
+
+for memory in extracted:
+    if hash_seen(memory):
+        continue
+    vector_store.insert(memory)
+    history.event = "ADD"
+    link_entities(memory)</code></pre>
 
             <div class="table-wrap">
               <table>
@@ -454,27 +517,27 @@ Read:
                 <tbody>
                   <tr>
                     <td>single-pass extraction</td>
-                    <td>Reduces the cost and latency of multi-step LLM judgment during write.</td>
+                    <td>Stops asking the LLM to repeatedly arbitrate old-vs-new state during write.</td>
                     <td>Extraction quality depends more on one prompt and its input context.</td>
                   </tr>
                   <tr>
                     <td>ADD-only</td>
-                    <td>Avoids turning time changes into irreversible overwrite or deletion.</td>
+                    <td>Stores a state change as new evidence instead of immediately overwriting old evidence.</td>
                     <td>Duplicates, conflicts, and stale facts must be handled by retrieval.</td>
                   </tr>
                   <tr>
                     <td><code>linked_memory_ids</code></td>
-                    <td>Connects new and old facts without using overwrite to express change.</td>
+                    <td>Connects new and old facts so later retrieval can explain the transition.</td>
                     <td>Retrieval and display need to understand what those links mean.</td>
                   </tr>
                   <tr>
                     <td>built-in entity linking</td>
-                    <td>Keeps the relationship cue from mem0g without requiring users to operate an external graph store.</td>
+                    <td>Keeps part of mem0g's relationship cue without requiring users to operate an external graph store.</td>
                     <td>Entity signals become part of retrieval ranking, not the whole answer by themselves.</td>
                   </tr>
                   <tr>
                     <td>hybrid retrieval</td>
-                    <td>Puts semantic, keyword, entity, time, and usage signals into one ranking problem.</td>
+                    <td>Moves "which memory should this answer see?" into read-time ranking.</td>
                     <td>Model-view quality now depends on signal fusion, not only on a clean write path.</td>
                   </tr>
                 </tbody>
@@ -482,12 +545,11 @@ Read:
             </div>
 
             <p>
-              Seen this way, ADD-only is not just a token-saving trick. It asks the write path to avoid irreversible judgment,
-              reducing historical loss from mistaken deletion or overwrite. Links, entities, and multi-signal retrieval then turn
-              "which memory is useful now?" into a read-time question. There is a cost: old facts remain in the store, storage keeps growing,
-              and retrieval has to handle deduplication, conflict ranking, and stale-fact filtering. If ranking signals are weak,
-              an old fact can still be pulled into the model view by mistake. Temporal Reasoning and Memory Decay continue from there
-              by deciding how the same history should be ranked under different time conditions and recent-use signals.
+              Seen this way, ADD-only is not just a token-saving trick. It pushes the dangerous action later:
+              write avoids irreversible judgment and preserves evidence; read combines semantic, keyword, entity, time, and access signals
+              to decide the current model view. The tradeoff is clear: old facts remain in the store, storage grows, and retrieval must handle
+              duplication, conflicts, and stale facts. Temporal Reasoning and Memory Decay answer the next question:
+              once history is preserved, which few records should this turn see?
             </p>
 
             <h3>1.4 Separate Three Objects First: Window, Record, and Model View</h3>
@@ -543,15 +605,6 @@ Read:
                 </tbody>
               </table>
             </div>
-
-            <h4>The Later Posts Are About Model View Quality</h4>
-            <p>
-              Mem0's <a href="https://mem0.ai/blog/why-beam-is-a-good-memory-benchmark-for-ai-agents">BEAM benchmark post</a>
-              and <a href="https://mem0.ai/blog/how-to-test-ai-agent-memory-with-mem0-a-practical-memory-simulation-guide">memory simulation guide</a>
-              both point beyond simple recall. Production memory needs to handle stale facts, contradictions, time conditions,
-              and retrieval drift. Temporal Reasoning and Memory Decay sit in that problem space: they keep history available
-              while making "now", "then", and "recently reinforced" easier to distinguish.
-            </p>
 
             <h2 id="write-path">2. Why Writes Are ADD-only: Preserve Evidence Before Judging Old Facts</h2>
             <p>
@@ -653,8 +706,9 @@ Write-time handling:
 
             <h3>2.2 The OSS Path Keeps a Hard Boundary Around Platform-only Time Fields</h3>
             <p>
+              Because later sections use Temporal Reasoning, it is worth setting the source boundary first.
               Once observation dates enter the discussion, it is tempting to treat Temporal Reasoning as part of the visible OSS path.
-              That would blur the evidence boundary. Public OSS source shows ADD-only write, baseline retrieval, and the parameter boundary.
+              That would blur the evidence boundary. Public OSS source shows ADD-only write, baseline retrieval, and the parameter boundary;
               Platform v3 exposes the full temporal fields.
               Passing <code>timestamp</code> to OSS <code>Memory.add()</code>
               raises a Platform-only error; passing <code>reference_date</code> to OSS <code>Memory.search()</code> does the same.
@@ -662,56 +716,53 @@ Write-time handling:
               from search reference time, but the server-side ranking algorithm is not visible in the public source.
             </p>
 
-            <h2 id="retrieval">3. Why Retrieval Needs Fusion: More Candidates Need Filtering and Ranking</h2>
+            <h2 id="retrieval">3. Read: Find Candidates First, Then Decide What the Model Sees</h2>
             <p>
-              ADD-only keeps the history, so read cannot be lazy. A plain vector top-k mainly answers "which sentences look close to this query."
-              The product question is sharper: "which memories should the model see now?" Those are different questions.
-              Old and new preferences may both be semantically close, and a frequently mentioned coworker can drag in the wrong project context.
-              The selection removed from write has to happen when the model view is formed: broaden the candidate pool, then filter and rank with multiple signals.
+              ADD-only keeps the history, so read has to be more careful. In the restaurant case, the query is
+              "Find a restaurant for this weekend, and remember my current situation." "Beijing vegetarian,"
+              "Paris seafood," and "Alice is allergic to shellfish" may all matter, but they matter in different ways:
+              old preference, current location, and companion constraint. The read layer is not only asking
+              "which sentences look close to the query?" It is asking "which memories belong in this turn's model view?"
             </p>
             <p>
               In OSS, search starts at
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1248-L1372"><code>Memory.search()</code></a>
               and flows into
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1488-L1668"><code>_search_vector_store()</code></a>.
-              The query is lemmatized and entity-extracted, embedded, semantically over-fetched, matched by keyword search, and boosted by entity links.
-              Those signals then flow into
+              Read in source order, it does five things: normalize the query for keyword search and extract entities; embed the query;
+              over-fetch semantic candidates; turn keyword-search results into BM25 scores when the store supports it; compute entity boosts
+              through linked memories; then pass the signals into
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/utils/scoring.py#L1-L130"><code>score_and_rank()</code></a>.
-              A simple mental model is: semantic similarity keeps results on topic, keywords keep exact terms from being lost,
-              and entity signals keep related objects connected.
-            </p>
-            <p>
-              The lemmatization step here is keyword normalization through <code>lemmatize_for_bm25()</code>, not a tokenizer-first
-              retrieval architecture such as a Chinese segmentation pipeline. BM25 is also not fused by RRF over an independent keyword
-              result list. In the visible OSS implementation, the candidate pool comes from semantic search; <code>keyword_search()</code>
-              provides BM25 scores and the entity store provides boosts for those semantic candidates. If a vector store does not support
-              keyword search, or optional NLP dependencies are missing, the path degrades to semantic-only or semantic plus the available signals.
             </p>
 
-            <pre><code class="language-python"># OSS search shape, simplified from _search_vector_store()
-query_lemmatized = lemmatize_for_bm25(query)
+            <pre><code class="language-python"># _search_vector_store(), simplified shape
+query_terms = lemmatize_for_bm25(query)
 query_entities = extract_entities(query)
-embedding = embedding_model.embed(query, "search")
+query_vector = embedding_model.embed(query, "search")
 
-semantic_results = vector_store.search(
-    query=query,
-    vectors=embedding,
-    top_k=max(top_k * 4, 60),
-    filters=filters,
-)
-keyword_results = vector_store.keyword_search(query_lemmatized, top_k=max(top_k * 4, 60))
-bm25_scores = {}
-if keyword_results is not None:
-    midpoint, steepness = get_bm25_params(query, lemmatized=query_lemmatized)
-    for memory in keyword_results:
-        bm25_scores[memory.id] = normalize_bm25(memory.score, midpoint, steepness)
-entity_boosts = self._compute_entity_boosts(query_entities, filters)
+internal_limit = max(limit * 4, 60)
+semantic_results = vector_store.search(..., top_k=internal_limit)
+keyword_results = vector_store.keyword_search(query_terms, top_k=internal_limit)
 
-results = score_and_rank(
+bm25_scores = normalize_keyword_scores(keyword_results)
+entity_boosts = compute_boosts_from_linked_entities(query_entities)
+
+ranked = score_and_rank(
     semantic_results,
     bm25_scores=bm25_scores,
     entity_boosts=entity_boosts,
+    threshold=threshold,
+    top_k=limit,
 )</code></pre>
+
+            <p>
+              That order clears up the common retrieval questions. BM25 is present, but in the visible OSS path it is a keyword score signal;
+              the candidate pool first comes from semantic search. Entity search does not produce the final answer by itself either;
+              it boosts memories linked to matched entities. The path is closer to additive score fusion: semantic candidates pass a gate,
+              then BM25 and entity boost adjust their scores. Therefore, this is better read as adding scores over the same semantic candidate set,
+              not as applying RRF to separate vector, BM25, and entity ranked lists.
+              A compact reading is: semantic similarity keeps results on topic, keywords preserve exact terms, and entity signals keep related objects connected.
+            </p>
 
             <figure class="figure">
               <img
@@ -726,7 +777,7 @@ results = score_and_rank(
             <h3>3.1 Semantic Relevance Gates Before Keyword and Entity Fusion</h3>
             <p>
               Ranking fails quickly when familiarity is mistaken for relevance. Suppose Alice appears in many memories and the query also mentions Alice,
-              but this turn is about restaurant preference, not the Hermes project. If entity boost acted alone, many Alice-related records would look important.
+              but this turn is about restaurant preference, not every older dinner plan involving Alice. If entity boost acted alone, many Alice-related records would look important.
               Fusion starts with a gate instead: candidates below the semantic threshold are removed before normalized BM25 and entity boost are added.
               Keyword and entity signals can change the order among relevant candidates, but they should not rescue a semantically unrelated one.
             </p>
@@ -744,10 +795,10 @@ results = score_and_rank(
 combined = (semantic_score + bm25_score + entity_boost) / max_possible_score</code></pre>
 
             <p>
-              That is additive score fusion, not RRF over separate vector, BM25, and entity top-k lists.
+              In other words, the final score comes from semantic score, BM25 score, and entity boost added together.
               BM25 and entity signals can reorder relevant candidates, but they do not pull a memory into the final result if it never entered
               the semantic candidate pool. The design is conservative: it gives up some pure keyword recall in exchange for not letting familiar
-              names, project names, or frequent terms force unrelated memories into the model view.
+              names, restaurant names, or frequent terms force unrelated memories into the model view.
             </p>
 
             <h3>3.2 "Still Applies Now" Needs Time and Usage Signals</h3>
@@ -913,6 +964,13 @@ client.project.update(decay=True)</code></pre>
               Mem0's route is layered instead of extreme: ADD-only preserves the evidence; hybrid retrieval builds the candidate pool;
               Temporal Reasoning supplies the time perspective; Memory Decay lets recent usage influence result order.
               The model sees neither the whole store nor one overwritten truth. It sees the model view for this question.
+            </p>
+
+            <p>
+              Mem0's <a href="https://mem0.ai/blog/why-beam-is-a-good-memory-benchmark-for-ai-agents">BEAM benchmark post</a>
+              and <a href="https://mem0.ai/blog/how-to-test-ai-agent-memory-with-mem0-a-practical-memory-simulation-guide">memory simulation guide</a>
+              point in the same evaluation direction: production memory cannot stop at "was something retrieved?"
+              It also has to handle stale facts, contradictions, time conditions, and retrieval drift. That is the model-view quality problem.
             </p>
 
             <figure class="figure">

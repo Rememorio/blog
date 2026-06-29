@@ -108,18 +108,24 @@
 
           <section class="article-body">
             <p>
-              先看一个很普通的长期记忆场景。用户一月说自己喜欢素食餐厅，三月说最近开始吃海鲜，六月又问“我以前约朋友吃饭一般选什么地方？”。
-              如果系统只保留最后一条偏好，就会丢掉一月的历史；如果系统把所有事实都无差别塞进上下文，又会让模型把过时偏好当成现在偏好。
-              这个场景把长期记忆拆成两个问题：<strong>历史应该怎样保存，现在是否仍然适用又该在哪一层判断。</strong>
+              先设一个具体场景。一个订餐厅的 agent 和同一个用户聊了半年：一月，用户说自己住在北京，通常约朋友吃素食；
+              三月，用户说最近开始吃海鲜；四月，用户搬到巴黎；六月，用户问“这个周末帮我找个餐厅，别忘了我现在的情况”；
+              七月，用户又问“以前我和朋友吃饭一般会选什么地方？” 这时 agent 不能只会背聊天记录，它要知道哪些事实是现在的偏好，
+              哪些事实已经变成历史，哪些变化本身也值得保留。
+            </p>
+
+            <p>
+              最直接的做法有三种。第一，把半年聊天全塞进 prompt：短期能用，长期成本高，还容易让旧事实干扰当前回答。
+              第二，维护一份“用户档案”，每次新事实来了就覆盖旧值：当前状态很干净，但用户问历史时就没有证据。
+              第三，把每条事实都写进向量库，搜索时拿 top-k：实现简单，却会遇到重复事实、冲突事实、关系漏召回和时间解释的问题。
+              Mem0 受关注，正是因为它没有把这三种方法当成终点，而是把记忆拆成一层独立系统：先从对话里抽出可检索事实，
+              再在回答前挑一小部分相关记忆放回模型上下文。
             </p>
 
             <p>
               在工程形态上，Mem0 位于应用和模型之间：应用把对话、用户维度和 agent 维度交给它，
               它把可长期使用的信息抽成 memory records；模型需要回答时，应用再从 Mem0 搜出少量相关记忆放回上下文。
               这个位置解释了它为什么容易成为 agent 记忆讨论里的核心组件：它不要求把所有历史塞进 prompt，也不要求每个应用自己重写一套记忆抽取、去重和检索逻辑。
-            </p>
-
-            <p>
               Mem0 官方博客从几个角度反复强调同一件事：
               <a href="https://mem0.ai/blog/context-window-is-ram-not-storage-why-most-agent-failures-happen-how-to-fix-them-in-2026">context window 更像 RAM，不是长期存储</a>；
               <a href="https://mem0.ai/blog/context-window-vs-persistent-memory-why-1m-tokens-isn-t-enough">更大的上下文窗口也不能替代持久记忆</a>；
@@ -139,22 +145,17 @@
             </div>
 
             <p>
-              读这篇文章可以带着五个问题：
+              下面会一直沿着这个餐厅场景读 Mem0 的几代设计。先看 paper mem0 如何在写入时判断 ADD、UPDATE、DELETE、NOOP；
+              再看 mem0g 为什么把实体和关系放进图；然后看 v3 为什么改成 ADD-only、实体索引和 hybrid retrieval。
+              最后再接上 Temporal Reasoning 与 Memory Decay：一个处理“站在哪一天看历史”，一个处理“最近反复用到的记忆该不该更靠前”。
             </p>
-            <ol>
-              <li>口头说的 v1、v2、v3，和论文里的 mem0、mem0g 是不是一回事？</li>
-              <li>paper mem0 为什么要让 LLM 判断 ADD、UPDATE、DELETE、NOOP？</li>
-              <li>mem0g 为什么把实体和关系放进图数据库，又带来了什么成本？</li>
-              <li>v3 为什么改成 ADD-only、实体索引和 hybrid retrieval？</li>
-              <li>Temporal Reasoning 与 Memory Decay 分别把“时间”和“近期使用”放到了哪一层？</li>
-            </ol>
 
-            <h2 id="evolution">一、先看三代算法怎么一路改过来</h2>
+            <h2 id="evolution">一、同一个问题，三种记忆路线</h2>
             <p>
               讲 Mem0 演进时，最容易混在一起的是两条命名线：论文里讨论的是 mem0 和 mem0g，
               产品与 SDK 迁移材料里讨论的是 v2 API 和 v3 行为。本文不把它们硬套成“官方 v1、v2、v3”，
-              而是按算法取舍来读：先用 LLM 维护一组较小的文本记忆，再用图结构表达实体关系，最后把写入变简单，
-              把更多判断交给检索和排序。这样后面谈 ADD-only、Temporal 和 Decay 时，读者能看到它们各自接住了前一代留下的哪部分压力。
+              而是按算法取舍来读：如果用户偏好和居住地会变化，系统到底在什么时候合并旧事实、什么时候显式保存关系、什么时候只追加新证据。
+              这条线读顺以后，ADD-only、Temporal 和 Decay 就不是一堆功能名，而是连续回答同一个问题的不同层。
             </p>
 
             <div class="table-wrap">
@@ -201,124 +202,184 @@
               </figcaption>
             </figure>
 
-            <h3>1.1 paper mem0：先抽取，再决定怎么改旧记忆</h3>
+            <h3>1.1 paper mem0：在写入时整理旧记忆</h3>
             <p>
-              最早的 mem0 先面对一个很实际的目标：memory set 不能无限膨胀，否则每次检索和注入上下文都会变贵；
-              重复事实应该合并，明显错误或过时的信息也应该移出当前记忆。<a href="https://arxiv.org/html/2504.19413v1">原始论文</a>
-              于是把“整理旧记忆”放进写入路径。它看到的也不是单条用户消息，而是一小段对话状态：
-              最新 user/assistant message、之前的 summary、最近若干条消息，以及已有 memory。流程可以简化成这样：
-            </p>
-
-            <pre><code class="language-text">输入：
-  最新 user message + assistant message
-  之前的 summary
-  最近 m 条消息
-  已有 memory store
-
-写入：
-  1. LLM 从新对话里抽取 k 条 candidate memory
-  2. 对每条 candidate，用 embedding / vector similarity 在已有 memory 里召回相似的 m 条
-  3. LLM 比较 candidate 和相似旧记忆
-  4. 输出 ADD / UPDATE / DELETE / NOOP
-  5. 按输出修改 memory store
-
-读取：
-  query -> vector similarity -> top memories -> 放回本轮上下文</code></pre>
-
-            <p>
-              所以 1.1 里的“找回”先不要按今天的 hybrid retrieval 去理解。paper mem0 的相似性主要是
-              embedding / vector similarity：candidate 被转成向量，再和已有 memory 的向量做相似度搜索，找出最值得比较的旧记录。
-              这里没有 BM25、RRF，也不是先跑 GSE 这类中文分词再混排。关键词和实体信号，是后面 v3 搜索路径才显式放进来的层。
-            </p>
-            <p>
-              这里的“相似”还要分两层看。第一层是召回：向量检索只负责把可能相关的旧记录拿出来。
-              第二层才是裁决：相似旧记录只是被拿给 LLM 看的候选项，并不表示分数高就一定 <code>UPDATE</code>。
-              可见 OSS 代码里的
-              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L176-L324"><code>DEFAULT_UPDATE_MEMORY_PROMPT</code></a>
-              也把这一步写成“比较新事实和已有 memory，然后选择 ADD、UPDATE、DELETE 或 NONE”。这里的 <code>NONE</code>
-              可以理解成论文和本文里的 <code>NOOP</code>：不修改。
+              先只看一件事：用户三月说“我最近也开始吃海鲜了”。系统里已经有一条旧记忆“用户通常约朋友吃素食餐厅”。
+              这条新事实到底应该怎么进 memory store？如果直接新增，未来可能同时召回“素食”和“海鲜”，模型不知道哪个更适合当前回答；
+              如果直接覆盖，又会把一月的历史抹掉。paper mem0 的想法是：写入时先整理一次旧记忆，让 memory set 尽量紧凑。
             </p>
 
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>新事实和旧 memory 的关系</th>
-                    <th>应该怎么处理</th>
-                    <th>直觉例子</th>
+                    <th>写入前</th>
+                    <th>新对话</th>
+                    <th>paper mem0 要回答的问题</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr>
-                    <td>旧 memory 里没有这个事实</td>
-                    <td><code>ADD</code></td>
-                    <td>旧：用户是工程师；新：用户叫 John。</td>
+                    <td>用户通常约朋友吃素食餐厅。</td>
+                    <td>最近开始吃海鲜。</td>
+                    <td>这是新偏好、偏好扩展，还是旧偏好被替换？</td>
                   </tr>
                   <tr>
-                    <td>同一事实，只是换了说法</td>
-                    <td><code>NOOP</code> / <code>NONE</code></td>
-                    <td>旧：喜欢 cheese pizza；新：loves cheese pizza。</td>
+                    <td>用户住在北京。</td>
+                    <td>四月搬到巴黎。</td>
+                    <td>旧居住地要更新，还是保留成历史？</td>
                   </tr>
                   <tr>
-                    <td>同一对象或偏好，但新信息更具体，或者值已经改变</td>
-                    <td><code>UPDATE</code></td>
-                    <td>旧：喜欢打 cricket；新：喜欢和朋友一起打 cricket。</td>
-                  </tr>
-                  <tr>
-                    <td>新事实否定旧事实，或者明确要求删除</td>
-                    <td><code>DELETE</code></td>
-                    <td>旧：喜欢 cheese pizza；新：不喜欢 cheese pizza。</td>
+                    <td>用户喜欢安静的小餐馆。</td>
+                    <td>不喜欢吵闹的餐吧。</td>
+                    <td>这是同一偏好的补充，还是另一条独立记忆？</td>
                   </tr>
                 </tbody>
               </table>
             </div>
 
             <p>
-              这套做法的优点是 memory set 比较紧凑：相关事实可以合并，明显过时或错误的内容也能删掉。
-              但它不是严格去重算法：如果 embedding 没召回正确的旧 memory，或者 LLM 把“同义重复”误判成新事实，
-              系统仍然可能重复 <code>ADD</code>。缺点也来自同一个地方：写入阶段要让 LLM 做一次“新旧记忆裁决”，
-              而 <code>UPDATE</code> 和 <code>DELETE</code> 会削弱历史证据。用户后来问“去年我为什么改变偏好”时，被改写或删除的版本未必还在。
-              这就引出后面的核心问题：长期记忆到底应该在写入时整理成一个最新状态，还是先把历史留下来？
+              <a href="https://arxiv.org/html/2504.19413v1">原始论文</a>里的基础算法大致分两步。
+              第一步，LLM 从最新对话和近期上下文里抽出 candidate memory；第二步，对每条 candidate，先从已有 memory 里找出相似旧记录，
+              再让 LLM 比较新旧事实，输出 <code>ADD</code>、<code>UPDATE</code>、<code>DELETE</code> 或 <code>NOOP</code>。
+              这里的“相似”不是最终裁决，只是为了把可能有关的旧记忆拿到 LLM 面前。
+            </p>
+
+            <pre><code class="language-text">paper mem0 写入路径，可以这样读：
+
+new conversation
+  -> LLM extracts candidate memories
+  -> embed each candidate
+  -> vector search retrieves similar existing memories
+  -> LLM compares candidate with those old memories
+  -> ADD / UPDATE / DELETE / NOOP changes the memory store</code></pre>
+
+            <p>
+              “怎么判断相似”也要分清职责。向量检索负责召回：candidate 变成 embedding，再用 vector similarity 找旧 memory。
+              召回结果只是候选集合，分数高不等于一定更新。真正判断重复、补充、冲突还是删除的是后面的 LLM。
+              可见 OSS 里的
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L176-L324"><code>DEFAULT_UPDATE_MEMORY_PROMPT</code></a>
+              也按这个思路组织：比较新事实和已有 memory，然后在四种操作里选一个。源码提示词里的 <code>NONE</code>
+              对应这里说的 <code>NOOP</code>。
+            </p>
+
+            <pre><code class="language-text">DEFAULT_UPDATE_MEMORY_PROMPT 的核心职责（简化）：
+
+new fact + similar existing memories
+  -> ADD     新事实不在旧 memory 里
+  -> UPDATE  同一对象的信息变了，或新事实更完整
+  -> DELETE  新事实否定旧 memory，或用户要求移除
+  -> NONE    已经存在，或者不值得写入</code></pre>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>新事实和旧 memory 的关系</th>
+                    <th>操作</th>
+                    <th>放回餐厅场景里理解</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>旧 memory 没有这个事实</td>
+                    <td><code>ADD</code></td>
+                    <td>旧记忆只有餐厅偏好；新事实是用户搬到巴黎。</td>
+                  </tr>
+                  <tr>
+                    <td>同一事实，只是换了说法</td>
+                    <td><code>NOOP</code> / <code>NONE</code></td>
+                    <td>旧：喜欢安静餐厅；新：偏好不吵的地方。</td>
+                  </tr>
+                  <tr>
+                    <td>同一对象或偏好，但新信息更具体，或者值已经改变</td>
+                    <td><code>UPDATE</code></td>
+                    <td>旧：通常吃素食；新：现在也接受海鲜。</td>
+                  </tr>
+                  <tr>
+                    <td>新事实明确否定旧事实，或者用户要求删除</td>
+                    <td><code>DELETE</code></td>
+                    <td>旧：喜欢海鲜；新：以后不要再推荐海鲜。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              尤其要注意 <code>UPDATE</code> 这一行：paper mem0 的目标是让 memory set 更紧凑，
+              所以它可能把“偏好扩展或变更”折叠进同一条偏好记忆。后面的 v3 会走另一条路：不急着折叠，
+              先把变化作为新证据保存下来。
+            </p>
+
+            <p>
+              这样就能自然回答“过于相似为什么不是重复 ADD”。paper mem0 不是只看相似度然后新增；
+              它先用 embedding 召回相似旧记忆，再用 LLM 在旧记忆和候选事实之间做裁决。
+              但这也不是严格数据库约束：如果向量检索没有召回正确旧记忆，或者 LLM 把同义重复误判成新事实，
+              仍然可能出现重复 <code>ADD</code>。paper mem0 的优点是 memory set 更紧凑；缺点是写入时的
+              <code>UPDATE</code> 和 <code>DELETE</code> 会削弱历史证据。用户后来问“我以前为什么更常选素食餐厅”时，
+              被覆盖或删除的旧版本未必还在。
             </p>
 
             <h3>1.2 paper mem0g：把“关系”从文本记忆里拆出来</h3>
             <p>
-              paper mem0 已经能维护一组相对紧凑的文本记忆，但它主要依赖向量相似度。这个办法适合找“意思接近”的事实，
-              对关系型问题就不够直接：用户、公司、项目、同事可能分别出现在不同 memory 里，语义相似度能找回相关文本，
-              却不会天然知道这些对象之间是上下级、协作、归属还是依赖关系。mem0g 的改动，是在文本 memory 旁边再放一条结构化路径：
-              memory records 仍然写入向量存储，entity 和 relationship 另外进入 graph store。
-              换句话说，图是实体/关系索引旁路，不是文本 memory 的替代品。
+              再给餐厅场景加一个关系问题：用户说“我经常和 Alice 约饭”，后来又说“Alice 对贝类过敏”，再后来问
+              “周末和 Alice 在巴黎吃饭，有什么要避开？” 纯文本 memory 可以存下这些句子，也能通过向量相似度找回一部分相近内容。
+              但它没有天然的“对象表”：Alice 是谁、她和用户是什么关系、贝类过敏和海鲜推荐有什么关系，都要从散落的文本里临时推。
+              mem0g 的改动，是在文本 memory 旁边放一条结构化路径：memory records 仍然写入向量存储，
+              entity 和 relationship 另外进入 graph store。图不是替代文本记忆，而是给“谁和谁有关”一个可走的索引。
             </p>
 
-            <pre><code class="language-text">输入：
-  对话消息
-  已有 memory store
-  graph store
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>步骤</th>
+                    <th>文本 memory 路径</th>
+                    <th>graph 路径</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>写入</td>
+                    <td>抽取“用户经常和 Alice 约饭”“Alice 对贝类过敏”等事实，写入 vector memory store。</td>
+                    <td>同时抽取 <code>Alice</code>、<code>shellfish allergy</code>、<code>Paris</code> 等 entity 和关系边。</td>
+                  </tr>
+                  <tr>
+                    <td>读取</td>
+                    <td>用 query 的语义相似度召回相关 memory records。</td>
+                    <td>从 query 或召回结果里的 entity 出发，沿 graph store 找邻居和关系。</td>
+                  </tr>
+                  <tr>
+                    <td>合并</td>
+                    <td>把语义相关的文本事实放进候选上下文。</td>
+                    <td>把“和 Alice 有关”“和过敏禁忌有关”的结构化事实补进候选上下文。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
 
-写入：
-  1. 从消息中抽取 memory facts
-  2. 同时抽取 entities 和 relationships
-  3. memory facts 写入 vector memory store
-  4. entities / relationships 写入 graph store
-  5. 对同名 entity 做合并，对重复或变化的 relationship 做维护
+            <pre><code class="language-text">mem0g 可以想成两条并行写入：
 
-读取：
-  1. query 先通过语义检索召回 memory records
-  2. 从 query 或已召回 memory 中识别 entity
-  3. 沿 graph store 找邻居 entity、relationship 和相关 memory
-  4. 合并 vector memories 与 graph facts，组成本轮上下文</code></pre>
+message
+  -> memory facts -----------------> vector memory store
+  -> entities + relationships -----> graph store
+
+search(query)
+  -> vector memories
+  -> graph neighbors around matched entities
+  -> merged context for the model</code></pre>
+
+            <pre><code class="language-text">最小 graph 例子：
+
+User  --eats_with----> Alice
+Alice --allergic_to--> shellfish
+User  --located_in---> Paris</code></pre>
 
             <p>
-              举个例子，用户先说“我在 Acme 做 Hermes 项目”，后来又说“Alice 也在跟 Hermes 的接口”。
-              纯文本记忆会留下两三条事实；graph 路线则能显式得到 <code>用户 - works_on - Hermes</code>、
-              <code>Alice - collaborates_on - Hermes</code>、<code>Hermes - belongs_to - Acme</code> 这样的结构。
-              当用户问“跟 Alice 讨论 Hermes 时要注意什么”时，系统不只是在文本里找相似句子，还可以顺着 Hermes 这个节点把同事、
-              公司和项目关系一起带回来。
-            </p>
-            <p>
-              这也不是 BM25 式的全文检索。mem0g 解决的是另一类漏召回：两个句子可能并不相似，但它们共享同一个实体或关系路径。
-              因此读取可以先用语义检索拿到文本 memory，再用实体识别和 graph traversal 把邻接对象补进上下文。
-              它扩展的是“对象连接”，不是用关键词分数替代向量相似度。
+              这解决的是另一类漏召回：两个事实的句子可能不相似，却因为共享实体或关系路径而应该一起出现。
+              “Alice 对贝类过敏”和“用户想订巴黎海鲜餐厅”并不是同义句，但推荐时必须把它们放在一起看。
+              graph 路线让系统可以顺着 Alice 这个节点找到过敏禁忌，再把它和餐厅偏好合并进本轮上下文。
+              它扩展的是对象连接，不是用关键词分数替代向量相似度。
             </p>
 
             <div class="table-wrap">
@@ -358,24 +419,23 @@
             <p>
               所以，mem0g 的重点不是把文本记忆替换成图，而是让关系型信息有自己的索引方式。
               这一步解决了“相关对象怎么串起来”的问题，却没有解决“历史版本该不该被覆盖”的问题。
-              图可以告诉系统 Alice、Hermes 和 Acme 之间有关联，但当用户后来换了项目，或者同一关系在不同时间发生变化时，
+              图可以告诉系统 Alice、贝类过敏和巴黎餐厅之间有关联，但当用户后来换了同行人，或者同一关系在不同时间发生变化时，
               系统仍然要决定旧事实是更新、删除，还是作为历史保留。这个压力会继续落到下一步。
             </p>
 
             <h3>1.3 mem0 v3：把写入做薄，把判断推到读取</h3>
             <p>
-              前两条路线叠在一起以后，写入路径会变得很重：paper mem0 要在写入时判断 ADD、UPDATE、DELETE、NOOP；
-              mem0g 还要维护实体、关系和图存储。更麻烦的是，长期记忆里的很多变化不是简单的“旧的错了，新的对了”。
-              用户一月说“我现在住在北京”，四月又说“我现在住在巴黎”；问“现在住哪里”应该偏向四月事实，
-              问“三月之前住在哪里”又需要一月事实。
-              如果写入时直接覆盖，当前状态会更干净，但历史解释会变弱。
+              paper mem0 让写入阶段像编辑器：新事实来了，马上决定旧记忆是改、删，还是保留。
+              mem0g 又在旁边加了一套图关系维护。这样做的好处是 memory set 更干净，关系也更明确；
+              问题是写入路径越来越像“最终裁判”。但长期记忆里最麻烦的恰恰不是事实纠错，而是状态变化。
+              用户一月住北京、四月住巴黎，这不是“北京一定错了”，而是“北京在一月成立，巴黎在四月成立”。
+              如果写入时直接覆盖，当前回答可能更简单，历史问题就少了一段证据。
             </p>
             <p>
               <a href="https://docs.mem0.ai/migration/oss-v2-to-v3">v2 到 v3 迁移文档</a>
               和 <a href="https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm">Token-Efficient Memory Algorithm 文章</a>
-              里说的 single-pass ADD-only，可以按这个思路理解：写入阶段不再承担“旧事实还算不算数”的最终裁决，
-              它只负责把新的记忆证据写成可检索记录，并把它和相关旧记忆、实体索引连接起来。当前问题应该看哪几条，
-              交给 retrieval、Temporal Reasoning 和 Memory Decay 等读取阶段信号共同决定。
+              里说的 single-pass ADD-only，可以按“减少写入阶段的不可逆决定”来理解。写入阶段只做三件事：
+              从新对话里抽出值得保存的事实；用去重、链接和实体索引把它放好；把“这次回答应该相信哪条记忆”留给检索和排序。
             </p>
 
             <pre><code class="language-text">状态变化，shape-level 示例：
@@ -396,32 +456,31 @@ search("Where did the user live before March?", reference_date="2025-03-01")
   -> 仍然可以找回 Beijing</code></pre>
 
             <p>
-              这段不是公开 API 的完整返回格式，而是为了说明责任边界：ADD-only 让北京和巴黎两条证据都留下来；
+              这不是公开 API 的完整返回格式，而是说明责任边界：ADD-only 让北京和巴黎两条证据都留下来；
               <code>linked_memory_ids</code> 表示它们谈的是同一类状态变化；Platform 的 <code>timestamp</code>
-              和 <code>reference_date</code> 让搜索表达“站在哪一天看”。公开源码能看到写入提示词要求用 observation date
-              固定相对时间，也能看到 OSS 对 <code>timestamp</code> / <code>reference_date</code> 保持 Platform-only 边界；
-              服务端最终如何给“当前状态”加时间排序权重，并不在公开源码里。
+              和 <code>reference_date</code> 让搜索表达“站在哪一天看”。写入不急着把北京判死，读取才根据问题视角决定该把谁排前面。
             </p>
 
-            <pre><code class="language-text">输入：
-  对话消息
-  existing memories
-  可选 timestamp
+            <p>
+              公开 OSS 的 <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L806-L1070"><code>_add_to_vector_store()</code></a>
+              可以按下面的顺序读。它会先拿最近消息和相似旧记忆作为输入，让 LLM 单次抽取新 memories；之后做 batch embedding、
+              hash 去重、vector insert、history <code>ADD</code>，再做 entity linking。这里仍然会看 existing memories，
+              但用途是去重和链接，不是从旧 memory 里再生成新事实，也不是在这一步改写旧记录。
+            </p>
 
-写入：
-  1. 单次 LLM 调用抽取新 memory
-  2. 不在这一步对旧 memory 做 UPDATE / DELETE
-  3. 用 hash / batch embedding 做基础去重与向量化
-  4. 新 memory 作为 ADD 事件写入 vector store
-  5. 用 linked_memory_ids 连接相关旧 memory
-  6. 做内置 entity linking，给检索提供实体信号
+            <pre><code class="language-python"># _add_to_vector_store(), simplified shape
+last_messages = db.get_last_messages(...)
+existing_results = vector_store.search(..., top_k=10)
 
-读取：
-  query -> semantic candidate pool
-        -> BM25 keyword boost when available
-        -> entity boost through linked_memory_ids
-        -> Platform temporal / decay signals when enabled
-        -> ranked model view</code></pre>
+extracted = llm.generate_response(ADDITIVE_EXTRACTION_PROMPT, ...)
+embeddings = embedding_model.embed_batch(memory_texts, "add")
+
+for memory in extracted:
+    if hash_seen(memory):
+        continue
+    vector_store.insert(memory)
+    history.event = "ADD"
+    link_entities(memory)</code></pre>
 
             <div class="table-wrap">
               <table>
@@ -435,27 +494,27 @@ search("Where did the user live before March?", reference_date="2025-03-01")
                 <tbody>
                   <tr>
                     <td>single-pass extraction</td>
-                    <td>减少写入阶段多轮 LLM 裁决带来的成本和延迟。</td>
+                    <td>写入阶段不再反复让 LLM 做新旧裁决。</td>
                     <td>抽取质量更依赖一次调用的提示词和输入上下文。</td>
                   </tr>
                   <tr>
                     <td>ADD-only</td>
-                    <td>避免把时间变化误写成不可逆覆盖或删除。</td>
+                    <td>把状态变化保留成新证据，而不是马上覆盖旧证据。</td>
                     <td>重复、冲突和过时事实要在检索层处理。</td>
                   </tr>
                   <tr>
                     <td><code>linked_memory_ids</code></td>
-                    <td>让新旧事实有连接，而不是靠覆盖表达“变化”。</td>
+                    <td>让新旧事实有连接，后面可以一起解释变化。</td>
                     <td>检索和展示时要理解这些连接的含义。</td>
                   </tr>
                   <tr>
                     <td>内置 entity linking</td>
-                    <td>保留 mem0g 的关系线索，但不要求用户维护外部 graph store。</td>
+                    <td>保留 mem0g 的一部分关系线索，但不要求用户维护外部 graph store。</td>
                     <td>实体信号成为检索排序的一部分，不再是单独图查询的全部答案。</td>
                   </tr>
                   <tr>
                     <td>hybrid retrieval</td>
-                    <td>把语义、关键词、实体、时间和使用历史放到同一个排序问题里。</td>
+                    <td>把“当前问题应该看哪条记忆”放到读取阶段处理。</td>
                     <td>model view 的质量取决于多信号融合，而不只取决于写入是否“干净”。</td>
                   </tr>
                 </tbody>
@@ -463,11 +522,10 @@ search("Where did the user live before March?", reference_date="2025-03-01")
             </div>
 
             <p>
-              这样看，ADD-only 的优势不只是省 token。它让写入阶段少做不可逆判断，降低误删、误覆盖带来的历史损失；
-              同时通过链接、实体和多信号检索，把“哪条记忆现在更有用”变成读取阶段的问题。
-              它也有代价：旧事实仍在库里，存储会继续增长，检索层要承担去重、冲突排序和过时事实过滤；
-              如果排序信号处理不好，旧事实仍可能被误带回 model view。后面的 Temporal Reasoning 和 Memory Decay，
-              正是继续回答“同一批历史记录，在不同时间问题和近期使用信号下该怎么排”。
+              所以 ADD-only 的优势不只是省 token。它把危险的动作往后推：写入阶段少做不可逆判断，先保留证据；
+              读取阶段再结合语义、关键词、实体、时间和访问历史，决定本轮 model view。代价也很清楚：
+              旧事实仍在库里，存储会增长，检索层必须处理重复、冲突和过时事实。后面的 Temporal Reasoning 和 Memory Decay，
+              就是在回答同一个后续问题：历史都留下来以后，当前这一次到底该看哪几条？
             </p>
 
             <h3>1.4 先把三层对象分清：窗口、记录和模型视图</h3>
@@ -521,14 +579,6 @@ search("Where did the user live before March?", reference_date="2025-03-01")
                 </tbody>
               </table>
             </div>
-
-            <h4>后续博客共同讨论的是 model view 质量</h4>
-            <p>
-              Mem0 的 <a href="https://mem0.ai/blog/why-beam-is-a-good-memory-benchmark-for-ai-agents">BEAM benchmark 文章</a>
-              和 <a href="https://mem0.ai/blog/how-to-test-ai-agent-memory-with-mem0-a-practical-memory-simulation-guide">memory simulation guide</a>
-              都在强调生产记忆评测不能只看“有没有召回”。更关键的是过时事实、矛盾事实、时间条件和检索漂移。
-              Temporal Reasoning 和 Memory Decay 正是在这个问题空间里出现的：它们让系统在保留历史的同时，更清楚地回答“现在、当时、最近常用”。
-            </p>
 
             <h2 id="write-path">二、写入为什么只 ADD：先留下证据，不急着改判旧事实</h2>
             <p>
@@ -627,8 +677,9 @@ search("Where did the user live before March?", reference_date="2025-03-01")
 
             <h3>2.2 OSS 对 Platform-only 时间参数保持硬边界</h3>
             <p>
-              讲到 observation date，很容易顺手把 Temporal Reasoning 也算进 OSS。这里要停一下。
-              公开 OSS 能看到的是 ADD-only 写入、基础检索和参数边界；Platform v3 合约才暴露完整的时间推理参数。
+              后面会继续讲 Temporal Reasoning，所以这里先把源码证据边界说清楚。
+              讲到 observation date，很容易顺手把 Temporal Reasoning 也算进 OSS，但公开 OSS 能看到的是 ADD-only 写入、基础检索和参数边界；
+              Platform v3 合约才暴露完整的时间推理参数。
               公开源码里，
               <code>Memory.add(timestamp=...)</code> 在 OSS 路径会直接抛出 Platform-only 错误；
               <code>Memory.search(reference_date=...)</code> 也一样。
@@ -637,54 +688,49 @@ search("Where did the user live before March?", reference_date="2025-03-01")
               至于服务端怎么把时间信号并入 ranking，公开源码没有给出实现细节。
             </p>
 
-            <h2 id="retrieval">三、读取为什么要混合排序：候选多了，就要先筛再排</h2>
+            <h2 id="retrieval">三、读取：先找候选，再决定本轮给模型看什么</h2>
             <p>
-              ADD-only 把历史留下来了，读取阶段就不能偷懒。一次普通的 vector top-k 只能回答“哪些句子和 query 像”，
-              但读者真正关心的是“哪些记忆该给模型看”。这两个问题差别很大：
-              旧偏好和新偏好都可能和 query 相似，常提到的同事名也可能把无关项目带出来。
-              v3 路线把写入阶段拿掉的选择，放到了 model view 形成阶段，也就是先扩大候选，再用多种信号筛选和排序。
+              ADD-only 把历史留下来了，读取阶段就必须更谨慎。回到餐厅场景，query 是“这个周末帮我找餐厅，别忘了我现在的情况”。
+              “北京素食”“巴黎海鲜”“Alice 对贝类过敏”都可能相关，但它们的作用不同：有的是旧偏好，有的是当前地点，有的是同行人的限制。
+              读取层要回答的不是“哪几句话和 query 最像”，而是“哪几条记忆应该进入这一轮 model view”。
             </p>
             <p>
               Mem0 OSS 的搜索路径从
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1248-L1372"><code>Memory.search()</code></a>
-              进入 <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1488-L1668"><code>_search_vector_store()</code></a>：
-              先做 query lemmatization 和实体抽取，再做 embedding；语义召回会 over-fetch，关键词搜索会生成 BM25 分数，
-              实体 store 会给相关 memory 加 boost。
-              最后这些信号进入
+              进入 <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1488-L1668"><code>_search_vector_store()</code></a>。
+              按源码顺序读，会看到五个动作：先把 query 做关键词归一化和实体抽取；再把 query 转成 embedding；
+              然后用 semantic search 多取一些候选；如果 vector store 支持关键词检索，就把 keyword search 的结果转成 BM25 分数；
+              同时用 entity store 给 linked memories 算 boost；最后把这些信号交给
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/utils/scoring.py#L1-L130"><code>score_and_rank()</code></a>。
-              可以把这条链路理解成三句话：语义负责“别跑题”，关键词负责“别漏掉精确词”，实体负责“别漏掉相关对象”。
-            </p>
-            <p>
-              这里的 query lemmatization 是 <code>lemmatize_for_bm25()</code> 这类关键词归一化，不是中文分词器式的 GSE 路径。
-              BM25 也不是通过 RRF 把一条独立关键词结果列表并进来。当前可见 OSS 实现里，候选池来自 semantic search；
-              <code>keyword_search()</code> 返回的 BM25 分数和 entity store 算出的 boost 只给这些语义候选加权。
-              如果 vector store 不支持关键词检索，或者可选 NLP 依赖不可用，搜索会降级为 semantic-only 或 semantic + 部分信号。
             </p>
 
-            <pre><code class="language-python"># OSS search shape, simplified from _search_vector_store()
-query_lemmatized = lemmatize_for_bm25(query)
+            <pre><code class="language-python"># _search_vector_store(), simplified shape
+query_terms = lemmatize_for_bm25(query)
 query_entities = extract_entities(query)
-embedding = embedding_model.embed(query, "search")
+query_vector = embedding_model.embed(query, "search")
 
-semantic_results = vector_store.search(
-    query=query,
-    vectors=embedding,
-    top_k=max(top_k * 4, 60),
-    filters=filters,
-)
-keyword_results = vector_store.keyword_search(query_lemmatized, top_k=max(top_k * 4, 60))
-bm25_scores = {}
-if keyword_results is not None:
-    midpoint, steepness = get_bm25_params(query, lemmatized=query_lemmatized)
-    for memory in keyword_results:
-        bm25_scores[memory.id] = normalize_bm25(memory.score, midpoint, steepness)
-entity_boosts = self._compute_entity_boosts(query_entities, filters)
+internal_limit = max(limit * 4, 60)
+semantic_results = vector_store.search(..., top_k=internal_limit)
+keyword_results = vector_store.keyword_search(query_terms, top_k=internal_limit)
 
-results = score_and_rank(
+bm25_scores = normalize_keyword_scores(keyword_results)
+entity_boosts = compute_boosts_from_linked_entities(query_entities)
+
+ranked = score_and_rank(
     semantic_results,
     bm25_scores=bm25_scores,
     entity_boosts=entity_boosts,
+    threshold=threshold,
+    top_k=limit,
 )</code></pre>
+
+            <p>
+              这段顺序把几个容易混淆的点说清了。第一，BM25 是存在的，但它在可见 OSS 路径里是一个关键词分数信号；
+              候选池先来自 semantic search。第二，entity 也不是单独给出最终答案，而是通过 linked memories 给候选加权。
+              第三，这条路径更像 additive score fusion：语义候选过门槛后，再叠加 BM25 和 entity boost。
+              因此，这里更像在同一批语义候选上叠加分数，而不是把 vector、BM25、entity 几张独立榜单再做 RRF 混排。
+              可以把三种信号压成一句话：语义负责不跑题，关键词负责保留精确词，实体负责把相关对象带上。
+            </p>
 
             <figure class="figure">
               <img
@@ -699,7 +745,7 @@ results = score_and_rank(
             <h3>3.1 先用语义守门，再融合关键词和实体</h3>
             <p>
               排名最怕“熟人误伤”。比如 Alice 是用户经常提到的人，query 里也出现了 Alice，
-              但这次问的是餐厅偏好，不是 Hermes 项目。如果只看实体，很多 Alice 相关记忆都会显得“重要”。
+              但这次问的是餐厅偏好，不是所有 Alice 相关旧约饭记录。如果只看实体，很多 Alice 相关记忆都会显得“重要”。
               所以融合排序的第一步不是加分，而是守门：semantic score 低于 threshold 的候选先出局，
               后面才轮到 normalized BM25 和 entity boost。关键词或实体信号可以改变相关候选之间的顺序，
               但不应该把一个语义不相关的候选硬送进 model view。
@@ -718,9 +764,9 @@ results = score_and_rank(
 combined = (semantic_score + bm25_score + entity_boost) / max_possible_score</code></pre>
 
             <p>
-              这就是为什么说它是 additive score fusion，而不是“向量、BM25、实体三路各取 top-k 后做 RRF”。
+              换句话说，这里的最终分数来自 semantic score、BM25 score 和 entity boost 的加法组合。
               BM25 和 entity 能调整相关候选之间的顺序，但不会把一个没有进入语义候选池的 memory 单独拉进最终结果。
-              这个设计保守一些：它牺牲了一部分关键词纯召回能力，换来的是不让熟人名、项目名或高频词把不相关记忆硬塞进 model view。
+              这个设计保守一些：它牺牲了一部分关键词纯召回能力，换来的是不让熟人名、餐厅名或高频词把不相关记忆硬塞进 model view。
             </p>
 
             <h3>3.2 当前是否适用，需要时间和访问信号</h3>
@@ -880,6 +926,13 @@ client.project.update(decay=True)</code></pre>
               Mem0 这条路线的答案不是选一个极端，而是分层：ADD-only 保留变化证据；
               hybrid retrieval 先形成候选池；Temporal Reasoning 让查询带上时间视角；Memory Decay 让近期使用历史影响结果顺序。
               最后进入模型的不是“全部记忆”，而是这一轮问题下的 model view。
+            </p>
+
+            <p>
+              Mem0 的 <a href="https://mem0.ai/blog/why-beam-is-a-good-memory-benchmark-for-ai-agents">BEAM benchmark 文章</a>
+              和 <a href="https://mem0.ai/blog/how-to-test-ai-agent-memory-with-mem0-a-practical-memory-simulation-guide">memory simulation guide</a>
+              也在强调同一个评测方向：生产记忆不能只看“有没有召回”，还要看过时事实、矛盾事实、时间条件和检索漂移。
+              这正是 model view 质量问题。
             </p>
 
             <figure class="figure">
