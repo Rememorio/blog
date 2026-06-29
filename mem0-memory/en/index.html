@@ -238,9 +238,15 @@ Read:
   query -> vector similarity -> top memories -> current prompt context</code></pre>
 
             <p>
-              "Similar" has two separate jobs here. The first job is retrieval: the candidate is embedded, then compared with existing memory vectors
-              so the system can bring back old records worth checking. The second job is decision-making: those similar records are only candidates
-              shown to the LLM, not a rule that says a high similarity score must become <code>UPDATE</code>. The visible OSS
+              So retrieval in 1.1 should not be read as today's hybrid retrieval path. In paper mem0, similarity is mainly
+              embedding / vector similarity: the candidate is embedded and compared with existing memory vectors so the system can bring back
+              old records worth checking. There is no BM25, RRF, or tokenizer-first keyword fusion at this layer. Keyword and entity signals
+              become explicit later in the v3 search path.
+            </p>
+            <p>
+              "Similar" also has two separate jobs here. The first job is recall: vector search only brings back old records that may matter.
+              The second job is decision-making: those similar records are only candidates shown to the LLM, not a rule that says a high
+              similarity score must become <code>UPDATE</code>. The visible OSS
               <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/configs/prompts.py#L176-L324"><code>DEFAULT_UPDATE_MEMORY_PROMPT</code></a>
               frames this step as comparing newly retrieved facts with existing memory and choosing ADD, UPDATE, DELETE, or NONE.
               <code>NONE</code> is the same no-op idea that the paper-level description and this article call <code>NOOP</code>.
@@ -324,6 +330,12 @@ Read:
               <code>Hermes - belongs_to - Acme</code> explicit. When the user asks what to discuss with Alice about Hermes,
               retrieval can follow the Hermes node instead of relying only on sentence-level similarity.
             </p>
+            <p>
+              This is not BM25-style full-text retrieval either. Mem0g handles a different recall failure: two sentences may not be
+              close in embedding space, but they share an entity or relationship path. Read can first recall text memories semantically,
+              then use entity recognition and graph traversal to add adjacent objects to the context. The graph expands object connectivity;
+              it does not replace vector similarity with keyword scoring.
+            </p>
 
             <div class="table-wrap">
               <table>
@@ -370,8 +382,9 @@ Read:
             <p>
               Once the first two routes are combined, the write path carries a lot of work: paper mem0 decides ADD, UPDATE, DELETE, or NOOP;
               mem0g also maintains entities, relationships, and a graph store. The harder issue is that many long-term memories are not simply
-              "old is wrong, new is right." A user liked almond milk in January and switched to oat milk in April after an allergy issue.
-              "What should I buy now?" should prefer the April fact; "why did their taste change?" needs the January fact too.
+              "old is wrong, new is right." A user says in January, "I currently live in Beijing," and then says in April,
+              "I currently live in Paris." "Where do I live now?" should prefer the April fact; "where did I live before March?"
+              still needs the January fact.
               If write overwrites history immediately, the current state looks cleaner, but later explanation gets weaker.
             </p>
             <p>
@@ -381,6 +394,32 @@ Read:
               write no longer makes the final call on whether an old fact still counts. It writes new memory evidence as searchable records
               and connects those records to related old memories and entity indexes. Retrieval, Temporal Reasoning, and Memory Decay decide
               which records should enter the current model view.
+            </p>
+
+            <pre><code class="language-text">Changing state, shape-level example:
+
+t1 memory:
+  text: "User lives in Beijing as of 2025-01-10"
+  timestamp: "2025-01-10T09:00:00Z"
+
+t2 memory:
+  text: "User lives in Paris as of 2025-04-02"
+  timestamp: "2025-04-02T11:00:00Z"
+  linked_memory_ids: ["t1"]
+
+search("Where does the user live now?", reference_date="2025-04-10")
+  -> should rank Paris higher
+
+search("Where did the user live before March?", reference_date="2025-03-01")
+  -> can still recover Beijing</code></pre>
+
+            <p>
+              This is not the exact public API response shape; it is a responsibility boundary. ADD-only preserves both Beijing and Paris
+              as evidence. <code>linked_memory_ids</code> says the two records are about the same changing state. Platform
+              <code>timestamp</code> and <code>reference_date</code> let search say which date should frame the answer.
+              Public source shows the extraction prompt grounding relative time with an observation date, and it shows OSS treating
+              <code>timestamp</code> / <code>reference_date</code> as Platform-only boundaries. The server-side ranking details for
+              current-state temporal selection are not public.
             </p>
 
             <pre><code class="language-text">Input:
@@ -397,10 +436,10 @@ Write:
   6. Run built-in entity linking for retrieval signals
 
 Read:
-  query -> semantic candidates
-        -> BM25 keyword signal
-        -> entity boost
-        -> time / decay signals
+  query -> semantic candidate pool
+        -> BM25 keyword boost when available
+        -> entity boost through linked_memory_ids
+        -> Platform temporal / decay signals when enabled
         -> ranked model view</code></pre>
 
             <div class="table-wrap">
@@ -641,6 +680,38 @@ Write-time handling:
               A simple mental model is: semantic similarity keeps results on topic, keywords keep exact terms from being lost,
               and entity signals keep related objects connected.
             </p>
+            <p>
+              The lemmatization step here is keyword normalization through <code>lemmatize_for_bm25()</code>, not a tokenizer-first
+              retrieval architecture such as a Chinese segmentation pipeline. BM25 is also not fused by RRF over an independent keyword
+              result list. In the visible OSS implementation, the candidate pool comes from semantic search; <code>keyword_search()</code>
+              provides BM25 scores and the entity store provides boosts for those semantic candidates. If a vector store does not support
+              keyword search, or optional NLP dependencies are missing, the path degrades to semantic-only or semantic plus the available signals.
+            </p>
+
+            <pre><code class="language-python"># OSS search shape, simplified from _search_vector_store()
+query_lemmatized = lemmatize_for_bm25(query)
+query_entities = extract_entities(query)
+embedding = embedding_model.embed(query, "search")
+
+semantic_results = vector_store.search(
+    query=query,
+    vectors=embedding,
+    top_k=max(top_k * 4, 60),
+    filters=filters,
+)
+keyword_results = vector_store.keyword_search(query_lemmatized, top_k=max(top_k * 4, 60))
+bm25_scores = {}
+if keyword_results is not None:
+    midpoint, steepness = get_bm25_params(query, lemmatized=query_lemmatized)
+    for memory in keyword_results:
+        bm25_scores[memory.id] = normalize_bm25(memory.score, midpoint, steepness)
+entity_boosts = self._compute_entity_boosts(query_entities, filters)
+
+results = score_and_rank(
+    semantic_results,
+    bm25_scores=bm25_scores,
+    entity_boosts=entity_boosts,
+)</code></pre>
 
             <figure class="figure">
               <img
@@ -667,6 +738,18 @@ Write-time handling:
   -> normalize by active signal budget
   -> return top_k</code></pre>
 
+            <pre><code class="language-python">if semantic_score &lt; threshold:
+    drop(candidate)
+
+combined = (semantic_score + bm25_score + entity_boost) / max_possible_score</code></pre>
+
+            <p>
+              That is additive score fusion, not RRF over separate vector, BM25, and entity top-k lists.
+              BM25 and entity signals can reorder relevant candidates, but they do not pull a memory into the final result if it never entered
+              the semantic candidate pool. The design is conservative: it gives up some pure keyword recall in exchange for not letting familiar
+              names, project names, or frequent terms force unrelated memories into the model view.
+            </p>
+
             <h3>3.2 "Still Applies Now" Needs Time and Usage Signals</h3>
             <p>
               Passing the semantic gate only means "related." It does not mean "the right fact for this moment."
@@ -677,7 +760,7 @@ Write-time handling:
 
             <h2 id="temporal">4. Temporal Reasoning: Let the Query Stand on a Date</h2>
             <p>
-              "I drink oat milk now" and "what did I prefer in February?" may involve the same preference, but they should not produce the same answer.
+              "I live in Paris now" and "where did I live before March?" may involve the same residence state, but they should not produce the same answer.
               Temporal Reasoning gives the query a point of view in history instead of making the latest fact automatically win.
               It does not rewrite old records into new ones. It lets write record when a fact was observed and lets search state the date
               from which the answer should be framed.
@@ -699,9 +782,10 @@ Write-time handling:
 
             <h3>4.1 Request Shape: Observation Time and Search Time Are Separate</h3>
             <p>
-              Return to the restaurant example. "Started eating seafood in March" is the time a fact was observed.
-              Asking in June about January habits is the time perspective of the current search. They both look like "time,"
-              but they are different roles. If those roles collapse, the system has to guess whether the newest fact should overwrite the older one.
+              Return to the Beijing/Paris example. Saying in January that the user lives in Beijing, and in April that the user lives in Paris,
+              are observation times for two facts. Asking in April "where do I live now?" or asking from March "where did I live then?"
+              is the time perspective of the current search. They both look like "time," but they are different roles.
+              If those roles collapse, the system has to guess whether the newest fact should overwrite the older one.
               Platform requests separate them:
               <code>timestamp</code> describes when the memory entered history, and <code>reference_date</code> describes the date from which this search should answer.
               The Python Platform client posts add and search requests to v3 endpoints:
@@ -711,20 +795,27 @@ Write-time handling:
 
             <pre><code class="language-python"># Platform shape, simplified
 client.add(
-    messages=[{"role": "user", "content": "I switched to oat milk."}],
+    messages=[{"role": "user", "content": "I currently live in Beijing."}],
     user_id="u1",
-    timestamp="2025-03-08T09:30:00Z",
+    timestamp="2025-01-10T09:00:00Z",
+)
+
+client.add(
+    messages=[{"role": "user", "content": "I currently live in Paris."}],
+    user_id="u1",
+    timestamp="2025-04-02T11:00:00Z",
 )
 
 client.search(
-    "What milk did I prefer in February?",
+    "Where do I live now?",
     filters={"user_id": "u1"},
-    reference_date="2025-02-28",
+    reference_date="2025-04-10",
 )</code></pre>
 
             <p>
               The design point is not merely two extra fields. Write attaches time to the evidence; search tells the system
-              which date to look back from. That keeps "what is true now" and "what was true then" from competing for one overwritten record.
+              which date to look back from. That keeps "lives in Paris now" and "used to live in Beijing" from competing for one overwritten record:
+              a current query can prefer Paris, while a historical query can still recover Beijing.
             </p>
 
             <h3>4.2 Temporal Handles Contradictory History; It Does Not Replace Filters</h3>
