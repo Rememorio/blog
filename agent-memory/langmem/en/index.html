@@ -136,7 +136,7 @@
               to record and search information during active conversations, in the hot path. It also provides a
               background memory manager that automatically extracts, consolidates, and updates agent knowledge. Both
               routes integrate with LangGraph's Long-term Memory Store. The positioning is in the
-              <a href="https://github.com/langchain-ai/langmem/blob/main/README.md#L13-L16">README feature list</a>.
+              <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/README.md#L13-L16">README feature list</a>.
             </p>
 
             <p>
@@ -147,6 +147,26 @@
               personalities explicit execution paths.
             </p>
 
+            <pre><code>Same sentence: "answer me in English from now on"
+
+Hot path:
+  the current agent decides this is a durable preference
+  -> calls manage_memory to write into BaseStore
+  -> the next prompt / search_memory call can retrieve it immediately
+
+Background:
+  the current agent answers normally
+  -> the conversation slice is processed later by a manager
+  -> the manager searches old preferences and chooses add or update
+  -> the result is written back into BaseStore</code></pre>
+
+            <p>
+              The rest of the mechanism is easier to read through this example. Hot path optimizes for “remember it
+              now”; background processing optimizes for “consolidate it carefully.” LangGraph's split between
+              <code>store</code> and <code>checkpointer</code> decides whether that preference becomes cross-conversation
+              long-term memory or only recoverable state inside the current thread.
+            </p>
+
             <h3 id="paths-contract">1.2 Choose The Path By Visibility, Latency, And Governance Pressure</h3>
             <p>
               The README quickstart makes this concrete. It creates an <code>InMemoryStore</code> with an embedding
@@ -154,34 +174,39 @@
               <code>create_react_agent</code>, and passes the same <code>store</code> into the agent. The README then
               explains that these tools let the agent control what gets stored, and that the LLM can invoke the search
               tool for similar past memories. See the
-              <a href="https://github.com/langchain-ai/langmem/blob/main/README.md#L32-L64">agent creation example</a>
-              and the <a href="https://github.com/langchain-ai/langmem/blob/main/README.md#L82-L86">follow-up explanation</a>.
+              <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/README.md#L32-L64">agent creation example</a>
+              and the <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/README.md#L82-L86">follow-up explanation</a>.
             </p>
 
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>Decision Question</th>
-                    <th>Hot Path Fits</th>
-                    <th>Background Fits</th>
+                    <th>Dimension</th>
+                    <th>Hot Path</th>
+                    <th>Background</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr>
-                    <td>Should the user see the effect immediately?</td>
-                    <td>Yes, and a tool trace is acceptable.</td>
-                    <td>No, delayed consolidation is acceptable.</td>
+                    <td>Trigger</td>
+                    <td>The current agent calls a tool during reasoning.</td>
+                    <td>A worker, timer, idle hook, or post-conversation job invokes the manager.</td>
                   </tr>
                   <tr>
-                    <td>Does the model need the current task context to decide?</td>
-                    <td>Yes, the turn context is the best evidence.</td>
-                    <td>No, it can be judged alongside similar old memories.</td>
+                    <td>Write path</td>
+                    <td><code>manage_memory</code> directly creates, updates, or deletes.</td>
+                    <td>The manager searches similar old memories before deciding insert, update, or delete.</td>
                   </tr>
                   <tr>
-                    <td>What is the main risk?</td>
-                    <td>Distracting the current answer and spending tool budget.</td>
-                    <td>Eventual consistency and user expectation management.</td>
+                    <td>Read path</td>
+                    <td>The prompt can call <code>store.search()</code>, or the model can call <code>search_memory</code>.</td>
+                    <td>The consolidated result lands in the same <code>BaseStore</code> and is retrieved normally later.</td>
+                  </tr>
+                  <tr>
+                    <td>Common failure</td>
+                    <td>The model forgets the tool call, or stores a one-off constraint as a durable preference.</td>
+                    <td>There is a delay before the latest information reaches long-term store.</td>
                   </tr>
                 </tbody>
               </table>
@@ -207,36 +232,94 @@
               <code>store.search(("memories",), query=...)</code>, and inserts the results into a
               <code>&lt;memories&gt;</code> system-message section. The agent is then created with
               <code>create_manage_memory_tool</code>, <code>store</code>, and <code>checkpointer</code>. The route is
-              shown in the <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/hot_path_quickstart.md#L8-L15">hot path definition</a>
-              and <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/hot_path_quickstart.md#L35-L89">agent example</a>.
+              shown in the <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/docs/docs/hot_path_quickstart.md#L8-L15">hot path definition</a>
+              and <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/docs/docs/hot_path_quickstart.md#L35-L89">agent example</a>.
             </p>
 
+            <pre><code class="language-python">def prompt(state):
+    store = get_store()
+    memories = store.search(
+        ("memories",),
+        query=state["messages"][-1].content,
+    )
+    return [
+        {"role": "system", "content": f"&lt;memories&gt;\n{memories}\n&lt;/memories&gt;"},
+        *state["messages"],
+    ]
+
+agent = create_react_agent(
+    model,
+    prompt=prompt,
+    tools=[create_manage_memory_tool(namespace=("memories",))],
+    store=store,
+    checkpointer=checkpointer,
+)</code></pre>
+
             <p>
-              The point is easy to miss: hot path does not mean “summarize every turn automatically.” It makes memory
-              write a tool, and the agent chooses whether to call it while reasoning through the current task. That gives
-              the user an observable trace for why something was remembered, and it lets the model distinguish long-term
-              preference from one-off task context. The cost is equally clear: the model can forget to call the tool, or
-              write memory when it should have stayed local to the current turn.
+              Two things matter in this snippet. Retrieval is explicit: the prompt function searches the store with the
+              latest user message and puts the matching memories back into the system message. Writing is not automatic:
+              only when the agent decides that "answer me in English from now on" should be durable does it call
+              <code>manage_memory</code>. The benefit is auditability in the tool trace, plus a better chance to separate
+              durable preference from one-off task context.
             </p>
 
             <h3 id="hot-search">2.2 The Search Tool Lets Long-Term Memory Re-Enter The Current Model View</h3>
             <p>
               The tool implementation is equally direct.
-              <a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L25-L39"><code>create_manage_memory_tool</code></a>
+              <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/tools.py#L25-L39"><code>create_manage_memory_tool</code></a>
               ships with default instructions to call the tool when the model identifies a new user preference, receives
               an explicit request to remember something, wants to record important context, or notices that an existing
               memory is incorrect or outdated. At execution time,
-              <a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L271-L303"><code>amanage_memory</code></a>
+              <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/tools.py#L271-L303"><code>amanage_memory</code></a>
               resolves the namespace; deletes call <code>store.adelete()</code>, while creates and updates call
               <code>store.aput()</code> with JSON-serializable <code>content</code>.
             </p>
 
+            <pre><code class="language-python">async def amanage_memory(content=None, action="create", *, id=None):
+    namespace = namespacer()
+    if action == "delete":
+        await store.adelete(namespace, key=str(id))
+        return f"Deleted memory {id}"
+
+    id = id or uuid.uuid4()
+    await store.aput(
+        namespace,
+        key=str(id),
+        value={"content": _ensure_json_serializable(content)},
+    )
+    return f"{action}d memory {id}"</code></pre>
+
+            <p>
+              The write boundary is narrow. The tool does not invent a separate memory database. It stores the model's
+              chosen <code>content</code> under a LangGraph <code>BaseStore</code> namespace. The <code>id</code> decides
+              whether this is a new item or an overwrite, and delete must point at an existing memory id.
+            </p>
+
             <p>
               Search follows the same pattern.
-              <a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L362-L454"><code>create_search_memory_tool</code></a>
+              <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/tools.py#L362-L454"><code>create_search_memory_tool</code></a>
               exposes <code>query</code>, <code>limit</code>, <code>offset</code>, and <code>filter</code>, then calls
               <code>store.asearch(namespace, query=..., filter=..., limit=..., offset=...)</code>. The hot path is
               therefore not hidden background magic. It turns memory write and memory search into model-callable tools.
+            </p>
+
+            <pre><code class="language-python">async def asearch_memory(query, *, limit=10, offset=0, filter=None):
+    namespace = namespacer()
+    memories = await store.asearch(
+        namespace,
+        query=query,
+        filter=filter,
+        limit=limit,
+        offset=offset,
+    )
+    return utils.dumps([m.dict() for m in memories])</code></pre>
+
+            <p>
+              This is also how to answer questions about BM25, RRF, or hybrid retrieval without guessing. In this tool
+              path, LangMem delegates retrieval to the configured <code>BaseStore</code>: the tool passes
+              <code>namespace</code>, <code>query</code>, <code>filter</code>, and pagination parameters. Whether the
+              actual behavior is embedding search, exact filtering, or a database adapter's richer capability depends on
+              the store implementation and index configuration.
             </p>
 
             <p>
@@ -253,30 +336,67 @@
               The store can persist arbitrary information under user, agent, organization, or other namespaces, making
               it better suited for long-term cross-thread memory. The checkpointer tracks graph state and conversation
               history inside each thread for durable execution. That boundary is explained in the
-              <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/hot_path_quickstart.md#L105-L119">hot path quickstart</a>.
+              <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/docs/docs/hot_path_quickstart.md#L105-L119">hot path quickstart</a>.
             </p>
 
             <p>
               LangGraph's source keeps the same split.
-              <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint/langgraph/store/base/__init__.py#L700-L713"><code>BaseStore</code></a>
+              <a href="https://github.com/langchain-ai/langgraph/blob/8c9d59c842454e7f4531f5e69ff9dab0af3c660f/libs/checkpoint/langgraph/store/base/__init__.py#L700-L713"><code>BaseStore</code></a>
               is described as a persistent key-value store that can be shared across threads and conversations, scoped
               by user IDs, assistant IDs, or arbitrary namespaces. Its
-              <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint/langgraph/store/base/__init__.py#L771-L846"><code>search()</code></a>
+              <a href="https://github.com/langchain-ai/langgraph/blob/8c9d59c842454e7f4531f5e69ff9dab0af3c660f/libs/checkpoint/langgraph/store/base/__init__.py#L771-L846"><code>search()</code></a>
               supports namespace prefix, query, filter, limit, and offset; its
-              <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint/langgraph/store/base/__init__.py#L848-L928"><code>put()</code></a>
+              <a href="https://github.com/langchain-ai/langgraph/blob/8c9d59c842454e7f4531f5e69ff9dab0af3c660f/libs/checkpoint/langgraph/store/base/__init__.py#L848-L928"><code>put()</code></a>
               stores values by namespace plus key and can control indexing.
+            </p>
+
+            <pre><code class="language-python">class BaseStore(ABC):
+    """Persistent key-value store shared across threads."""
+
+    def search(
+        self,
+        namespace_prefix: tuple[str, ...],
+        *,
+        query: str | None = None,
+        filter: dict | None = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> list[SearchItem]: ...
+
+    def put(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        value: dict,
+        index: Literal[False] | list[str] | None = None,
+    ) -> None: ...</code></pre>
+
+            <p>
+              That is why namespaces are not cosmetic. <code>("memories", "user_123")</code> can hold one user's durable
+              preference. <code>("memories", "org_7", "user_123")</code> can separate organization-level and user-level
+              scope. The same "answer me in English" preference should live in a personal namespace; in a shared
+              namespace, it could affect other users.
             </p>
 
             <h3 id="store-checkpointer">3.2 The Checkpointer Restores Execution; It Does Not Own The User Profile</h3>
             <p>
-              In <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/graph/state.py#L1164-L1201"><code>StateGraph.compile()</code></a>,
+              In <a href="https://github.com/langchain-ai/langgraph/blob/8c9d59c842454e7f4531f5e69ff9dab0af3c660f/libs/langgraph/langgraph/graph/state.py#L1164-L1201"><code>StateGraph.compile()</code></a>,
               <code>checkpointer</code> is described as fully versioned short-term memory that allows pause, resume,
               and replay. The same method has a separate <code>store</code> parameter. Runtime also exposes
-              <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/runtime.py#L198-L205"><code>Runtime.store</code></a>
+              <a href="https://github.com/langchain-ai/langgraph/blob/8c9d59c842454e7f4531f5e69ff9dab0af3c660f/libs/langgraph/langgraph/runtime.py#L198-L205"><code>Runtime.store</code></a>
               as persistence and memory for a graph run, and nodes can access the configured store through
-              <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/config.py#L32-L52"><code>get_store()</code></a>.
+              <a href="https://github.com/langchain-ai/langgraph/blob/8c9d59c842454e7f4531f5e69ff9dab0af3c660f/libs/langgraph/langgraph/config.py#L32-L52"><code>get_store()</code></a>.
               That separation keeps recoverable thread state distinct from cross-thread long-term preferences.
             </p>
+
+            <pre><code class="language-python">graph = builder.compile(
+    checkpointer=checkpointer,  # short-term recoverable state for the current thread
+    store=store,                # long-term memory shared across threads
+)
+
+@dataclass
+class Runtime:
+    store: BaseStore | None = None</code></pre>
 
             <p>
               A practical test is: if this state disappeared, would the current task fail to resume, or would the user's
@@ -294,9 +414,9 @@
               <code>@entrypoint(store=store)</code> function, then passes the user message plus response to
               <code>memory_manager.ainvoke()</code>. The docs also recommend delayed processing for active conversations
               to debounce repeated work. See the
-              <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/background_quickstart.md#L8-L15">background definition</a>,
-              <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/background_quickstart.md#L48-L63">basic example</a>,
-              and <a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/background_quickstart.md#L72-L80">processing note</a>.
+              <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/docs/docs/background_quickstart.md#L8-L15">background definition</a>,
+              <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/docs/docs/background_quickstart.md#L48-L63">basic example</a>,
+              and <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/docs/docs/background_quickstart.md#L72-L80">processing note</a>.
             </p>
 
             <p>
@@ -306,24 +426,76 @@
               or delete an incorrect memory. Its job is to maintain long-term state, not record every sentence.
             </p>
 
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Step</th>
+                    <th>What Happens</th>
+                    <th>Why It Is Designed This Way</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>1. Collect slice</td>
+                    <td>The user message and assistant response become a conversation window.</td>
+                    <td>The main turn can finish without memory cleanup interrupting it.</td>
+                  </tr>
+                  <tr>
+                    <td>2. Search old memory</td>
+                    <td>The manager calls <code>store.asearch()</code> with conversation-derived queries.</td>
+                    <td>Add-versus-update decisions need the old state in view.</td>
+                  </tr>
+                  <tr>
+                    <td>3. LLM consolidation</td>
+                    <td>The memory manager receives conversation messages plus existing memories.</td>
+                    <td>The model can merge, correct, and structure information with more context.</td>
+                  </tr>
+                  <tr>
+                    <td>4. Apply changes</td>
+                    <td>Final puts and deletes are written back into <code>BaseStore</code>.</td>
+                    <td>The long-term store receives cleaned memory, not raw chat noise.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
             <h3 id="background-apply">4.2 Background Work Turns Memory Writes Into Delayed, Mergeable Transactions</h3>
             <p>
               The manager source has three layers.
-              <a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L536-L570"><code>create_memory_manager</code></a>
+              <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/extraction.py#L536-L570"><code>create_memory_manager</code></a>
               analyzes conversation messages and existing memories to generate or update structured memory entries,
               controlled by <code>enable_inserts</code>, <code>enable_updates</code>, and <code>enable_deletes</code>.
-              <a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L1666-L1723"><code>create_memory_store_manager</code></a>
+              <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/extraction.py#L1666-L1723"><code>create_memory_store_manager</code></a>
               connects that process to BaseStore: it searches relevant memories, extracts new information, updates old
               memories, and maintains a versioned history. Its data-flow diagram sends conversation history to the
               manager, searches the store, asks the LLM to analyze and extract, then applies changes back to the store.
             </p>
 
+            <pre><code class="language-python">async def ainvoke(self, input, config=None):
+    namespace = self.namespace(config)
+    search_results_lists = await asyncio.gather(
+        *[store.asearch(namespace, query=query) for query in queries]
+    )
+    store_map = self._sort_results(search_results_lists, self.query_limit)
+
+    enriched = await self.memory_manager.ainvoke({
+        "messages": input["messages"],
+        "existing": store_based,
+        "max_steps": input.get("max_steps"),
+    })
+
+    await asyncio.gather(
+        *(store.aput(**put) for put in final_puts),
+        *(store.adelete(ns, key) for (ns, key) in final_deletes),
+    )</code></pre>
+
             <p>
               Execution follows that chain.
-              <a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L1006-L1039"><code>MemoryStoreManager.ainvoke()</code></a>
+              <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/extraction.py#L1006-L1039"><code>MemoryStoreManager.ainvoke()</code></a>
               resolves the namespace, then either uses a query generator or dilated conversation windows to call
               <code>store.asearch()</code> for existing memories. Later it builds final puts and deletes and applies them
-              through <a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L1126-L1135"><code>store.aput()</code> / <code>store.adelete()</code></a>.
+              through <a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/extraction.py#L1126-L1135"><code>store.aput()</code> / <code>store.adelete()</code></a>.
               In other words, the background manager updates memory with old memories in view; it is not just dumping a
               conversation summary into storage.
             </p>
@@ -362,18 +534,18 @@
 
             <h2 id="sources">Sources</h2>
             <ul>
-              <li><a href="https://github.com/langchain-ai/langmem/blob/main/README.md#L13-L16">LangMem README: core features</a></li>
-              <li><a href="https://github.com/langchain-ai/langmem/blob/main/README.md#L32-L64">LangMem README: agent with memory tools</a></li>
-              <li><a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/hot_path_quickstart.md#L8-L15">LangMem hot path quickstart: two memory paths</a></li>
-              <li><a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/hot_path_quickstart.md#L35-L119">LangMem hot path quickstart: store, tools, checkpointer</a></li>
-              <li><a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L25-L39">LangMem <code>create_manage_memory_tool</code></a></li>
-              <li><a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L271-L303">LangMem <code>manage_memory</code> write path</a></li>
-              <li><a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/tools.py#L362-L454">LangMem <code>create_search_memory_tool</code></a></li>
-              <li><a href="https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint/langgraph/store/base/__init__.py#L700-L713">LangGraph <code>BaseStore</code></a></li>
-              <li><a href="https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/graph/state.py#L1164-L1201">LangGraph <code>StateGraph.compile()</code></a></li>
-              <li><a href="https://github.com/langchain-ai/langmem/blob/main/docs/docs/background_quickstart.md#L8-L80">LangMem background quickstart</a></li>
-              <li><a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L1666-L1740">LangMem <code>create_memory_store_manager</code> data flow</a></li>
-              <li><a href="https://github.com/langchain-ai/langmem/blob/main/src/langmem/knowledge/extraction.py#L1006-L1135">LangMem <code>MemoryStoreManager.ainvoke()</code></a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/README.md#L13-L16">LangMem README: core features</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/README.md#L32-L64">LangMem README: agent with memory tools</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/docs/docs/hot_path_quickstart.md#L8-L15">LangMem hot path quickstart: two memory paths</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/docs/docs/hot_path_quickstart.md#L35-L119">LangMem hot path quickstart: store, tools, checkpointer</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/tools.py#L25-L39">LangMem <code>create_manage_memory_tool</code></a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/tools.py#L271-L303">LangMem <code>manage_memory</code> write path</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/tools.py#L362-L454">LangMem <code>create_search_memory_tool</code></a></li>
+              <li><a href="https://github.com/langchain-ai/langgraph/blob/8c9d59c842454e7f4531f5e69ff9dab0af3c660f/libs/checkpoint/langgraph/store/base/__init__.py#L700-L713">LangGraph <code>BaseStore</code></a></li>
+              <li><a href="https://github.com/langchain-ai/langgraph/blob/8c9d59c842454e7f4531f5e69ff9dab0af3c660f/libs/langgraph/langgraph/graph/state.py#L1164-L1201">LangGraph <code>StateGraph.compile()</code></a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/docs/docs/background_quickstart.md#L8-L80">LangMem background quickstart</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/extraction.py#L1666-L1740">LangMem <code>create_memory_store_manager</code> data flow</a></li>
+              <li><a href="https://github.com/langchain-ai/langmem/blob/b5dbe4aa34055face022cb4a6db153edd5826377/src/langmem/knowledge/extraction.py#L1006-L1135">LangMem <code>MemoryStoreManager.ainvoke()</code></a></li>
             </ul>
           </section>
         </article>
