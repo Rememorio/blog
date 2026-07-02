@@ -102,10 +102,10 @@
             <p class="eyebrow">源码阅读 · Agent Memory</p>
             <h1>Agent Memory 系列：长期记忆不只是向量检索</h1>
             <p class="lead">
-              Agent 一旦要跨会话工作，记忆就会从一个“把内容存下来”的问题，变成一组边界判断：
-              哪些历史要原样保留，哪些信息能沉淀成用户画像，关系和时间变化放在哪里，
-              最后又由谁把少量内容变成模型这一轮能看见的上下文。这个系列先把几类主流项目放到同一张地图里，
-              再一篇一篇读它们的设计取舍。
+              一个长期工作的 agent 最容易出错的地方，往往不在“有没有历史”，而在“历史多到混在一起”。
+              用户上周说“报销走深圳主体”，今天又说“这个项目按上海口径”；工具刚跑出的日志只服务当前任务，
+              用户长期偏好却要跨项目复用。Agent Memory 系列就从这类场景出发，拆解记忆如何被写入、召回、排序，
+              再压成这一轮模型真正能看的 model view。
             </p>
             <div class="meta-line">
               <span>系列：agent memory</span>
@@ -122,16 +122,16 @@
 
           <section class="article-body">
             <p>
-              如果只从实现材料看，很多记忆项目都会出现 embedding、search、profile、graph、context 这些词。
-              这些词容易让人误以为大家在做同一件事，只是底层索引不同。真正决定系统形状的，其实是更前面的一问：
-              <strong>谁拥有历史，谁负责把历史变成当前模型可用的上下文。</strong>
+              读 memory 项目，如果一开始就盯着 embedding、graph、BM25、RRF，很容易变成名词对名词。
+              更稳的读法，是跟着一次请求往下走：这条新消息会不会沉淀成长期事实；旧事实要不要被覆盖、保留还是降权；
+              哪些工具结果只属于当前任务；最后进入 prompt 的，是原文、摘要、实体关系，还是几条已经排好序的记忆。
             </p>
 
             <p>
-              这篇是系列入口，不急着把所有源码细节塞到一起。它先回答三个问题：哪些项目值得单独讲；
-              它们分别站在 memory layer、stateful agent、temporal graph、workflow memory、knowledge graph、context API 的哪个位置；
-              以及为什么已经写完的 <a href="../../mem0-memory/zh/">Mem0 记忆算法篇</a> 和
-              <a href="../letta/zh/">Letta 篇</a> 分别代表两种不同的记忆边界。
+              这篇是系列入口。它先把“写入”和“召回”讲成一条能复盘的链路，再把
+              <a href="../../mem0-memory/zh/">Mem0</a>、<a href="../letta/zh/">Letta</a>、
+              <a href="../graphiti/zh/">Graphiti</a>、LangMem、TencentDB-Agent-Memory、Cognee、Supermemory
+              放到同一张地图里。这样后面读源码时，读者看到的就不是一堆孤立功能，而是每个系统把哪一段责任拿到自己手里。
             </p>
 
             <div id="evidence" class="note series-note">
@@ -142,10 +142,16 @@
               </p>
             </div>
 
-            <h2 id="basics">一、先把基础讲清楚：memory 只有两条主线</h2>
+            <h2 id="basics">一、从一次请求看起：memory 到底帮 Agent 做什么</h2>
             <p>
-              对一个不了解 agent memory 的读者来说，可以先忘掉一堆项目名。长期记忆系统最核心的动作只有两条：
-              <strong>写入时把对话里的可复用事实变成 memory record，读取时从 memory store 里挑出少量证据放回本轮上下文。</strong>
+              假设一个 coding agent 连续陪你做三周项目。第一周你告诉它“这个仓库不要 mock 数据库”；第二周它从测试失败里学到
+              “账单模块依赖真实租户配置”；第三周你只问一句“继续修上次那个报销问题”。如果没有 memory，它只能重新翻聊天记录和工具输出；
+              如果把所有历史都塞进 prompt，上下文很快被日志和旧结论淹没。
+            </p>
+
+            <p>
+              长期记忆系统介入的位置就在这里：<strong>写入时把对话里的可复用事实变成 memory record，
+              读取时从 memory store 里挑出少量证据放回本轮上下文。</strong>
               前者常被叫做 extraction、add、upsert 或 memory write；后者常被叫做 search、retrieve、recall 或 context assembly。
             </p>
 
@@ -161,28 +167,162 @@
 
             <h3>1.1 写入：从原始对话里提取可长期复用的事实</h3>
             <p>
-              写入要比“把整段聊天原封不动塞进数据库”多一层判断。一次对话里有闲聊、临时指令、工具输出、用户偏好、项目事实和时间线变化；
-              memory 系统要先判断哪些内容以后还可能用得上。常见做法是先做清洗和切分，再用规则或 LLM 抽取候选事实，
-              最后把事实写成带 metadata 的记录：它属于哪个 user 或 agent，来自哪段证据，是什么时间观察到的，是否和已有记忆、实体或任务有关。
+              写入不是把整段聊天原封不动塞进数据库。一次对话里有闲聊、临时指令、工具输出、用户偏好、项目事实和时间线变化；
+              memory 系统要先判断哪些内容以后还可能用得上，再把它变成更稳定的记录。把这条链路展开，通常会经过五步：
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>步骤</th>
+                    <th>系统在判断什么</th>
+                    <th>产物长什么样</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>观察</td>
+                    <td>这轮输入、回复、工具结果里哪些内容值得检查。</td>
+                    <td>一段 conversation / event / tool trace。</td>
+                  </tr>
+                  <tr>
+                    <td>抽取</td>
+                    <td>哪些句子以后还可能影响回答或行动。</td>
+                    <td>几条 candidate memory，例如用户偏好、项目事实、约束。</td>
+                  </tr>
+                  <tr>
+                    <td>归并</td>
+                    <td>候选事实和旧记忆是重复、补充、冲突，还是新事实。</td>
+                    <td>ADD、UPDATE、NOOP，或只追加一条新记录并保留旧证据。</td>
+                  </tr>
+                  <tr>
+                    <td>落库</td>
+                    <td>这条事实归哪个 user、agent、workspace、project 或 entity。</td>
+                    <td>带 source、scope、time、confidence、entity links 的 memory record。</td>
+                  </tr>
+                  <tr>
+                    <td>建索引</td>
+                    <td>以后应该通过关键词、语义、实体还是时间把它找回来。</td>
+                    <td>关键词索引、向量、图边、metadata 字段。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              分词和 embedding 在这条链路里更像基础设施。中文关键词检索需要分词，例如用 GSE 这类 tokenizer 把连续中文切成可索引的词；
+              embedding 把文本转成向量，方便后面按语义召回相似旧记忆。它们常参与建索引、去重和相似记忆查找；
+              “这句话值不值得长期保存”这个判断，还要看 LLM 抽取、规则、schema、时间字段和应用侧边界。
+              在一些系统里，LLM 会先抽 candidate memory，再用 embedding / vector search 找相似旧记忆做归并；在另一些系统里，抽取、索引和归并会被拆成异步任务。
             </p>
 
             <p>
-              分词和 embedding 在这里更像基础设施。中文关键词检索需要分词，例如用 GSE 这类 tokenizer 把连续中文切成可索引的词；
-              embedding 把文本转成向量，方便后面按语义召回。它们会帮助系统建索引、去重、找相似旧记忆，但不会单独回答“这条内容该不该成为长期记忆”。
-              这个判断通常还需要 LLM、规则、schema、时间字段和应用侧边界一起参与。
+              <strong>放到源码里看会更直观。</strong>
+              以 Mem0 当前 OSS 代码为例，<a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L705-L751"><code>add()</code></a>
+              先把 <code>user_id</code>、<code>agent_id</code>、<code>run_id</code> 变成存储 metadata 和查询 filters，
+              再把消息送进 <code>_add_to_vector_store(..., infer)</code>。默认 <code>infer=True</code> 时，
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L800-L840"><code>_add_to_vector_store()</code></a>
+              会取最近消息、召回相似旧记忆，再让 LLM 做一次抽取。
+            </p>
+
+            <pre><code class="language-python">processed_metadata, effective_filters = _build_filters_and_metadata(...)
+vector_store_result = self._add_to_vector_store(
+    messages, processed_metadata, effective_filters, infer, prompt=prompt
+)
+
+last_messages = self.db.get_last_messages(session_scope, limit=10)
+existing_results = self.vector_store.search(..., top_k=10, filters=search_filters)
+response = self.llm.generate_response(...)</code></pre>
+
+            <p>
+              这几行说明两件事：写入入口已经带着 scope，LLM 看到的是新消息、最近消息和一小批相似旧记忆，
+              不是整座 memory store。embedding / vector search 在这里承担“找相似旧记忆”的职责，LLM 才负责把候选事实写成新的 memory record。
             </p>
 
             <h3>1.2 召回：从记忆库里组装本轮 model view</h3>
             <p>
-              读取也不会把 memory store 全部拿出来。用户这一轮问问题时，系统先确定范围，例如 user、agent、workspace、时间段或项目；
-              然后用多种信号召回候选：关键词检索负责精确词，向量检索负责语义相近，实体或图负责“谁和谁有关”，metadata filter 负责边界。
-              候选出来以后，还要排序、去重、重排和截断，最后只把 top-k 或经过预算控制的一小批结果放进 prompt。
+              召回面对的是相反的压力：memory store 可以越积越大，prompt 只能容纳很少一部分。用户问“继续修上次那个报销问题”时，
+              系统不能把三周历史全部拿出来，只能先限定范围，再用几路检索信号召回候选，最后按上下文预算压成 model view。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>步骤</th>
+                    <th>系统在做什么</th>
+                    <th>为什么不能省</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>范围过滤</td>
+                    <td>先按 user、agent、workspace、project、时间段或权限缩小搜索面。</td>
+                    <td>防止把别的用户、别的项目或已经失效的事实带进来。</td>
+                  </tr>
+                  <tr>
+                    <td>多路召回</td>
+                    <td>BM25 找精确词，vector search 找语义相近，entity / graph 找相关对象。</td>
+                    <td>单一路径很容易漏掉“同义不同词”或“词相同但对象不同”的情况。</td>
+                  </tr>
+                  <tr>
+                    <td>融合排序</td>
+                    <td>用 RRF、reranker、时间衰减或业务权重合并候选。</td>
+                    <td>候选多了以后，顺序本身就会影响模型注意到什么。</td>
+                  </tr>
+                  <tr>
+                    <td>预算裁剪</td>
+                    <td>只保留 top-k 或 token 预算内的一小批证据。</td>
+                    <td>模型需要的是当前任务的工作集，不是完整记忆库。</td>
+                  </tr>
+                  <tr>
+                    <td>组装上下文</td>
+                    <td>把记忆记录改写成 prompt 能读的 bullet、引用、profile 或 tool result。</td>
+                    <td>memory record 的存储形态通常不适合直接塞给模型。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              BM25、RRF、reranker、hybrid search 就是在这条链路里发挥作用。BM25 给关键词匹配打分；
+              vector search 给语义相似度打分；RRF 可以按名次融合多路结果；reranker 会在候选集上做更精细的相关性判断。
+              它们共同服务于一个目标：<strong>memory store 可以很大，但 model view 必须小、准、和当前问题有关。</strong>
             </p>
 
             <p>
-              这就是 BM25、RRF、reranker、hybrid search 经常一起出现的原因。BM25 给关键词匹配打分；
-              vector search 给语义相似度打分；RRF 可以按名次融合多路结果；reranker 会在候选集上做更精细的相关性判断。
-              这些机制都服务于同一个目标：<strong>memory store 可以很大，但 model view 必须小、准、和当前问题有关。</strong>
+              再看 Mem0 的召回路径。<a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1297-L1365"><code>search()</code></a>
+              先校验 <code>top_k</code>、<code>threshold</code> 和 filters，再调用
+              <a href="https://github.com/mem0ai/mem0/blob/29d131f7aa7e493b190f6bbd215aeff9ca453607/mem0/memory/main.py#L1488-L1544"><code>_search_vector_store()</code></a>。
+              后者把 query 同时送进语义检索、关键词检索和实体增强，最后由 <code>score_and_rank()</code> 输出预算内结果。
+            </p>
+
+            <pre><code class="language-python">query_lemmatized = lemmatize_for_bm25(query)
+query_entities = extract_entities(query)
+embeddings = self.embedding_model.embed(query, "search")
+
+internal_limit = max(limit * 4, 60)
+semantic_results = self.vector_store.search(..., top_k=internal_limit, filters=filters)
+keyword_results = self.vector_store.keyword_search(..., top_k=internal_limit, filters=filters)
+
+scored_results = score_and_rank(
+    semantic_results=candidates,
+    bm25_scores=bm25_scores,
+    entity_boosts=entity_boosts,
+    threshold=threshold,
+    top_k=limit,
+)</code></pre>
+
+            <p>
+              这样讲，读者不用靠猜来判断“有没有 BM25、RRF 或 rerank”。这条 OSS 路径里能直接看到 BM25 侧的关键词分数、vector 侧的语义候选和 entity boost；
+              <code>rerank</code> 是 <code>search()</code> 外层的可选分支，RRF 不是这段路径里显式出现的融合步骤。
+            </p>
+
+            <h3>1.3 基础概念要放回链路里理解</h3>
+            <p>
+              很多概念单独看都像“检索技术”，放回写入和召回两条链路以后，位置就清楚了。下面这张表不是词汇表，
+              而是一张读源码时的定位表：看到某个机制，先判断它在帮系统保存事实、找候选、合并候选，还是控制最后进入模型的内容。
             </p>
 
             <div class="table-wrap">
@@ -191,39 +331,44 @@
                   <tr>
                     <th>概念</th>
                     <th>在哪条链路里出现</th>
-                    <th>它解决什么问题</th>
+                    <th>读源码时看什么</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr>
                     <td>分词 / GSE</td>
                     <td>写入建索引，读取处理 query</td>
-                    <td>把中文或无空格文本切成关键词检索能理解的 token。</td>
+                    <td>它通常服务关键词索引，不代表系统已经理解了事实。</td>
                   </tr>
                   <tr>
                     <td>embedding</td>
                     <td>写入建向量，读取做 vector search</td>
-                    <td>把文本变成向量，让“说法不同但意思相近”的内容能被召回。</td>
+                    <td>它负责语义相似度，常用来找相似旧记忆或候选证据。</td>
                   </tr>
                   <tr>
                     <td>BM25</td>
                     <td>读取召回或排序</td>
-                    <td>按关键词出现频率、稀有度和文档长度计算字面相关性。</td>
+                    <td>它偏字面匹配，适合项目名、函数名、专有名词这类精确线索。</td>
+                  </tr>
+                  <tr>
+                    <td>vector search</td>
+                    <td>读取召回或写入归并</td>
+                    <td>它偏语义相似，适合“说法变了但意思接近”的线索。</td>
                   </tr>
                   <tr>
                     <td>entity / graph</td>
                     <td>写入抽实体，读取扩展关系</td>
-                    <td>让人、项目、地点、任务之间的连接参与检索。</td>
+                    <td>它让人、项目、地点、任务之间的连接参与检索。</td>
                   </tr>
                   <tr>
                     <td>RRF / rerank</td>
                     <td>读取排序</td>
-                    <td>把多路候选合并、重排，减少单一路径的偏差。</td>
+                    <td>它决定候选进入模型前的先后顺序和去重结果。</td>
                   </tr>
                   <tr>
                     <td>top-k / model view</td>
                     <td>读取结束</td>
-                    <td>在上下文预算内，只给模型看当前回答最需要的少量记忆。</td>
+                    <td>它是最后一道预算边界，决定模型这一轮真正看见什么。</td>
                   </tr>
                 </tbody>
               </table>
@@ -234,20 +379,18 @@
               还有的项目真正特别的地方在于 ownership，比如历史、画像、关系、任务状态和模型可见上下文分别由谁负责。
             </p>
 
-            <h2 id="map">二、再画地图：长期记忆到底分哪几件事</h2>
+            <h2 id="map">二、用五个盒子看项目边界</h2>
             <p>
-              一个能长期工作的 agent，至少要同时处理五种任务。第一种是保存原始证据，比如消息、文件、事件和工具结果；
-              第二种是沉淀比较稳定的用户画像或偏好；第三种是理解关系，比如人、项目、文档、任务之间怎样连接；
-              第四种是处理时间变化，区分以前成立、现在成立和未来计划；第五种是把前面这些材料压成这一轮模型能读的上下文。
+              回到前面的报销例子，agent 手里其实有五个盒子。第一个盒子装原始证据：消息、文件、事件、工具结果；
+              第二个盒子装稳定画像：用户偏好、团队习惯、项目约束；第三个盒子装关系：人、项目、文档、任务怎样连接；
+              第四个盒子装时间线：哪些事实以前成立、现在成立、未来计划；第五个盒子装 model view：这一轮 prompt 里真正出现的少量材料。
             </p>
 
             <p>
-              这五件事可以全放进一个平台，也可以拆给不同层。Mem0 选择把记忆抽取和检索做成外置 memory layer；
-              Letta 把 memory blocks、agent state 和工具能力放在 stateful agent 这条线上；
-              Graphiti 从 temporal context graph 出发，强调事实随时间变化时仍能保留来源和有效期；
-              LangMem/LangGraph 更靠近工作流运行时，让 agent 在 hot path 或 background path 管理记忆；
-              TencentDB-Agent-Memory 把当前任务的工具日志做成可下钻的 Context Offload；
-              Cognee 与 Supermemory 则分别把知识图谱化和完整 context stack 做得更重。
+              判断一个项目，不妨先看它把哪个盒子当主战场。Mem0 把写入、归并和召回放到应用与模型之间的一层 memory service；
+              Letta 把 profile、tools、messages 和 agent state 绑在同一个有状态 agent 里；Graphiti 把实体、关系、episodes 和时间有效期组织成 temporal graph；
+              LangMem/LangGraph 把记忆动作接进工作流运行时，区分 hot path 和 background path；TencentDB-Agent-Memory 先处理当前任务里的上下文卸载，
+              再沉淀 L0 到 L3 长期记忆；Cognee 与 Supermemory 更像把企业知识、连接器、文件处理和用户画像一起产品化。
             </p>
 
             <figure class="figure">
@@ -256,7 +399,7 @@
                 alt="Agent Memory 路线图，用项目卡片展示 memory layer、agent state、temporal graph、workflow memory、context offload、knowledge graph 和 context API 的不同侧重"
               />
               <figcaption>
-                入口篇只先做路线图。每个项目最值得读的地方，不在“有没有向量检索”，而在它把 history、profile、graph 和 model view 放在哪一层。
+                入口篇先做路线图。每个项目最值得读的地方，是它把 evidence、profile、graph、timeline 和 model view 分别交给哪一层。
               </figcaption>
             </figure>
 
