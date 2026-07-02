@@ -126,6 +126,26 @@
               它的回答是：低层保留原始证据，高层只给模型一张结构图。
             </p>
 
+            <pre><code>场景：代码 agent 连续跑了 8 次测试和 12 次文件搜索
+
+原始上下文：
+  assistant tool_use -> tool_result(几千行测试日志)
+  assistant tool_use -> tool_result(多段源码)
+  assistant tool_use -> tool_result(报错堆栈)
+  ...
+
+TencentDB-Agent-Memory 的处理：
+  refs/*.md        保存完整工具结果
+  offload-*.jsonl  保存 tool_call_id、摘要、score、result_ref
+  mmds/*.mmd       把多个工具调用合成任务拓扑节点
+  prompt           只保留摘要和 MMD，必要时再按 result_ref 找回原文</code></pre>
+
+            <p>
+              这里最重要的不是“压缩”，而是“可展开”。如果模型后来需要确认某个测试失败的原始堆栈，它不是去猜摘要里丢掉了什么，
+              而是沿着 <code>node_id</code>、<code>tool_call_id</code> 和 <code>result_ref</code> 回到原始文件。
+              这也是它和普通 summary memory 最大的区别。
+            </p>
+
             <div class="note reading-contract">
               <p>
                 <strong>阅读契约。</strong>
@@ -152,7 +172,7 @@
               <code>node_id</code> 的 Mermaid 任务画布；长期用户理解侧，则是
               <code>L0 Conversation</code>、<code>L1 Atom</code>、<code>L2 Scenario</code>、<code>L3 Persona</code>
               的语义金字塔。这个总纲可以看 README 的
-              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/README_CN.md#L65-L85">核心技术说明</a>。
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/README_CN.md#L65-L85">核心技术说明</a>。
             </p>
 
             <p>
@@ -167,8 +187,8 @@
               从实现边界看，TencentDB-Agent-Memory 是 OpenClaw 插件。默认本地存储使用 SQLite + sqlite-vec，
               README 说明启用后会自动完成对话录制、记忆提取、场景归纳、用户画像生成和下一轮召回；
               短期 offload 则是独立开关。相关配置在 README 的
-              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/README_CN.md#L151-L170">快速开始</a>
-              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/openclaw.plugin.json#L146-L164">插件 schema</a> 里都能看到。
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/README_CN.md#L151-L170">快速开始</a>
+              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/openclaw.plugin.json#L146-L164">插件 schema</a> 里都能看到。
             </p>
 
             <p>
@@ -194,8 +214,8 @@
               <code>mmds/</code>、<code>refs/</code> 和 <code>state.json</code>，每个 session 有自己的
               <code>offload-&lt;sessionId&gt;.jsonl</code>；路径构造里也能看到默认根目录、<code>refsDir</code>、
               <code>mmdsDir</code> 与 session JSONL 的关系。看
-              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/storage.ts#L1-L18"><code>storage.ts</code> 顶部设计说明</a>
-              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/storage.ts#L38-L53">StorageContext 构造</a>。
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/storage.ts#L1-L18"><code>storage.ts</code> 顶部设计说明</a>
+              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/storage.ts#L38-L53">StorageContext 构造</a>。
             </p>
 
             <p>
@@ -204,12 +224,35 @@
               而是把原文放到外部文件和 JSONL 索引里，让模型当前只看摘要和任务结构。
             </p>
 
+            <pre><code class="language-typescript">export interface OffloadEntry {
+  timestamp: string;
+  node_id: string | null;
+  tool_call: string;
+  summary: string;
+  result_ref: string;
+  tool_call_id: string;
+  score?: number;
+}
+
+export async function writeRefMd(ctx, timestamp, toolName, content) {
+  const filename = `${isoToFilename(timestamp)}.md`;
+  const filePath = join(ctx.refsDir, filename);
+  await writeFile(filePath, header + safeContent, "utf-8");
+  return `refs/${filename}`;
+}</code></pre>
+
+            <p>
+              一条工具结果在这里被拆成两部分：原文进入 <code>refs/*.md</code>，索引进入 <code>OffloadEntry</code>。
+              <code>summary</code> 给模型快速理解，<code>result_ref</code> 给系统恢复细节，
+              <code>score</code> 用来判断后续 L3 压缩能不能用摘要替代原文。
+            </p>
+
             <h3 id="offload-l1-l2">2.2 L1 写步骤摘要，L2 把步骤变成任务拓扑</h3>
             <p>
               Offload 的 L1 不是长期 memory 的 L1，而是工具结果摘要。<code>l1-prompt.ts</code> 要求 LLM 把 tool call/result
               合成 JSON 数组，每条包含 <code>tool_call</code>、<code>summary</code>、<code>tool_call_id</code>、时间戳和
               <code>score</code>。prompt 还要求摘要说清“发现了什么关键线索”“做了什么关键动作”“遇到了什么具体报错”。
-              这可以看 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/local-llm/prompts/l1-prompt.ts#L9-L29">L1 摘要 prompt</a>。
+              这可以看 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/local-llm/prompts/l1-prompt.ts#L9-L29">L1 摘要 prompt</a>。
             </p>
 
             <p>
@@ -217,8 +260,30 @@
               而是要求它用少量节点表达任务状态，合并连续常规动作，保留关键转折和失败路径，并把每个
               <code>tool_call_id</code> 映射到一个 <code>node_id</code>。同一个文件里还规定了
               <code>write</code> 和 <code>replace</code> 两种更新方式，以及 4000 字以内的 MMD 控制目标。
-              参考 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/local-llm/prompts/l2-prompt.ts#L9-L54">L2 MMD 生成规则</a>
-              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/local-llm/prompts/l2-prompt.ts#L118-L125">新 offload entries 的输入格式</a>。
+              参考 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/local-llm/prompts/l2-prompt.ts#L9-L54">L2 MMD 生成规则</a>
+              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/local-llm/prompts/l2-prompt.ts#L118-L125">新 offload entries 的输入格式</a>。
+            </p>
+
+            <pre><code class="language-typescript">const req: L2Request = {
+  existingMmd,
+  newEntries: batch.map((e) => ({
+    tool_call_id: e.tool_call_id,
+    tool_call: e.tool_call,
+    summary: e.summary,
+    timestamp: e.timestamp,
+  })),
+  recentHistory,
+  currentTurn,
+  taskLabel,
+  mmdPrefix,
+};
+
+// L2 返回 node_mapping，把每个 tool_call_id 挂到一个 Mermaid 节点上。</code></pre>
+
+            <p>
+              这一步解释了 MMD 图为什么有用。它不是给文章好看的插图，而是把“很多条工具调用”合并成“少量任务节点”。
+              例如连续查看五个文件，L2 可以合成一个“定位实现边界”的节点；一次测试失败和一次修复，则应该保留成两个有方向关系的节点。
+              只要 <code>node_mapping</code> 保留，模型就能从任务图下钻到具体工具调用。
             </p>
 
             <div class="flow-list" aria-label="Context Offload 流程">
@@ -242,16 +307,39 @@
               快速重放已经确认的替换和删除、按 token 阈值做 L3 压缩、最后注入 MMD。代码里会读取 offload entries，
               把确认可替代的 tool result 换成摘要；如果超过 aggressive 阈值，则删除更老的工具消息，并用历史 MMD 作为补偿；
               mild 阶段则按分数级联替换。对应源码在
-              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/hooks/before-prompt-build.ts#L1-L7">三阶段注释</a>
-              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/hooks/before-prompt-build.ts#L70-L230">核心处理逻辑</a>。
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/hooks/before-prompt-build.ts#L1-L7">三阶段注释</a>
+              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/hooks/before-prompt-build.ts#L70-L230">核心处理逻辑</a>。
             </p>
 
             <p>
               MMD 注入是另一个关键点。<code>mmd-injector.ts</code> 只注入当前活跃的 MMD，历史 MMD 主要在 aggressive 删除后作为丢失上下文的替代。
               注入时还会按 <code>mmdMaxTokenRatio</code> 计算预算，并把 MMD 作为带标记的 user message 插到合适位置。
               这样模型看到的是“当前任务图”，不是一串已经滚远的工具日志。可以看
-              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/mmd-injector.ts#L24-L31">MMD 注入策略</a>
-              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/mmd-injector.ts#L61-L85">注入实现</a>。
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/mmd-injector.ts#L24-L31">MMD 注入策略</a>
+              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/mmd-injector.ts#L61-L85">注入实现</a>。
+            </p>
+
+            <pre><code class="language-typescript">// before_prompt_build 的三段逻辑
+// 1. 已确认可替换的 tool_result -> 摘要
+if (entry && isToolResultMessage(msg)) {
+  replaceWithSummary(msg, entry);
+  msg._offloaded = true;
+}
+
+// 2. 超过 aggressive 阈值时删除更老工具消息，并注入 history MMD
+const result = await aggressiveCompressUntilBelowThreshold(...);
+
+// 3. 注入当前 active MMD
+await injectMmdIntoMessages(messages, stateManager, logger, getContextWindow, pluginConfig);</code></pre>
+
+            <pre><code>[Offloaded Tool Result | node: 012-N3]
+Summary: 测试失败集中在连接池重试逻辑，超时错误可复现
+result_ref: refs/2026-07-02T10-21-33.md (read this file for full tool call and raw result)</code></pre>
+
+            <p>
+              所以 L3 的动作有轻有重：mild 阶段把工具结果换成摘要；aggressive 阶段会删除更老的工具消息，
+              再用历史 MMD 补上被删掉的任务结构；最后 active MMD 进入消息数组。模型看到的是“当前任务为什么走到这里”，
+              而不是“过去每一次命令完整输出了什么”。
             </p>
 
             <h2 id="long-term">三、长期记忆：L0 到 L3 是另一条语义金字塔</h2>
@@ -260,31 +348,54 @@
               长期记忆这边，L0 是原始对话记录，L1 才是结构化 memory。<code>l1-extractor.ts</code> 的文件注释直接写出管线：
               从 L0 读取近期消息，调用 LLM 做场景切分和 memory extraction，再做批量冲突检测，最后写 L1 JSONL。
               实现里还会先通过质量过滤，只把值得提取的消息送给 LLM，并把新消息和少量 background messages 分开。
-              源码见 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/record/l1-extractor.ts#L1-L13">L1 extractor 总流程</a>
-              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/record/l1-extractor.ts#L126-L220">过滤、抽取、展平步骤</a>。
+              源码见 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/record/l1-extractor.ts#L1-L13">L1 extractor 总流程</a>
+              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/record/l1-extractor.ts#L126-L220">过滤、抽取、展平步骤</a>。
+            </p>
+
+            <pre><code class="language-typescript">const qualifiedMessages = messages.filter((m) => shouldExtractL1(m.content));
+const newMessages = qualifiedMessages.slice(-maxNewMessages);
+const backgroundMessages = qualifiedMessages.slice(...);
+
+const scenes = await callLlmExtraction({
+  newMessages,
+  backgroundMessages,
+  previousSceneName,
+});
+
+// scenes -> memories -> L1 records</code></pre>
+
+            <p>
+              这段代码说明 L1 不是把每条对话都变成 memory。L0 可以保留原始对话，但 L1 会先过质量过滤，
+              再把最近消息和背景消息分开交给 LLM。这样做能减少噪声，也让模型知道当前这一段和上一段场景之间的关系。
             </p>
 
             <p>
               Dedup 也不是全量扫 JSONL。<code>l1-dedup.ts</code> 注释说，v4 移除了 JSONL Jaccard fallback，
               候选召回主要靠向量搜索，降级到 FTS5 BM25，如果两者都不可用就跳过冲突检测直接写入。这个选择很工程化：
               避免每次写 memory 都做 O(N) 文件扫描，把“可能冲突的旧记忆”先用检索缩小，再交给 LLM 批量判断 store、skip、update、merge。
-              参考 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/record/l1-dedup.ts#L1-L12">L1 dedup 注释</a>
-              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/record/l1-dedup.ts#L30-L40">三层候选策略</a>。
+              参考 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/record/l1-dedup.ts#L1-L12">L1 dedup 注释</a>
+              和 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/record/l1-dedup.ts#L30-L40">三层候选策略</a>。
             </p>
+
+            <pre><code>新 L1 memory 写入前：
+  1. vector recall 找 top-k 候选旧记忆
+  2. 没有向量能力时，用 FTS5 BM25 找关键词候选
+  3. 两者都没有时，跳过冲突检测，直接 store
+  4. LLM 只比较“新记忆 + 候选池”，批量判断 store / skip / update / merge</code></pre>
 
             <h3 id="long-term-l2-l3">3.2 L2 是场景日记，L3 是用户画像</h3>
             <p>
               L2 的场景抽取由 <code>SceneExtractor</code> 完成。它不是把 L1 memory 追加成列表，而是让 LLM 在受限的
               <code>scene_blocks/</code> 目录里读写 Markdown 场景文件。文件注释写得很明确：先备份和加载 scene index，
               再用 memories 与 scene context 组装 prompt，随后用开启工具的 runner 在沙箱目录里操作场景文件，最后清理软删除、同步索引、更新导航。
-              看 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/scene/scene-extractor.ts#L1-L17">SceneExtractor 说明</a>。
+              看 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/scene/scene-extractor.ts#L1-L17">SceneExtractor 说明</a>。
             </p>
 
             <p>
               L3 的 <code>PersonaGenerator</code> 则读取发生变化的场景内容，生成或增量更新 <code>persona.md</code>。
               它会剥离旧导航、读取 changed scenes，把 prompt 交给允许文件工具的 runner，最后把工程生成的 scene navigation 追加回 persona。
               这意味着高层画像不是凭空总结，而是从 L2 场景文件继续向上抽象。相关逻辑可以看
-              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/persona/persona-generator.ts#L58-L185"><code>generateLocalPersona</code></a>。
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/persona/persona-generator.ts#L58-L185"><code>generateLocalPersona</code></a>。
             </p>
 
             <h3 id="long-term-recall">3.3 召回时，稳定画像和动态记忆分开注入</h3>
@@ -293,16 +404,32 @@
               L3 persona 会注入；L2 scene navigation 也会注入，由 LLM 决定是否进一步读取。真正组装上下文时，
               L3 persona、L2 navigation 和工具使用说明放在 stable system context，L1 relevant memories 则放到当前 user prompt 前缀。
               这样做的好处是：画像和场景导航变化较慢，适合 prompt cache；L1 命中每轮都不同，放在动态区域更合适。
-              源码见 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/hooks/auto-recall.ts#L1-L10">auto-recall 顶部说明</a>
-              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/hooks/auto-recall.ts#L186-L218">stable/dynamic context 拆分</a>。
+              源码见 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/hooks/auto-recall.ts#L1-L10">auto-recall 顶部说明</a>
+              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/hooks/auto-recall.ts#L186-L218">stable/dynamic context 拆分</a>。
+            </p>
+
+            <pre><code class="language-typescript">const stableParts: string[] = [];
+if (personaContent) stableParts.push(`&lt;user-persona&gt;...&lt;/user-persona&gt;`);
+if (sceneNavigation) stableParts.push(`&lt;scene-navigation&gt;...&lt;/scene-navigation&gt;`);
+
+let prependContext: string | undefined;
+if (memoryLines.length > 0) {
+  prependContext = `&lt;relevant-memories&gt;\n${memoryLines.join("\n")}\n&lt;/relevant-memories&gt;`;
+}
+
+return { appendSystemContext, prependContext };</code></pre>
+
+            <p>
+              这段拆分很关键。Persona 和 Scene Navigation 是慢变量，适合放进 system prompt 末尾，给 prompt cache 留机会；
+              L1 检索结果每轮都变，放进 user prompt 前缀更自然。它不是把所有记忆塞到同一个段落里，而是按变化频率安排位置。
             </p>
 
             <p>
               存储层也配合这个策略。<code>sqlite.ts</code> 管理 L1 结构化记忆和 L0 原始对话两层索引：关系表保存 metadata，
               <code>sqlite-vec</code> 虚表做 cosine similarity；同时还有 FTS5 和中文分词相关逻辑。搜索策略里 hybrid 会优先使用原生 hybrid，
               否则并行跑 keyword 与 embedding，再用 RRF 合并。可看
-              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/store/sqlite.ts#L1-L20">SQLite store 设计注释</a>
-              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/hooks/auto-recall.ts#L299-L388">recall 搜索调度</a>。
+              <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/store/sqlite.ts#L1-L20">SQLite store 设计注释</a>
+              与 <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/hooks/auto-recall.ts#L299-L388">recall 搜索调度</a>。
             </p>
 
             <h2 id="compare">四、把它放回 Agent Memory 地图</h2>
@@ -363,14 +490,14 @@
             <h2 id="sources">参考资料</h2>
             <ul>
               <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory">TencentCloud/TencentDB-Agent-Memory</a></li>
-              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/README_CN.md#L65-L85">README_CN：记忆分层、短期卸载、L0-L3 与可恢复链路</a></li>
-              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/openclaw.plugin.json#L146-L164">OpenClaw plugin schema：Context Offload 配置</a></li>
-              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/storage.ts#L1-L53">Context Offload storage paths</a></li>
-              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/local-llm/prompts/l1-prompt.ts#L9-L29">Offload L1 summarization prompt</a></li>
-              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/local-llm/prompts/l2-prompt.ts#L9-L54">Offload L2 MMD prompt</a></li>
-              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/offload/hooks/before-prompt-build.ts#L1-L230">before_prompt_build L3 compression</a></li>
-              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/record/l1-extractor.ts#L1-L220">Long-term L1 extraction pipeline</a></li>
-              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/main/src/core/hooks/auto-recall.ts#L1-L388">Auto-recall search and context assembly</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/README_CN.md#L65-L85">README_CN：记忆分层、短期卸载、L0-L3 与可恢复链路</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/openclaw.plugin.json#L146-L164">OpenClaw plugin schema：Context Offload 配置</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/storage.ts#L1-L53">Context Offload storage paths</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/local-llm/prompts/l1-prompt.ts#L9-L29">Offload L1 summarization prompt</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/local-llm/prompts/l2-prompt.ts#L9-L54">Offload L2 MMD prompt</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/offload/hooks/before-prompt-build.ts#L1-L230">before_prompt_build L3 compression</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/record/l1-extractor.ts#L1-L220">Long-term L1 extraction pipeline</a></li>
+              <li><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/ee76536f30ae49e598ad43f472da7e09f4155b8a/src/core/hooks/auto-recall.ts#L1-L388">Auto-recall search and context assembly</a></li>
             </ul>
           </section>
         </article>
