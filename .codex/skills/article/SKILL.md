@@ -95,12 +95,13 @@ concrete user or runtime situation
 -> tradeoff, failure boundary, and handoff to the next mechanism
 ```
 
-When adjacent sections explain one mechanism family, keep a single
-representative scenario running across them so readers can carry state forward.
-Vary the local details only when a new example clarifies a new boundary; do not
-restart with unrelated examples in every section. Titles should name the
-reader-facing question or tradeoff first, then mention the mechanism when it is
-needed for precision.
+When adjacent sections explain one mechanism family, keep one representative
+request, persisted record, tool result, user preference, or runtime object
+running across them. Let readers carry the same state through write, update,
+retrieval, recovery, and later-observation boundaries. Vary the local details
+only when a new example clarifies a new boundary; do not restart with unrelated
+examples in every section. Titles should name the reader-facing question or
+tradeoff first, then mention the mechanism when it is needed for precision.
 
 Use source names only after the reader has a concrete hook for the concept.
 When a mechanism depends on overloaded terms such as `history`, `prompt`,
@@ -198,11 +199,15 @@ When a reader-comprehension problem is raised, do a reader-review pass before
 rewriting. The review should read like a target-reader audit, not a copy-edit:
 list what a reasonable reader still cannot answer, which terms arrive too
 early, which transitions feel abrupt, where an example or contrast is missing,
-and what sequence would make the section natural. If the user explicitly
-authorizes a subagent or outside reader, use it only for this bounded feedback.
-The subagent should not edit files; it should return prioritized reading
-obstacles and concrete rewrite suggestions. Keep the final rewrite owned by the
-main pass, so the article remains one coherent voice.
+and what sequence would make the section natural. Also test whether a fresh
+reader can replay the mechanism without private context: what entered, who
+owned it, which gate fired, which record changed, where it was stored, how it is
+retrieved later, why the simpler design would fail, and where the claim stops.
+Prioritize gaps that block this replay over sentence-level polish. If the user
+explicitly authorizes a subagent or outside reader, use it only for this bounded
+feedback. The subagent should not edit files; it should return prioritized
+reading obstacles and concrete rewrite suggestions. Keep the final rewrite
+owned by the main pass, so the article remains one coherent voice.
 
 Protocol-shaped examples are mandatory when prose alone leaves too much
 ambiguity. For API/runtime articles, include small before/after request or
@@ -222,6 +227,13 @@ record examples at mechanism boundaries:
   resume variants, use minimal sequence examples (`M1 M2 M3 F1`) or compact
   JSON fragments before adding a new diagram. Add a figure only when the
   ownership boundary, lifecycle, or recovery path remains hard to see.
+- For source walkthroughs, include short source-shaped snippets when the prose
+  depends on a state transition. Prefer excerpts that show the owner, key
+  fields, and handoff point, such as `namespace + key + value`,
+  `tool_call_id + result_ref`, `resolved / invalidated / new`, or
+  `static profile + dynamic search results`. Link the full source, show only
+  fields that carry the mechanism, and explain immediately what changed. Do not
+  paste long source blocks as evidence by volume.
 
 Keep source and publication targets synchronized during every revision. When a
 standalone Markdown source and generated public HTML both exist, render the
@@ -359,8 +371,9 @@ Default image/text ratio for source-heavy technical articles:
 - One overview image in the introduction or first major section.
 - One figure per major conceptual turn, usually every `700` to `1100` Chinese
   characters for dense source analysis. Do not let a long mechanism section run
-  past roughly `1300` Chinese characters without a figure unless the section is
-  intentionally code/table-heavy and visually self-explanatory.
+  past roughly `1300` Chinese characters without a figure unless source-shaped
+  snippets, before/after records, or compact decision tables already make the
+  section visually self-explanatory.
 - Add an extra figure only when it prevents a specific misreading: boundary vs
   replacement, UI history vs model view, snapshot vs hot reload, local
   truncation vs semantic compaction.
@@ -372,6 +385,10 @@ Default image/text ratio for source-heavy technical articles:
   short or already has interactive visuals that do the same teaching work.
 - Use figures to serve the argument, not as decoration. Every figure should
   answer a reader confusion that prose alone would make costly.
+- Do not add a new figure merely to satisfy rhythm when it would duplicate a
+  precise snippet or table, weaken visual consistency, or turn a source
+  transition into a vague diagram. Keep the existing figure package when code,
+  record shapes, and tables carry the new explanation more accurately.
 
 All new article images must follow the
 `.codex/skills/image/SKILL.md` skill.
@@ -398,7 +415,8 @@ For incremental edits, run the same check at smaller scope:
 4. If a figure is added or touched, save the final PNG under the article assets
    directory and update the published image reference.
 5. Preserve image rhythm; do not add decorative images just because a change was
-   made.
+   made. It is acceptable to leave figures unchanged when the edit is better
+   carried by source snippets, before/after records, or compact tables.
 6. Include the visual decision in final verification notes: regenerated,
    adjusted, or intentionally unchanged.
 
@@ -667,9 +685,10 @@ a reference list at the end.
 - Source links must use the canonical repository name, not a temporary local
   directory name or scratch mirror. Verify the GitHub repository before linking.
 - If the analysis depends on a fixed source snapshot, use an immutable commit in
-  the link target or record the snapshot internally, but keep the reader-facing
-  text human: file paths, function names, and mechanisms matter more than raw
-  commit hashes.
+  the link target unless the article intentionally tracks live `main`. When the
+  source was verified from a local clone, convert explanatory GitHub links to
+  the checked commit before publishing; keep the reader-facing text human:
+  file paths, function names, and mechanisms matter more than raw commit hashes.
 - Do not make `based on owner/repo@sha`, raw commit IDs, local branch names, or
   revision metadata a headline, hero line, caption, navigation label, or other
   prominent reader-facing motif.
@@ -693,10 +712,10 @@ a reference list at the end.
 - Audit generated public HTML or Markdown for leaked local file URLs, local
   absolute paths, temporary paths, private prompts, or internal process language
   before publishing.
-- For long-lived source articles, prefer immutable source URLs or record the
-  source snapshot being explained. Moving `main` links are acceptable only when
-  the article intentionally tracks live source and the link target is checked
-  during the current edit.
+- For long-lived source articles, prefer immutable source URLs for verified
+  source claims. Moving `main` links are acceptable only when the article
+  intentionally tracks live source and the link target is checked during the
+  current edit.
 - Audit representative GitHub line anchors before publishing: verify that they
   still point at the named symbol, field, or file section.
 
@@ -790,7 +809,11 @@ that covers the edit:
   they clarify invariants or misreadings and do not create a stack of generic
   callouts.
 - If links were added or changed, sample-check official docs and representative
-  GitHub line anchors.
+  GitHub line anchors. For fixed source snapshots, scan touched pages for stale
+  `blob/main` source links and replace them with the verified commit target.
+- If source-shaped snippets, JSON fragments, or API shapes were added, check
+  balanced tags or fences and make sure shape-level examples cannot be mistaken
+  for exact private internals.
 - Run repository content/build checks when the touched files participate in a
   renderer or build step.
 
