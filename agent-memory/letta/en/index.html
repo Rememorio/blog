@@ -84,10 +84,10 @@
             <p class="eyebrow">Agent Memory · Letta</p>
             <h1>Letta / Letta Code: When Memory Becomes Agent State</h1>
             <p class="lead">
-              Mem0 starts by turning conversation history into an external memory service. Letta starts somewhere else:
-              the agent itself is stateful. Memory blocks, the active message window, tools, files, secrets, and maintenance
-              work all sit inside the agent-state boundary. That changes the first question from "what old fact should I retrieve?"
-              to "which part of this agent's state should become visible to the model now?"
+              If a coding agent works with the same repository every day, it needs more than a fact that says the user
+              likes concise answers. It also needs to know who it is, where the active message window stops, which tools
+              it owns, which blocks should stay in the prompt, and which file context can be restored. Letta's answer is
+              to put those pieces into agent state first, then let the runtime compile them into the model view for this turn.
             </p>
             <div class="meta-line">
               <span>Project: letta-ai/letta</span>
@@ -106,7 +106,9 @@
             <p>
               The previous Mem0 chapter focused on an external memory layer: extract facts, deduplicate or preserve them,
               retrieve a small relevant set, and inject those memories into the model view. Letta is easier to read if we
-              shift the mental model. The durable object is not just a memory store. It is the agent.
+              shift the mental model. The durable object is the running agent, with preferences, persona, tools, active
+              messages, and file context restored together. If those pieces are only searched at answer time, the agent
+              keeps feeling newly assembled on every turn.
             </p>
 
             <div class="note reading-contract">
@@ -136,8 +138,23 @@
               The example labels two blocks as <code>human</code> and <code>persona</code>, in the same create call that
               chooses the model and tools. That is the first signal that this memory is not a retrieval result found at
               answer time. It is part of the initialized agent state. You can see the same contract in the
-              <a href="https://github.com/letta-ai/letta/blob/main/README.md#L47-L63">README example</a> and in
-              <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/agent.py#L206-L214"><code>CreateAgent.memory_blocks</code></a>.
+              <a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/README.md#L47-L63">README example</a> and in
+              <a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/schemas/agent.py#L206-L214"><code>CreateAgent.memory_blocks</code></a>.
+            </p>
+
+            <pre><code class="language-python">class CreateAgent(BaseModel, validate_assignment=True):
+    name: str = Field(default_factory=lambda: create_random_username())
+
+    # memory creation
+    memory_blocks: Optional[List[CreateBlock]] = Field(
+        None,
+        description="The blocks to create in the agent's in-context memory.",
+    )
+    tools: Optional[List[str]] = Field(None, description="The tools used by the agent.")</code></pre>
+
+            <p>
+              The creation contract already places memory and tools on the same surface. Letta first decides which
+              durable context the agent is born with; later, the runtime projects that context into the current step.
             </p>
 
             <p>
@@ -173,6 +190,22 @@ At answer time:
               context blocks compile into the prompt, and which sources or identities still apply. <code>AgentState</code> puts
               those restoration surfaces together. Memory is not only content to be found; it is material required to rebuild
               the agent.
+            </p>
+
+            <pre><code class="language-python">class AgentState(OrmMetadataBase, validate_assignment=True):
+    """Representation of an agent's state... persisted in the DB backend."""
+
+    message_ids: Optional[List[str]] = Field(...)
+    system: str = Field(..., description="The system prompt used by the agent.")
+    model: Optional[str] = Field(None, description="The model handle used by the agent.")
+    blocks: List[Block] = Field(..., description="The memory blocks used by the agent.")
+    tools: List[Tool] = Field(..., description="The tools used by the agent.")
+    secrets: List[AgentEnvironmentVariable] = Field(default_factory=list)
+    identities: List[Identity] = Field([])</code></pre>
+
+            <p>
+              That snippet is the core ownership boundary. Blocks follow the lifecycle of agent state, not the lifecycle
+              of a single retrieval request.
             </p>
 
             <div class="table-wrap">
@@ -212,12 +245,22 @@ At answer time:
             <h2 id="blocks">2. Blocks Are Reserved Context, Not Search Hits</h2>
             <h3 id="blocks-budget">2.1 A Block Has Budget, Label, And Permissions</h3>
             <p>
-              Letta's <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/block.py#L67-L80"><code>Block</code></a>
+              Letta's <a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/schemas/block.py#L13-L80"><code>Block</code></a>
               is documented as a reserved section of the LLM context window. It has a <code>value</code>, <code>limit</code>,
               <code>label</code>, <code>read_only</code>, <code>description</code>, hidden state, and tags. The same file defines
               default <code>Human</code> and <code>Persona</code> block types. That is why Letta memory reads like a set of state
               slots: each block has a name, budget, description, and permission surface.
             </p>
+
+            <pre><code class="language-python">class BaseBlock(LettaBase, validate_assignment=True):
+    """Base block of the LLM context"""
+
+    value: str = Field(..., description="Value of the block.")
+    limit: int = Field(CORE_MEMORY_BLOCK_CHAR_LIMIT)
+    label: Optional[str] = Field(None, description="Label of the block...")
+    read_only: bool = Field(False, description="Whether the agent has read-only access.")
+    description: Optional[str] = Field(None, description="Description of the block.")
+    hidden: Optional[bool] = Field(None, description="If set to True, the block will be hidden.")</code></pre>
 
             <p>
               Those fields protect a context boundary. <code>limit</code> prevents an always-visible block from expanding without
@@ -230,12 +273,23 @@ At answer time:
             <h3 id="blocks-compile">2.2 <code>compile()</code> Projects State Into The Current Model View</h3>
             <p>
               The blocks become model-visible through <code>Memory</code>. The source describes
-              <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/memory.py#L68-L77"><code>Memory</code></a>
+              <a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/schemas/memory.py#L68-L77"><code>Memory</code></a>
               as in-context memory that contains labelled <code>Block</code> objects and tools to edit them. The standard renderer
               emits <code>&lt;memory_blocks&gt;</code> and writes each block's label, description, metadata, and value. Then
-              <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/memory.py#L688-L712"><code>compile()</code></a>
+              <a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/schemas/memory.py#L688-L712"><code>compile()</code></a>
               chooses the rendering mode based on agent type, model provider, and whether git-backed memory is enabled.
             </p>
+
+            <pre><code class="language-python">def compile(self, tool_usage_rules=None, sources=None, max_files_open=None, llm_config=None, client_skills=None) -> str:
+    """Efficiently render memory, tool rules, and sources into a prompt string."""
+
+    if not is_react:
+        if self.git_enabled:
+            self._render_memory_blocks_git(s)
+        elif is_line_numbered:
+            self._render_memory_blocks_line_numbered(s)
+        else:
+            self._render_memory_blocks_standard(s)</code></pre>
 
             <p>
               This is Letta's model-view projection. Durable state may contain many objects, but the model only sees the
@@ -260,13 +314,23 @@ At answer time:
             <h3 id="update-prompt-affecting">3.1 First Decide Whether The Change Affects The Prompt</h3>
             <p>
               If a block is reserved context, changing it can change the system prompt. Letta's
-              <a href="https://github.com/letta-ai/letta/blob/main/letta/services/block_manager.py#L32-L68"><code>BlockManager</code></a>
+              <a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/services/block_manager.py#L32-L68"><code>BlockManager</code></a>
               lists prompt-affecting block fields: <code>description</code>, <code>label</code>, <code>limit</code>,
               <code>read_only</code>, and <code>value</code>. Its
-              <a href="https://github.com/letta-ai/letta/blob/main/letta/services/block_manager.py#L211-L268"><code>update_block_async</code></a>
+              <a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/services/block_manager.py#L211-L268"><code>update_block_async</code></a>
               path checks whether anything actually changed and rebuilds system prompts for connected agents after
               prompt-affecting updates.
             </p>
+
+            <pre><code class="language-python">PROMPT_AFFECTING_BLOCK_FIELDS = {"description", "label", "limit", "read_only", "value"}
+
+has_prompt_changes = any(
+    key in PROMPT_AFFECTING_BLOCK_FIELDS and getattr(block, key) != value
+    for key, value in update_data.items()
+)
+
+if has_prompt_changes:
+    await self._rebuild_system_prompts_for_connected_agents(block_id, actor)</code></pre>
 
             <p>
               That check means more than writing a database row. Changing block metadata may be bookkeeping. Changing
@@ -280,14 +344,14 @@ At answer time:
             <p>
               That is the sharpest difference from an external retrieval layer. Mem0 retrieves memories before an answer.
               Letta block edits can change the agent's base view. The
-              <a href="https://github.com/letta-ai/letta/blob/main/letta/agents/letta_agent_v2.py#L813-L890"><code>_rebuild_memory</code></a>
+              <a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/agents/letta_agent_v2.py#L813-L890"><code>_rebuild_memory</code></a>
               path refreshes memory, files, sources, and tool rules, recompiles memory, and updates the first system message
               if the compiled prompt differs.
             </p>
 
             <p>
               Letta still does not keep every conversation token in the prompt forever. In v3,
-              <a href="https://github.com/letta-ai/letta/blob/main/letta/agents/letta_agent_v3.py#L758-L817"><code>_checkpoint_messages</code></a>
+              <a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/agents/letta_agent_v3.py#L758-L817"><code>_checkpoint_messages</code></a>
               persists new messages only when a step has completed safely, then updates <code>message_ids</code> or the
               conversation's in-context message set. The code also treats system-prompt overflow as its own stop reason,
               which is a reminder that blocks, tools, and system instructions have a separate capacity boundary.
@@ -341,10 +405,10 @@ At answer time:
             <h3 id="code-rendering">4.2 Git-Backed Rendering Keeps Files And Prompt Projection Separate</h3>
             <p>
               The Letta source shows how that becomes prompt-visible. In git-backed memory,
-              <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/memory.py#L205-L330"><code>_render_memory_blocks_git</code></a>
+              <a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/schemas/memory.py#L205-L330"><code>_render_memory_blocks_git</code></a>
               renders <code>system/persona</code> into a dedicated <code>&lt;self&gt;</code> section, renders other
               <code>system/*</code> blocks under nested <code>&lt;memory&gt;</code> tags, and projects external blocks as a file tree.
-              <a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/memory.py#L483-L525"><code>compile_available_skills</code></a>
+              <a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/schemas/memory.py#L483-L525"><code>compile_available_skills</code></a>
               also renders agent-scoped skills from <code>skills/</code> blocks. MemFS is therefore not just file syncing. It is
               versioned agent context that can be projected into the model view.
             </p>
@@ -409,9 +473,9 @@ At answer time:
             <ul>
               <li><a href="https://github.com/letta-ai/letta">letta-ai/letta</a></li>
               <li><a href="https://github.com/letta-ai/letta-code">letta-ai/letta-code</a></li>
-              <li><a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/agent.py#L67-L146">Letta <code>AgentState</code></a></li>
-              <li><a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/block.py#L67-L80">Letta <code>Block</code></a></li>
-              <li><a href="https://github.com/letta-ai/letta/blob/main/letta/schemas/memory.py#L688-L712">Letta <code>Memory.compile()</code></a></li>
+              <li><a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/schemas/agent.py#L67-L146">Letta <code>AgentState</code></a></li>
+              <li><a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/schemas/block.py#L67-L80">Letta <code>Block</code></a></li>
+              <li><a href="https://github.com/letta-ai/letta/blob/1131535716e8a31c9a437f8695e25ac98f203a24/letta/schemas/memory.py#L688-L712">Letta <code>Memory.compile()</code></a></li>
             </ul>
           </section>
         </article>
