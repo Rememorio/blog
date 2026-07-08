@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex 源码阅读（十二）：Memory 记忆层，旧线程怎样变成可用经验</title>
+    <meta
+      name="description"
+      content="沿 openai/codex 源码拆解 Codex Memories：feature gate、thread memory_mode、两阶段 memory pipeline、read extension、memory citation，以及 AGENTS.md、rollout 和 Chronicle 的边界。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex 源码阅读（十二）：Memory 记忆层，旧线程怎样变成可用经验" />
+    <meta
+      property="og:description"
+      content="Codex Memories 不是把旧聊天塞回上下文，而是把可复用经验从 eligible rollout 中抽取、合并成可追溯的本地召回层。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/memory-local-recall-layer.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/zh/memory-layer/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/memory-layer/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/memory-layer/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(163, 89, 52, 0.3);
+        background: rgba(163, 89, 52, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Codex 系列</a>
+        <a href="../sdk-app-server/">上一篇：SDK</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/memory-layer/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex 源码阅读 · 第十二篇</p>
+            <h1>Memory 记忆层，旧线程怎样变成可用经验</h1>
+            <p class="lead">
+              第十篇讲 rollout 时，我们已经看到 Codex 怎样把一条 thread 写成可重放证据。
+              第十一篇再往外看，SDK 和 app-server 怎样把外部调用接回同一套 runtime。
+              现在可以回答一个更贴近日常使用的问题：下一条新 thread 开始时，
+              Codex 为什么有时已经知道你的偏好、项目习惯和上次踩过的坑？
+            </p>
+            <div class="meta-line">
+              <span>项目：openai/codex</span>
+              <span>主题：Memories / recall layer</span>
+              <span>范围：官方文档 + 公开源码</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/memory-local-recall-layer.png"
+                alt="Codex Memory 记忆层图，展示 rollout 经过空闲门、Phase 1、State DB、Phase 2、memories 文件夹，再通过 read path 进入未来 turn；AGENTS.md 作为独立规则入口"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先把直觉放慢一点。很多人听到 agent memory，会马上想到“更长的聊天记录”：
+              旧 thread 越多，下一次 prompt 里塞得越多。Codex 的实现没有走这条路。
+              官方文档把 Memories 描述成 useful context from earlier threads，源码里也把它拆成
+              <code>memories/read</code> 和 <code>memories/write</code> 两条路径：
+              一条负责把已有记忆带进当前线程，另一条在后台把历史 rollout 提炼成以后可用的本地材料。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                第十二篇的核心判断是：<strong>Codex memory 是本地召回层，不是上下文窗口的延长线。</strong>
+                它从 eligible rollout 中抽取高信号经验，先落到 state DB，再合并到
+                <code>~/.codex/memories/</code> 下的文件化 workspace；未来 turn 读取这些文件时，
+                还要经过 read path、引用和污染隔离。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>阅读契约。</strong>
+                本篇只追一条生命周期：哪些线程可以生成记忆，后台怎样抽取和合并，
+                记忆怎样进入未来 turn，以及它和 <code>AGENTS.md</code>、rollout、Chronicle 的边界。
+                读完以后，应该能判断一条信息应该写进规则文件、留在 rollout，还是适合沉淀成 memory。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                产品行为来自 OpenAI Codex Memories、AGENTS.md 和 Chronicle 官方文档；
+                feature gate、配置、读写 pipeline、citation 和污染隔离来自
+                <code>openai/codex</code> 公开源码。本文不读取或引用任何本机
+                <code>~/.codex/memories</code> 内容，也不推断私有服务端策略。
+              </p>
+            </div>
+
+            <h2>一、先拆开“会记住”这句话</h2>
+            <p>
+              Codex 里有好几种东西都会让人感觉“它记得”。第二篇讲过的
+              <code>TurnContext</code> 是本轮运行快照；第十篇讲过的 rollout 是持久证据；
+              <code>AGENTS.md</code> 是进入任务前就该读到的规则；Memories 则是另一层：
+              它从过往工作里提炼可复用经验，下一次需要时再检索。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>看起来都像“记忆”的东西</th>
+                    <th>真正 owner</th>
+                    <th>生命周期</th>
+                    <th>适合放什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>当前上下文</td>
+                    <td><code>TurnContext</code> 和 model-visible view。</td>
+                    <td>一次 turn 内生效，可压缩、可投影。</td>
+                    <td>本轮必须看到的输入、工具结果、环境和指令。</td>
+                  </tr>
+                  <tr>
+                    <td>项目规则</td>
+                    <td><code>AGENTS.md</code> / checked-in docs。</td>
+                    <td>每次进入仓库时读取，靠文件维护。</td>
+                    <td>必须稳定执行的团队约定、命令、权限和交付规则。</td>
+                  </tr>
+                  <tr>
+                    <td>运行证据</td>
+                    <td>rollout / state DB。</td>
+                    <td>thread 执行后留下，供 resume、fork、审计和恢复使用。</td>
+                    <td>曾经发生过什么、工具输出是什么、回滚点在哪里。</td>
+                  </tr>
+                  <tr>
+                    <td>Memories</td>
+                    <td><code>codex-memories-read</code> / <code>codex-memories-write</code>。</td>
+                    <td>后台从旧 thread 生成，本地文件化，未来 turn 选择性读取。</td>
+                    <td>稳定偏好、重复工作流、项目习惯、已知坑和高杠杆步骤。</td>
+                  </tr>
+                  <tr>
+                    <td>Chronicle</td>
+                    <td>Codex app 的 opt-in research preview。</td>
+                    <td>用屏幕上下文辅助构建 memory。</td>
+                    <td>最近正在看的工具、文档、网页或工作流线索。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这个表先定下边界：需要强制执行的规则不要靠 memory；需要精确重放的历史不要靠 memory；
+              memory 的价值在于减少重复说明，让未来 agent 更快找到“这类任务通常该怎么做”。
+            </p>
+
+            <h2>二、开关先决定有没有 memory</h2>
+            <p>
+              官方文档第一句就把预期压住：Memories 默认关闭。源码里的 feature spec 也对应这一点：
+              <code>Feature::MemoryTool</code> 的 key 是 <code>memories</code>，
+              stage 是 Experimental，<code>default_enabled</code> 为 <code>false</code>。
+              所以配置要分两层看：外层 feature flag 决定有没有 Memories；内层
+              <code>[memories]</code> 决定生成、使用、外部上下文隔离和模型选择。
+            </p>
+
+            <pre><code class="language-toml">[features]
+memories = true
+
+[memories]
+generate_memories = true
+use_memories = true
+disable_on_external_context = true</code></pre>
+
+            <p>
+              这三个 memory 子开关容易混淆。<code>generate_memories</code> 影响新 thread
+              是否能作为未来生成输入；<code>use_memories</code> 影响当前线程是否注入已有 memory
+              读取指令；<code>disable_on_external_context</code> 则用于把用了 web search、tool search、
+              或会污染 memory 的 MCP 调用的 thread 排除出生成路径。TUI 里的
+              <code>/memories</code> 也按这个边界工作：功能没开时先弹启用提示；功能已开时再展示
+              use / generate 的 thread-level 设置。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>开关</th>
+                    <th>控制什么</th>
+                    <th>读源码时的落点</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>features.memories</code></td>
+                    <td>是否启用 Memories 功能。</td>
+                    <td><code>Feature::MemoryTool</code>，默认关闭。</td>
+                  </tr>
+                  <tr>
+                    <td><code>memories.generate_memories</code></td>
+                    <td>新 thread 是否可作为 memory 生成输入。</td>
+                    <td>thread 创建时写入 <code>memory_mode</code>。</td>
+                  </tr>
+                  <tr>
+                    <td><code>memories.use_memories</code></td>
+                    <td>当前线程是否使用已有 memory。</td>
+                    <td>read extension 是否注入 developer instruction。</td>
+                  </tr>
+                  <tr>
+                    <td><code>memories.disable_on_external_context</code></td>
+                    <td>外部上下文参与后是否标记污染。</td>
+                    <td>web/tool search 和 MCP 路径可把 thread 置为 <code>polluted</code>。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>三、写入为什么要放到后台</h2>
+            <p>
+              如果每条回复结束后立刻总结，memory 会变得很吵：任务可能还没结束，用户可能马上纠正，
+              工具输出也可能只是临时失败。Codex 的写入路径把这件事放到后台。
+              app-server 在 <code>turn/start</code> 成功提交用户输入后，会尝试调用
+              <code>start_memories_startup_task</code>。这个函数先过几道门：
+              ephemeral session、未开启 feature、非 root agent session、没有 state DB，都会直接跳过。
+            </p>
+
+            <p>
+              真正启动以后，后台 task 会创建 <code>memories</code> root，seed extension instructions，
+              先做 prune，再检查 rate limit。只有额度允许时才继续跑 Phase 1 和 Phase 2。
+              这解释了官方文档里那句“Memories may not update right away”：它不是同步尾巴，
+              而是一条带空闲时间、额度阈值和 state DB lease 的维护路径。
+            </p>
+
+            <pre><code class="language-text">turn/start accepted
+  -> start_memories_startup_task
+  -> skip gates: ephemeral / feature off / sub-agent / no state DB
+  -> create memories root
+  -> prune
+  -> rate-limit guard
+  -> Phase 1 extraction
+  -> Phase 2 consolidation</code></pre>
+
+            <p>
+              这也是 memory 文章要放在 rollout 之后讲的原因。写入路径不是从可见 UI 消息开始，
+              而是从 state DB 里挑 eligible rollout；没有第十篇的可重放账本，读这一段很容易把
+              memory 误读成普通聊天摘要。
+            </p>
+
+            <h2>四、Phase 1：先把 rollout 变成 raw memory</h2>
+            <p>
+              Phase 1 的任务很具体：从最近的、空闲足够久的、允许参与 memory 的 thread 中，
+              为每条 rollout 生成结构化输出。state 层的 claim 查询会排除
+              <code>memory_mode != 'enabled'</code> 的线程，排除当前 thread，
+              限制 age window 和 idle window，并用 scan / claim limit 控制启动时的工作量。
+              这不是“把所有历史都拿来总结”，而是先筛出值得处理的一小批候选。
+            </p>
+
+            <p>
+              模板里还有一个很重要的信号门：如果一条 rollout 没有可复用洞察，
+              memory writer 可以返回全空字段。高价值记忆通常是稳定用户偏好、高杠杆步骤、
+              任务地图、决策触发器和可靠环境事实；泛泛的“跑过测试”“看过日志”不该占用未来注意力。
+            </p>
+
+            <pre><code class="language-json">{
+  "raw_memory": "durable, evidence-based detail",
+  "rollout_summary": "compact recap with reusable lesson",
+  "rollout_slug": "short-searchable-name"
+}</code></pre>
+
+            <p>
+              这里的关键词是 <strong>evidence-based</strong>。Phase 1 prompt 明确要求把 rollout
+              和工具输出当作数据而不是指令，不能保存 secrets，不能复制大段输出，宁可 no-op。
+              对未来 agent 有帮助，才值得进入下一步。
+            </p>
+
+            <h2>五、Phase 2：把零散记忆合并成本地 workspace</h2>
+            <p>
+              Phase 2 负责把 stage-1 outputs 变成文件化 memory workspace。
+              README 里列出的动作很有工程味：先拿全局 lock，再按 <code>usage_count</code>、
+              <code>last_usage</code> / <code>generated_at</code> 和 <code>max_unused_days</code>
+              选择输入；把 <code>raw_memories.md</code> 和 <code>rollout_summaries/</code>
+              同步到 <code>~/.codex/memories/</code>；用 git baseline 记录 workspace diff；
+              如果没有变化，就直接结束。
+            </p>
+
+            <p>
+              有变化时，Codex 会启动一个内部 consolidation agent。它没有网络、没有 approval、
+              只写本地 memory workspace，并且关闭协作，避免递归委派。这个细节很能说明设计取向：
+              memory 合并不是前台 turn 的一部分，也不应该随便碰当前项目；它是一个本地状态维护任务。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>文件或目录</th>
+                    <th>用途</th>
+                    <th>读取方式</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>memory_summary.md</code></td>
+                    <td>高密度导航摘要。</td>
+                    <td>read path 会把摘要放进指令区域，先用于快速判断。</td>
+                  </tr>
+                  <tr>
+                    <td><code>MEMORY.md</code></td>
+                    <td>可 grep 的 handbook。</td>
+                    <td>按关键词查，找到相关条目后再深入。</td>
+                  </tr>
+                  <tr>
+                    <td><code>rollout_summaries/</code></td>
+                    <td>每条 rollout 的压缩证据和经验。</td>
+                    <td>只有被 <code>MEMORY.md</code> 指到时才打开少量文件。</td>
+                  </tr>
+                  <tr>
+                    <td><code>skills/</code></td>
+                    <td>可复用流程或脚本。</td>
+                    <td>作为 progressive disclosure 的下一层。</td>
+                  </tr>
+                  <tr>
+                    <td><code>raw_memories.md</code></td>
+                    <td>Phase 1 的合并输入。</td>
+                    <td>主要给 Phase 2 consolidation 使用。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>六、读取路径：memory 怎样回到未来 turn</h2>
+            <p>
+              读取路径由 extension 提供。<code>MemoriesExtensionConfig</code> 只有在
+              <code>Feature::MemoryTool</code> 开启且 <code>memories.use_memories</code> 为真时才启用；
+              thread context contributor 随后调用 <code>build_memory_tool_developer_instructions</code>，
+              把 memory 读取规则作为 developer policy 片段注入。
+            </p>
+
+            <p>
+              这段 read-path prompt 并不是“看到 memory 就全读”。它先要求判断任务是否需要 memory；
+              需要时做 quick memory pass：先看 <code>memory_summary.md</code>，再 grep
+              <code>MEMORY.md</code>，只有命中直接指向 rollout summary 或 skill 时，才打开一两个具体文件。
+              这个设计和 skill 的 progressive disclosure 很像：先给导航，再按需展开证据。
+            </p>
+
+            <pre><code class="language-text">future user query
+  -> memory_summary.md hints
+  -> grep MEMORY.md
+  -> open 1-2 rollout_summaries or skills
+  -> answer with hidden memory citation
+  -> record usage for future selection</code></pre>
+
+            <p>
+              还有一个容易忽略的机制：memory citation。read-path prompt 要求如果使用了 memory，
+              最终回复末尾要带一个隐藏的 <code>&lt;oai-mem-citation&gt;</code> block。
+              <code>MemoryCitation</code> 结构保存 entries 和 rollout ids；流式输出处理会剥掉隐藏标记，
+              解析 citation，并把相关 stage-1 输出的 usage 记回 state DB。用户看到的是干净答案，
+              runtime 得到的是“哪条记忆真的被用上”的反馈。
+            </p>
+
+            <h2>七、为什么要有 <code>polluted</code></h2>
+            <p>
+              memory 最大的风险不是“忘了”，而是把来源不稳定的东西记得太牢。
+              如果一条 thread 的答案依赖 web search、tool search 或某个会污染 memory 的 MCP server，
+              这些外部材料可能很快过期，也可能只适合当次使用。Codex 提供了
+              <code>disable_on_external_context</code>：配置打开后，相关 response item 或 MCP tool call
+              会把 thread 标记成 <code>polluted</code>。
+            </p>
+
+            <p>
+              state 层筛选 Phase 1 job 时只选择 <code>memory_mode = 'enabled'</code>
+              且 <code>history_mode = 'legacy'</code> 的线程；一旦 thread 被标记为
+              <code>polluted</code>，后续就不会作为普通 memory 输入继续进入抽取路径。
+              这不是说外部上下文不能用，而是把“当下查询”与“长期沉淀”分开。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                这条边界很适合迁移到自己的 agent 设计里：
+                <strong>临时外部事实可以进入当前答案，但不应该默认进入长期偏好和工作流记忆。</strong>
+                真要沉淀，也应该先经过更明确的来源、时效和人工确认边界。
+              </p>
+            </div>
+
+            <h2>八、最后把三类长期材料放回各自的位置</h2>
+            <p>
+              到这里，Codex 的 memory 就不神秘了。它不替代上下文管理，也不替代 AGENTS.md；
+              它站在 rollout 后面，把旧线程里真正能减少未来重复沟通的东西抽出来，再通过 read path
+              带回未来任务。放错位置时，问题也很明显：规则放进 memory 会变得不可靠；
+              短期事实放进 memory 会过期；恢复证据只靠 memory 又丢失精度。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>信息类型</th>
+                    <th>应该放哪里</th>
+                    <th>为什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>团队要求、提交流程、必须执行的验证。</td>
+                    <td><code>AGENTS.md</code> 或 checked-in docs。</td>
+                    <td>需要每次稳定加载，不能依赖后台抽取是否命中。</td>
+                  </tr>
+                  <tr>
+                    <td>某条 thread 中到底发生过什么。</td>
+                    <td>rollout / state DB。</td>
+                    <td>恢复、fork、审计需要可重放证据。</td>
+                  </tr>
+                  <tr>
+                    <td>重复出现的偏好、工作流和已知坑。</td>
+                    <td>Memories。</td>
+                    <td>它们能减少未来重复说明，但允许被验证、更新和淘汰。</td>
+                  </tr>
+                  <tr>
+                    <td>正在屏幕上看的临时材料。</td>
+                    <td>Chronicle 或当前 turn 的具体工具读取。</td>
+                    <td>它适合帮助定位上下文，不适合未经处理直接长期化。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这也给 Codex 系列补上了最后一块长期状态拼图：第二篇讲“本轮看见什么”，
+              第十篇讲“旧 thread 怎样重放”，第十二篇讲“哪些旧经验值得带到新 thread”。
+              这三件事相互连接，但 owner 不同。把 owner 分清楚，才不会把 agent memory
+              想成一个无限增长的 prompt，也不会把需要强约束的规则交给概率性的召回层。
+            </p>
+
+            <h2 id="sources">参考源码</h2>
+            <ul>
+              <li><a href="https://developers.openai.com/codex/memories">OpenAI Codex Memories 官方文档：默认关闭、配置、存储和 per-thread 控制</a></li>
+              <li><a href="https://developers.openai.com/codex/guides/agents-md">OpenAI Codex AGENTS.md 官方文档：规则文件的发现和层级</a></li>
+              <li><a href="https://developers.openai.com/codex/memories/chronicle">OpenAI Codex Chronicle 官方文档：用屏幕上下文辅助 memory 的 opt-in preview</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/features/src/lib.rs#L923-L932"><code>Feature::MemoryTool</code> feature spec 与默认关闭</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/config/src/types.rs#L280-L345"><code>MemoriesToml</code> / <code>MemoriesConfig</code> 配置项和默认值</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/tui/src/chatwidget.rs#L1076-L1101">TUI <code>/memories</code> 入口和启用提示</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/README.md#L8-L15"><code>memories/read</code> 与 <code>memories/write</code> crate 分工</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/src/start.rs#L20-L79">后台 memory startup task 的 skip gates、rate-limit guard 与 Phase 1 / Phase 2 顺序</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/app-server/src/request_processors/turn_processor.rs#L542-L551">app-server 在 turn 提交后触发 memory startup task</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L133-L149">Phase 1 startup claim 的候选选择说明</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L218-L225">Phase 1 查询只选择 <code>memory_mode = 'enabled'</code> 的 legacy thread</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/stage_one_system.md#L1-L45">Phase 1 prompt：从 rollout 转成 raw memory / rollout summary，且允许 no-op</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/stage_one_system.md#L48-L82">Phase 1 prompt：高信号 memory 的判断边界</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/README.md#L79-L120">Phase 2 consolidation 的输入选择、文件同步、git baseline 和内部 agent</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/consolidation.md#L20-L35">Phase 2 memory folder 结构：summary、MEMORY、raw、skills、rollout_summaries</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/src/extension.rs#L40-L69">read extension 根据 feature 和 <code>use_memories</code> 注入 developer policy</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/templates/memories/read_path.md#L1-L41">read path prompt：什么时候使用 memory、memory layout 和 quick pass</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/templates/memories/read_path.md#L75-L123">read path prompt：memory citation 和 ad-hoc update 边界</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/protocol/src/memory_citation.rs#L6-L20"><code>MemoryCitation</code> / <code>MemoryCitationEntry</code> 协议结构</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/read/src/citations.rs#L6-L43">memory citation parser 解析 citation entries 和 rollout ids</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/stream_events_utils.rs#L79-L93">流式输出剥离隐藏 citation 并解析 memory citation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/stream_events_utils.rs#L227-L295">response item 完成后记录 memory citation usage，并标记外部上下文污染</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/mcp_tool_call.rs#L780-L798">MCP tool call 根据 server metadata 标记 thread memory pollution</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L586-L615"><code>mark_thread_memory_mode_polluted</code> 将 thread 置为 <code>polluted</code></a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen ? `${base}-${seen + 1}` : base;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          link.dataset.index = index;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (const knownLevel of [2, 3, 4]) {
+            if (knownLevel > level) lastItems.delete(knownLevel);
+          }
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (!visible.length) return;
+            const id = visible[0].target.id;
+            links.forEach((link) => {
+              link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+            });
+          },
+          { rootMargin: "-18% 0px -68% 0px", threshold: 0.01 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

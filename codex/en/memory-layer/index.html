@@ -1,0 +1,661 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes XII: Memory Layer</title>
+    <meta
+      name="description"
+      content="A source-guided walkthrough of Codex Memories: feature gates, thread memory_mode, the two-phase write pipeline, read extension, memory citations, and the boundary with AGENTS.md, rollout, and Chronicle."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes XII: Memory Layer" />
+    <meta
+      property="og:description"
+      content="Codex Memories turns reusable lessons from eligible rollouts into a local, traceable recall layer rather than extending the context window with old chat logs."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/memory-local-recall-layer.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/memory-layer/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/memory-layer/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/memory-layer/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(163, 89, 52, 0.3);
+        background: rgba(163, 89, 52, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Codex series</a>
+        <a href="../sdk-app-server/">Previous: SDK</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/memory-layer/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part XII</p>
+            <h1>Memory Layer: How Old Threads Become Reusable Context</h1>
+            <p class="lead">
+              Part X showed how Codex makes a thread replayable through rollout
+              evidence. Part XI moved outside the runtime to app-server and SDK
+              entry points. We can now ask the user-facing question that sits
+              beyond a single thread: when a new task starts, how can Codex
+              already know your preferences, project habits, or the pitfall you
+              corrected last time?
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: Memories / recall layer</span>
+              <span>Scope: official docs + public source</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/memory-local-recall-layer.png"
+                alt="Codex Memory Layer diagram showing rollout passing through an idle gate, Phase 1, State DB, Phase 2, a memories folder, and read path into a future turn, with AGENTS.md shown as a separate rules source"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              The first mistake is to treat memory as a larger chat transcript.
+              That would make every future request carry more old text and more
+              ambiguity. Codex takes a different route. The official Memories
+              documentation describes useful context from earlier threads, and
+              the source splits the implementation into <code>memories/read</code>
+              and <code>memories/write</code>: one path brings existing memory
+              into the current thread, while the other turns historical rollouts
+              into local material that future threads can consult.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The central model for this chapter is simple:
+                <strong>Codex memory is a local recall layer, not a longer context window.</strong>
+                It extracts high-signal lessons from eligible rollouts, stores
+                stage outputs in state, consolidates them into
+                <code>~/.codex/memories/</code>, and later exposes them through a
+                read path with citations and pollution guards.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Reading contract.</strong>
+                This chapter follows one lifecycle: which threads may generate
+                memories, how the background writer extracts and consolidates
+                them, how a future turn reads them, and where the boundary sits
+                between <code>AGENTS.md</code>, rollout, Memories, and Chronicle.
+                By the end, you should know where each durable fact belongs.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                Product behavior comes from OpenAI's Codex Memories, AGENTS.md,
+                and Chronicle docs. Feature gates, configuration, read/write
+                pipelines, citations, and pollution handling come from public
+                <code>openai/codex</code> source. This article does not inspect or
+                cite any local <code>~/.codex/memories</code> contents, and it
+                does not infer private service behavior.
+              </p>
+            </div>
+
+            <h2>1. Separate the Surfaces That Feel Like Memory</h2>
+            <p>
+              Several Codex surfaces can make the product feel like it
+              remembers. <code>TurnContext</code>, covered in Part II, is the
+              current runtime snapshot. Rollout, covered in Part X, is durable
+              execution evidence. <code>AGENTS.md</code> is instruction material
+              loaded before work starts. Memories form a separate layer: reusable
+              lessons extracted from previous work and consulted later when they
+              are likely to help.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Surface</th>
+                    <th>Owner</th>
+                    <th>Lifetime</th>
+                    <th>Best fit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Current context</td>
+                    <td><code>TurnContext</code> and model-visible view.</td>
+                    <td>One turn, projected and compacted as needed.</td>
+                    <td>Inputs, tool results, environment, and instructions the model must see now.</td>
+                  </tr>
+                  <tr>
+                    <td>Project rules</td>
+                    <td><code>AGENTS.md</code> / checked-in docs.</td>
+                    <td>Read when entering the repository.</td>
+                    <td>Rules, commands, permissions, and delivery requirements that must reliably apply.</td>
+                  </tr>
+                  <tr>
+                    <td>Execution evidence</td>
+                    <td>Rollout / state DB.</td>
+                    <td>Written as a thread runs; reused for resume, fork, audit, and recovery.</td>
+                    <td>What happened, which tool output exists, and where recovery should restart.</td>
+                  </tr>
+                  <tr>
+                    <td>Memories</td>
+                    <td><code>codex-memories-read</code> / <code>codex-memories-write</code>.</td>
+                    <td>Generated in the background, stored locally, selectively read by future turns.</td>
+                    <td>Stable preferences, recurring workflows, project habits, known pitfalls, and high-leverage steps.</td>
+                  </tr>
+                  <tr>
+                    <td>Chronicle</td>
+                    <td>Opt-in Codex app research preview.</td>
+                    <td>Uses recent screen context to help memory building.</td>
+                    <td>Clues about the tools, documents, dashboards, or workflows currently on screen.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Required rules should stay in rules files. Replay evidence should
+              stay in rollout. Memory earns its place when it reduces repeated
+              explanation in future work without pretending to be the only
+              source of truth.
+            </p>
+
+            <h2>2. Feature Gates Come Before Memory Behavior</h2>
+            <p>
+              The official docs start with the important default: Memories are
+              off by default. The source matches that contract. The feature spec
+              for <code>Feature::MemoryTool</code> uses the key
+              <code>memories</code>, marks it Experimental, and sets
+              <code>default_enabled</code> to <code>false</code>. Configuration
+              therefore has two layers: the feature flag decides whether the
+              system exists, while the <code>[memories]</code> table decides
+              generation, use, external-context handling, and model overrides.
+            </p>
+
+            <pre><code class="language-toml">[features]
+memories = true
+
+[memories]
+generate_memories = true
+use_memories = true
+disable_on_external_context = true</code></pre>
+
+            <p>
+              The three memory-specific switches answer different questions.
+              <code>generate_memories</code> controls whether newly created
+              threads can become future memory inputs. <code>use_memories</code>
+              controls whether existing memory instructions are injected into
+              the current thread. <code>disable_on_external_context</code> can
+              keep threads that used web search, tool search, or memory-polluting
+              MCP servers out of memory generation. In the TUI, <code>/memories</code>
+              follows the same split: if the feature is off, it prompts for
+              enablement; once enabled, it exposes use/generate settings for the
+              thread.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Switch</th>
+                    <th>Controls</th>
+                    <th>Source anchor</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>features.memories</code></td>
+                    <td>Whether Memories is enabled at all.</td>
+                    <td><code>Feature::MemoryTool</code>, default off.</td>
+                  </tr>
+                  <tr>
+                    <td><code>memories.generate_memories</code></td>
+                    <td>Whether a new thread may become a memory input.</td>
+                    <td>Thread creation writes a <code>memory_mode</code>.</td>
+                  </tr>
+                  <tr>
+                    <td><code>memories.use_memories</code></td>
+                    <td>Whether an active thread can use existing memories.</td>
+                    <td>The read extension injects developer instructions only when enabled.</td>
+                  </tr>
+                  <tr>
+                    <td><code>memories.disable_on_external_context</code></td>
+                    <td>Whether external context can mark a thread polluted.</td>
+                    <td>Web/tool search and MCP paths can set <code>memory_mode = polluted</code>.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>3. Memory Writing Runs in the Background</h2>
+            <p>
+              Immediate summarization would be noisy. A thread may still be in
+              progress, the user may correct the agent, and an error may be
+              temporary rather than reusable. Codex moves memory writing to a
+              background path. After <code>turn/start</code> successfully submits
+              user input, app-server attempts to call
+              <code>start_memories_startup_task</code>. That function exits early
+              for ephemeral sessions, disabled feature flags, non-root agent
+              sessions, or missing state DB.
+            </p>
+
+            <p>
+              Once running, the task creates the memories root, seeds extension
+              instructions, prunes stale data, checks rate limits, and then runs
+              Phase 1 followed by Phase 2. This is why the docs warn that
+              memories may not update immediately after a thread ends. The
+              writer is a maintenance path with idle windows, quota checks, and
+              state DB leases, not a synchronous tail attached to every answer.
+            </p>
+
+            <pre><code class="language-text">turn/start accepted
+  -> start_memories_startup_task
+  -> skip gates: ephemeral / feature off / sub-agent / no state DB
+  -> create memories root
+  -> prune
+  -> rate-limit guard
+  -> Phase 1 extraction
+  -> Phase 2 consolidation</code></pre>
+
+            <p>
+              This placement is also why the memory chapter belongs after the
+              rollout chapter. The write path selects from state-backed rollout
+              records. Without the replay ledger, memory would look like a
+              generic chat summarizer; with rollout in view, it becomes a later
+              extraction layer over execution evidence.
+            </p>
+
+            <h2>4. Phase 1 Turns Rollout into Raw Memory</h2>
+            <p>
+              Phase 1 extracts structured memory from a bounded set of recent,
+              idle, eligible rollouts. The state-layer claim query excludes
+              threads whose <code>memory_mode</code> is not <code>enabled</code>,
+              excludes the current thread, applies age and idle windows, and
+              bounds startup work through scan and claim limits. This is not
+              "summarize everything." It first narrows the candidate set.
+            </p>
+
+            <p>
+              The prompt template adds a second gate. If a rollout has no
+              reusable insight, the memory writer may return all-empty fields.
+              High-signal memories are stable user preferences, high-leverage
+              procedures, task maps, decision triggers, and reliable environment
+              facts. Routine status notes should not occupy future attention.
+            </p>
+
+            <pre><code class="language-json">{
+  "raw_memory": "durable, evidence-based detail",
+  "rollout_summary": "compact recap with reusable lesson",
+  "rollout_slug": "short-searchable-name"
+}</code></pre>
+
+            <p>
+              The important word is <strong>evidence-based</strong>. The Phase 1
+              prompt treats rollout text and tool output as data, not
+              instructions. It forbids storing secrets, discourages large output
+              copies, and prefers no-op when no future agent would plausibly act
+              better because of the saved memory.
+            </p>
+
+            <h2>5. Phase 2 Consolidates a Local Memory Workspace</h2>
+            <p>
+              Phase 2 turns stage-1 outputs into the file-based memory
+              workspace. The README describes a very concrete sequence: claim a
+              global lock, select bounded stage-1 inputs by usage and recency,
+              sync <code>raw_memories.md</code> and <code>rollout_summaries/</code>
+              into <code>~/.codex/memories/</code>, maintain a git baseline for
+              the workspace diff, and exit if nothing changed.
+            </p>
+
+            <p>
+              When the workspace does change, Codex spawns an internal
+              consolidation agent. It runs with no approvals, no network, and
+              local write access only; collaboration is disabled to prevent
+              recursive delegation. That makes the boundary clear: consolidation
+              is local state maintenance, not foreground project work.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>File or directory</th>
+                    <th>Role</th>
+                    <th>Read behavior</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>memory_summary.md</code></td>
+                    <td>Dense navigational summary.</td>
+                    <td>Provided to the read path as the first quick signal.</td>
+                  </tr>
+                  <tr>
+                    <td><code>MEMORY.md</code></td>
+                    <td>Searchable handbook.</td>
+                    <td>Grep by relevant keywords before opening deeper files.</td>
+                  </tr>
+                  <tr>
+                    <td><code>rollout_summaries/</code></td>
+                    <td>Compressed evidence and lessons per rollout.</td>
+                    <td>Open only a small number when <code>MEMORY.md</code> points there.</td>
+                  </tr>
+                  <tr>
+                    <td><code>skills/</code></td>
+                    <td>Reusable procedures or scripts.</td>
+                    <td>A deeper progressive-disclosure layer.</td>
+                  </tr>
+                  <tr>
+                    <td><code>raw_memories.md</code></td>
+                    <td>Merged Phase 1 input.</td>
+                    <td>Primarily used by Phase 2 consolidation.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>6. The Read Path Brings Memory Back into Future Turns</h2>
+            <p>
+              Reading is provided by an extension. <code>MemoriesExtensionConfig</code>
+              is enabled only when <code>Feature::MemoryTool</code> is enabled
+              and <code>memories.use_memories</code> is true. The thread context
+              contributor then builds memory developer instructions and injects
+              them as a developer-policy prompt fragment.
+            </p>
+
+            <p>
+              The read-path prompt does not tell the agent to open every memory
+              file. It first asks whether the user query is likely to benefit
+              from memory. If yes, it performs a quick memory pass: skim the
+              provided <code>memory_summary.md</code>, search <code>MEMORY.md</code>,
+              and only then open one or two pointed rollout summaries or skills.
+              It is the same progressive-disclosure discipline this series has
+              already seen in skills and context management.
+            </p>
+
+            <pre><code class="language-text">future user query
+  -> memory_summary.md hints
+  -> grep MEMORY.md
+  -> open 1-2 rollout_summaries or skills
+  -> answer with hidden memory citation
+  -> record usage for future selection</code></pre>
+
+            <p>
+              Memory citation closes the loop. When memory is used, the read-path
+              prompt requires a hidden <code>&lt;oai-mem-citation&gt;</code>
+              block at the end of the final reply. <code>MemoryCitation</code>
+              stores citation entries and rollout ids. The streaming layer strips
+              the hidden markup from visible output, parses the citation, and
+              records usage for the underlying stage-1 outputs. The user sees a
+              clean answer; the runtime learns which memories actually helped.
+            </p>
+
+            <h2>7. Why <code>polluted</code> Exists</h2>
+            <p>
+              The dangerous failure mode is not simply forgetting. It is
+              remembering unstable material too confidently. If a thread depends
+              on web search, tool search, or an MCP server that may pollute
+              memory, that external context may be stale or only valid for the
+              current task. Codex provides <code>disable_on_external_context</code>:
+              when enabled, matching response items or MCP tool calls can mark
+              the thread as <code>polluted</code>.
+            </p>
+
+            <p>
+              The Phase 1 state query only selects threads with
+              <code>memory_mode = 'enabled'</code> and
+              <code>history_mode = 'legacy'</code>. Once a thread is marked
+              <code>polluted</code>, it no longer looks like a normal memory
+              input. External context can still be useful for the current answer;
+              it simply should not become long-term preference or workflow memory
+              by default.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                This boundary transfers well to any agent runtime:
+                <strong>temporary external facts may answer the current task, but they should not automatically become durable preference memory.</strong>
+                If they must be saved, require clearer source, freshness, and
+                confirmation boundaries.
+              </p>
+            </div>
+
+            <h2>8. Put Durable Material Back in the Right Place</h2>
+            <p>
+              The memory system is easier to reason about once each durable
+              material has an owner. Memories do not replace context management
+              or <code>AGENTS.md</code>. They stand after rollout: old thread
+              evidence is extracted into reusable lessons, consolidated into a
+              local workspace, and selectively read by future turns.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Information</th>
+                    <th>Where it belongs</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Team requirements, delivery flow, mandatory validation.</td>
+                    <td><code>AGENTS.md</code> or checked-in docs.</td>
+                    <td>Must load reliably; cannot depend on whether memory extraction hits.</td>
+                  </tr>
+                  <tr>
+                    <td>What exactly happened in a thread.</td>
+                    <td>Rollout / state DB.</td>
+                    <td>Resume, fork, audit, and recovery need replayable evidence.</td>
+                  </tr>
+                  <tr>
+                    <td>Recurring preferences, workflows, and known pitfalls.</td>
+                    <td>Memories.</td>
+                    <td>They reduce repeated explanation while remaining verifiable and replaceable.</td>
+                  </tr>
+                  <tr>
+                    <td>What is currently visible on screen.</td>
+                    <td>Chronicle or explicit current-turn tool reads.</td>
+                    <td>Useful for locating context; not automatically suitable for durable memory.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              That completes the long-state side of the Codex route. Part II
+              asked what the model sees now. Part X asked how an old thread can
+              be replayed. Part XII asks which old lessons deserve to travel
+              into a new thread. They are connected, but their owners are
+              different. Keeping those owners separate prevents memory from
+              becoming an ever-growing prompt and prevents mandatory rules from
+              being entrusted to probabilistic recall.
+            </p>
+
+            <h2 id="sources">Sources</h2>
+            <ul>
+              <li><a href="https://developers.openai.com/codex/memories">OpenAI Codex Memories docs: defaults, setup, storage, and per-thread control</a></li>
+              <li><a href="https://developers.openai.com/codex/guides/agents-md">OpenAI Codex AGENTS.md docs: instruction discovery and layering</a></li>
+              <li><a href="https://developers.openai.com/codex/memories/chronicle">OpenAI Codex Chronicle docs: opt-in screen context for memory building</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/features/src/lib.rs#L923-L932"><code>Feature::MemoryTool</code> feature spec and default-off state</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/config/src/types.rs#L280-L345"><code>MemoriesToml</code> / <code>MemoriesConfig</code> settings and defaults</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/tui/src/chatwidget.rs#L1076-L1101">TUI <code>/memories</code> popup and enable prompt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/README.md#L8-L15"><code>memories/read</code> and <code>memories/write</code> crate ownership</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/src/start.rs#L20-L79">Background memory startup task: skip gates, rate-limit guard, Phase 1 and Phase 2 order</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/app-server/src/request_processors/turn_processor.rs#L542-L551">app-server starts the memory startup task after turn submission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L133-L149">Phase 1 startup claim candidate selection</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L218-L225">Phase 1 selects only <code>memory_mode = 'enabled'</code> legacy threads</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/stage_one_system.md#L1-L45">Phase 1 prompt: convert rollout into raw memory / rollout summary and allow no-op</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/stage_one_system.md#L48-L82">Phase 1 prompt: high-signal memory criteria</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/README.md#L79-L120">Phase 2 consolidation: input selection, file sync, git baseline, and internal agent</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/consolidation.md#L20-L35">Phase 2 memory folder structure</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/src/extension.rs#L40-L69">Read extension injects developer policy when feature and <code>use_memories</code> are enabled</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/templates/memories/read_path.md#L1-L41">Read path prompt: when to use memory, layout, and quick pass</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/templates/memories/read_path.md#L75-L123">Read path prompt: memory citation and ad-hoc update boundary</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/protocol/src/memory_citation.rs#L6-L20"><code>MemoryCitation</code> / <code>MemoryCitationEntry</code> protocol structs</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/read/src/citations.rs#L6-L43">Memory citation parser for citation entries and rollout ids</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/stream_events_utils.rs#L79-L93">Streaming output strips hidden citation markup and parses memory citation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/stream_events_utils.rs#L227-L295">Completed response items record memory usage and external-context pollution</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/mcp_tool_call.rs#L780-L798">MCP tool calls can mark thread memory pollution from server metadata</a></li>
+              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L586-L615"><code>mark_thread_memory_mode_polluted</code> sets a thread to <code>polluted</code></a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen ? `${base}-${seen + 1}` : base;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          link.dataset.index = index;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (const knownLevel of [2, 3, 4]) {
+            if (knownLevel > level) lastItems.delete(knownLevel);
+          }
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (!visible.length) return;
+            const id = visible[0].target.id;
+            links.forEach((link) => {
+              link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+            });
+          },
+          { rootMargin: "-18% 0px -68% 0px", threshold: 0.01 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
