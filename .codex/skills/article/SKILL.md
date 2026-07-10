@@ -138,6 +138,24 @@ pressure source
 -> failure boundary
 ```
 
+For framework overviews and framework source readings, a requested focus
+changes depth, not the reader's need for a system map. Before the focused deep
+dive, follow one representative run across the major owners that actually
+exist: entry and run loop, model/provider adapter, tools and side effects,
+graph/delegation, session/context/memory/artifacts, streaming/UI/remote
+protocols, and recovery/observability/evolution. Do not force absent layers or
+turn this map into a feature brochure. Select the mechanisms that materially
+change ownership, execution, persistence, or the user-visible contract, then
+make the requested subsystem deeper than the rest.
+
+Treat dense identifier runs as a comprehension failure, not as proof of source
+depth. A paragraph that introduces roughly five or more fields, functions,
+types, or modules in sequence should trigger a rewrite: group them under `3` to
+`5` reader questions, owners, or lifecycle steps; explain the group through a
+small scenario or shape; move exhaustive names to a compact table or
+`details`; and place source links after the reader understands why the names
+matter.
+
 Do not stop at `what` and `how`. Each major mechanism should naturally reveal
 the `why` behind the design: the invariant being protected, the simpler design
 that would fail, the cost of the chosen approach, and the boundary where the
@@ -212,6 +230,15 @@ owned by the main pass, so the article remains one coherent voice.
 Protocol-shaped examples are mandatory when prose alone leaves too much
 ambiguity. For API/runtime articles, include small before/after request or
 record examples at mechanism boundaries:
+
+When one framework supports multiple API protocols, do not infer identical
+behavior from a shared runner or model abstraction. Compare the protocols at
+their wire and ownership boundaries: request envelope, history ownership,
+session or response identity, tool-call and tool-result shape, streaming event
+model, resume/recovery semantics, error handling, and unsupported or translated
+parameters. Show the smallest equivalent request for each protocol and state
+where adaptation is lossy or where the framework, rather than the provider,
+owns compatibility.
 
 - label examples as shape-level when fields are simplified or internal
   normalization is omitted;
@@ -588,6 +615,14 @@ translate sentence by sentence when the target language needs different
 rhythm, transitions, or terminology. Keep the evidence, figures, source links,
 and claims aligned across editions.
 
+Check teaching-device parity, not paragraph-count parity. For every major
+section, both editions should preserve the same scenario, mental model,
+decision trace or table, source-shaped example, evidence boundary, and final
+tradeoff or conclusion when those devices carry the explanation. The prose may
+be rewritten for the target language, but one sibling must not collapse into
+continuous source-heavy paragraphs or silently drop the example that makes the
+other sibling understandable.
+
 Do not publish an English route map, stub, or placeholder when the user asks
 for an English edition of an article or series. Either create a finished
 sibling article in the target language, or keep the unfinished route
@@ -697,6 +732,10 @@ a reference list at the end.
 - Before publishing, check that representative source URLs return 200 and that
   visible file paths, function names, and line anchors still point to the
   intended code.
+- For a batch of fixed-snapshot source links, verify every touched path, symbol,
+  and line range against the pinned local checkout, then sample public URLs for
+  HTTP 200. A few reachable links do not prove that the remaining anchors still
+  explain the words they are attached to.
 - Prefer official docs for provider contracts, APIs, SDK behavior, and product
   features.
 - Use reputable primary or canonical sources for background concepts: official
@@ -754,8 +793,11 @@ wide comparison tables in standalone HTML articles:
   header via `data-label`.
 - Generate `data-label` from the table headers in page script rather than
   duplicating labels by hand in prose.
-- Validate the mobile viewport for body scroll width, heading overflow, image
-  overflow, and table/card overflow.
+- Do not treat `overflow-x: hidden` as responsive validation. At representative
+  desktop and mobile widths, confirm the intended media queries activate,
+  compare document `scrollWidth` with `clientWidth`, inspect element bounding
+  rectangles, give shrinking grid/flex children `min-width: 0`, keep code
+  scrolling local to its wrapper, and verify table/card `data-label` behavior.
 
 ## Update Protocol
 
@@ -805,8 +847,9 @@ that covers the edit:
 - Search for private leakage: local absolute paths, local file URLs, temporary
   paths, unfinished editorial markers, hidden process language, private request
   text, or private rationale.
-- Check generated TOC, table `data-label` behavior, mobile body `scrollWidth`,
-  and whether heading hierarchy still reads as a useful route map.
+- Check generated TOC, active responsive rules, table `data-label` behavior,
+  document and body `scrollWidth`, high-risk element bounding rectangles, and
+  whether heading hierarchy still reads as a useful route map.
 - When emphasis blocks, notes, or highlighted sentences were added, verify that
   they clarify invariants or misreadings and do not create a stack of generic
   callouts.

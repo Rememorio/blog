@@ -28,17 +28,22 @@ Default accepted mechanism-scene references in this repository:
 - `claude-code/zh/assets/agent-selection-gates.png`
 - `claude-code/zh/assets/mcp-tool-pool.png`
 - `claude-code/zh/assets/commands-skills-mcp-cover.png`
-- `codex/zh/assets/codex-turn-runtime-overview.png`
-- `codex/zh/assets/context-ledger-cover.png`
-- `codex/zh/assets/tool-runtime-pipeline.png`
-- `codex/zh/assets/protocol-event-stream.png`
 
-Use these local references for visual discipline: warm parchment or off-white
-paper, rough but restrained edges, compact mechanism cards, red-brown title
-ribbons, bottom invariant ribbons, clean sketched arrows, short labels, visible
-ownership boundaries, useful desk props, and one mechanism per figure. The
-accepted figures are not clip-art to copy; they are calibration for paper,
-line weight, density, character integration, and mechanism clarity.
+Unless the user names another accepted visual family, the named Claude Code
+figures are the default composition and style authority. Do not blend several
+series' visual grammars in one prompt. Other repository figures may help verify
+a mechanism, but they are not default visual calibration merely because they
+exist nearby.
+
+Use the Claude Code references for a clean, light technical-notebook page:
+warm off-white paper, restrained grain and roughness, crisp ink, soft watercolor
+fills, generous breathing room, scene-specific composition, short labels,
+visible ownership boundaries, and an Eyjafjalla-like guide integrated into the
+mechanism. Avoid dark aged parchment, tea-stained or treasure-map texture,
+heavy brown shadows, repeated narrow dashboard/card columns, and oversized
+decorative ledgers or shelves. The references are calibration for paper, line
+weight, density, character integration, and mechanism clarity, not clip-art to
+copy.
 
 Do not use a work-in-progress article's current images as the style authority
 for revising that same article. Existing local images are candidates to keep,
@@ -95,6 +100,15 @@ redraw of the same character, not as a new logo concept.
   otherwise correct. Regenerate or edit the whole figure so the guide appears
   as a recognizable participant in the workspace, not as an optional decoration
   to drop under layout pressure.
+- Character anatomy is a binary gate for every in-scene guide and every visible
+  brand-card pose. Prompt for exactly two arms and exactly two hands, one hand
+  connected to each wrist/sleeve; use occlusion only when the pose still
+  accounts unambiguously for both arms. Before acceptance, trace every visible
+  hand back through one wrist and one arm. Reject duplicate, floating, hidden
+  third, prop-emerging, or extra-fingered hands. Prefer one small held prop in
+  total and never assign more than one prop to a hand. If the topology fails,
+  simplify the pose and regenerate or edit the whole image; never patch a limb
+  locally.
 - Before generating or accepting a bilingual figure, choose its language asset
   policy. A figure is `shared-neutral` only when every visible label is an exact
   code identifier, product or protocol name, numeral, or symbol that should be
@@ -136,11 +150,12 @@ Palette:
 - Ink navy: `#102a43`.
 - Rememorio teal: `#0f766e`.
 - Rememorio blue: `#2d5f8b`.
-- Codex green: `#1f7a4d` or `#15803d`.
+- Muted forest green: `#1f7a4d` or `#15803d`.
 - Slate gray: `#52606d` / `#64748b`.
 - Warm amber: `#b7791f`.
 - Soft paper: `#fffaf0` / `#fffffb`.
-- Use red only for explicit danger or deletion semantics.
+- Use bright red only for explicit danger or deletion semantics. A restrained
+  red-brown may appear in title or invariant ribbons.
 
 Line and shape:
 
@@ -220,30 +235,27 @@ Established Eyjafjalla mechanism-scene style:
   `claude-code/zh/assets/worker-tool-scope.png`,
   `claude-code/zh/assets/agent-selection-gates.png`,
   `claude-code/zh/assets/mcp-tool-pool.png`,
-  `codex/zh/assets/codex-turn-runtime-overview.png`,
-  `codex/zh/assets/context-ledger-cover.png`, and other accepted sibling
-  figures when present. Use them as composition and integration references,
-  while `Eyjafjalla.png` remains the identity reference. For this established
-  mechanism-scene treatment, accepted in-repo figures are the composition
-  authority. Do not regress these figures into a generic chart plus a
+  `claude-code/zh/assets/commands-skills-mcp-cover.png`, and other figures the
+  user explicitly accepts as sibling references. Use them as composition and
+  integration references, while `Eyjafjalla.png` remains the identity
+  reference. Do not regress this treatment into a generic chart plus a
   bottom-right Rememorio card.
 - Use only the named accepted figures in this section as default calibration
   unless the user explicitly identifies newer accepted examples. Do not promote
   experimental, disliked, or merely existing images into style authority just
   because they are nearby in the repository.
-- The desired look is a warm hand-drawn technical notebook: parchment or
-  off-white paper, slightly rough edges, ink outlines, soft watercolor fills,
-  compact cards, ribbons, shelves, tools, ledgers, gates, arrows, desk props,
-  open books, folders, stamps, small note scraps, and occasional side shelves
-  that feel drawn into one scene. The figure should look like an illustrated
-  mechanism desk page, not a flat flowchart with a character pasted beside it.
-- The default scene grammar for this treatment is:
-  a red-brown title ribbon at the top; a left-to-right or top-to-bottom
-  mechanism lane in the center; a bottom ribbon or paper strip stating the
-  protected invariant; the Eyjafjalla-like guide placed near a local prop in a
-  lower corner or side margin; and optional shelves, ledgers, tool crates,
-  envelopes, compasses, stop signs, magnifiers, gates, funnels, or workbenches
-  chosen to match the mechanism.
+- The desired look is a clean, warm hand-drawn technical notebook: light
+  off-white paper, restrained grain, slightly rough edges, crisp ink outlines,
+  soft watercolor fills, and generous negative space. Cards, ribbons, shelves,
+  tools, ledgers, gates, arrows, and desk props should form one
+  mechanism-specific scene. Do not default to an aged parchment dashboard or a
+  repeated row of narrow cards; the composition must arise from the mechanism.
+- The recurring scene vocabulary may include a red-brown title ribbon, one
+  clear mechanism lane, a bottom invariant strip, an Eyjafjalla-like guide near
+  a local prop, and mechanism-specific shelves, ledgers, tool crates,
+  envelopes, compasses, gates, funnels, or workbenches. This is a visual
+  vocabulary, not a fixed template: vary the spatial composition to fit the
+  claim and do not repeat the same card row across a batch.
 - The guide is usually a visible full-body or upper-body chibi participant in
   the workspace, not a tiny corner avatar. Keep it secondary to the mechanism,
   but large enough that the horns, chestnut hair mass, red eyes, and white/red
@@ -255,20 +267,18 @@ Established Eyjafjalla mechanism-scene style:
   mechanism calls for them. Do not cargo-cult a prop from a previous figure,
   and do not repeat the same pose across an entire batch when a mechanism has a
   more natural local prop.
-- Keep the character's action anatomically stable. Avoid poses that require a
-  chibi arm to reach across the canvas, a hand to touch distant cards, or a
-  long pointer to be held at full extension; those often produce oversized
-  hands, stretched arms, detached wrists, or missing limbs. Prefer a short
-  prop held near the body, a notebook in both hands, a nearby tool, or a red
+- Design every pose to pass the character anatomy gate. Avoid poses that
+  require a chibi arm to reach across the canvas, a hand to touch distant
+  cards, or a long pointer to be held at full extension; those often produce
+  oversized hands, stretched arms, detached wrists, or missing limbs. Prefer a
+  short prop held near the body, a notebook in both hands, a nearby tool, or a red
   highlight/attention mark on the target node. If the mechanism needs emphasis
   far from the guide character, mark the node in the diagram instead of
   stretching the character toward it.
-- When the guide character is prominent, specify anatomy in the prompt: both
-  arms visible, elbows near the torso unless the pose truly requires
-  extension, small proportional hands, natural wrist-to-sleeve connection, no
-  extra fingers, no detached hands, and no missing limbs. If imagegen keeps
-  failing a pose, simplify the pose and regenerate the whole figure rather than
-  locally patching the broken body part.
+- In every in-scene prompt, repeat the exact topology: exactly two arms and two
+  hands, each hand connected to one visible wrist/sleeve and one arm, elbows
+  near the torso, small proportional hands, and no duplicate or floating hand.
+  If imagegen keeps failing, simplify the pose and regenerate the whole figure.
 - For stable results, name the character and pose concretely in every prompt:
   `Eyjafjalla-like chibi guide`, `chestnut-brown hair`, `pale segmented curled
   horns`, `red eyes`, `white/red outfit cues`, and a local prop held close to
@@ -322,26 +332,29 @@ Reference selection workflow:
 Before generating, write a compact figure brief:
 
 1. Claim: the one source-level idea this figure must teach.
-2. Nodes: the exact entities that may appear.
-3. Edges: the exact order or relationship between nodes.
-4. Uncertainties: anything that must be described as public API contract rather
+2. Scope: declare `full-map` or `focus-map`. A `full-map` inventory must match
+   the public article or series. A `focus-map` may omit modules only when its
+   title, alt text, and opening prose clearly frame the partial view.
+3. Nodes: the exact entities that may appear.
+4. Edges: the exact order or relationship between nodes.
+5. Uncertainties: anything that must be described as public API contract rather
    than inferred provider internals.
-5. Caption role: what the surrounding prose will explain so the image can stay
+6. Caption role: what the surrounding prose will explain so the image can stay
    visually clean.
-6. References: which accepted local image roles should guide style and layout.
+7. References: which accepted local image roles should guide style and layout.
    If the figure includes or revises a Rememorio brand treatment, separately
    name the Eyjafjalla character reference and any accepted in-repo
    source-notes card used only for brand-card integration.
-7. Character contract: say whether this figure belongs to an established
+8. Character contract: say whether this figure belongs to an established
    in-scene guide series. If yes, the guide is mandatory and must remain large
    enough to identify the horns, chestnut hair mass, red eyes, and white/red
    outfit cues at article width.
-8. Character action: when a guide character appears, describe a pose that can
+9. Character action: when a guide character appears, describe a pose that can
    be drawn with normal proportions, and describe how distant nodes are
    emphasized without forcing the character to reach across the diagram.
    Include the local prop and body constraints, for example `holding a small
-   ledger close to the body`, `both arms visible`, `small proportional hands`,
-   and `no long pointing arm`.
+   ledger close to the body`, `exactly two arms and two connected hands`,
+   `small proportional hands`, and `no long pointing arm`.
 
 For runtime and protocol figures, prefer lifecycle or before/after layouts over
 generic box clusters. A good figure should make one transition visible:
@@ -426,10 +439,10 @@ New standalone figure prompt pattern:
 
 ```text
 High-resolution 16:9 hand-drawn technical article infographic for Rememorio.
-Use accepted local Rememorio article figures as style references, especially
-[accepted local reference filenames and what each contributes].
-Warm off-white or parchment paper, precise ink sketch lines, subtle watercolor
-fills.
+Use the selected Claude Code figures, or a user-approved series family, as
+style references: [reference filenames and what each contributes].
+Clean light warm off-white notebook paper, restrained grain and roughness,
+precise ink sketch lines, subtle watercolor fills. No aged parchment.
 Palette: deep navy, Rememorio blue, muted forest green, slate gray, small
 amber highlights.
 Subject: [one precise source-level idea].
@@ -438,6 +451,8 @@ Integrate a small bottom-right Rememorio source-notes paper card into the same
 hand-drawn style, with a tiny Eyjafjalla-like character based on
 `Eyjafjalla.png` (warm brown hair, curled horns, red eyes, white/red outfit
 cues) and the exact words `Rememorio` and `source notes`.
+If the character's hands are visible, show exactly two arms and exactly two
+hands, each hand connected to one wrist/sleeve; no extra or floating hand.
 No process notes, no prompt references, no meta text.
 Use only these short English labels: [label list].
 Avoid generic mascots, reading mascots, generic logos, clovers, leaves, pasted
@@ -459,12 +474,13 @@ Asset type: Rememorio technical article figure, 16:9 PNG.
 Create a high-resolution hand-drawn technical notebook infographic in the
 established Rememorio Eyjafjalla mechanism-scene style.
 
-Style references: use the accepted local mechanism-scene figures as composition
-references and the project `Eyjafjalla.png` as the identity reference. Warm
-off-white parchment, rough paper edge, precise ink sketch lines, soft
-watercolor fills, compact mechanism cards, red-brown title ribbon, bottom
-invariant ribbon, clean non-crossing arrows, shelves, ledgers, tools, notes,
-and desk props integrated into one illustrated workspace.
+Style references: use the selected Claude Code mechanism-scene figures, or a
+user-approved series family, as composition references and the project
+`Eyjafjalla.png` as the identity reference. Clean light warm off-white notebook
+paper, restrained grain and edge roughness, crisp ink sketch lines, soft
+watercolor fills, clean non-crossing arrows, and mechanism-specific props
+integrated into one illustrated workspace. No aged parchment or repeated
+dashboard/card-column layout.
 
 Subject: [one source-level mechanism or invariant].
 Composition: top title ribbon: "[short title]"; center mechanism lane:
@@ -476,9 +492,11 @@ near [local prop] in [lower-left/lower-center/lower-right/side margin],
 integrated into the same paper scene. Faithful stylized redraw of the canonical
 character: chestnut-brown rounded hair with loose side locks, pale segmented
 curled horns, red eyes, white/red outfit cues, dark glove or boot accents.
-The guide holds [small local prop] close to the body; both arms visible, elbows
-near the torso, small proportional hands, natural wrist-to-sleeve connection,
-no long pointing arm, no detached wrists, no missing limbs, no extra fingers.
+The guide holds [one small local prop] close to the body; exactly two arms and
+exactly two hands, each hand connected one-to-one to a visible wrist/sleeve and
+arm; elbows near the torso; small proportional hands; no long pointing arm,
+duplicate hand, floating hand, hidden third hand, detached wrist, missing limb,
+or extra finger.
 
 Visible labels only: [short labels].
 Avoid: flat flowchart with pasted character, generic Rememorio logo/card,
@@ -496,10 +514,12 @@ Use case: infographic-diagram
 Asset type: Rememorio source-reading article figure, 16:9 PNG.
 High-resolution hand-drawn technical notebook infographic in the established
 Rememorio mechanism-scene style.
-Style: warm parchment or off-white paper with rough edges, precise ink sketch
-lines, soft watercolor fills, compact cards, red-brown title ribbon, bottom
-invariant ribbon, clean arrows, small desk props, ledgers, shelves, gates,
-tools, envelopes, funnels, workbenches, or maps chosen to match the mechanism.
+Style: clean light warm off-white notebook paper with restrained grain and edge
+roughness, crisp ink sketch lines, soft watercolor fills, clean arrows, and
+small desk props, ledgers, shelves, gates, tools, envelopes, funnels,
+workbenches, or maps chosen to match the mechanism. Use cards and ribbons only
+when the mechanism benefits from them. No aged parchment or repeated
+dashboard/card-column layout.
 Character: preserve the established in-scene Rememorio treatment: an
 Eyjafjalla-like chibi guide drawn into the mechanism scene, faithful to the
 project character reference: chestnut-brown hair with rounded volume and loose
@@ -510,10 +530,11 @@ detached badge, or unrelated anime character.
 Character action: [place the guide near a local prop that belongs to this
 mechanism, for example a ledger, notebook, envelope tray, tool crate, compass,
 small stop sign, magnifier, wrench, catalog, tag, instruction card, or map].
-Keep both arms visible, elbows near the torso, small proportional hands,
-natural wrist-to-sleeve connections, no long pointing arm, no detached hands,
-no missing limbs, and no extra fingers. If the target node is far away,
-highlight that node in the diagram instead of making the character reach across
+Show exactly two arms and exactly two hands, each hand connected one-to-one to
+a visible wrist/sleeve and arm; keep elbows near the torso and hands small and
+proportional. No long pointing arm, duplicate or floating hand, hidden third
+hand, detached wrist, missing limb, or extra finger. If the target node is far
+away, highlight it in the diagram instead of making the character reach across
 the canvas.
 Subject: [one precise source-level idea].
 Composition: [title ribbon; exact nodes and arrows; side lanes; bottom
@@ -534,6 +555,7 @@ Edit/reference <source-image-path> as the exact visual target.
 Create the <target-language> version of this same figure.
 Preserve the original composition, canvas size, paper texture, character,
 boxes, icons, arrows, palette, shadows, and hand-drawn style.
+Preserve the exact limb count, hand-to-wrist connections, pose, and held props.
 Only replace visible <source-language> labels with concise <target-language>
 labels from this list: [label map].
 Keep code identifiers, product names, arrows, numbering, and all non-language
@@ -731,7 +753,8 @@ Plan figures from the article argument, not from existing assets:
 
 ## Quality Gate
 
-Inspect every generated figure before publishing:
+Inspect every generated figure at full size and at its intended article width
+before publishing. A contact sheet alone is not an anatomy or readability pass:
 
 - Text is readable and not misspelled.
 - No missing-glyph boxes, clipped words, accidental line breaks inside code
@@ -767,10 +790,11 @@ Inspect every generated figure before publishing:
   mascot, unrelated anime mascot, detached badge, missing curled horns, missing
   red eyes, missing chestnut hair mass, or a guide that does not participate in
   the mechanism.
-- Character anatomy is credible at full size: no stretched arms, oversized
-  gloves or hands, missing limbs, detached wrists, duplicate hands, extra
-  fingers, or props that force impossible reach. If a pointing pose creates any
-  of those failures, redesign the pose so the character stays local and the
+- Character anatomy passes the binary topology gate: exactly two arms and no
+  more than two hands, with every visible hand traceable through one wrist or
+  sleeve to one arm. There is no duplicate, floating, hidden third, or
+  prop-emerging hand, no extra finger, and no prop that forces impossible
+  reach. If the pose fails, redesign it so the character stays local and the
   diagram node carries the visual emphasis.
 - The guide's action matches the mechanism rather than merely copying an old
   prop: ledgers for context/history, envelopes for events, tool crates or
@@ -815,7 +839,9 @@ mechanism flow.
 
 For article batches, create a temporary contact sheet of new figures beside the
 accepted local reference images and inspect the set as one family. The batch
-should look systematic, not like unrelated one-off diagrams.
+should look systematic, not like unrelated one-off diagrams. Also open every
+figure with a visible character at full size; contact sheets can hide extra
+hands, disconnected wrists, and small identity drift.
 
 For any figure with deterministic text overlays, also inspect at least the
 highest-risk images at full size. Contact sheets are useful for family style,
