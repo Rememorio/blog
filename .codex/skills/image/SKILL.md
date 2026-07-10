@@ -95,9 +95,18 @@ redraw of the same character, not as a new logo concept.
   otherwise correct. Regenerate or edit the whole figure so the guide appears
   as a recognizable participant in the workspace, not as an optional decoration
   to drop under layout pressure.
-- Every final generated figure must be saved under the relevant article's
-  local `assets/` directory before publication. Published article markup should
-  use the correct page-relative path for that static page.
+- Before generating or accepting a bilingual figure, choose its language asset
+  policy. A figure is `shared-neutral` only when every visible label is an exact
+  code identifier, product or protocol name, numeral, or symbol that should be
+  identical in both editions. If it contains a reader-facing title, invariant
+  ribbon, explanation, generic system label, action, or state that changes with
+  the page language, it requires `localized-siblings`. Short or readable English
+  is not automatically language-neutral.
+- Every final generated figure must be saved under the relevant article asset
+  directory before publication: a shared `assets/` directory for a genuinely
+  `shared-neutral` figure, or the matching `<lang>/assets/` directory for
+  `localized-siblings`. Published article markup, home cards, and social
+  metadata must use the correct language-specific page-relative path.
 - Do not include production notes, prompts, private instructions, model names,
   or process explanations inside public images.
 - Do not let generated text invent source facts. If exact identifiers, arrows,
@@ -266,9 +275,11 @@ Established Eyjafjalla mechanism-scene style:
   the body. Avoid vague phrases such as `cute mascot`, `brand avatar`,
   `anime helper`, `little sheep logo`, or `Rememorio logo`; they invite the
   model to freely redesign the character.
-- Chinese-edition figures may use Chinese-majority labels with short English
-  source identifiers. English-edition figures should keep the same composition
-  and replace only the language-bearing labels.
+- Chinese-edition figures must use Chinese for reader-facing titles, callouts,
+  actions, states, and invariant ribbons. Keep short English source identifiers,
+  product names, API fields, and protocol literals only when translation would
+  make them less exact. English-edition figures should keep the same composition
+  and replace only those language-bearing labels.
 - Do not drift into a generic mascot, dark tech poster, glossy UI mock,
   isolated avatar logo, or decorative character sheet. The figure is still a
   source-code mechanism diagram.
@@ -386,10 +397,12 @@ For source-code diagrams, keep visible labels short:
 
 - Prefer code identifiers only when short, for example `cache_control`,
   `prompt_cache_key`, `compact_boundary`, `replacement_history`.
-- Prefer concise English labels and source identifiers when they are
-  language-neutral. For Chinese articles whose accepted series style uses
-  Chinese-majority figure text, use short Chinese headings and callouts with
-  English code identifiers rather than over-Englishing the diagram.
+- Prefer concise English only for exact source identifiers, product names, API
+  fields, and protocol literals that remain unchanged across editions. A short
+  English heading, generic noun, action, state, explanation, or invariant is
+  still reader-facing language and must match the publication language. For
+  Chinese articles, use short Chinese headings and callouts with English code
+  identifiers rather than over-Englishing the diagram.
 - Avoid long Chinese sentences inside generated images.
 - If Chinese labels are required, keep them short and prefer whole-image
   generation or a built-in edit pass so the lettering stays integrated with the
@@ -401,10 +414,13 @@ For source-code diagrams, keep visible labels short:
   captions, and callouts. Never place Chinese explanation text in a
   monospace-only font that can render missing-glyph boxes.
 - Maximum visible labels per figure: `10`; maximum words per label: `4`.
-- When a diagram is likely to be reused across language editions, prefer short
-  English labels and move localized explanation into alt text, captions, and
-  surrounding prose. Do not regenerate a figure solely to translate labels if
-  the existing labels are readable and language-neutral.
+- When a diagram is likely to appear in multiple language editions, first reduce
+  its label set, then classify what remains. Share the raster only when all
+  labels are exact identifiers, product/protocol names, numerals, or symbols.
+  If any title, ribbon, callout, action, state, or generic system label needs
+  translation, create localized sibling rasters from the accepted source image;
+  localized alt text and prose do not substitute for localizing visible
+  reader-facing image text.
 
 New standalone figure prompt pattern:
 
@@ -522,6 +538,9 @@ Only replace visible <source-language> labels with concise <target-language>
 labels from this list: [label map].
 Keep code identifiers, product names, arrows, numbering, and all non-language
 diagram structure unchanged.
+Translate every reader-facing title, invariant ribbon, callout, action, state,
+and generic system label in the map. Do not leave narrative text untranslated
+merely because it is short or familiar to technical readers.
 Do not redesign, crop, simplify, add a new Rememorio card, remove the
 Eyjafjalla-like guide, or change the figure's teaching role.
 ```
@@ -533,10 +552,15 @@ finished raster image.
 
 ## Figure Localization And Language Editions
 
-Treat a language-only variant of an accepted figure as an edit target, not as a
-fresh illustration brief. The source-language PNG is the authority for layout,
-character placement, colors, arrows, and visual density. The target-language
-figure should read as the same image in another language.
+Before deciding whether an accepted figure can be reused, classify every
+visible label as either `identifier/product/protocol` or `reader-facing
+narrative`. The latter includes titles, invariant ribbons, explanations,
+generic component names, actions, states, and audience-facing callouts. Reuse a
+single raster only when the second class is empty. If any reader-facing label
+changes with the publication language, treat the language variant as an edit
+target, not as a fresh illustration brief. The source-language PNG is the
+authority for layout, character placement, colors, arrows, and visual density.
+The target-language figure should read as the same image in another language.
 
 When in-image text differs by language:
 
@@ -547,8 +571,12 @@ When in-image text differs by language:
   intentionally language-specific;
 - generate or edit the target-language image from the accepted source-language
   raster, replacing text only;
-- keep concise English source identifiers unchanged when they are already
-  language-neutral;
+- keep exact English source identifiers, product names, API fields, and protocol
+  literals unchanged when they are semantically identical across editions;
+- update each language page's figure paths, `og:image`, gateway or home-card
+  cover, and any other public image reference so it resolves to that language's
+  raster. Do not keep a Chinese page pointed at an English sibling merely
+  because the filename is the same;
 - avoid programmatically rebuilding the diagram from scratch just to translate
   labels, because it usually drifts in character, layout, and visual style.
 - preserve accepted character anatomy during localization. If the localized
@@ -654,22 +682,29 @@ Integrated brand protocol:
 Recommended final asset layout:
 
 ```text
-<article>/assets/<figure-name>.png
+shared-neutral:
+  <article>/assets/<figure-name>.png
+
+localized-siblings:
+  <article>/zh/assets/<figure-name>.png
+  <article>/en/assets/<figure-name>.png
 ```
 
 When mirroring a standalone source article into generated HTML, keep the same
-filename in the article's `assets/` directory and update both Markdown and HTML
-references.
+filename in the selected shared or language-specific `assets/` directory and
+update both Markdown and HTML references.
 
 Static blog publication protocol:
 
 1. Finish the built-in image generation or edit pass, label fixes, and
    integrated `Rememorio` treatment first.
-2. Save the final PNG locally under the article's assets directory so the source
-   package remains reproducible.
-3. Reference the final PNG with the correct page-relative path: usually
-   `./assets/<figure-name>.png` from an article root page and
-   `../assets/<figure-name>.png` from chapter pages.
+2. Save the final PNG locally under the asset directory selected by the
+   language policy so the source package remains reproducible. Use a shared
+   article `assets/` directory only for `shared-neutral` figures; otherwise save
+   matching filenames under each language's `assets/` directory.
+3. Reference the final PNG with the correct page-relative path for that package.
+   Verify the resolved path from the published page instead of assuming that a
+   shared `../assets/` path is suitable for both languages.
 4. If the article source is Markdown and generated HTML is checked in, update
    the source first, then render or mirror the generated page.
 5. Update captions, alt text, cover references, and social metadata when the
@@ -750,7 +785,14 @@ Inspect every generated figure before publishing:
   brand area.
 - For localized figures, compare source and target language versions side by
   side. They should match in layout, character identity, visual density, and
-  teaching role; only the language-bearing text should materially change.
+  teaching role; only the language-bearing text should materially change. Also
+  verify that every reader-facing title, ribbon, callout, action, state, and
+  generic label matches the page language, while exact identifiers and product
+  names remain source-accurate.
+- For `localized-siblings`, verify that the Chinese and English pages, social
+  metadata, gateways, and home cards resolve to their own language asset paths.
+  A visually correct localized PNG is not published if the page still points
+  at the other edition's file.
 - The published article references the correct local relative URL for each
   generated figure, and the referenced PNG exists in the repository.
 - No private instruction, prompt, unfinished editorial marker, or process note

@@ -302,8 +302,9 @@ Use the exemplar as a practical bar for new or revised articles:
 
 MUST: Any illustrated Rememorio article must use
 `.codex/skills/image/SKILL.md` for every public figure. The published page must
-reference final raster images, usually PNG, stored under the article's local
-`assets/` directory and referenced with the correct relative URL for the page.
+reference final raster images, usually PNG, stored under the shared or
+language-specific asset directory selected by the image skill and referenced
+with the correct relative URL for the page.
 
 MUST: Every article change requires a visual impact pass by default, even when
 the user asks only for prose, links, source details, section structure, or a
@@ -314,11 +315,13 @@ or regenerate the relevant image through the image workflow. If not, keep the
 existing figures and note that no image change was needed during handoff.
 
 MUST: Any newly generated or regenerated article image must be saved as a final
-PNG under the relevant article assets directory, for example
-`<article>/assets/<figure-name>.png`. Update Markdown sources, generated HTML,
-index pages, and social metadata that point at the figure. If a future article
-intentionally uses a remote image host, record the local source path and remote
-URL mapping, but local repository assets are the default for this blog.
+PNG under the relevant shared or language-specific article assets directory.
+Use `<article>/assets/<figure-name>.png` only for a genuinely language-neutral
+figure; use `<article>/<lang>/assets/<figure-name>.png` when reader-facing image
+text differs by edition. Update Markdown sources, generated HTML, index pages,
+and social metadata that point at the figure. If a future article intentionally
+uses a remote image host, record the local source path and remote URL mapping,
+but local repository assets are the default for this blog.
 
 MUST NOT: Do not publish hand-authored HTML, inline SVG, Mermaid, canvas, CSS
 shape compositions, DOM diagrams, or other code-drawn substitutes as article
@@ -591,22 +594,21 @@ sibling article in the target language, or keep the unfinished route
 unpublished until it is ready. A bilingual series should feel like one
 publication surface with two complete reading paths.
 
-Figures may use concise English labels, source identifiers, and product terms
-even inside a Chinese article. This keeps diagrams legible, reduces generated
-text errors, and makes later English localization cheaper. Explain the meaning
-in surrounding Chinese prose when an English label might be ambiguous.
+Figures must match the target publication language for reader-facing titles,
+invariant ribbons, explanations, generic component names, actions, states, and
+callouts. Keep concise English only for exact source identifiers, product or
+protocol names, API fields, and other literals that should not change between
+editions. A short or familiar English phrase such as `model view`, `snapshot`,
+`fork`, or `ledger` is not automatically language-neutral when it functions as
+reader-facing narrative on a Chinese page.
 
-Do not force Chinese labels into generated figures when the same idea can be
-carried by short English terms such as `model view`, `snapshot`, `fork`, or
-`ledger`. If a future English version is added, keep heading slugs, asset
-filenames, source links, and figure concepts stable so the translation can share
-the same evidence and visual package.
-
-When adding a new language edition, reuse existing figures when their labels
-are already concise, source-accurate, and language-neutral. Localize alt text,
-captions, headings, navigation, metadata, and surrounding prose. Regenerate a
-figure only when the visual claim, label semantics, or target-language
-readability actually changes.
+When adding a new language edition, apply the image skill's language asset
+policy before reusing a raster. A single shared figure is valid only when every
+visible label is an exact identifier, product/protocol name, numeral, or symbol.
+If any reader-facing label changes with the page language, create a localized
+sibling through the image edit workflow, keep the filename and visual concept
+aligned, and localize alt text, captions, navigation, metadata, and surrounding
+prose at the same time.
 
 When figure text must differ by language, mirror the asset layout in the
 language directories and keep filenames aligned. For example, if the article
