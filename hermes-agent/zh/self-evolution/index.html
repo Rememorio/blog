@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hermes Agent 自进化：Skill 怎样通过评测变得更好</title>
+    <meta
+      name="description"
+      content="从运行时沉淀为什么不足以证明 Skill 变好开始，循序理解评测集、执行轨迹、GEPA 反思变异、帕累托候选池，以及 Hermes Agent Self-Evolution 当前源码的真实边界。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Hermes Agent 自进化：Skill 怎样通过评测变得更好" />
+    <meta
+      property="og:description"
+      content="一条从经验沉淀到独立评测的证据链：先理解 GEPA，再对照 Hermes Agent Self-Evolution 的实现、实验和未闭合环节。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="assets/self-evolution-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/hermes-agent/zh/self-evolution/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/hermes-agent/zh/self-evolution/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/hermes-agent/en/self-evolution/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/hermes-agent/" />
+    <link rel="stylesheet" href="../../styles.css?v=hermes-series-3" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../../">Hermes Agent</a>
+        <a href="../">上一篇</a>
+        <a href="../../../zh/#posts">文章目录</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/self-evolution/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">源码阅读 · Hermes Agent 系列 2 / 2</p>
+            <h1 class="long-title">Hermes Agent 自进化：Skill 怎样通过评测变得更好</h1>
+            <p class="lead">
+              Agent 可以在一轮任务结束后把经验写成 Skill，但“写下来了”和“真的变好了”之间，还缺一条独立证据链。
+              Hermes Agent Self-Evolution 想用 DSPy 与 GEPA 补上这条链。要看懂它，先别急着看优化器，先问：我们凭什么判断新版 Skill 更好？
+            </p>
+            <div class="meta-line">
+              <span>系列 2 / 2</span>
+              <span>源码快照：0a929e3</span>
+              <span>论文：GEPA v2</span>
+              <span>主题：prompt evolution</span>
+            </div>
+            <nav class="series-strip" aria-label="Hermes Agent 系列">
+              <a href="../"><strong>01</strong> 运行闭环：经验怎样在交付之后沉淀</a>
+              <span class="series-current"><strong>02</strong> 离线进化：改写怎样经过评测成为可信改进</span>
+            </nav>
+            <figure class="hero-image">
+              <img
+                src="assets/self-evolution-cover.png"
+                alt="Hermes 的两只进化时钟：左侧运行时沉淀经验，右侧离线评测候选 Skill，再把通过门控的版本交给未来回合"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              继续上一篇的场景。Agent 修完一次测试失败，后台 review 发现“这个仓库必须先运行生成器，再跑单测”，于是把它写进一个 Skill。
+              下一次遇到类似任务，Agent 加载新版 Skill，顺利完成了工作。到这里，我们很容易说：它学会了。
+            </p>
+
+            <p>
+              但成功可能来自很多地方：第二个任务更简单，模型那次恰好选对了工具，环境已经被上一次修好，或者新版 Skill 只是写得更长，碰巧复述了题目里的关键词。
+              如果没有固定题目、统一评分和未参与优化的留出样本，我们只能看到“这次成功”，不能知道“改写有效”。
+            </p>
+
+            <p>
+              这就是两篇文章的接缝。第一篇讨论的是<strong>运行时沉淀</strong>：当前任务结束后，什么值得进入 Memory 或 Skill；
+              这一篇讨论的是<strong>离线进化</strong>：拿到一个现有 Skill 后，怎样生成候选、复盘失败、比较版本，并把未经证明的变化挡在交付之外。
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>先分清三层证据。</strong>
+                <a href="https://arxiv.org/abs/2507.19457v2">GEPA 论文 v2</a>说明一种通用的反思式提示词进化方法；
+                <a href="https://github.com/NousResearch/hermes-agent-self-evolution/tree/0a929e3aa20e15cf04dc7c28492a7d41a5139125">Hermes Agent Self-Evolution 固定源码</a>
+                展示它准备怎样把方法接到 Skill 上；仓库内的 Phase 1 报告则记录一次很小的 DSPy 实验。三者不能互相代替：论文结果不是 Hermes 集成结果，README 路线图也不是当前调用链。
+              </p>
+            </div>
+
+            <p>带着下面四个问题往下读，后面的名词就会各自找到位置：</p>
+            <ol>
+              <li>如果不能只看一次成功，评测题和“好答案标准”从哪里来？</li>
+              <li>GEPA 为什么不只拿一个总分，而要读取执行轨迹与文字反馈？</li>
+              <li>为什么候选池里要保留偏科选手，而不是永远只留下总分第一？</li>
+              <li>当前 Hermes 源码已经接通了哪些步骤，哪些仍是 README 里的目标？</li>
+            </ol>
+
+            <h2>一、两只时钟解决的是两个不同问题</h2>
+            <p>
+              运行时学习发生得快。一个 turn 完成，background review 就能判断某条偏好或流程是否值得保存；curator 再按更长周期整理技能库。
+              它的输入是真实经历，优点是贴近使用现场，风险是每段经历只有一个上下文，很难构成公平对照。
+            </p>
+
+            <p>
+              离线进化发生得慢。它先冻结一个基线版本，把同一批题交给不同候选，在训练与验证样本上寻找改进，只在最后打开留出集。
+              它牺牲即时性，换来可比较性。两只时钟通过 Skill 交接：运行时提供值得改进的对象和真实任务线索；离线流程提供“这个版本是否值得回到运行时”的证据。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>问题</th><th>运行时沉淀</th><th>离线评测进化</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>主要输入</td><td>刚完成的对话、工具结果、用户偏好</td><td>冻结的 Skill、评测样本、执行轨迹</td></tr>
+                  <tr><td>核心判断</td><td>什么值得留下？</td><td>哪次改写有可重复的改进？</td></tr>
+                  <tr><td>时间尺度</td><td>一轮之后或空闲时</td><td>独立优化运行</td></tr>
+                  <tr><td>主要风险</td><td>把偶然经历写成长期事实</td><td>过拟合评测、奖励错误代理指标</td></tr>
+                  <tr><td>合理出口</td><td>Memory / Skill 候选</td><td>可审阅的差异、指标和交付候选</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以“自进化”不是一个模型在后台不断重写自己。更可靠的理解是：一条快路径收集经验，一条慢路径验证改写；任何变化都要在明确的版本边界上交接。
+            </p>
+
+            <h2>二、先补齐六个概念：评测到底在比较什么</h2>
+            <p>
+              假设我们要改进一个代码审查 Skill。原版要求检查正确性、安全性和测试，但经常漏掉资源泄漏。离线进化不是直接让模型“把它写得更好”，
+              而是先把问题拆成六种可以追踪的对象。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>概念</th><th>在这个例子里是什么</th><th>它解决什么问题</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Artifact</td><td>当前 <code>SKILL.md</code> 正文</td><td>明确究竟在改哪个有版本的对象</td></tr>
+                  <tr><td>Eval example</td><td>一段待审代码，加一份“应发现资源泄漏”的 rubric</td><td>把任务输入和成功标准分开</td></tr>
+                  <tr><td>Rollout</td><td>模型按某个 Skill 完成这道审查题的一次执行</td><td>让候选接受同一种实际使用方式</td></tr>
+                  <tr><td>Trace + feedback</td><td>执行过程、输出、分数，以及“为什么漏检”的文字反馈</td><td>告诉优化器失败发生在哪里</td></tr>
+                  <tr><td>Candidate</td><td>一次改写后的 Skill 提示词</td><td>让搜索保留多个可比较版本</td></tr>
+                  <tr><td>Holdout</td><td>从未参与生成候选的审查题</td><td>检查改进是否只是在背训练题</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Hermes 仓库把单道题表示成 <code>EvalExample</code>，字段包括 <code>task_input</code>、<code>expected_behavior</code>、难度、类别和来源；
+              再由 <code>EvalDataset</code> 分成 train、validation 和 holdout。对应数据形状在
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/dataset_builder.py#L20-L86"><code>dataset_builder.py</code></a>。
+            </p>
+
+            <p>
+              这里最容易忽略的是 <code>expected_behavior</code>。它不是唯一标准答案，而是一份评分说明：好结果应该做什么、不能漏什么。
+              对开放式 Agent 任务，这比要求逐字匹配更合理；但 rubric 本身如果写错，优化器就会忠实地把 Skill 推向错误方向。
+            </p>
+
+            <h2>三、评测题从哪里来：先解决尺子，再启动优化</h2>
+            <figure class="figure">
+              <img
+                src="assets/eval-dataset-sources.png"
+                alt="合成任务、人工金标和真实会话经过统一样本与相关性筛选后，分入训练集、验证集和最后才打开的留出集"
+              />
+              <figcaption>数据源可以混合，但留出集必须保持独立；否则最后的分数只是训练过程的回声。</figcaption>
+            </figure>
+
+            <h3>3.1 合成任务负责启动，不负责自动成为真理</h3>
+            <p>
+              没有历史数据时，仓库里的 <code>SyntheticDatasetBuilder</code> 会把完整 artifact 交给模型，要求生成任务、期望行为、难度和类别，再随机切成三份。
+              这条路径能快速启动一个新 Skill，源码在
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/dataset_builder.py#L89-L169"><code>SyntheticDatasetBuilder.generate</code></a>。
+            </p>
+
+            <p>
+              它的盲点也很直接：出题模型读的是旧 Skill，容易把旧 Skill 已经写出的关注点再次包装成题目，却漏掉旧 Skill 根本没意识到的问题。
+              因此合成集适合做启动样本，不该独自承担最终证明。关键 Skill 仍需要人工金标或可自动核验的任务补足盲区。
+            </p>
+
+            <h3>3.2 真实会话提供分布，但不能把历史回答直接当答案</h3>
+            <p>
+              外部导入器会读取 Claude Code、Copilot 和 Hermes 的本地会话，先做便宜的关键词预筛，再由模型判断消息是否与目标 Skill 相关，并生成新的 expected behavior。
+              两阶段过滤在
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/external_importers.py#L422-L520"><code>RelevanceFilter</code></a>，
+              三种来源汇总与切分在
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/external_importers.py#L608-L693"><code>build_dataset_from_external</code></a>。
+            </p>
+
+            <p>
+              这意味着“真实会话”主要贡献真实任务分布，而不是把当时 assistant 的回答直接封成金标。历史回答会帮助相关性判断，但最终进入 <code>EvalExample</code> 的仍是任务与新生成的 rubric。
+              这个边界是对的：旧回答可能正是我们想修复的失败，不能因为它来自真实会话就自动变成标准答案。
+            </p>
+
+            <h3>3.3 留出集只回答一个问题：你学会的是规则，还是题目</h3>
+            <p>
+              训练集用于产生候选，验证集用于搜索期间比较候选，留出集只在候选确定之后做一次独立检查。
+              如果不断根据留出分数继续改 Skill，留出集就已经变成另一份验证集。可信的交付应该保留数据版本、切分种子和基线结果，让同一个候选不能反复偷看最终答案。
+            </p>
+
+            <h2>四、GEPA 的关键不是“遗传”，而是带着失败原因改提示词</h2>
+            <p>
+              现在才轮到 GEPA。论文把目标写得很清楚：模型权重保持不变，搜索的是自然语言提示词。每轮从候选池里选一个父代，拿一小批样本执行，收集轨迹、分数和文字反馈，
+              再让反思模型解释失败原因并提出新的提示词。新候选经过评测后回到池里，循环继续。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="assets/gepa-reflection-loop.png"
+                alt="GEPA 从候选提示词出发执行小批量任务，读取轨迹与反馈，反思失败原因，生成新候选并放入帕累托候选池"
+              />
+              <figcaption>分数告诉系统哪里不好，轨迹和文字反馈才让反思器判断应该改哪一段提示词。</figcaption>
+            </figure>
+
+            <h3>4.1 轨迹让“错了”变成“错在哪里”</h3>
+            <p>
+              只有一个 0.4 分，反思模型不知道问题来自工具选择、顺序、遗漏约束，还是输出格式。执行轨迹把中间决策暴露出来；评估器再补充文字反馈，
+              例如“调用了正确工具，但在拿到空结果后没有执行备用搜索”。GEPA 的 reflective mutation 正是读取这类上下文后，针对失败模式重写提示词。
+              论文的算法与反馈接口见
+              <a href="https://arxiv.org/pdf/2507.19457v2">GEPA v2 第 3 节</a>。
+            </p>
+
+            <h3>4.2 为什么不永远选择总分第一</h3>
+            <p>
+              一个候选可能擅长安全审查，另一个擅长 API 兼容性，第三个在格式要求上最稳定。只保留平均分最高的版本，会过早丢掉这些局部强项。
+              GEPA 维护按样本表现形成的帕累托候选集合：先抽一道题，再从这道题上的强候选中选择父代。这样，仍有独特优势的候选可以继续繁殖，而不是被一个暂时的总冠军清空。
+            </p>
+
+            <p>
+              这也解释了论文名称里的 Pareto。它不是为了让术语更复杂，而是在有限 rollout 预算下保护搜索多样性。
+              论文消融实验显示，只从“当前最好”变异会弱于帕累托选择；但候选合并也不是永远有利，组件之间存在依赖时可能反而破坏组合。
+            </p>
+
+            <h2>五、把论文映射到仓库：理想调用链应该怎样走</h2>
+            <p>
+              Hermes Agent Self-Evolution 的 CLI 把目标流程写成十个阶段：找到 Skill、准备数据、检查基线、配置 DSPy、运行 GEPA、取出新版、检查约束、比较留出集、展示结果、保存输出。
+              主入口在
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/evolve_skill.py#L45-L280"><code>evolve_skill.py</code></a>。
+            </p>
+
+            <p>
+              Skill 通过 <code>SkillModule</code> 包成 DSPy 模块：每次 forward 把 Skill 正文和任务输入交给 <code>ChainOfThought</code>，返回模型输出。
+              这个抽象的价值是把“某个 Skill 在某道题上的表现”变成可重复调用的函数。实现见
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/skill_module.py#L84-L115"><code>SkillModule</code></a>。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>理想阶段</th><th>必须留下的证据</th><th>失败时应该怎样</th></tr></thead>
+                <tbody>
+                  <tr><td>冻结基线</td><td>原始 Skill、源码版本、模型配置</td><td>不能悄悄换基线继续比较</td></tr>
+                  <tr><td>准备评测</td><td>题目来源、rubric、切分和种子</td><td>题目质量不足就停止优化</td></tr>
+                  <tr><td>反思变异</td><td>父候选、样本、轨迹、反馈、新候选</td><td>可定位哪次变异导致退化</td></tr>
+                  <tr><td>候选门控</td><td>结构、长度、测试、基准结果</td><td>任一硬约束失败就淘汰</td></tr>
+                  <tr><td>留出比较</td><td>基线与候选在同一未见集合上的结果</td><td>无提升就不交付</td></tr>
+                  <tr><td>人工交付</td><td>diff、指标、已知局限、可回滚版本</td><td>不直接覆盖运行中 Skill</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这张表是理解后续源码审计的标尺。一个仓库可以同时拥有所有模块文件，却还没有把它们接成这条证据链；判断“实现了没有”，要看值是否真的从入口流到门控和交付，而不是只看类名是否存在。
+            </p>
+
+            <h2>六、当前源码走到哪里：原型已经成形，闭环还没有</h2>
+            <figure class="figure">
+              <img
+                src="assets/implementation-boundary.png"
+                alt="当前源码已经有读取 Skill、构建评测集、运行优化器和留出集比较的原型，但结构校验、测试和交付尚未形成端到端闭环"
+              />
+              <figcaption>README 画的是目标架构；判断现状要沿着参数、返回值和实际调用逐步追踪。</figcaption>
+            </figure>
+
+            <p>
+              先说已经具备的部分：仓库能发现和解析 Skill，能生成或导入评测数据，能构造 DSPy 模块，能调用优化器，能在留出集上比较基线与候选，也能保存指标与前后版本。
+              这些不是空白路线图，而是一套有单元测试覆盖的数据和编排骨架。
+            </p>
+
+            <p>但在固定快照 <code>0a929e3</code> 上，几处关键接线决定了它还不能被称为完整交付闭环：</p>
+
+            <h3>6.1 被优化的 Skill 文本还没有明确注册为 GEPA 参数</h3>
+            <p>
+              <code>SkillModule</code> 把正文保存在普通 Python 属性 <code>self.skill_text</code>，forward 时再把它作为 <code>skill_instructions</code> 输入字段传给 predictor。
+              主流程却假设 <code>optimized_module.skill_text</code> 已经装着 GEPA 改写后的正文。当前源码没有展示把这个普通属性注册为 DSPy 可优化提示词参数的桥接，
+              因此仅凭这条调用链，不能确认 GEPA 会改写 Skill 本身，而不是只优化 predictor 内部提示。
+            </p>
+
+            <h3>6.2 结构校验拿到的是正文，却要求它带 frontmatter</h3>
+            <p>
+              <code>load_skill</code> 已经把 frontmatter 与 body 分开。主流程把 <code>skill["body"]</code> 和 <code>evolved_body</code> 送入 <code>validate_all</code>；
+              但 <code>_check_skill_structure</code> 又要求输入以 <code>---</code> 开头，并在前 500 字符里包含 <code>name:</code> 与 <code>description:</code>。
+              对当前调用来说，这个条件天然失败。相关检查在
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/constraints.py#L25-L53"><code>validate_all</code></a>
+              与
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/constraints.py#L137-L166"><code>_check_skill_structure</code></a>。
+            </p>
+
+            <h3>6.3 丰富的 LLM Judge 存在，但优化器实际拿到的是关键词重合度</h3>
+            <p>
+              <code>fitness.py</code> 定义了 correctness、procedure following、conciseness 和文字反馈组成的 <code>LLMJudge</code>；这正接近 GEPA 需要的可解释反馈。
+              可是传入 <code>dspy.GEPA(metric=...)</code> 的 <code>skill_fitness_metric</code> 只计算 expected behavior 与输出的单词重合比例，并返回一个浮点数。
+              两条路径见
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/fitness.py#L14-L104"><code>LLMJudge</code></a>
+              和
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/fitness.py#L107-L136"><code>skill_fitness_metric</code></a>。
+            </p>
+
+            <p>
+              关键词代理指标速度快，却会奖励“重复 rubric 里的词”，不一定奖励正确完成任务；同时，丰富的失败原因没有通过这条 metric 返回给优化器。
+              这不是调权重能解决的小问题，而是当前搜索目标与论文方法之间的接口差异。
+            </p>
+
+            <h3>6.4 测试门、逐候选约束和 PR 交付仍是断开的</h3>
+            <p>
+              <code>ConstraintValidator</code> 有 <code>run_test_suite</code>，配置也有 <code>run_pytest</code> 与 <code>create_pr</code>；但主流程没有调用测试函数，也没有创建 PR。
+              约束只在优化完成后检查最终提取出的正文，并没有进入 GEPA 的每个候选评测。成功路径最终只是把文件与 <code>metrics.json</code> 写进 <code>output/</code>。
+              测试函数可见于
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/constraints.py#L55-L93"><code>run_test_suite</code></a>，
+              输出路径则在
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/evolve_skill.py#L244-L288">保存阶段</a>。
+            </p>
+
+            <h3>6.5 异常回退会把“GEPA 不可用”和“GEPA 执行失败”混在一起</h3>
+            <p>
+              主流程用一个宽泛的 <code>except Exception</code> 捕获 GEPA compile 的任何错误，然后回退到 MIPROv2。
+              这能提高演示时的可运行性，却可能把真正的接线错误伪装成“当前 DSPy 版本没有 GEPA”。严谨的进化运行应该只对已知能力缺失回退，其余异常保留失败现场。
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>这不是说仓库没有价值。</strong>
+                数据导入、样本结构、Skill 包装、留出比较和约束类都提供了可继续建设的骨架。准确的状态描述应是：Phase 1 原型已出现，端到端的 GEPA Skill 改写、硬门控和人工交付尚未由当前调用链证明。
+              </p>
+            </div>
+
+            <h2>七、怎样读“提升 39.5%”：先问实验真正改了什么</h2>
+            <p>
+              仓库的 Phase 1 报告记录了一次 arxiv Skill 实验：使用 MiniMax M2.5、7 个合成样本中的 3 个训练样本与 2 个验证样本，优化器是 DSPy BootstrapFewShot，
+              评分是关键词重合度。第一个验证样本从 0.408 到 0.569，报告为 +39.5%；第二个从 0.374 到 0.374，平均从 0.391 到 0.472，即 +20.7%。
+              配置、指标和结果写在
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/generate_report.py#L261-L395"><code>generate_report.py</code></a>。
+            </p>
+
+            <p>
+              这次实验不是 GEPA 实验，也没有重写 Skill。BootstrapFewShot 选择表现较好的执行轨迹作为 few-shot demonstrations，给模块增加示例。
+              因此它能支持的窄结论是：在一个很小的合成集合和代理指标上，DSPy 包装后的模块通过示例增强得到更高分。它不能证明 GEPA 已经接通，更不能证明改写后的 Hermes Skill 在真实任务上稳定提升。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>证据</th><th>它实际测试了什么</th><th>不能外推成什么</th></tr></thead>
+                <tbody>
+                  <tr><td>GEPA 论文</td><td>六类任务上的提示词进化方法与消融</td><td>Hermes 集成已经获得同样收益</td></tr>
+                  <tr><td>Phase 1 报告</td><td>一个 Skill、极小合成集、BootstrapFewShot、关键词指标</td><td>GEPA 已跑通或 Skill 正文已被改写</td></tr>
+                  <tr><td>当前源码</td><td>数据、编排、比较和约束原型</td><td>测试、PR 与逐候选门控已经自动闭环</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              GEPA 论文自己的结果更强：在六项任务上，相比 GRPO 平均高约 6%、最高约 20%，并报告最多 35 倍更少的 rollout；相对 MIPROv2 平均也有超过 10% 的优势。
+              这些数字说明方法值得研究，但评价对象是论文基准，不是这份 Hermes 原型。把两个证据层级分开，反而能看清项目下一步真正需要补什么。
+            </p>
+
+            <h2>八、要把原型变成可信闭环，还缺哪几步</h2>
+            <p>
+              补齐路线不需要发明更多名词，只要让前面的证据链一环不漏地传下去：
+            </p>
+
+            <ol>
+              <li><strong>固定 artifact。</strong>记录源仓库 commit、Skill 哈希、模型与数据配置，保证基线可重放。</li>
+              <li><strong>把 Skill 正文变成真正可优化的提示词参数。</strong>用 DSPy 明确支持的 instruction / signature 机制接入，而不是依赖普通属性被隐式改写。</li>
+              <li><strong>让 metric 返回正确目标。</strong>优先使用可执行检查；开放任务再用 rubric judge，并把可操作的文字反馈交给 GEPA。</li>
+              <li><strong>每个候选先过硬约束。</strong>完整 frontmatter、长度增长、测试和缓存边界都应在候选进入池前检查。</li>
+              <li><strong>把异常留在正确层。</strong>GEPA 失败就保留失败，不用另一个优化器掩盖；回退必须是显式运行模式。</li>
+              <li><strong>最后只打开一次留出集。</strong>同时报告逐题结果、置信区间或重复运行，避免一个样本的百分比制造确定感。</li>
+              <li><strong>交付是 diff，不是覆盖。</strong>输出候选、基线、指标、失败案例和 PR，让人决定是否进入 Hermes Agent。</li>
+              <li><strong>回到运行时仍要等下一轮。</strong>通过评测的 Skill 在安全边界刷新，不能在当前会话中途改变稳定提示前缀。</li>
+            </ol>
+
+            <p>
+              做完这些，第一篇与第二篇才真正闭合：运行时从真实任务里发现值得沉淀的经验，离线流程把某个 Skill 当成有版本的 artifact 做实验，
+              人工批准后，新版本再在未来会话生效；新的失败继续成为下一轮评测线索，而不是当场改写自身。
+            </p>
+
+            <h2>九、结论：自进化不是不断重写，而是不断补强证据</h2>
+            <p>
+              回到开头的问题。Agent 把“先运行生成器”写进 Skill，并不等于它已经变好；只有当旧版和新版面对同一套独立任务，新版在正确指标上更稳定，
+              又没有破坏结构、测试和运行边界，这次改写才有资格被称为改进。
+            </p>
+
+            <pre><code class="language-text">运行时负责发现经验；
+评测集负责固定问题；
+轨迹与反馈负责解释失败；
+候选池负责保留多种强项；
+约束与留出集负责阻止自我说服；
+人工审阅负责决定是否交付。</code></pre>
+
+            <p>
+              Hermes Agent 给出了第一只时钟：回答之后，经验怎样进入长期状态。GEPA 给出了第二只时钟的方法：在不训练模型权重的前提下，怎样让提示词候选经历执行、反思和选择。
+              Hermes Agent Self-Evolution 则把两者之间的工程接口摆到了桌面上。它当前最有价值的地方，不是宣告自进化已经完成，而是让我们能沿着源码准确看到下一段路。
+            </p>
+
+            <h2 id="sources">参考源码与论文</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/NousResearch/hermes-agent-self-evolution/tree/0a929e3aa20e15cf04dc7c28492a7d41a5139125">NousResearch/hermes-agent-self-evolution 固定源码快照</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/README.md">项目 README 与阶段状态</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/PLAN.md#L250-L370">Phase 1 目标、数据策略与完成门</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/dataset_builder.py#L20-L169">EvalExample、数据切分与合成生成</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/external_importers.py#L422-L693">会话相关性过滤与外部数据集构建</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/skill_module.py#L84-L115">SkillModule</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/evolve_skill.py#L45-L288">Skill 进化主流程</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/fitness.py#L14-L136">LLM Judge 与实际 fitness metric</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/constraints.py#L25-L166">约束与测试函数</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/generate_report.py#L261-L433">Phase 1 实验配置、结果与安全声明</a></li>
+              <li><a href="https://arxiv.org/abs/2507.19457v2">GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning</a></li>
+              <li><a href="https://arxiv.org/pdf/2507.19457v2">GEPA v2 论文 PDF</a></li>
+              <li><a href="https://github.com/gepa-ai/gepa">GEPA 官方实现</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim());
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const base = slugify(heading.textContent.trim());
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+        toc.appendChild(list);
+        const activate = (id) => {
+          links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === `#${id}`));
+        };
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
