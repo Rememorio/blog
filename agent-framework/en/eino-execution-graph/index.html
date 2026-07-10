@@ -129,6 +129,13 @@
 
           <section class="article-body">
             <p>
+              Start with a Go team whose order, risk, and search services already run in Go. It wants to add an agent
+              that can retrieve data, call tools, stream results, and pause for external input without introducing a
+              separate Python service boundary. Eino's answer is to make those capabilities Go components and composable
+              execution graphs first, then run the agent loop on top of that graph runtime.
+            </p>
+
+            <p>
               Eino's README opens with a direct positioning statement: Eino is an LLM application development framework in Golang, drawing from LangChain, Google ADK, and other open-source frameworks while following Golang conventions. It provides four areas: Components, Agent Development Kit, Composition, and Examples.
               Source:
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/README.md#L15-L23">Eino README overview</a>.
@@ -144,8 +151,10 @@
 
             <div class="note key-point">
               <p>
-                The conclusion: <strong>Eino's central owner is the typed Go execution graph.</strong>
-                It does not begin with a team abstraction or a hosted platform. It first places ChatModel, Tool, Retriever, Prompt, schema, and user lambdas behind <code>Runnable[I, O]</code> and <code>compose.Graph[I, O]</code>. ADK agent behavior is a layer on top of that graph runtime.
+                <strong>Reading contract.</strong>
+                Follow one line: Eino first solves how Go components compose, stream, interrupt, and resume; it then
+                implements ADK Runner, ChatModelAgent, and AgentTool on that foundation. Start with
+                <code>Runnable[I, O]</code> and <code>compose.Graph[I, O]</code>, not with team roles or an isolated ReAct loop.
               </p>
             </div>
 
@@ -185,7 +194,7 @@ ADK layer
               The point is not a nicer model-call wrapper. Eino puts node input / output, streaming data, interrupt points, and resume state into one Go graph runtime. The component, Graph, runner, and ADK sections below all hang off that route.
             </p>
 
-            <h2>One: Components Seal Model, Tool, And Message Shapes</h2>
+            <h2 id="one-components-seal-model-tool-and-message-shapes">1. Components Seal Model, Tool, And Message Shapes</h2>
             <p>
               Eino's component layer is idiomatic Go. <code>BaseModel[M]</code> uses a sealed type constraint: message type <code>M</code> can only be <code>*schema.Message</code> or <code>*schema.AgenticMessage</code>. It exposes <code>Generate</code> and <code>Stream</code>. <code>BaseChatModel</code> is the <code>*schema.Message</code> alias and takes conversation history. The old <code>ChatModel.BindTools</code> path is deprecated because it mutates the instance and can race under concurrency. <code>ToolCallingChatModel.WithTools</code> returns an immutable per-request variant. <code>AgenticModel</code> is the <code>*schema.AgenticMessage</code> alias and receives tools through request options.
               Source:
@@ -223,12 +232,51 @@ ADK layer
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/schema/agentic_message.go#L38-L173"><code>AgenticMessage</code> blocks</a>.
             </p>
 
-            <h2 id="compose-runtime">Two: <code>Runnable</code> Is The Minimal compose Runtime Contract</h2>
+            <h2 id="compose-runtime">2. <code>Runnable</code> Is The Minimal compose Runtime Contract</h2>
             <p>
               Eino's key abstraction is not a graph with one run method. <code>Runnable[I, O]</code> promises four data-flow shapes: <code>Invoke</code> for normal input to normal output, <code>Stream</code> for normal input to streaming output, <code>Collect</code> for streaming input to normal output, and <code>Transform</code> for streaming input to streaming output. The source comment says graph and chain compile into Runnable and that Eino provides downgrade compatibility across these four patterns.
               Source:
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/runnable.go#L28-L37"><code>Runnable</code> interface</a>.
             </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Data flow</th>
+                    <th>Input</th>
+                    <th>Output</th>
+                    <th>Typical component</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>Invoke</code></td>
+                    <td>Value</td>
+                    <td>Value</td>
+                    <td>One-shot classification, formatting, or synchronous tool execution.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Stream</code></td>
+                    <td>Value</td>
+                    <td>Stream</td>
+                    <td>LLM token output or streaming search results.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Collect</code></td>
+                    <td>Stream</td>
+                    <td>Value</td>
+                    <td>Aggregate upstream chunks into one final structure.</td>
+                  </tr>
+                  <tr>
+                    <td><code>Transform</code></td>
+                    <td>Stream</td>
+                    <td>Stream</td>
+                    <td>Rewrite while reading, such as streaming redaction, filtering, or conversion.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
 
             <p>
               This solves a real composition problem. Different components naturally support different stream shapes, so the framework should not force every component to implement all four manually. <code>runnablePacker</code> wraps user-provided invoke / stream / collect / transform functions into a <code>composableRunnable</code> with input, output, and option type checks. Default conversion functions then bridge modes through stream concatenation or single-element streams.
@@ -252,12 +300,42 @@ ADK layer
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/graph.go#L36-L89"><code>graph</code> fields and run types</a>.
             </p>
 
-            <h2>Three: The Execution Loop Joins Channels, Tasks, Checkpoints, And Interrupts</h2>
+            <h2 id="three-the-execution-loop-joins-channels-tasks-checkpoints-and-interrupts">3. The Execution Loop Joins Channels, Tasks, Checkpoints, And Interrupts</h2>
             <p>
-              The compiled runner stores channel subscriptions, successors, data and control predecessors, input channels, eager / DAG flags, graph compile options, stream filters, handler managers, checkpoint pointer, interrupt-before / interrupt-after nodes, and fan-in merge configs. Runtime ownership covers topology, data flow, control flow, state recovery, and observation aspects.
-              Source:
+              Once a Graph is compiled, the runner owns more than edge traversal. It decides where data comes from, which
+              tasks are ready, what a checkpoint must restore, and how an interrupt hands control back to the caller.
+              Those responsibilities are visible in
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/graph_run.go#L43-L84"><code>runner</code> fields</a>.
             </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Runner-owned layer</th>
+                    <th>What it makes explicit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>channels / predecessors / successors</td>
+                    <td>Data and control flow are scheduled by the graph runtime, not improvised through callbacks.</td>
+                  </tr>
+                  <tr>
+                    <td>task manager</td>
+                    <td>The runner computes which nodes are ready and which tasks have completed in each round.</td>
+                  </tr>
+                  <tr>
+                    <td>checkpoint pointer</td>
+                    <td>Recovery can reconstruct channels, graph state, and pending work.</td>
+                  </tr>
+                  <tr>
+                    <td>interruptBefore / interruptAfter</td>
+                    <td>Human approval or external waiting becomes a formal graph pause point.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
 
             <p>
               The first half of <code>runner.run</code> chooses <code>Invoke</code> or <code>Transform</code>, initializes the channel and task managers, resolves max steps, node options, checkpoint id, and subgraph path. It then either restores from checkpoint or starts from START and calculates the first tasks. If those tasks hit an interrupt-before node, execution returns an interrupt immediately.
@@ -288,7 +366,16 @@ ADK layer
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/compose/interrupt.go#L139-L237"><code>CompositeInterrupt</code></a>.
             </p>
 
-            <h2>Four: Callbacks Are Aspects, Not Loose Logging Hooks</h2>
+            <div class="note">
+              <p>
+                <strong>Recovery boundary.</strong>
+                A checkpoint owns the replayable channels, state, and pending inputs. An interrupt identifies the paused
+                address and exposes the waiting condition. The caller later supplies resume data; it does not have to
+                reconstruct the graph's internal state, and the interrupt token alone is not that state.
+              </p>
+            </div>
+
+            <h2 id="four-callbacks-are-aspects-not-loose-logging-hooks">4. Callbacks Are Aspects, Not Loose Logging Hooks</h2>
             <p>
               Eino treats callbacks as a runtime boundary. <code>RunInfo</code> describes the entity that triggered a callback: user-meaningful name, implementation type, and component category. The docs tell handlers to filter by RunInfo rather than assuming any fixed order between different handlers.
               Source:
@@ -301,7 +388,7 @@ ADK layer
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/callbacks/interface.go#L62-L85"><code>Handler</code> contract</a>.
             </p>
 
-            <h2 id="adk-runner">Five: ADK Runner Is The Agent Entry Point, Still Behind flowAgent</h2>
+            <h2 id="adk-runner">5. ADK Runner Is The Agent Entry Point, Still Behind flowAgent</h2>
             <p>
               The README quick start creates a ChatModel, creates <code>adk.NewChatModelAgent</code>, hands it to <code>adk.NewRunner</code>, then reads events from <code>runner.Query</code>. Tools go into <code>ToolsConfig</code> through <code>compose.ToolsNodeConfig</code>. The README says the agent handles the ReAct loop internally.
               Source:
@@ -323,7 +410,7 @@ ADK layer
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/runner.go#L271-L342">runner event handling</a>.
             </p>
 
-            <h2>Six: ChatModelAgent Is An Agent Loop Built On A Graph</h2>
+            <h2 id="six-chatmodelagent-is-an-agent-loop-built-on-a-graph">6. ChatModelAgent Is An Agent Loop Built On A Graph</h2>
             <p>
               <code>ToolsConfig</code> embeds <code>compose.ToolsNodeConfig</code>, then adds ReturnDirectly and EmitInternalEvents. Internal agent-tool events can be forwarded to the parent agent's AsyncGenerator, but they are not recorded in the parent state or checkpoint. Interrupted is the exception, propagated through CompositeInterrupt for cross-agent resume.
               Source:
@@ -362,7 +449,7 @@ ADK layer
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/chatmodel.go#L1366-L1516"><code>ChatModelAgent.Run</code></a>.
             </p>
 
-            <h2>Seven: AgentTool Collapses Multi-Agent Coordination Into A Tool Boundary</h2>
+            <h2 id="seven-agenttool-collapses-multi-agent-coordination-into-a-tool-boundary">7. AgentTool Collapses Multi-Agent Coordination Into A Tool Boundary</h2>
             <p>
               The README describes DeepAgent as a pattern that breaks complex tasks into steps, delegates to sub-agents, and tracks progress. The Composition example also shows a graph wrapped as a tool and handed to an agent. Eino connects multi-agent behavior and deterministic workflow through the same tool and graph surfaces, not through a separate message bus.
               Source:
@@ -383,7 +470,7 @@ ADK layer
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/agent_tool.go#L216-L279">agent tool event loop</a>.
             </p>
 
-            <h2>Eight: Put It Back Beside The Earlier Frameworks</h2>
+            <h2 id="eight-put-it-back-beside-the-earlier-frameworks">8. Put It Back Beside The Earlier Frameworks</h2>
             <div class="table-wrap">
               <table>
                 <thead>
@@ -461,6 +548,7 @@ ADK layer
       </main>
     </div>
 
+    <script src="../../table-labels.js"></script>
     <script>
       (() => {
         const article = document.querySelector(".article-body");
