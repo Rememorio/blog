@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Temporal: When an AI Video Job Must Outlive Its Process</title>
+    <meta
+      name="description"
+      content="Follow one AI video job through Temporal Client, History, Task Queue, Worker, Workflow, and Activity to see what durable execution moves out of process memory."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Temporal: When an AI Video Job Must Outlive Its Process" />
+    <meta
+      property="og:description"
+      content="Trace an AI music-video job through disconnects, worker restarts, replay, retries, heartbeats, and external side-effect boundaries."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/temporal-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/temporal/en/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/temporal/zh/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/temporal/en/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/temporal/" />
+    <link rel="stylesheet" href="../../hermes-agent/styles.css?v=site-nav-series" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Temporal</a>
+        <a href="../../en/#posts">Posts</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../zh/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Source Notes · Durable Execution</p>
+            <h1>Temporal: When an AI Video Job Must Outlive Its Process</h1>
+            <p class="lead">
+              An AI music video may require storyboarding, GPU scheduling, third-party models, retries, composition, and upload.
+              The hard part is not connecting those steps. It is keeping “this generation” the same job after the browser closes and the worker restarts.
+            </p>
+            <div class="meta-line">
+              <span>Source: temporalio/temporal</span>
+              <span>Contrast: trpc-group/trpc-agent-go</span>
+              <span>Topic: durable execution</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/temporal-cover.png"
+                alt="Temporal durable-execution overview where a video job, Workflow ID, and event history survive a disconnected browser and replaceable workers"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              Consider a concrete product request. A user supplies a song and a visual direction. The system writes a treatment, splits it into eight shots,
+              submits those shots to video models or GPU workers, retries failures, normalizes color, adds subtitles, composes the final cut, uploads it, and notifies the user.
+              The path may take twenty minutes, or hours once quotas, queues, and human review enter the picture.
+            </p>
+
+            <p>
+              A backend can certainly start a goroutine after receiving an HTTP request and call that a workflow. But a browser refresh loses the live stream;
+              a pod restart loses in-memory control state; and a retry after the video provider accepted a request but lost the response may create a second paid job.
+              This is not merely missing error handling. <strong>The job has the wrong owner.</strong> It still belongs to a connection and a process instead of a durable execution identity.
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                Temporal platform semantics come from official documentation and the fixed
+                <a href="https://github.com/temporalio/temporal/tree/752e480a9882fee372ba3db28b9aa78d70ec686e">temporalio/temporal source snapshot</a>.
+                The tRPC-Agent-Go comparison uses its
+                <a href="https://github.com/trpc-group/trpc-agent-go/tree/8f8042aa8350b0fb37c93873cef1f343d462dc7a">public source snapshot</a>.
+                Provider-side deduplication, cancellation, and callback internals are outside Temporal's visible boundary, so this article discusses only the integration contract.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Reading contract.</strong>
+                We follow one AI music video across the request connection, Temporal Service, Workflow, Activity, Worker, video provider, and object store.
+                By the end, you should be able to name who owns each state, what replay can recover, and which side effects still require business idempotency.
+              </p>
+            </div>
+
+            <p>Five questions guide the route:</p>
+            <ol>
+              <li>What is actually missing when “the frontend dies but the backend keeps running”?</li>
+              <li>Why does Temporal separate Workflows, Activities, and Workers?</li>
+              <li>How does Event History turn an in-process function into recoverable execution?</li>
+              <li>Why can Temporal still not promise that an external video job runs exactly once?</li>
+              <li>How does it relate to tRPC-Agent-Go, queues, Argo, and cloud state machines?</li>
+            </ol>
+
+            <h2>1. Change the owner first: the job no longer belongs to HTTP</h2>
+            <p>
+              The easiest way to understand Temporal is to start with ownership, not service names. In a request-shaped design, a connection owns a context,
+              the context owns a goroutine, and the goroutine owns the current step and local variables. Detaching cancellation may let that process continue after a browser leaves,
+              but those values still have no owner after the process exits.
+            </p>
+
+            <p>
+              Temporal first creates a <strong>Workflow Execution</strong>. It has a stable Workflow ID and a Run ID for a particular run.
+              Queries, Signals, Updates, cancellation, and recovery address that execution. The official overview calls it a durable, reliable, and scalable function execution:
+              state persists through failures and resumes from its latest recorded point. Durable does not mean that one goroutine lives forever.
+              It means the process may die while the execution identity remains. See the
+              <a href="https://docs.temporal.io/workflow-execution">Workflow Execution overview</a>.
+            </p>
+
+            <figure class="figure">
+              <img src="../assets/ownership-shift.png" alt="Ownership shifts from a short-lived HTTP connection and process memory to a Workflow ID, Event History, and durable state" />
+              <figcaption>The connection starts or observes work; the Workflow Execution is the durable identity.</figcaption>
+            </figure>
+
+            <h3>1.1 Three overloaded uses of “frontend” and “worker”</h3>
+            <p>
+              The browser frontend is the user interface. Temporal's Frontend Service is the cluster API surface. A Temporal Worker is a user-hosted process that runs Workflow and Activity code.
+              That worker is also different from a child agent that an agent framework may call a worker.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Term</th><th>Meaning here</th><th>What it owns</th></tr></thead>
+                <tbody>
+                  <tr><td>Client / UI</td><td>Browser, app, or business API.</td><td>Starts jobs, stores business IDs, and renders state.</td></tr>
+                  <tr><td>Temporal Service</td><td>Frontend, History, Matching, and persistence.</td><td>Execution identity, history, queues, and timers.</td></tr>
+                  <tr><td>Temporal Worker</td><td>A process polling Task Queues and running user code.</td><td>One transient Workflow Task or Activity attempt.</td></tr>
+                  <tr><td>Agent worker</td><td>A delegated role or background agent run.</td><td>Agent semantics, not durable execution by itself.</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>2. How a start request becomes a recoverable workflow</h2>
+            <p>
+              The business API uses an SDK to call <code>StartWorkflowExecution</code> with a Workflow ID, Workflow Type, Task Queue, and input.
+              The repository README is explicit that this repository contains the
+              <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/README.md#L64-L65">Temporal Server</a>;
+              language SDKs implement Workflows, Activities, and Workers. Temporal is a platform plus SDKs, not an imported library that silently takes over arbitrary goroutines.
+            </p>
+
+            <figure class="figure">
+              <img src="../assets/execution-route.png" alt="Temporal execution route from Client through Frontend, History and Persistence, then Matching Task Queue to Worker" />
+              <figcaption>History/Persistence owns authoritative state; a Task Queue only hands the next small unit to a replaceable Worker.</figcaption>
+            </figure>
+
+            <h3>2.1 Frontend creates an execution instead of holding a connection</h3>
+            <p>
+              The service entry point
+              <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/frontend/workflow_handler.go#L532-L565"><code>WorkflowHandler.StartWorkflowExecution</code></a>
+              prepares the request, resolves the namespace, and delegates creation to History Service. Its comment says that the call creates a
+              <code>WorkflowExecutionStarted</code> event and schedules the first Workflow Task. Once Start succeeds, a connected browser is no longer a condition for execution.
+            </p>
+
+            <h3>2.2 History records facts before Workers advance them</h3>
+            <p>
+              History Service maintains mutable state and an append-only Event History for each Workflow Execution.
+              The architecture document states the central design directly: complete workflow state can be rebuilt through replay;
+              Workflow code must be deterministic and side-effect free, while Activity code must be idempotent or explicitly non-retryable.
+              See <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/docs/architecture/README.md#L17-L35"><code>docs/architecture/README.md</code></a>.
+            </p>
+
+            <p>At shape level, the initial durable record contains facts needed to derive the next step, not a Go call stack:</p>
+            <pre><code class="language-json">[
+  { "event": "WorkflowExecutionStarted", "workflowId": "mv-20260710-42" },
+  { "event": "WorkflowTaskScheduled", "taskQueue": "mv-orchestrator" }
+]</code></pre>
+
+            <p>
+              A Worker takes the Workflow Task, replays the Workflow function until it waits on an Activity, Timer, Signal, or Child Workflow,
+              and returns Commands describing what should happen next. Matching's
+              <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/matching/matching_engine.go#L668-L735"><code>PollWorkflowTaskQueue</code></a>
+              shows the polling boundary that connects replaceable Workers to queued work.
+            </p>
+
+            <h2>3. Workflows own control flow; Activities touch the world</h2>
+            <p>
+              Why not call the LLM, video provider, storage service, and notification API directly inside the Workflow function? Recovery depends on replay.
+              The same Workflow code may run many times and must emit the same Commands for the same history. Reading wall-clock time, choosing random values,
+              or making a direct provider call would make that path drift. Temporal SDKs therefore push non-determinism and side effects into Activities.
+            </p>
+
+            <figure class="figure">
+              <img src="../assets/workflow-activity-boundary.png" alt="Deterministic Workflow control on one side and side-effecting Activities for LLM, video provider, GPU, object storage, and notifications on the other" />
+              <figcaption>The Workflow decides when, how many, and what to do after failure; Activities actually call the outside world.</figcaption>
+            </figure>
+
+            <h3>3.1 Boundaries for one music video</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Step</th><th>Suggested boundary</th><th>Reason</th></tr></thead>
+                <tbody>
+                  <tr><td>Write and split the treatment</td><td>LLM Activity returning structured shots.</td><td>The recorded result prevents repeated LLM calls during replay.</td></tr>
+                  <tr><td>Submit each shot</td><td>One Activity or Child Workflow per shot.</td><td>Independent retry, rate limits, cancellation, and visibility.</td></tr>
+                  <tr><td>Wait for generation</td><td>Signal/webhook, async completion, or polling Activity.</td><td>Waiting consumes no dedicated Worker thread.</td></tr>
+                  <tr><td>Compose and upload</td><td>Long Activity writing to object storage.</td><td>History stores URIs and metadata, not video bytes.</td></tr>
+                  <tr><td>Notify the user</td><td>Separate idempotent Activity.</td><td>A composition retry should not resend notifications.</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Temporal's own Activity overview names media transcoding, LLM calls, and large downloads as representative use cases.
+              It recommends splitting larger functionality into smaller Activities for tighter recovery, timeouts, and idempotency.
+              See <a href="https://docs.temporal.io/activities">Temporal Activities</a>.
+            </p>
+
+            <h3>3.2 Waiting is not a sleeping goroutine</h3>
+            <p>
+              After the video provider returns a job ID, a Workflow may wait on a Signal, Timer, or Activity Future. The wait is reconstructible from server state and needs no pinned application thread.
+              A webhook can Signal the Workflow; a user style change or cancellation can alter later control flow through Signals, Updates, or cancellation requests.
+              Their read/write contracts are documented in
+              <a href="https://docs.temporal.io/encyclopedia/workflow-message-passing">Workflow Message Passing</a>.
+            </p>
+
+            <h2>4. Recovery starts after the last recorded fact</h2>
+            <p>
+              Event History does not serialize a Worker stack. It records state transitions accepted by the Service.
+              A new Worker starts the Workflow function from the beginning; the SDK supplies recorded Activity results, Timers, and Signals and checks generated Commands against history.
+              Real forward progress begins only at the first action that has no recorded outcome.
+            </p>
+
+            <figure class="figure">
+              <img src="../assets/replay-recovery.png" alt="Worker A crashes, Worker B replays Event History, skips completed work, and resumes at the first unrecorded action" />
+              <figcaption>Replay reruns Workflow code, not Activities whose completed results are already in history.</figcaption>
+            </figure>
+
+            <h3>4.1 Browser, Workflow Worker, and Activity Worker failures differ</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Failure</th><th>What Temporal observes</th><th>Recovery</th></tr></thead>
+                <tbody>
+                  <tr><td>Browser or SSE disconnect</td><td>No Workflow state change.</td><td>The client later queries or resubscribes by business ID.</td></tr>
+                  <tr><td>Workflow Worker crash</td><td>An incomplete or timed-out Workflow Task.</td><td>Another Worker replays history and emits Commands.</td></tr>
+                  <tr><td>Activity Worker crash</td><td>No completion arrives; a timeout eventually fires.</td><td>The Retry Policy schedules another Activity attempt.</td></tr>
+                  <tr><td>Temporary Service outage</td><td>Committed history remains in persistence.</td><td>Dispatch resumes; actual guarantees depend on cluster and storage deployment.</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              For a long Activity, heartbeats provide liveness, cancellation delivery, and application-level progress checkpoints.
+              A compositor processing 8,000 frames may heartbeat its latest completed chunk so the next attempt can continue after a Worker loss.
+              The official failure guide explains Start-To-Close timeout and heartbeat payload recovery:
+              <a href="https://docs.temporal.io/encyclopedia/detecting-activity-failures">Detecting Activity Failures</a>.
+              The server entry point documents the same liveness/progress split in
+              <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/history/history_engine.go#L630-L641"><code>RecordActivityTaskHeartbeat</code></a>.
+            </p>
+
+            <h2>5. The dangerous gap: the provider succeeded, but the reply vanished</h2>
+            <p>
+              A common misreading is that Temporal makes every step exactly once. Workflow control can produce an effectively-once execution effect through history,
+              but an Activity still crosses an uncertain boundary into an external system.
+            </p>
+
+            <ol>
+              <li><code>submit_scene(scene-03)</code> creates a paid provider job.</li>
+              <li>The Worker or network fails before receiving the job ID.</li>
+              <li>Temporal only knows that the Activity did not complete and retries it.</li>
+              <li>Without a stable external identity, the second request may create another job.</li>
+            </ol>
+
+            <figure class="figure">
+              <img src="../assets/activity-idempotency.png" alt="The provider accepts an Activity request but its response is lost; a retry uses the same idempotency key to recover the same provider job" />
+              <figcaption>Temporal decides reliably whether to try again; the provider contract and business key decide whether the side effect duplicates.</figcaption>
+            </figure>
+
+            <h3>5.1 Bind idempotency to the logical action</h3>
+            <p>
+              A practical design derives a stable key from <code>workflowId + sceneId + operation</code> and asks the provider, or an internal submission ledger, to deduplicate on it.
+              Persist the returned provider job ID as the Activity result and perform later waits and reads against that ID.
+              Without provider idempotency, a local ledger narrows the window but cannot erase the fundamental “remote success before local record” ambiguity on its own.
+            </p>
+
+            <pre><code class="language-json">{
+  "workflow_id": "mv-20260710-42",
+  "scene_id": "scene-03",
+  "operation": "submit-video",
+  "idempotency_key": "mv-20260710-42:scene-03:submit-video"
+}</code></pre>
+
+            <h3>5.2 Cancellation is a cooperation protocol, not remote kill</h3>
+            <p>
+              Workflow cancellation can stop unscheduled work and propagate cancellation to running Activities.
+              An Activity must heartbeat or check its context to receive it promptly; the provider must expose a cancellation API before business code can stop the remote GPU job.
+              “Canceled in Temporal” therefore does not automatically mean “all external compute stopped instantly.”
+            </p>
+
+            <h2>6. tRPC-Agent-Go builds inside a Worker; Temporal owns life outside it</h2>
+            <p>
+              Temporal is not another GraphAgent. tRPC-Agent-Go owns models, tools, subagents, event streams, and graph-node execution.
+              Temporal owns long-running identity, state, timers, retries, messages, and recovery across process boundaries.
+            </p>
+
+            <figure class="figure">
+              <img src="../assets/trpc-temporal-layers.png" alt="Temporal owns durable workflow, queue, and recovery while tRPC-Agent-Go runs agent graph, model, and tools inside replaceable Workers" />
+              <figcaption>A natural composition uses Temporal as durable control plane and tRPC-Agent-Go as the Agent runtime.</figcaption>
+            </figure>
+
+            <h3>6.1 The durable-looking pieces already in tRPC-Agent-Go</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Capability</th><th>What it solves now</th><th>What it does not automatically solve</th></tr></thead>
+                <tbody>
+                  <tr><td><code>WithDetachedCancel</code></td><td>A run can survive parent cancellation inside the current process.</td><td>Process restart and multi-node recovery.</td></tr>
+                  <tr><td>Dynamic Workflow</td><td>Temporary Python orchestration across Agents.</td><td>Its first version is foreground and one-shot, without durable execution state.</td></tr>
+                  <tr><td>Graph checkpoint</td><td>State/frontier persistence, explicit resume, and time travel.</td><td>Dead-owner detection, lease takeover, and Activity semantics.</td></tr>
+                  <tr><td><code>taskrun.Controller</code></td><td>Run ID, status, wait, cancel, and child sessions.</td><td>The bundled controller is in-process; distributed queue and lease belong to the product.</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The source makes these boundaries explicit. Dynamic Workflow calls its first version
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/docs/mkdocs/en/dynamic-workflow.md#L330-L346">foreground and one-shot</a>;
+              taskrun says a multi-node controller needs
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/docs/mkdocs/en/taskrun.md#L7-L23">external storage, queues, leases, and cross-node cancellation</a>;
+              and the bundled FileStore's
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/agent/taskrun/inprocess/store.go#L163-L180"><code>normalizeLoadedRuns</code></a>
+              marks unfinished runs as interrupted by a prior runtime restart instead of resuming them.
+            </p>
+
+            <h3>6.2 Coarse and fine-grained integrations</h3>
+            <p>
+              A coarse integration runs an entire <code>runner.Run</code> as one Activity. It is easy to adopt, but a mid-run Worker crash may repeat the whole invocation,
+              so LLM and tool effects need strong idempotency. A fine-grained integration models LLM calls, tool calls, video submission, and human waits as Activities or Child Workflows.
+              It provides better recovery points and visibility, but turns the Agent loop into a durable state machine and costs much more to build.
+            </p>
+
+            <p>
+              The safer framework boundary is therefore not to rebuild Temporal inside the Agent runtime. Keep a replaceable durable-controller interface:
+              use in-process taskrun for simple deployments and attach Temporal, a cloud state machine, or an internal scheduler when cross-node recovery becomes a product requirement.
+            </p>
+
+            <h2>7. The industry has no single answer; choose by recovery pressure</h2>
+            <p>
+              Temporal is a mature durable-execution platform descended from Uber Cadence, but a long job does not automatically require Temporal.
+              A single idempotent async video API may need only a database job row and queue. Kubernetes GPU DAG pressure may favor Argo Workflows.
+              An AWS-native organization may prefer Step Functions to avoid operating a separate control plane.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Approach</th><th>Best-fit pressure</th><th>Main cost</th></tr></thead>
+                <tbody>
+                  <tr><td>Temporal / Cadence</td><td>Code-first long workflows, Signals/HITL, complex recovery, service orchestration.</td><td>Determinism, Worker versioning, and cluster or Cloud cost.</td></tr>
+                  <tr><td>Restate / DBOS / Inngest</td><td>Lighter service, Postgres, or step-oriented durable execution.</td><td>Different ecosystems, language support, and deployment boundaries.</td></tr>
+                  <tr><td>AWS Step Functions / Azure Durable Functions</td><td>Deep cloud integration and managed operations.</td><td>Cloud coupling, state-machine constraints, and pricing model.</td></tr>
+                  <tr><td>Argo / Airflow / Prefect / Dagster</td><td>GPU, data, media, and ML batch DAGs.</td><td>Interactive messaging and app-level long transactions are not a shared strength.</td></tr>
+                  <tr><td>Queue + DB</td><td>Short flows, little state, and teams willing to own recovery logic.</td><td>Cancellation, timeouts, idempotency, observability, and orphan recovery are yours.</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Useful primary comparisons include
+              <a href="https://docs.restate.dev/">Restate</a>,
+              <a href="https://docs.dbos.dev/">DBOS</a>,
+              <a href="https://www.inngest.com/docs/learn/how-functions-are-executed">Inngest</a>,
+              <a href="https://docs.aws.amazon.com/step-functions/latest/dg/welcome.html">AWS Step Functions</a>, and
+              <a href="https://learn.microsoft.com/en-us/azure/durable-task/durable-functions/durable-functions-overview">Azure Durable Functions</a>.
+              They agree on the pressure—state, checkpoints, retries, recovery—and differ in programming model, deployment surface, and who operates the engine.
+            </p>
+
+            <h2>8. Compress the music video into transferable rules</h2>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>If the state belongs to</th><th>Put it in</th><th>Invariant protected</th></tr></thead>
+                <tbody>
+                  <tr><td>Browser presentation</td><td>Business API, reconnectable event stream, query endpoint.</td><td>A disconnect does not alter execution.</td></tr>
+                  <tr><td>Flow control</td><td>Workflow state and Event History.</td><td>The next step can be rebuilt after process death.</td></tr>
+                  <tr><td>External side effects</td><td>Activity, idempotency key, provider-job ledger.</td><td>Retries do not silently duplicate cost.</td></tr>
+                  <tr><td>Long-step progress</td><td>Heartbeat checkpoint or external progress store.</td><td>Recovery need not start from zero.</td></tr>
+                  <tr><td>Video and audio artifacts</td><td>Object storage, with references in history.</td><td>Workflow history stays small and replayable.</td></tr>
+                  <tr><td>Agent node internals</td><td>tRPC-Agent-Go session, graph, and checkpoint.</td><td>Agent runtime and durable control plane keep separate ownership.</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              “Building a flow inside a Worker” and “letting the flow outlive the Worker” are different jobs.
+              The first decides how models, tools, and subagents run while the process is alive. The second decides who can prove what already happened and what should happen next after that process disappears.
+              Temporal's value is precisely this move: a short-lived control flow becomes an execution identity driven by durable history and recoverable by a new Worker.
+            </p>
+
+            <p>
+              A reliable AI video system is still a composition. A durable orchestrator owns business life; a GPU or Kubernetes platform owns compute;
+              object storage owns large artifacts; an Agent runtime owns reasoning; provider contracts and idempotency ledgers own external effects.
+              Once those owners are explicit, “the frontend died but the backend is still running” becomes a testable engineering contract instead of a vague requirement.
+            </p>
+
+            <h2 id="sources">Sources</h2>
+            <ul>
+              <li><a href="https://github.com/temporalio/temporal/tree/752e480a9882fee372ba3db28b9aa78d70ec686e">temporalio/temporal fixed source snapshot</a></li>
+              <li><a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/docs/architecture/README.md">Temporal Server architecture</a></li>
+              <li><a href="https://docs.temporal.io/workflow-execution">Temporal Workflow Execution</a></li>
+              <li><a href="https://docs.temporal.io/activities">Temporal Activities</a></li>
+              <li><a href="https://docs.temporal.io/encyclopedia/detecting-activity-failures">Activity failure detection and heartbeat</a></li>
+              <li><a href="https://docs.temporal.io/encyclopedia/workflow-message-passing">Signals, Queries, and Updates</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/tree/8f8042aa8350b0fb37c93873cef1f343d462dc7a">trpc-group/trpc-agent-go fixed source snapshot</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim());
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const base = slugify(heading.textContent.trim());
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+        toc.appendChild(list);
+        const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === `#${id}`));
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
