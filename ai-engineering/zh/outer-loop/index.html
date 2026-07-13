@@ -1,0 +1,50 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>AI Engineering（六）：Loop Engineering，把多次运行连成工作系统</title><meta name="description" content="从一次 agent run 走到跨运行控制：触发、选工、租约、验证、checkpoint、幂等、重试预算与人工升级。" /><meta name="theme-color" content="#f5f1e8" /><meta property="og:title" content="Loop Engineering：把多次运行连成工作系统" /><meta property="og:description" content="Outer loop 让 agent run 能被触发、验证、接力和治理。" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/outer-loop-cover.png" /><link rel="canonical" href="https://rememorio.github.io/blog/ai-engineering/zh/outer-loop/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/ai-engineering/zh/outer-loop/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/ai-engineering/en/outer-loop/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/ai-engineering/" /><link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" /><link rel="stylesheet" href="../../assets/series.css?v=1" /></head>
+<body id="top"><header class="site-header"><a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">AI Engineering 系列</a><a href="../agent-loop/">上一篇：Agent Loop</a><a href="../">下一篇：Evals（即将发布）</a><a href="#sources">官方资料</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/outer-loop/" lang="en">English</a></span></nav></header><div class="article-shell"><aside class="toc-panel"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card"><section class="article-hero"><p class="eyebrow">AI Engineering · 第六篇</p><h1>Loop Engineering：把多次运行连成工作系统</h1><p class="lead">单次 agent loop 解决“这一轮怎样推进”；outer loop 解决“工作从哪里来、哪次运行拥有它、结果怎样验证、失败怎样接力、什么时候停止重试”。只有后者，才能把若干聪明的 run 变成可运营的系统。</p><div class="meta-line"><span>主题：Outer loop</span><span>时间尺度：across runs</span><span>依据：官方公开资料</span></div><figure class="hero-image"><img src="../../assets/outer-loop-cover.png" alt="Outer loop 图，围绕内部 agent loop 展示触发、选工、启动、验证、持久化与重试或下一项" /></figure></section><section class="article-body">
+<p>一次 run 可能在十分钟内修好问题，也可能因为窗口、预算、环境重启或人工决策而结束。真正的工作对象却往往活得更久：一个 issue 经过调查、实现、CI、review 和修复；一个告警经历诊断、缓解、复盘；一份报告每天收集新数据。Outer loop 的任务，是让这些长期对象不依赖某个会话的偶然记忆。</p>
+<div class="reading-contract"><h2>阅读契约</h2><ul><li><strong>这篇回答：</strong>怎样跨 run 管理工作、所有权、验证、checkpoint、重试和升级。</li><li><strong>术语说明：</strong>“Loop Engineering” 是本系列给 outer-loop 设计的操作性标签，不宣称它是 OpenAI 或 Anthropic 的统一官方术语。</li><li><strong>读完检查：</strong>你能把 cron + prompt 改写成带 work item、lease、idempotency、verifier 和 terminal state 的系统。</li></ul></div>
+<div class="evidence-note"><h2>证据边界</h2><p>OpenAI 的 Harness engineering 公开了 agent-first 团队如何让 Codex review、迭代到满足检查；2026 年官方 Symphony 规范进一步展示持续观察任务板、为任务启动 agent 的 orchestrator。Anthropic 的 long-running harness 与 Managed agents 说明 checkpoint、session 和跨窗口进展。本篇从这些一手机制抽象 outer loop，不引用社区命名作为定义来源。</p></div>
+
+<h2>一、Outer loop 的对象是 Work Item，不是 Chat</h2>
+<p>Chat 适合交互，work item 才适合运营。它要有稳定 id、目标、完成标准、优先级、依赖、当前 owner、attempt、checkpoint、外部对象引用和终态。Run 只是某次处理 work item 的执行实例。</p>
+<figure class="mechanism-figure"><img src="../../assets/outer-loop-cover.png" alt="Outer loop 包含 trigger、select work、launch run、verify、persist、retry or next，内部有 agent loop" /><figcaption>Inner loop 消耗一个 work item；outer loop 决定何时创建、交给谁、是否接受结果以及下一步。</figcaption></figure>
+<figure class="shape-example"><pre><code>{
+  "work_id": "issue-1842",
+  "state": "running",
+  "goal": "Payment regression fixed and merged",
+  "done_checks": ["ci:required", "review:approved"],
+  "lease": { "run_id": "run-31", "expires_at": "..." },
+  "attempt": 3,
+  "checkpoint_ref": "checkpoint://issue-1842/2",
+  "retry_budget": { "remaining": 2 },
+  "idempotency_key": "issue-1842:fix:v3"
+}</code></pre><figcaption><strong>形状级示例：</strong>Work item 的生命周期独立于某个模型会话；run 通过 lease 暂时拥有处理权。</figcaption></figure>
+
+<h2>二、完整 outer loop 有六个阶段</h2>
+<div class="table-wrap"><table><thead><tr><th>阶段</th><th>控制问题</th><th>必须留下的事实</th></tr></thead><tbody><tr><td>Trigger</td><td>事件、时间、人工还是依赖完成触发？</td><td>触发源、去重键、时间</td></tr><tr><td>Select work</td><td>优先级、依赖、能力和并发是否允许？</td><td>选择理由、lease</td></tr><tr><td>Launch run</td><td>用哪个 harness、模型、权限和 checkpoint？</td><td>run config 与输入版本</td></tr><tr><td>Verify</td><td>结果满足哪些独立 done checks？</td><td>验证证据与失败分类</td></tr><tr><td>Persist</td><td>哪些状态、artifact 和外部变化必须持久化？</td><td>checkpoint、effect ledger</td></tr><tr><td>Retry / next</td><td>重试、换策略、下一个任务或人工升级？</td><td>决策原因与新预算</td></tr></tbody></table></div>
+
+<h2>三、触发和选工需要租约，不只是队列</h2>
+<p>Webhook 可能重复，cron 可能重叠，worker 会崩溃，网络分区会让完成通知丢失。没有 ownership protocol，同一 work item 可能被多个 agent 同时修改，或在 worker 死亡后永久卡住。Lease 提供带过期时间的临时所有权：worker 定期续约，完成或失败后释放，超时可被重新领取。</p>
+<figure class="mechanism-figure"><img src="../../assets/outer-loop-control-plane.png" alt="Outer loop 控制面图，展示去重、队列、租约、运行、验证、重试预算和人工升级" /><figcaption>Queue 管顺序，lease 管所有权，idempotency 管重复副作用；三者不能互相替代。</figcaption></figure>
+<ul><li><strong>Deduplication：</strong>相同外部事件只创建一个 work item。</li><li><strong>Lease：</strong>同一时刻只有一个 run 拥有排他写权；只读调查可另设并行策略。</li><li><strong>Heartbeat：</strong>区分长运行与已死亡 worker。</li><li><strong>Fencing token：</strong>旧 lease 即使迟到，也不能覆盖新 owner 的状态。</li><li><strong>Backpressure：</strong>根据资源、风险和人工审查容量限制启动。</li></ul>
+
+<h2>四、跨 Run 的关键不是摘要，而是 Handoff</h2>
+<p>Anthropic 的 long-running harness 经验强调，让后续 agent 能从明确进展文件、git 状态和干净的任务切片继续。Handoff 必须同时服务机器与人：结构化字段保证恢复，叙述记录决策与异常；原始 artifact 保留证据。</p>
+<figure class="mechanism-figure"><img src="../../assets/cross-run-handoff.png" alt="跨运行交接图，Run N 通过 checkpoint、effect ledger 和 artifacts 把状态交给 Run N+1" /><figcaption>下一次 run 不应该重新猜上次发生了什么，也不应该盲信一段没有证据指针的摘要。</figcaption></figure>
+<div class="table-wrap"><table><thead><tr><th>Handoff 字段</th><th>回答的问题</th><th>恢复检查</th></tr></thead><tbody><tr><td>Goal / done</td><td>要完成什么？</td><td>是否仍有效</td></tr><tr><td>Confirmed facts</td><td>已经知道什么？</td><td>来源是否可访问、新鲜</td></tr><tr><td>Effects</td><td>已经改了什么外部状态？</td><td>与真实世界对账</td></tr><tr><td>Attempts</td><td>哪些路径失败、为什么？</td><td>避免同策略重复</td></tr><tr><td>Open / next</td><td>阻塞点和最小下一步？</td><td>能力与权限是否足够</td></tr><tr><td>Artifacts</td><td>日志、diff、测试和截图在哪里？</td><td>引用是否完整</td></tr></tbody></table></div>
+
+<h2>五、Retry budget 属于 Work Item</h2>
+<p>Inner loop 的一次工具重试与 outer loop 的整次 run 重试不同。后者成本更高，也更容易重复副作用。每次重新启动前要问：失败类别是什么？新 run 会得到什么变化？旧效果是否已对账？还剩多少预算？如果答案只有“再试一次”，就不该自动重试。</p>
+<p>重试预算应随 work item 持久化，不能在 worker 重启后归零。可以按错误类别设置不同策略：基础设施短暂错误自动退避；权限阻塞直接等待审批；同一 invariant 连续失败转人工；高风险外部写在状态不明时先 reconcile，不能重放。</p>
+
+<h2>六、Idempotency 与 Effect Ledger 防止重复世界</h2>
+<p>“创建 PR”“退款”“发通知”都可能出现请求成功但响应丢失。Outer loop 若只看本地超时，会再次执行。每个可重试副作用应携带稳定 idempotency key，并把 proposed、started、committed、observed 状态写入 effect ledger。恢复时先查询外部世界，再决定继续、补偿或完成。</p>
+<ul><li>把“我调用过”与“世界已经改变”分开记录。</li><li>优先使用外部 API 的幂等键；没有时用业务唯一键和对账查询。</li><li>补偿动作也要被建模和审计，不能假设所有效果可回滚。</li><li>未知状态不是失败重试，而是 reconciliation 状态。</li></ul>
+
+<h2>七、人应该接管判断边界，而不是当轮询器</h2>
+<p>OpenAI Harness engineering 的核心约束是人类注意力稀缺。Outer loop 应把人放在高杠杆边界：目标冲突、高风险授权、无法自动判定的质量、预算继续投入。系统要给出压缩但充分的升级包：发生了什么、已验证什么、选项与影响、推荐动作、截止时间。</p>
+
+<h2>八、复盘：Outer Loop 上线前的决策表</h2>
+<div class="table-wrap"><table><thead><tr><th>问题</th><th>最低机制</th><th>没有它会怎样</th></tr></thead><tbody><tr><td>重复事件会创建重复工作吗？</td><td>dedupe key</td><td>并发重复副作用</td></tr><tr><td>谁拥有当前 work item？</td><td>lease + fencing</td><td>双写或永久卡住</td></tr><tr><td>Run 结束后怎样判断完成？</td><td>独立 verifier</td><td>把 final 当结果真值</td></tr><tr><td>下一次 run 从什么继续？</td><td>checkpoint + artifacts</td><td>丢状态、重做调查</td></tr><tr><td>重试会改变什么？</td><td>error class + persistent budget</td><td>无限烧钱</td></tr><tr><td>外部效果状态不明怎么办？</td><td>idempotency + effect ledger</td><td>重复退款、PR 或通知</td></tr><tr><td>什么时候找人？</td><td>escalation policy</td><td>无人负责或人被频繁打断</td></tr></tbody></table></div>
+<p>Outer loop 把 run 变成了可运营的工作系统。但它仍需要一个外部真值来判断“verify”是否可信。最后一篇进入 <strong>Evals 与反馈</strong>：怎样测结果、定位失败层，并把证据变成下一次系统改动。</p>
+<h2 id="sources">官方资料</h2><ul class="source-list"><li><a href="https://openai.com/index/open-source-codex-orchestration-symphony/">OpenAI：An open-source spec for Codex orchestration: Symphony</a></li><li><a href="https://openai.com/index/harness-engineering/">OpenAI：Harness engineering</a></li><li><a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents">Anthropic：Effective harnesses for long-running agents</a></li><li><a href="https://www.anthropic.com/engineering/managed-agents">Anthropic：Managed agents</a></li></ul>
+</section></article></main></div><script src="../../assets/article.js?v=1"></script></body></html>
