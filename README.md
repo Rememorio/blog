@@ -15,6 +15,7 @@ and GitHub Pages.
 | Area | Description | Entry points |
 | --- | --- | --- |
 | Blog home | Language gateway and bilingual home pages. | [Gateway](https://rememorio.github.io/blog/) / [中文](https://rememorio.github.io/blog/zh/) / [English](https://rememorio.github.io/blog/en/) |
+| AI Engineering | Bilingual systems series on prompts, context, harnesses, loops, and evals. | [Gateway](https://rememorio.github.io/blog/ai-engineering/) / [中文](https://rememorio.github.io/blog/ai-engineering/zh/) / [English](https://rememorio.github.io/blog/ai-engineering/en/) |
 | Agent Framework Source Notes | Bilingual source-reading series comparing agent frameworks by runtime ownership, including [agentscope-ai/agentscope](https://github.com/agentscope-ai/agentscope), [earendil-works/pi](https://github.com/earendil-works/pi), [google/adk-python](https://github.com/google/adk-python), [agno-agi/agno](https://github.com/agno-agi/agno), [microsoft/autogen](https://github.com/microsoft/autogen), [crewAIInc/crewAI](https://github.com/crewAIInc/crewAI), [cloudwego/eino](https://github.com/cloudwego/eino), and [trpc-group/trpc-agent-go](https://github.com/trpc-group/trpc-agent-go). | [Gateway](https://rememorio.github.io/blog/agent-framework/) / [中文](https://rememorio.github.io/blog/agent-framework/zh/) / [English](https://rememorio.github.io/blog/agent-framework/en/) |
 | Claude Code Source Notes | Bilingual source-reading series on the public [Rememorio/claude-code](https://github.com/Rememorio/claude-code) mirror. | [Gateway](https://rememorio.github.io/blog/claude-code/) / [中文](https://rememorio.github.io/blog/claude-code/zh/) / [English](https://rememorio.github.io/blog/claude-code/en/) |
 | Codex Source Notes | Bilingual source-reading series on [openai/codex](https://github.com/openai/codex). | [Gateway](https://rememorio.github.io/blog/codex/) / [中文](https://rememorio.github.io/blog/codex/zh/) / [English](https://rememorio.github.io/blog/codex/en/) |
@@ -32,6 +33,11 @@ stay stable as new essays are added.
 ├── index.html                  # Site language gateway
 ├── zh/                         # Chinese blog home
 ├── en/                         # English blog home
+├── ai-engineering/             # AI Engineering systems series
+│   ├── index.html              # Series language gateway
+│   ├── assets/                 # Shared language-neutral figures and styles
+│   ├── zh/                     # Chinese articles
+│   └── en/                     # English articles
 ├── agent-framework/             # Agent framework source-reading series
 │   ├── index.html              # Series language gateway
 │   ├── zh/                     # Chinese articles and figures
