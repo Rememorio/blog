@@ -1,0 +1,66 @@
+<!doctype html><html lang="zh-CN"><head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>AI Engineering（三）：Context 是每次推理的工作集</title>
+  <meta name="description" content="从长期存储到每轮 model view：拆解 context 的选择、装配、预算、检索、压缩、记忆和新鲜度。" /><meta name="theme-color" content="#f5f1e8" />
+  <meta property="og:title" content="Context 是每次推理的工作集" /><meta property="og:description" content="保存过不等于模型看见了；窗口够大也不等于证据够好。" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/context-working-set-cover.png" />
+  <link rel="canonical" href="https://rememorio.github.io/blog/ai-engineering/zh/context-working-set/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/ai-engineering/zh/context-working-set/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/ai-engineering/en/context-working-set/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/ai-engineering/" /><link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" /><link rel="stylesheet" href="../../assets/series.css?v=1" />
+</head><body id="top"><header class="site-header"><a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">AI Engineering 系列</a><a href="../prompt-interface/">上一篇：Prompt</a><a href="../">下一篇：Harness（即将发布）</a><a href="#sources">官方资料</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/context-working-set/" lang="en">English</a></span></nav></header>
+<div class="article-shell"><aside class="toc-panel"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
+  <section class="article-hero"><p class="eyebrow">AI Engineering · 第三篇</p><h1>Context 是每次推理的工作集</h1><p class="lead">系统保存了什么、检索到了什么、这次请求带了什么，是三套不同事实。Context engineering 的核心不是把窗口填满，而是在每一步为下一次 inference 组装最小而充分、最新且可追溯的工作集。</p><div class="meta-line"><span>主题：Context engineering</span><span>视角：model-visible working set</span><span>依据：官方公开资料</span></div><figure class="hero-image"><img src="../../assets/context-working-set-cover.png" alt="Context 工作集图，从长期存储中选择少量材料装入模型工作台" /></figure></section>
+  <section class="article-body">
+    <p>一个长任务里，信息会不断增长：原始目标、对话、读过的文件、搜索结果、工具输出、失败原因、计划、补丁、测试日志。把它们全部保留下来有利于恢复，却不代表每轮都应该全部发送给模型。窗口是有限预算；注意力和相关性同样是预算。</p>
+    <div class="reading-contract"><h2>阅读契约</h2><ul><li><strong>这篇回答：</strong>Context 从哪里来，怎样选择、排序、压缩并验证新鲜度。</li><li><strong>这篇不回答：</strong>把 memory、RAG、聊天历史当作同义词，也不假定“窗口越大越好”。</li><li><strong>读完检查：</strong>你能画出 stored state → selected evidence → model view 的投影，并为每类材料指定生命周期。</li></ul></div>
+    <div class="evidence-note"><h2>证据边界</h2><p>本文以 Anthropic 官方 context engineering 文章、contextual retrieval 说明，以及 OpenAI 官方 conversation state / prompt 指南为公开依据。具体模型的 context window、缓存和截断规则会变化，设计时必须回到目标模型的当前文档。</p></div>
+
+    <h2>一、Context 不是仓库，而是投影</h2>
+    <p>先区分三个集合：<strong>durable store</strong> 保存可能以后有用的事实；<strong>candidate set</strong> 是检索、最近消息和运行时状态提供的候选；<strong>model view</strong> 才是本次请求真正序列化给模型的内容。保存成功只证明第一层存在，不能证明第三层可见。</p>
+    <figure class="mechanism-figure"><img src="../../assets/context-working-set-cover.png" alt="长期存储经过选择关口成为模型可见工作集" /><figcaption>Context 是一次读取视图，不是整个知识库。读取策略和写入策略必须分开。</figcaption></figure>
+    <div class="table-wrap"><table><thead><tr><th>材料</th><th>适合长期保存？</th><th>适合每轮携带？</th><th>主要风险</th></tr></thead><tbody>
+      <tr><td>稳定系统规则</td><td>是</td><td>通常是</td><td>多份副本漂移</td></tr><tr><td>用户目标与 done 条件</td><td>是</td><td>通常是</td><td>压缩时丢失约束</td></tr><tr><td>完整工具日志</td><td>是，便于审计</td><td>否，只带相关片段</td><td>噪声挤占证据</td></tr><tr><td>当前文件内容</td><td>可由仓库保存</td><td>按任务选择</td><td>快照过期</td></tr><tr><td>阶段性计划</td><td>可 checkpoint</td><td>当前阶段需要</td><td>旧计划阻碍新证据</td></tr><tr><td>秘密与敏感数据</td><td>按政策最小化</td><td>默认否</td><td>泄漏和权限扩大</td></tr>
+    </tbody></table></div>
+
+    <h2>二、每次 inference 前都要走装配管线</h2>
+    <p>Anthropic 把 context engineering 概括为在 agent 每一步维护最佳 token 集合。这里的“最佳”不是相似度最高，而是能支持当前决策：相关、足够新、来源可信、与目标一致，并且值得占用预算。</p>
+    <figure class="mechanism-figure"><img src="../../assets/context-assembly-pipeline.png" alt="Context 装配管线，从任务、检索、过滤、排序、预算打包到模型视图" /><figcaption>检索只是候选来源之一。真正决定 model view 的是后面的过滤、排序和预算分配。</figcaption></figure>
+    <h3>2.1 先问“下一步要做什么”</h3>
+    <p>同一个任务在调查、编辑、验证三个阶段需要不同工作集。调查时需要入口文件与错误日志；编辑时需要目标符号、调用方和约束；验证时需要 diff、测试命令和失败输出。用整个任务的宽泛 query 检索，往往会得到“总体相关、当前无用”的材料。</p>
+    <h3>2.2 再按来源和新鲜度过滤</h3>
+    <p>相似度不能判断权威。正式 schema 比旧讨论更可靠，刚执行的测试比三轮前的猜测更新，工作区文件比模型记忆更接近当前事实。每个 context item 最好携带来源、时间/版本、作用域和敏感级别，装配器才能做确定性过滤。</p>
+    <figure class="shape-example"><pre><code>{
+  "item": "payment.go: validateRefund(...) signature",
+  "source": "workspace_file",
+  "version": "git:7ad12f + dirty",
+  "observed_at": "turn:18",
+  "scope": ["refund-fix"],
+  "trust": "local-authoritative",
+  "ttl": "until-file-change"
+}</code></pre><figcaption><strong>形状级示例：</strong>Context item 不只是一段文本，还需要足够的 provenance 来判断它是否仍能使用。</figcaption></figure>
+
+    <h2>三、预算不是统一截断，而是分区分配</h2>
+    <p>简单地“超过 N tokens 就砍前面”会随机伤害关键约束。更稳的策略是先预留输出和工具 schema，再给稳定契约、当前目标、近期 observation、检索证据和历史摘要划预算。预算可以动态变化，但优先级必须显式。</p>
+    <div class="table-wrap"><table><thead><tr><th>分区</th><th>预算原则</th><th>压力下的处理</th></tr></thead><tbody>
+      <tr><td>行为契约</td><td>小而稳定，优先保留</td><td>去重，不随意总结</td></tr><tr><td>目标与完成标准</td><td>每轮可见</td><td>结构化压缩并校验字段</td></tr><tr><td>当前 observation</td><td>离决策越近越优先</td><td>保留错误码、关键行和来源</td></tr><tr><td>历史过程</td><td>只保留仍影响决策的状态</td><td>总结、tombstone 或移出 model view</td></tr><tr><td>候选文档</td><td>按任务阶段打包</td><td>降级、分批读取或再检索</td></tr><tr><td>输出空间</td><td>调用前预留</td><td>不能等输入塞满后再希望模型完成</td></tr>
+    </tbody></table></div>
+
+    <h2>四、压缩要保留不变量，不是追求短</h2>
+    <p>长任务早晚需要 compact。高质量压缩应保留目标、约束、已确认事实、已做变更、未解决问题、下一步和证据指针；可丢弃重复解释、完整低价值日志和已经被新事实推翻的猜测。摘要本身是有损变换，所以必须可追溯到原始记录。</p>
+    <figure class="mechanism-figure"><img src="../../assets/context-lifecycle.png" alt="Context 生命周期图，区分写入长期存储、选择进入模型视图和压缩后的指针" /><figcaption>Write、select、compact 是三种操作。把它们做成一个“memory”按钮，会同时损害恢复和推理。</figcaption></figure>
+    <h3>4.1 用 checkpoint schema 保护关键状态</h3>
+    <ul><li><strong>Goal：</strong>当前任务与完成条件。</li><li><strong>Constraints：</strong>不能丢的产品、安全和用户边界。</li><li><strong>Confirmed：</strong>带来源的已验证事实。</li><li><strong>Changed：</strong>文件、外部对象和副作用记录。</li><li><strong>Open：</strong>未解决问题、失败尝试及原因。</li><li><strong>Next：</strong>下一动作以及为什么。</li></ul>
+    <p>自由文本摘要适合人读，结构化 checkpoint 适合恢复与校验。二者可以同时存在：结构保证不变量，叙述解释因果。</p>
+
+    <h2>五、Memory 与 retrieval 是 context 的上游</h2>
+    <p>Memory 是持久化机制，retrieval 是找候选的机制，context 是本次调用的可见集合。一个事实写进 memory 后，仍需要检索、过滤和预算才能进入 context；一个工具结果即使不写 memory，也可能在当前回合直接进入 context。</p>
+    <p>Anthropic 的 contextual retrieval 展示了一个关键点：孤立 chunk 可能丢失文档语境，为 chunk 补充来源上下文能改善检索。工程上还要继续往后走：检索命中只是候选，运行时仍需检查版本、权限、重复和与当前阶段的关系。</p>
+
+    <h2>六、用 context trace 调试，而不是只看最终答案</h2>
+    <p>当 agent 用错事实，必须能回答：候选里有没有正确事实？它在哪一步被过滤？错误事实为什么排得更高？最终请求带了哪一版？压缩是否改写了含义？因此每次调用最好记录一份不含敏感正文的 context manifest。</p>
+    <ul><li>item id、来源、版本与选择原因；</li><li>进入/淘汰的阶段与分数，不只保留最终列表；</li><li>每个分区的 token 用量和截断事件；</li><li>摘要或压缩产物指向的原始证据；</li><li>敏感材料的脱敏、授权与保留策略。</li></ul>
+
+    <h2>七、复盘：用五个问题做 Context 评审</h2>
+    <div class="table-wrap"><table><thead><tr><th>评审问题</th><th>要防的失败</th><th>首选机制</th></tr></thead><tbody>
+      <tr><td>模型此刻必须知道什么？</td><td>缺关键证据</td><td>按当前决策定义 working set</td></tr><tr><td>每条事实从哪里来、还新鲜吗？</td><td>过期与错误权威</td><td>provenance、版本、TTL</td></tr><tr><td>为什么它值得占窗口？</td><td>噪声和 lost-in-the-middle</td><td>分区预算、排序、去重</td></tr><tr><td>压力下哪些不变量不能丢？</td><td>compact 后目标漂移</td><td>结构化 checkpoint</td></tr><tr><td>下一次运行怎样重新取得它？</td><td>把 session 当 memory</td><td>durable store + 可重放选择策略</td></tr>
+    </tbody></table></div>
+    <p>Context engineering 的结果不是“塞得更多”，而是模型在每个决策点拿到正确的工作集。下一篇转向模型看不见却决定动作能否发生的部分：<strong>runtime harness。</strong></p>
+    <h2 id="sources">官方资料</h2><ul class="source-list"><li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">Anthropic：Effective context engineering for AI agents</a></li><li><a href="https://www.anthropic.com/news/contextual-retrieval">Anthropic：Introducing Contextual Retrieval</a></li><li><a href="https://developers.openai.com/api/docs/guides/conversation-state">OpenAI：Conversation state</a></li><li><a href="https://developers.openai.com/api/docs/guides/prompt-engineering">OpenAI：Prompt engineering</a></li><li><a href="https://openai.com/index/harness-engineering/">OpenAI：Harness engineering</a></li></ul>
+  </section>
+</article></main></div><script src="../../assets/article.js?v=1"></script></body></html>
