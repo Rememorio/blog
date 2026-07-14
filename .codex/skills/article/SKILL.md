@@ -654,13 +654,16 @@ editing the accepted source-language raster through the image workflow, not by
 redesigning the diagram from scratch. The localized figure should look like the
 same composition with different text.
 
-Navigation is part of the bilingual article, not surrounding chrome to patch
-later. After adding or moving any bilingual page, check the top tabs/actions,
-brand/home links, `中文 / English` switch, series index cards, previous/next
-links, root gateway, and blog home entry as one graph. Each Chinese page should
-point to the corresponding English sibling, and each English page should point
-back to the corresponding Chinese sibling. Avoid switches that only point to
-the language root unless the sibling article genuinely does not exist.
+Navigation and browser identity are part of the bilingual article, not
+surrounding chrome to patch later. After adding or moving any bilingual page,
+check the top tabs/actions, brand/home links, shared favicon, `中文 / English`
+switch, series index cards, previous/next links, root gateway, and blog home
+entry as one graph. Every public route in the package should declare the
+project favicon instead of falling back to the browser's generic globe. Each
+Chinese page should point to the corresponding English sibling, and each
+English page should point back to the corresponding Chinese sibling. Avoid
+switches that only point to the language root unless the sibling article
+genuinely does not exist.
 
 ## Terminology And Link Semantics
 
@@ -811,8 +814,8 @@ For any article change:
 5. Check the generated table of contents after heading changes.
 6. For series additions, removals, or reordering, verify that overview pages,
    route-map figures, cover images, alt text, chapter numbers, navigation
-   tabs, home cards, README entries, and language gateways all expose the same
-   sequence.
+   tabs, favicon links, home cards, README entries, and language gateways all
+   expose the same sequence and publication identity.
 7. Verify desktop and mobile widths for overflow, cramped figures, and broken
    code/table scrolling.
 8. Keep the README public index current for new public entry points.
@@ -822,7 +825,8 @@ For language-structure changes, also verify:
 - root gateway page, each language page, and the blog index all link to the
   intended targets;
 - `hreflang`, canonical URLs, page titles, descriptions, Open Graph metadata,
-  and header language switches are present and language-correct;
+  the project favicon, and header language switches are present and
+  language-correct;
 - every article page exposes both language options in the same header style,
   and each switch points to the corresponding sibling page rather than to the
   series root;
