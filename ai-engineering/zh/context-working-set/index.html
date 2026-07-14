@@ -8,9 +8,9 @@
 <div class="article-shell"><aside class="toc-panel"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
   <section class="article-hero"><p class="eyebrow">AI Engineering · 第三篇</p><h1>Context 是每次推理的工作集</h1><p class="lead">系统保存了什么、检索到了什么、这次请求带了什么，是三套不同事实。Context engineering 的核心不是把窗口填满，而是在每一步为下一次 inference 组装最小而充分、最新且可追溯的工作集。</p><div class="meta-line"><span>主题：Context engineering</span><span>视角：model-visible working set</span><span>依据：官方公开资料</span></div><figure class="hero-image"><img src="../assets/context-working-set-cover.png" alt="Context 工作集图，从长期存储中选择少量材料装入模型工作台" /></figure></section>
   <section class="article-body">
-    <p>一个长任务里，信息会不断增长：原始目标、对话、读过的文件、搜索结果、工具输出、失败原因、计划、补丁、测试日志。把它们全部保留下来有利于恢复，却不代表每轮都应该全部发送给模型。窗口是有限预算；注意力和相关性同样是预算。</p>
+    <p>一个长任务里，信息会不断增长：原始目标、对话、读过的文件、搜索结果、工具输出、失败原因、计划、补丁、测试日志。把它们全部保留下来有利于恢复，却不代表每轮都应该全部发送给模型。窗口容量有限；模型注意力和系统容忍噪声的空间同样有限。</p>
     <div class="reading-contract"><h2>阅读契约</h2><ul><li><strong>这篇回答：</strong>Context 从哪里来，怎样选择、排序、压缩并验证新鲜度。</li><li><strong>这篇不回答：</strong>把 memory、RAG、聊天历史当作同义词，也不假定“窗口越大越好”。</li><li><strong>读完检查：</strong>你能画出 stored state → selected evidence → model view 的投影，并为每类材料指定生命周期。</li></ul></div>
-    <div class="evidence-note"><h2>证据边界</h2><p>本文以 Anthropic 官方 context engineering 文章、contextual retrieval 说明，以及 OpenAI 官方 conversation state / prompt 指南为公开依据。具体模型的 context window、缓存和截断规则会变化，设计时必须回到目标模型的当前文档。</p></div>
+    <div class="evidence-note"><h2>证据边界</h2><p>本文以 Anthropic 官方 context engineering 文章、contextual retrieval 说明，以及 OpenAI 官方 conversation state / prompt 指南为公开依据。具体模型的 context window、缓存和截断规则会变化，设计时必须回到目标模型的当前文档。篇末延伸阅读只补充教学视角，不作为模型行为证据。</p></div>
 
     <h2>一、Context 不是仓库，而是投影</h2>
     <p>先区分三个集合：<strong>durable store</strong> 保存可能以后有用的事实；<strong>candidate set</strong> 是检索、最近消息和运行时状态提供的候选；<strong>model view</strong> 才是本次请求真正序列化给模型的内容。保存成功只证明第一层存在，不能证明第三层可见。</p>
@@ -22,6 +22,18 @@
     <h2>二、每次 inference 前都要走装配管线</h2>
     <p>Anthropic 把 context engineering 概括为在 agent 每一步维护最佳 token 集合。这里的“最佳”不是相似度最高，而是能支持当前决策：相关、足够新、来源可信、与目标一致，并且值得占用预算。</p>
     <figure class="mechanism-figure"><img src="../assets/context-assembly-pipeline.png" alt="Context 装配管线，从任务、检索、过滤、排序、预算打包到模型视图" /><figcaption>检索只是候选来源之一。真正决定 model view 的是后面的过滤、排序和预算分配。</figcaption></figure>
+    <p>继续用支付测试任务。验证阶段的候选里同时有目标、旧错误日志、当前 diff、最新测试输出和完整聊天历史。装配器应先淘汰过期日志，再选择当前 diff 与最新测试输出；固定 instruction 和工具 schema 先计入输入成本，随后为输出预留空间，剩余预算才用于候选材料。</p>
+    <figure class="shape-example"><pre><code>def assemble(candidates, phase, window, fixed_input, output_reserve):
+    usable = filter_by_scope_freshness_permission(candidates, phase)
+    ranked = rank_for_current_decision(usable)
+    budget = window - tokens(fixed_input) - output_reserve
+    return pack_without_splitting_evidence(ranked, budget)
+
+verify_candidates = [
+    "goal", "old-error-log", "current-diff",
+    "latest-test-output", "full-chat-history"
+]
+# selected: goal + current-diff + latest-test-output</code></pre><figcaption><strong>装配轨迹：</strong>先决定当前阶段，再做确定性过滤、排序和预算打包；“与整个任务有关”不等于“对下一步有用”。</figcaption></figure>
     <h3>2.1 先问“下一步要做什么”</h3>
     <p>同一个任务在调查、编辑、验证三个阶段需要不同工作集。调查时需要入口文件与错误日志；编辑时需要目标符号、调用方和约束；验证时需要 diff、测试命令和失败输出。用整个任务的宽泛 query 检索，往往会得到“总体相关、当前无用”的材料。</p>
     <h3>2.2 再按来源和新鲜度过滤</h3>
@@ -35,27 +47,38 @@
   "trust": "local-authoritative",
   "ttl": "until-file-change"
 }</code></pre><figcaption><strong>形状级示例：</strong>Context item 不只是一段文本，还需要足够的 provenance 来判断它是否仍能使用。</figcaption></figure>
+    <p><code>until-file-change</code> 不是文本自带的保证。Runtime 必须监听或比较工作区版本，在文件变化后使旧 item 失效；否则 TTL 只是一句无人执行的愿望。</p>
 
     <h2>三、预算不是统一截断，而是分区分配</h2>
-    <p>简单地“超过 N tokens 就砍前面”会随机伤害关键约束。更稳的策略是先预留输出和工具 schema，再给稳定契约、当前目标、近期 observation、检索证据和历史摘要划预算。预算可以动态变化，但优先级必须显式。</p>
+    <p>简单地“超过 N tokens 就砍前面”会随机伤害关键约束。更稳的策略是先扣除 instructions、工具 schema 等固定输入成本，再为输出预留空间，余下预算按分区分配给稳定契约、当前目标、近期 observation、检索证据和历史摘要。预算可以动态变化，但优先级必须显式。</p>
     <div class="table-wrap"><table><thead><tr><th>分区</th><th>预算原则</th><th>压力下的处理</th></tr></thead><tbody>
-      <tr><td>行为契约</td><td>小而稳定，优先保留</td><td>去重，不随意总结</td></tr><tr><td>目标与完成标准</td><td>每轮可见</td><td>结构化压缩并校验字段</td></tr><tr><td>当前 observation</td><td>离决策越近越优先</td><td>保留错误码、关键行和来源</td></tr><tr><td>历史过程</td><td>只保留仍影响决策的状态</td><td>总结、tombstone 或移出 model view</td></tr><tr><td>候选文档</td><td>按任务阶段打包</td><td>降级、分批读取或再检索</td></tr><tr><td>输出空间</td><td>调用前预留</td><td>不能等输入塞满后再希望模型完成</td></tr>
+      <tr><td>行为契约</td><td>小而稳定，优先保留</td><td>去重，不随意总结</td></tr><tr><td>目标与完成标准</td><td>每轮可见</td><td>结构化压缩并校验字段</td></tr><tr><td>当前 observation</td><td>离决策越近越优先</td><td>保留错误码、关键行和来源</td></tr><tr><td>历史过程</td><td>只保留仍影响决策的状态</td><td>总结、写入失效标记（tombstone）或移出 model view</td></tr><tr><td>候选文档</td><td>按任务阶段打包</td><td>降级、分批读取或再检索</td></tr><tr><td>输出空间</td><td>调用前预留</td><td>不能等输入塞满后再希望模型完成</td></tr>
     </tbody></table></div>
 
     <h2>四、压缩要保留不变量，不是追求短</h2>
-    <p>长任务早晚需要 compact。高质量压缩应保留目标、约束、已确认事实、已做变更、未解决问题、下一步和证据指针；可丢弃重复解释、完整低价值日志和已经被新事实推翻的猜测。摘要本身是有损变换，所以必须可追溯到原始记录。</p>
+    <p>长任务早晚需要压缩（compaction）。高质量压缩应保留目标、约束、已确认事实、已做变更、未解决问题、下一步和证据指针；可丢弃重复解释、完整低价值日志和已经被新事实推翻的猜测。摘要本身是有损变换，所以必须可追溯到原始记录。</p>
     <figure class="mechanism-figure"><img src="../assets/context-lifecycle.png" alt="Context 生命周期图，区分写入长期存储、选择进入模型视图和压缩后的指针" /><figcaption>Write、select、compact 是三种操作。把它们做成一个“memory”按钮，会同时损害恢复和推理。</figcaption></figure>
     <h3>4.1 用 checkpoint schema 保护关键状态</h3>
+    <p>下面是一种形状级 schema，不是某个产品的固定字段：</p>
     <ul><li><strong>Goal：</strong>当前任务与完成条件。</li><li><strong>Constraints：</strong>不能丢的产品、安全和用户边界。</li><li><strong>Confirmed：</strong>带来源的已验证事实。</li><li><strong>Changed：</strong>文件、外部对象和副作用记录。</li><li><strong>Open：</strong>未解决问题、失败尝试及原因。</li><li><strong>Next：</strong>下一动作以及为什么。</li></ul>
     <p>自由文本摘要适合人读，结构化 checkpoint 适合恢复与校验。二者可以同时存在：结构保证不变量，叙述解释因果。</p>
+    <figure class="shape-example"><pre><code>{
+  "goal": "Fix refund_should_reject_expired_order",
+  "constraints": ["Keep public APIs stable", "Run payment tests"],
+  "confirmed": [{"fact": "expired-order guard is missing", "ref": "workspace:payment.go"}],
+  "changed": ["payment.go"],
+  "open": ["payment tests have not run"],
+  "next": "run payment tests",
+  "evidence_refs": ["trace:test-run-4", "workspace:payment.go"]
+}</code></pre><figcaption><strong>恢复检查：</strong>下一次 run 先验证文件版本；若引用已失效就重新读取，再执行 <code>next</code>。删除 constraints、open 或 evidence_refs，分别会造成边界丢失、虚假完成或无法追溯。</figcaption></figure>
 
     <h2>五、Memory 与 retrieval 是 context 的上游</h2>
     <p>Memory 是持久化机制，retrieval 是找候选的机制，context 是本次调用的可见集合。一个事实写进 memory 后，仍需要检索、过滤和预算才能进入 context；一个工具结果即使不写 memory，也可能在当前回合直接进入 context。</p>
-    <p>Anthropic 的 contextual retrieval 展示了一个关键点：孤立 chunk 可能丢失文档语境，为 chunk 补充来源上下文能改善检索。工程上还要继续往后走：检索命中只是候选，运行时仍需检查版本、权限、重复和与当前阶段的关系。</p>
+    <p>Anthropic 的 contextual retrieval 展示了一个关键点：孤立的检索切片（chunk）可能丢失文档语境，为 chunk 补充来源上下文能改善检索。工程上还要继续往后走：检索命中只是候选，运行时仍需检查版本、权限、重复和与当前阶段的关系。</p>
 
     <h2>六、用 context trace 调试，而不是只看最终答案</h2>
     <p>当 agent 用错事实，必须能回答：候选里有没有正确事实？它在哪一步被过滤？错误事实为什么排得更高？最终请求带了哪一版？压缩是否改写了含义？因此每次调用最好记录一份不含敏感正文的 context manifest。</p>
-    <ul><li>item id、来源、版本与选择原因；</li><li>进入/淘汰的阶段与分数，不只保留最终列表；</li><li>每个分区的 token 用量和截断事件；</li><li>摘要或压缩产物指向的原始证据；</li><li>敏感材料的脱敏、授权与保留策略。</li></ul>
+    <ul><li>item id、来源、版本与选择原因；</li><li>确定性过滤原因、进入/淘汰阶段与排序分数，不只保留最终列表；</li><li>每个分区的 token 用量和截断事件；</li><li>摘要或压缩产物指向的原始证据；</li><li>敏感材料的脱敏、授权与保留策略。</li></ul>
 
     <h2>七、复盘：用五个问题做 Context 评审</h2>
     <div class="table-wrap"><table><thead><tr><th>评审问题</th><th>要防的失败</th><th>首选机制</th></tr></thead><tbody>
@@ -63,5 +86,6 @@
     </tbody></table></div>
     <p>Context engineering 的结果不是“塞得更多”，而是模型在每个决策点拿到正确的工作集。下一篇转向模型看不见却决定动作能否发生的部分：<strong>runtime harness。</strong></p>
     <h2 id="sources">官方资料</h2><ul class="source-list"><li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">Anthropic：Effective context engineering for AI agents</a></li><li><a href="https://www.anthropic.com/news/contextual-retrieval">Anthropic：Introducing Contextual Retrieval</a></li><li><a href="https://developers.openai.com/api/docs/guides/conversation-state">OpenAI：Conversation state</a></li><li><a href="https://developers.openai.com/api/docs/guides/prompt-engineering">OpenAI：Prompt engineering</a></li><li><a href="https://openai.com/index/harness-engineering/">OpenAI：Harness engineering</a></li></ul>
+    <h2>延伸阅读</h2><ul class="source-list"><li><a href="https://www.runoob.com/ai-agent/agent-context-engineering.html">菜鸟教程：Agent 上下文工程</a></li></ul>
   </section>
 </article></main></div><script src="../../assets/article.js?v=1"></script></body></html>

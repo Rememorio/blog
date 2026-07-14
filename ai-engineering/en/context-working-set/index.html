@@ -8,9 +8,9 @@
 <div class="article-shell"><aside class="toc-panel"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
   <section class="article-hero"><p class="eyebrow">AI Engineering · Part 3</p><h1>Context Is the Working Set for Each Inference</h1><p class="lead">What the system stored, what retrieval found, and what the next request carries are three different facts. Context engineering is not filling the window. It is assembling the smallest sufficient, current, traceable working set for the next inference at every step.</p><div class="meta-line"><span>Topic: Context engineering</span><span>Lens: model-visible working set</span><span>Evidence: official public material</span></div><figure class="hero-image"><img src="../assets/context-working-set-cover.png" alt="Context working-set diagram selecting a small set of material from durable storage for the model desk" /></figure></section>
   <section class="article-body">
-    <p>Information grows throughout a long task: the original goal, conversation, files read, search results, tool output, failed attempts, plans, patches, and test logs. Keeping all of it helps recovery. It does not mean every call should send all of it. The window is a budget; attention and relevance are budgets too.</p>
-    <div class="reading-contract"><h2>Reading contract</h2><ul><li><strong>This part answers:</strong> where context comes from and how to select, rank, compress, and validate it.</li><li><strong>It does not do:</strong> treat memory, RAG, and chat history as synonyms, or assume a larger window is automatically better.</li><li><strong>Exit check:</strong> you should be able to draw stored state → selected evidence → model view and assign a lifecycle to each material class.</li></ul></div>
-    <div class="evidence-note"><h2>Evidence boundary</h2><p>This article relies on Anthropic’s official context-engineering and contextual-retrieval material and OpenAI’s official conversation-state and prompt guidance. Context-window, caching, and truncation rules change; production design must return to the current documentation for the target model.</p></div>
+    <p>Information grows throughout a long task: the original goal, conversation, files read, search results, tool output, failed attempts, plans, patches, and test logs. Keeping all of it helps recovery. It does not mean every call should send all of it. Window space is finite; model attention and the system's tolerance for noise are limited too.</p>
+    <div class="reading-contract"><h2>Reading contract</h2><ul><li><strong>This part answers:</strong> where context comes from and how to select, rank, compress, and validate its freshness.</li><li><strong>It does not do:</strong> treat memory, RAG, and chat history as synonyms, or assume a larger window is automatically better.</li><li><strong>Exit check:</strong> you should be able to draw stored state → selected evidence → model view and assign a lifecycle to each material class.</li></ul></div>
+    <div class="evidence-note"><h2>Evidence boundary</h2><p>This article relies on Anthropic’s official context-engineering and contextual-retrieval material and OpenAI’s official conversation-state and prompt guidance. Context-window, caching, and truncation rules change; production design must return to the current documentation for the target model. Further reading at the end adds teaching perspectives, not evidence about model behavior.</p></div>
 
     <h2>1. Context is a projection, not the repository</h2>
     <p>Separate three sets. A <strong>durable store</strong> retains facts that may matter later. A <strong>candidate set</strong> comes from retrieval, recent messages, and runtime state. The <strong>model view</strong> is what the request actually serializes. A successful write proves the first set contains a fact; it says nothing about the third.</p>
@@ -22,6 +22,18 @@
     <h2>2. Run an assembly pipeline before every inference</h2>
     <p>Anthropic frames context engineering as maintaining the optimal set of tokens for every step of an agent. “Optimal” does not mean highest vector similarity. It means useful for the decision now: relevant, sufficiently fresh, trustworthy, aligned with the goal, and worth the budget.</p>
     <figure class="mechanism-figure"><img src="../assets/context-assembly-pipeline.png" alt="Context assembly pipeline from task and retrieval through filter, rank, budget packing, and model view" /><figcaption>Retrieval is one source of candidates. Filtering, ranking, and budget allocation decide the model view.</figcaption></figure>
+    <p>Keep following the payment-test task. During verification, candidates include the goal, a stale error log, the current diff, the latest test output, and full chat history. The assembler removes the stale log, prioritizes the diff and latest test, accounts for fixed instructions and tool schemas, reserves output space, and only then spends the remaining budget on evidence.</p>
+    <figure class="shape-example"><pre><code>def assemble(candidates, phase, window, fixed_input, output_reserve):
+    usable = filter_by_scope_freshness_permission(candidates, phase)
+    ranked = rank_for_current_decision(usable)
+    budget = window - tokens(fixed_input) - output_reserve
+    return pack_without_splitting_evidence(ranked, budget)
+
+verify_candidates = [
+    "goal", "old-error-log", "current-diff",
+    "latest-test-output", "full-chat-history"
+]
+# selected: goal + current-diff + latest-test-output</code></pre><figcaption><strong>Assembly trace:</strong> choose the phase, apply deterministic gates, rank, and pack. “Related to the task” does not mean “useful for the next decision.”</figcaption></figure>
     <h3>2.1 Start with the next decision</h3>
     <p>Investigation, editing, and verification need different working sets for the same task. Investigation needs entry points and error logs. Editing needs the target symbol, callers, and constraints. Verification needs the diff, test commands, and failure output. A broad task query often returns material that is globally related and locally useless.</p>
     <h3>2.2 Filter by provenance and freshness</h3>
@@ -35,19 +47,30 @@
   "trust": "local-authoritative",
   "ttl": "until-file-change"
 }</code></pre><figcaption><strong>Shape-level example:</strong> a context item needs enough provenance to decide whether its text is still usable.</figcaption></figure>
+    <p><code>until-file-change</code> is not a promise the text can enforce. The runtime must watch or compare workspace versions and invalidate the old item after a file changes; otherwise the TTL is only metadata.</p>
 
     <h2>3. Allocate budgets by zone; do not truncate blindly</h2>
-    <p>“When tokens exceed N, drop the front” damages constraints at random. Reserve output space and tool schemas first, then assign budgets to stable contracts, current goals, recent observations, retrieved evidence, and history summaries. Budgets can adapt, but precedence must be explicit.</p>
+    <p>“When tokens exceed N, drop the front” damages constraints at random. First account for fixed input such as instructions and tool schemas, then reserve output space, and only then assign the remaining budget to stable contracts, current goals, recent observations, retrieved evidence, and history summaries. Budgets can adapt, but precedence must be explicit.</p>
     <div class="table-wrap"><table><thead><tr><th>Zone</th><th>Budget principle</th><th>Under pressure</th></tr></thead><tbody>
-      <tr><td>Behavior contract</td><td>Small, stable, high priority</td><td>Deduplicate; do not casually summarize</td></tr><tr><td>Goal and done criteria</td><td>Visible every turn</td><td>Compress structurally and validate fields</td></tr><tr><td>Current observations</td><td>Closer to the decision ranks higher</td><td>Keep error codes, key lines, provenance</td></tr><tr><td>Process history</td><td>Only state that still affects a decision</td><td>Summarize, tombstone, or remove from model view</td></tr><tr><td>Candidate documents</td><td>Pack for the current phase</td><td>Defer, page, or retrieve again</td></tr><tr><td>Output space</td><td>Reserve before calling</td><td>Do not fill input and hope completion fits</td></tr>
+      <tr><td>Behavior contract</td><td>Small, stable, high priority</td><td>Deduplicate; do not casually summarize</td></tr><tr><td>Goal and done criteria</td><td>Visible every turn</td><td>Compress structurally and validate fields</td></tr><tr><td>Current observations</td><td>Closer to the decision ranks higher</td><td>Keep error codes, key lines, provenance</td></tr><tr><td>Process history</td><td>Only state that still affects a decision</td><td>Summarize, mark invalid with a tombstone, or remove from model view</td></tr><tr><td>Candidate documents</td><td>Pack for the current phase</td><td>Defer, page, or retrieve again</td></tr><tr><td>Output space</td><td>Reserve before calling</td><td>Do not fill input and hope completion fits</td></tr>
     </tbody></table></div>
 
     <h2>4. Compaction preserves invariants; shortness is secondary</h2>
     <p>Long tasks eventually need compaction. A good compact state preserves the goal, constraints, confirmed facts, changes made, unresolved questions, next action, and evidence pointers. It can discard repeated explanations, full low-value logs, and hypotheses superseded by facts. Because summarization is lossy, the compact result must remain traceable to original records.</p>
     <figure class="mechanism-figure"><img src="../assets/context-lifecycle.png" alt="Context lifecycle separating writes to durable storage, selection into the model view, and compact checkpoints" /><figcaption>Write, select, and compact are different operations. One “memory” button cannot optimize all three.</figcaption></figure>
     <h3>4.1 Protect state with a checkpoint schema</h3>
+    <p>The fields below are a shape-level schema, not a product contract:</p>
     <ul><li><strong>Goal:</strong> current task and done criteria.</li><li><strong>Constraints:</strong> product, safety, and user boundaries that cannot disappear.</li><li><strong>Confirmed:</strong> verified facts with provenance.</li><li><strong>Changed:</strong> files, external objects, and recorded effects.</li><li><strong>Open:</strong> unresolved questions and failed attempts with reasons.</li><li><strong>Next:</strong> the next action and why.</li></ul>
     <p>Free-form summaries are readable; structured checkpoints are recoverable and testable. Use both: structure protects invariants, narrative preserves causal explanation.</p>
+    <figure class="shape-example"><pre><code>{
+  "goal": "Fix refund_should_reject_expired_order",
+  "constraints": ["Keep public APIs stable", "Run payment tests"],
+  "confirmed": [{"fact": "expired-order guard is missing", "ref": "workspace:payment.go"}],
+  "changed": ["payment.go"],
+  "open": ["payment tests have not run"],
+  "next": "run payment tests",
+  "evidence_refs": ["trace:test-run-4", "workspace:payment.go"]
+}</code></pre><figcaption><strong>Recovery check:</strong> the next run verifies the file version, rereads invalid references, then executes <code>next</code>. Removing constraints, open work, or evidence references respectively loses boundaries, creates false completion, or breaks traceability.</figcaption></figure>
 
     <h2>5. Memory and retrieval are upstream of context</h2>
     <p>Memory persists. Retrieval finds candidates. Context is the visible set for this call. A fact written to memory still needs retrieval, filtering, and budget to enter context. A tool result may enter the current context without becoming long-term memory.</p>
@@ -55,7 +78,7 @@
 
     <h2>6. Debug the context trace, not only the final answer</h2>
     <p>When an agent uses the wrong fact, we need to ask whether the correct fact was among candidates, where it was filtered out, why the wrong one ranked higher, which version entered the request, and whether compaction changed meaning. Each call therefore needs a context manifest that can omit sensitive bodies while retaining decisions.</p>
-    <ul><li>Item id, provenance, version, and selection reason.</li><li>The stage where each candidate entered or exited, not merely the final list.</li><li>Token use by zone and every truncation event.</li><li>Evidence pointers behind summaries and compact states.</li><li>Redaction, authority, and retention policy for sensitive material.</li></ul>
+    <ul><li>Item id, provenance, version, and selection reason.</li><li>Deterministic filter reasons, entry or exit stage, and ranking score—not merely the final list.</li><li>Token use by zone and every truncation event.</li><li>Evidence pointers behind summaries and compact states.</li><li>Redaction, authority, and retention policy for sensitive material.</li></ul>
 
     <h2>7. Review context with five questions</h2>
     <div class="table-wrap"><table><thead><tr><th>Review question</th><th>Failure prevented</th><th>Primary mechanism</th></tr></thead><tbody>
@@ -63,5 +86,6 @@
     </tbody></table></div>
     <p>The outcome of context engineering is not “more tokens.” It is the right working set at every decision point. Next we move to what the model cannot see but what determines whether an action can occur: <strong>the runtime harness.</strong></p>
     <h2 id="sources">Official sources</h2><ul class="source-list"><li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">Anthropic: Effective context engineering for AI agents</a></li><li><a href="https://www.anthropic.com/news/contextual-retrieval">Anthropic: Introducing Contextual Retrieval</a></li><li><a href="https://developers.openai.com/api/docs/guides/conversation-state">OpenAI: Conversation state</a></li><li><a href="https://developers.openai.com/api/docs/guides/prompt-engineering">OpenAI: Prompt engineering</a></li><li><a href="https://openai.com/index/harness-engineering/">OpenAI: Harness engineering</a></li></ul>
+    <h2>Further reading</h2><ul class="source-list"><li><a href="https://www.runoob.com/ai-agent/agent-context-engineering.html">Runoob (Chinese): Agent Context Engineering</a></li></ul>
   </section>
 </article></main></div><script src="../../assets/article.js?v=1"></script></body></html>

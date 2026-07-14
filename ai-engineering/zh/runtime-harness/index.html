@@ -10,19 +10,38 @@
   <section class="article-body">
     <p>最小 agent demo 往往只有十几行：发消息给模型，若返回 tool call 就执行，再把结果送回去。真实运行时很快会遇到另外几十个问题：参数不合法怎么办？读和写能否并发？命令在哪里跑？谁批准网络访问？输出太大怎样保存？进程中断后从哪恢复？用户如何看到进度？一次动作如何审计？这些都不是模型权重里的能力。</p>
     <div class="reading-contract"><h2>阅读契约</h2><ul><li><strong>这篇回答：</strong>Runtime harness 包含哪些责任，工具调用怎样穿过安全与状态边界。</li><li><strong>这篇不回答：</strong>把所有 agent 工程都塞进 harness，也不混淆 loop 控制流和运行时承载面。</li><li><strong>读完检查：</strong>你能为一个 tool call 画出从提案到 evidence 的完整执行路径，并指出每个失败的归属。</li></ul></div>
-    <div class="evidence-note"><h2>术语边界</h2><p>OpenAI 的 Harness engineering 把 Codex harness 写成核心 agent loop 及其工具和指令环境；Anthropic 的公开材料有时强调 instructions + guardrails，有时把 session、harness、sandbox 拆开。本系列用较窄定义：<strong>harness 是模型之外、单次 run 之内的执行环境与控制面；agent loop 是驱动它反复前进的控制流。</strong></p></div>
+    <div class="evidence-note"><h2>术语边界</h2><p>OpenAI 的 Harness engineering 把 Codex harness 写成核心 agent loop 及其工具和指令环境；Anthropic 的公开材料有时强调 instructions + guardrails，有时把 session、harness、sandbox 拆开。本系列用较窄定义：<strong>harness 是模型之外、单次 run 之内的执行环境与控制面；agent loop 是驱动它反复前进的控制流。</strong>篇末延伸阅读用于补充教学视角，不作为厂商实现证据。</p></div>
 
     <h2>一、Harness 的第一职责是拥有边界</h2>
     <p>模型擅长在不完整信息下提出计划；运行时必须把不确定性关在确定边界里。什么工具对当前角色可见、参数是否符合 schema、哪些目录可写、网络连到哪里、结果如何序列化，都应由代码和策略拥有，而不是由模型临场决定。</p>
     <figure class="mechanism-figure"><img src="../assets/runtime-harness-cover.png" alt="Harness 分层图，围绕模型提供请求装配、工具、权限、沙箱、状态、事件与恢复" /><figcaption>模型是决策组件，不是整个 agent。Harness 让决策能够安全地接触真实世界。</figcaption></figure>
     <div class="table-wrap"><table><thead><tr><th>控制面</th><th>拥有的事实</th><th>不能外包给模型的原因</th></tr></thead><tbody>
-      <tr><td>Request assembler</td><td>模型、instructions、tools、context view、预算</td><td>请求必须可重现、可观测</td></tr><tr><td>Tool registry</td><td>名称、schema、能力、版本、结果类型</td><td>不能让模型发明真实接口</td></tr><tr><td>Policy / permission</td><td>allow、deny、ask、作用域</td><td>安全边界需要确定性</td></tr><tr><td>Sandbox / executor</td><td>文件、进程、网络、资源限制</td><td>提示词不能隔离副作用</td></tr><tr><td>State / transcript</td><td>run 状态、事件、结果引用、checkpoint</td><td>恢复与审计需要持久事实</td></tr><tr><td>Observer / evaluator</td><td>进度、指标、结果证据</td><td>自我报告不能成为唯一真值</td></tr>
+      <tr><td>Request assembler</td><td>模型、instructions、tools、context view、预算</td><td>请求必须可重现、可观测</td></tr><tr><td>Tool registry</td><td>名称、schema、能力、版本、结果类型</td><td>不能让模型发明真实接口</td></tr><tr><td>Policy / permission</td><td>allow、deny、ask、作用域</td><td>安全边界需要确定性</td></tr><tr><td>Sandbox / executor</td><td>文件、进程、网络、资源限制</td><td>提示词不能隔离副作用</td></tr><tr><td>State / transcript</td><td>run 状态、事件、结果引用、checkpoint</td><td>恢复与审计需要持久事实</td></tr><tr><td>Observer / verifier</td><td>进度、指标、执行证据</td><td>自我报告不能成为唯一真值</td></tr>
     </tbody></table></div>
+    <p>Harness 负责记录并暴露 evidence；一次 run 是否继续由 agent loop 决定，跨任务和跨版本的结果质量是否成立则由 evals 判断。Verifier 可以在 harness 内执行测试，却不能因此独占产品真值。</p>
 
     <h2>二、一次 tool call 要穿过七个关口</h2>
     <p>Tool call 是模型输出的一段结构化提案。一个稳健 harness 不会把它直接映射成函数调用，而会把“解释、授权、执行、观察”拆开。</p>
     <figure class="mechanism-figure"><img src="../assets/tool-execution-gates.png" alt="工具执行七关：解析、查找、校验、策略、沙箱、执行、结果归一化" /><figcaption>每个关口都产生明确事件。这样失败才是可路由状态，而不是一段含糊异常文本。</figcaption></figure>
     <ol><li><strong>Parse：</strong>确认 tool call 结构完整，关联到当前请求。</li><li><strong>Resolve：</strong>在当前可见 registry 中找到精确工具版本。</li><li><strong>Validate：</strong>按 schema 检查类型、范围、互斥和必填字段。</li><li><strong>Authorize：</strong>结合角色、资源、动作和环境决定 allow / deny / ask。</li><li><strong>Isolate：</strong>建立文件、进程、网络和凭据边界。</li><li><strong>Execute：</strong>管理超时、取消、并发、重试与幂等键。</li><li><strong>Normalize：</strong>把 stdout、结构结果、错误与 artifact 变成稳定 observation。</li></ol>
+    <figure class="shape-example"><pre><code>async function dispatch(call, run) {
+  const tool = registry.resolve(call.name, run.toolsetVersion)
+  if (!tool) return observe("unknown_tool", call.id)
+
+  const args = tool.schema.parse(call.arguments)
+  const decision = policy.decide(run.actor, tool.capability, args)
+  if (decision === "deny") return observe("denied", call.id)
+  if (decision === "ask") return pauseForApproval(run, call)
+
+  const box = await sandbox.open(tool.limits)
+  events.append("tool.started", { runId: run.id, callId: call.id })
+  try {
+    const raw = await executor.run(tool, args, { sandbox: box })
+    return normalize(raw, artifactStore)
+  } finally {
+    await box.close()
+  }
+}</code></pre><figcaption><strong>最小 dispatch：</strong>它只处理一个 tool proposal，不负责 <code>while</code> 循环。是否再次调用模型，是下一篇 agent loop 的责任。</figcaption></figure>
     <figure class="shape-example"><pre><code>{
   "call_id": "call_42",
   "tool": "run_tests@3",
@@ -33,7 +52,7 @@
 }</code></pre><figcaption><strong>形状级示例：</strong>把决策、执行环境和结果证据绑定在同一 call id 上，才能追踪一条副作用。</figcaption></figure>
 
     <h2>三、工具设计决定模型可学到的动作空间</h2>
-    <p>工具不是越多越好。两个语义重叠的写工具、一个万能 shell 和模糊的自由文本参数，会让动作空间膨胀。模型既要猜工具，又要猜参数，还要从非结构输出里判断成功。Harness engineering 的高杠杆工作之一，是把复杂世界压成少量、正交、可组合的工具。</p>
+    <p>Prompt 篇关心模型看到的工具说明，以及“应该怎么用”；本篇关心 registry、版本、schema validator、权限、dispatcher 和 artifact，以及“实际上能不能执行”。工具不是越多越好：两个语义重叠的写工具、一个万能 shell 和模糊的自由文本参数，会让动作空间膨胀。模型既要猜工具，又要猜参数，还要从非结构输出里判断成功。</p>
     <h3>3.1 一个好工具要同时服务模型与运行时</h3>
     <div class="table-wrap"><table><thead><tr><th>维度</th><th>给模型的界面</th><th>给运行时的界面</th></tr></thead><tbody>
       <tr><td>语义</td><td>何时调用、何时不调用</td><td>能力 id 与版本</td></tr><tr><td>输入</td><td>少量清晰字段</td><td>严格 schema 与规范化</td></tr><tr><td>输出</td><td>足够决定下一步</td><td>typed result、artifact 与错误分类</td></tr><tr><td>副作用</td><td>明确会改变什么</td><td>权限、幂等、补偿和审计</td></tr><tr><td>成本</td><td>何时值得调用</td><td>超时、速率、token 与资源预算</td></tr>
@@ -48,6 +67,9 @@
     <h2>五、Session、state 与 transcript 不能混成聊天记录</h2>
     <p>Anthropic 的 Managed agents 把 session 看作围绕模型、harness 和 sandbox 的有状态环境。工程上至少要区分：UI 对话、模型可见 messages、append-only 事件、外部 artifact、checkpoint 与环境快照。它们生命周期不同，也服务不同恢复路径。</p>
     <p>中断恢复时，最危险的做法是仅把旧聊天重新发给模型。运行时还需要知道哪些工具调用真正执行过、哪些在途、工作区是否改变、审批是否仍有效、外部对象是否已经创建。副作用状态必须从确定性记录恢复，不能让模型根据文本猜。</p>
+    <figure class="shape-example"><pre><code>tool.proposed → tool.validated → policy.allowed → tool.started
+→ runtime.crashed → run.recovered → effect.reconciled
+→ observation.ready</code></pre><figcaption><strong>恢复轨迹：</strong>若 <code>call_42</code> 只有 started 没有 completed，runtime 先查询环境。只读动作可受限重放；带幂等键的写动作先对账；非幂等且状态未知的动作必须进入 blocked 或人工升级，不能直接再执行一次。</figcaption></figure>
 
     <h2>六、可观测性必须跨越模型和工具</h2>
     <p>只有最终文本和总 token 数，无法诊断 harness。需要把一次 run 串成 trace：request assembly、model events、tool proposal、policy decision、sandbox execution、observation、checkpoint 和 exit reason。敏感正文可以脱敏，但控制事件不能消失。</p>
@@ -59,5 +81,6 @@
     </tbody></table></div>
     <p>Harness 把“模型能想到”变成“系统能安全做到”。下一篇进入它内部不断前进的控制流：<strong>Agent loop 怎样让一次运行正确收敛。</strong></p>
     <h2 id="sources">官方资料</h2><ul class="source-list"><li><a href="https://openai.com/index/harness-engineering/">OpenAI：Harness engineering</a></li><li><a href="https://openai.com/index/unrolling-the-codex-agent-loop/">OpenAI：Unrolling the Codex agent loop</a></li><li><a href="https://www.anthropic.com/research/trustworthy-agents">Anthropic：Building and evaluating trustworthy agents</a></li><li><a href="https://www.anthropic.com/engineering/managed-agents">Anthropic：Managed agents</a></li><li><a href="https://www.anthropic.com/engineering/harness-design-long-running-apps">Anthropic：Harness design for long-running applications</a></li></ul>
+    <h2>延伸阅读</h2><ul class="source-list"><li><a href="https://www.runoob.com/ai-agent/harness-engineering.html">菜鸟教程：Harness Engineering</a></li><li><a href="https://martinfowler.com/articles/harness-engineering.html">Martin Fowler：Harness engineering for coding agent users</a></li><li><a href="https://walkinglabs.github.io/learn-harness-engineering/zh/">Learn Harness Engineering</a></li></ul>
   </section>
 </article></main></div><script src="../../assets/article.js?v=1"></script></body></html>
