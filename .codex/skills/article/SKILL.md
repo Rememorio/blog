@@ -54,6 +54,30 @@ Preferred flow:
 7. Surface common misreadings near the mechanism that creates them, then end
    with a comparison table or distilled operational rules.
 
+For a concept-first tutorial aimed at readers without prior vocabulary, teach
+before compressing. Use a classroom arc:
+
+```text
+familiar failure or practical question
+-> one-sentence plain-language definition
+-> one continuous example
+-> introduce the elements one at a time as the example needs them
+-> replay the complete flow
+-> only then add formal boundaries, tables, schemas, code, and edge cases
+-> recap in language the reader can reuse
+```
+
+Do not open by saying that unfamiliar term A is not term B, or that A belongs
+to C, before the reader can explain A through an example. Tables compress
+relationships that have already been taught; they do not introduce a concept.
+JSON, protocol shapes, and state machines make a known mechanism precise; they
+do not replace a plain-language first explanation. In the opening portion,
+keep the term budget small, let one paragraph carry one main idea, and prefer a
+short natural-language task record before a production schema. A fresh reader
+should be able to answer “what is it, why do I need it, what parts does it have,
+and what happens in order?” before the article advances to implementation
+detail.
+
 For source-comparison articles, the default long-form arc is:
 
 ```text

@@ -1,20 +1,31 @@
 <!doctype html><html lang="zh-CN"><head>
-<meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>AI Engineering（五）：Agent Loop，让一次运行正确收敛</title><meta name="description" content="拆解一次 agent run 的推理—工具—观察循环：状态、退出条件、预算、错误恢复、人工介入与完成证据。" /><meta name="theme-color" content="#f5f1e8" />
-<meta property="og:title" content="Agent Loop：让一次运行正确收敛" /><meta property="og:description" content="循环的目标不是多做几轮，而是在证据、风险和预算边界内到达正确退出状态。" /><meta property="og:type" content="article" /><meta property="og:image" content="../assets/agent-loop-cover.png" />
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>AI Engineering（五）：Agent Loop，让 Agent 一步一步把任务做完</title><meta name="description" content="跟着支付测试修复走完多轮行动，理解 Agent Loop 怎样观察、行动、验证、退出和重试。" /><meta name="theme-color" content="#f5f1e8" />
+<meta property="og:title" content="Agent Loop：让 Agent 一步一步把任务做完" /><meta property="og:description" content="想一步、做一步、看结果，再决定继续还是停止。" /><meta property="og:type" content="article" /><meta property="og:image" content="../assets/agent-loop-cover.png" />
 <link rel="canonical" href="https://rememorio.github.io/blog/ai-engineering/zh/agent-loop/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/ai-engineering/zh/agent-loop/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/ai-engineering/en/agent-loop/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/ai-engineering/" /><link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-scroll" /><link rel="stylesheet" href="../../assets/series.css?v=1" />
   <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
 </head><body id="top"><header class="site-header"><a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">AI Engineering 系列</a><a href="../runtime-harness/">上一篇：Harness</a><a href="../outer-loop/">下一篇：Outer Loop</a><a href="#sources">官方资料</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/agent-loop/" lang="en">English</a></span></nav></header>
-<div class="article-shell"><aside class="toc-panel"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card"><section class="article-hero"><p class="eyebrow">AI Engineering · 第五篇</p><h1>Agent Loop：让一次运行正确收敛</h1><p class="lead">Agent loop 不是“模型不结束就继续调用”。它是一个有状态的控制器：每轮装配证据、请求下一次推理、执行受控动作、吸收 observation，再根据完成条件、风险和预算选择继续或退出。</p><div class="meta-line"><span>主题：Agent loop</span><span>范围：one run</span><span>依据：官方公开资料</span></div><figure class="hero-image"><img src="../assets/agent-loop-cover.png" alt="Agent loop 图，展示装配、推理、提案、执行、观察以及继续或完成的出口" /></figure></section><section class="article-body">
-<p>循环让模型有机会用行动获得新事实：读文件、搜索、运行测试、观察错误、修改方案。也正因为它会改变环境，可靠性不能只看最后一句话。一个 loop 要证明三件事：每次迭代都让状态前进；失败不会被无脑重复；退出是由可检查条件触发，而不是由语气触发。</p>
-<div class="reading-contract"><h2>阅读契约</h2><ul><li><strong>这篇回答：</strong>一次 run 内的状态怎样推进，何时继续、结束、阻塞或交给人。</li><li><strong>这篇不回答：</strong>跨任务触发和多次运行编排，那属于下一篇 outer loop。</li><li><strong>读完检查：</strong>你能把 while(true) 改写成显式状态机，并为每条退出边设置证据。</li></ul></div>
-<div class="evidence-note"><h2>证据边界</h2><p>本文以 OpenAI 对 Codex agent loop 的官方拆解、OpenAI agent 实践指南与 Anthropic Building effective agents 为机制依据。不同 SDK 的事件和 API 字段会变化，图中状态名是厂商中立的工程抽象。</p></div>
+<div class="article-shell"><aside class="toc-panel"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card"><section class="article-hero"><p class="eyebrow">AI Engineering · 第五篇</p><h1>Agent Loop：让 Agent 一步一步把任务做完</h1><p class="lead">修复失败测试通常不是“一问一答”：先看日志，再读代码，修改后运行测试，失败了还要继续调整。负责让模型想一步、做一步、看结果、再决定的重复流程，就是 Agent Loop。</p><div class="meta-line"><span>主题：Agent loop</span><span>范围：一次运行</span><span>依据：官方公开资料</span></div><figure class="hero-image"><img src="../assets/agent-loop-cover.png" alt="Agent Loop 让模型提出下一步、Harness 执行动作、结果返回，再决定继续或停止" /></figure></section><section class="article-body">
+<p>模型第一次看到任务时，不可能同时知道失败原因、正确修改和最终测试结果。它需要通过行动获得新信息，而每一条新信息都会改变下一步。</p>
 
-<h2>一、Loop 的不变量：Observation 必须改变下一轮判断</h2>
-<p>OpenAI 的 Codex loop 公开说明展示了核心往返：用户输入进入 prompt，模型 inference 产生文本或 tool call，工具结果回到下一次 inference，assistant message 标志 turn 的终止。真正的工程难点在“回到下一次”之前：运行时要把 observation 归一化、更新状态、重新计算 context，并决定是否还有理由继续。</p>
+<h2>一、跟着支付测试走完四轮</h2>
+<ol><li><strong>第一轮：</strong>模型先读取失败日志，发现错误与过期订单退款有关。</li><li><strong>第二轮：</strong>它读取相关函数和调用方，确认缺少一条过期状态校验。</li><li><strong>第三轮：</strong>它做最小修改并运行支付测试；测试仍然失败，但返回了新的边界条件。</li><li><strong>第四轮：</strong>它根据新错误调整代码，再次运行测试。目标测试和相关回归都通过，系统才允许结束。</li></ol>
+<p>如果没有这个往返，模型只能根据一开始的有限信息猜答案。Loop 的价值不是“多调用几次模型”，而是让每次动作带回新事实，用新事实修正下一步。</p>
+
+<h2>二、Loop 里到底是谁在重复什么</h2>
+<p><strong>Agent Loop 是外层程序反复执行的一段流程：让模型决定下一步，由 Harness 执行动作，把结果交还模型，再判断继续还是停止。</strong>它不是模型在内部无限思考。</p>
+<ul><li><strong>决定下一步：</strong>模型根据目标和当前材料，提出读取、修改、测试或结束。</li><li><strong>执行动作：</strong>Harness 检查并执行工具调用，模型本身不直接启动进程。</li><li><strong>得到观察：</strong>文件内容、测试输出和错误信息成为新的 observation，也就是“动作后看见的结果”。</li><li><strong>继续或停止：</strong>外层程序检查任务是否完成、是否需要等待、是否已经不应继续。</li></ul>
+<p>最小版本只需记住三种大状态：<strong>工作中</strong>、<strong>等待外部信息</strong>、<strong>已经结束</strong>。后文的状态机，只是为了把等待原因和结束原因记录得更精确。</p>
+
+<div class="reading-contract"><p><strong>读完这篇，你应该能回答：</strong>为什么一次回答不够？模型、Harness 和外层控制程序各做什么？怎样判断完成、等待或失败？</p></div>
+<div class="evidence-note"><p><strong>资料说明：</strong>本文依据 OpenAI 对 Codex agent loop 的公开拆解、OpenAI agent 实践指南与 Anthropic 的 Building effective agents。不同 SDK 字段会变化，图中的状态名是厂商中立的教学抽象。</p></div>
+
+<h2>三、每一轮都要改变下一步判断</h2>
+<p>用普通话说，这一轮必须为下一轮带回变化：读文件得到新事实，运行测试得到新错误，修改代码得到新 diff。外层程序先整理这个结果，更新当前进度，再为模型准备下一轮材料。只有当证据、计划、风险或完成判断发生变化时，继续才有意义。</p>
+<p>下面的表只是给刚才的动作加上工程名称：准备材料叫 Assemble，模型判断叫 Infer，执行叫 Execute，整理结果叫 Observe，决定继续或停止叫 Decide。它们不是另一套流程。</p>
 <figure class="mechanism-figure"><img src="../assets/agent-loop-cover.png" alt="Agent loop 状态图，五个循环站点和 continue、final 两个出口" /><figcaption>Observation 不一定改变外部环境，但必须改变证据状态、计划、风险或完成判断；否则下一轮大概率只是更昂贵的重复。</figcaption></figure>
 <div class="table-wrap"><table><thead><tr><th>状态</th><th>输入</th><th>必须产出的新事实</th></tr></thead><tbody><tr><td>Assemble</td><td>目标、当前状态、最近 observation</td><td>下一次 model view 与预算</td></tr><tr><td>Infer</td><td>model view</td><td>受约束的提案或 final candidate</td></tr><tr><td>Execute</td><td>已授权 tool call</td><td>typed result、artifact、环境变化</td></tr><tr><td>Observe</td><td>结果与环境差异</td><td>成功、失败、未知及 provenance</td></tr><tr><td>Decide</td><td>done criteria、风险、预算</td><td>continue 或明确 exit reason</td></tr></tbody></table></div>
 
-<h2>二、把循环写成显式状态机</h2>
+<h2>四、进阶：把三种状态展开成可恢复的状态机</h2>
 <p><code>while (toolCalls.length)</code> 只描述了语法条件，没有描述工程状态。至少要区分 running、waiting approval、waiting user、blocked、completed、failed、cancelled 和 budget exhausted。状态决定谁可以唤醒 run、哪些资源仍有效、outer loop 之后能否重试。</p>
 <figure class="shape-example"><pre><code>{
   "run_id": "run_18",
@@ -37,26 +48,26 @@
         run.state = "blocked"
     checkpoint(run)</code></pre><figcaption><strong>最小控制器：</strong><code>policy.ask</code> 会把 running 变成 waiting_approval；<code>approval_granted</code> 再唤醒 running；只有测试 observation 满足 done check，状态才进入 completed。模型输出 final 本身不会触发完成。</figcaption></figure>
 
-<h2>三、退出不是二元的 done / not done</h2>
+<h2>五、停止不只有“完成”和“没完成”</h2>
 <p>“模型返回了 final”只是一个信号，不是完整的终止协议。运行时要把它解释成多种出口：已验证完成、需要用户输入、权限阻塞、可重试错误、不可重试失败、预算耗尽、人工中止。不同出口需要不同证据和后续所有者。</p>
 <figure class="mechanism-figure"><img src="../assets/loop-exit-gates.png" alt="Agent loop 退出关口图，区分完成、等待、阻塞、预算、失败与取消" /><figcaption>Exit reason 是 outer loop 的输入，也是 UI、审计和恢复路径的公共事实。</figcaption></figure>
 <div class="table-wrap"><table><thead><tr><th>出口</th><th>最低证据</th><th>接下来谁负责</th></tr></thead><tbody><tr><td>Completed</td><td>done check 通过 + artifact/diff</td><td>Evaluator 或交付流程</td></tr><tr><td>Waiting user</td><td>缺失决策、可选项、默认影响</td><td>用户</td></tr><tr><td>Blocked</td><td>所需 capability / permission 与当前范围</td><td>Harness owner / 人工审批</td></tr><tr><td>Retryable failure</td><td>错误分类、attempt、退避条件</td><td>当前 loop 或 outer loop</td></tr><tr><td>Terminal failure</td><td>不可恢复原因、在途副作用已对账、失败 artifact</td><td>Outer loop / evaluator / 人工</td></tr><tr><td>Budget exhausted</td><td>已完成、未完成、checkpoint</td><td>Outer loop / 人工</td></tr><tr><td>Cancelled</td><td>取消源、在途动作、清理状态</td><td>Harness cleanup</td></tr></tbody></table></div>
 
-<h2>四、完成条件必须在行动前定义</h2>
+<h2>六、先写清什么证据才算做完</h2>
 <p>没有 done contract，agent 会用语言流畅度代替完成。修 bug 的 done 可能是目标测试通过、相关回归通过、diff 在范围内且没有未解释副作用；研究任务的 done 可能是覆盖指定来源、每个结论有引用、冲突被标明。完成条件应在 loop 开始前进入状态，在每次 observation 后重新评估。</p>
 <p>模型可以建议“我认为已经完成”，但确定性检查应由 harness 执行；主观质量可以由独立 grader 或人评审。自我反思有价值，却不能既当选手又当唯一裁判。</p>
-<p>责任链要分三层：agent loop 只判断这次 run 是否具备退出证据；outer loop 用独立 verifier 决定 work item 是否进入终态；evals 再在一组任务和多次运行上检验这些 verifier 与控制规则是否真的代表产品真值。</p>
+<p>把三个“检查”放回不同时间尺度就不会混淆：Agent Loop 看到本次测试通过后，判断“这次运行可以退出”；Outer Loop 读取测试、CI 或 review 证据，判断“这张长期任务卡可以结束”；Evals 则把许多任务重复运行，比较“这个系统版本是否稳定变好”。它们依次检查一次 run、一张 work item 和一版系统。</p>
 
-<h2>五、预算是控制变量，不是账单尾注</h2>
+<h2>七、为什么不能让 Loop 无限运行</h2>
 <p>Loop 至少管理时间、model calls、tool calls、token、外部 API、并发与风险预算。仅设最大迭代数会把不同成本的动作视为相同。更好的控制器在每轮前估计下一动作的价值与成本，并为验证预留预算。</p>
 <ul><li>接近上限时缩小搜索范围、减少并行或请求人工选择，而不是突然截断。</li><li>为最终验证保留独立预算，防止“改完了但没钱测试”。</li><li>高风险写动作受独立权限门约束，不能用更多 token 换取授权。</li><li>预算耗尽必须生成 checkpoint 和 exit reason，不能伪装成完成。</li></ul>
 
-<h2>六、Retry 必须带来变化</h2>
+<h2>八、失败后再试，必须改变一个条件</h2>
 <p>重试只有在输入、环境、策略或时间发生变化时才有意义。相同参数、相同错误、相同 context 的连续调用是 loop bug。把错误分成 transient、invalid input、permission、not found、conflict、invariant violation 与 unknown，才能选择正确恢复。</p>
 <figure class="mechanism-figure"><img src="../assets/loop-failure-recovery.png" alt="Agent loop 失败恢复图，按暂时错误、非法输入、权限、冲突和不变量失败选择不同动作" /><figcaption>恢复策略属于错误类别，而不是属于“失败”这个大桶。</figcaption></figure>
 <div class="table-wrap"><table><thead><tr><th>错误类</th><th>合理变化</th><th>不要做</th></tr></thead><tbody><tr><td>Transient</td><td>退避、抖动、有限重试</td><td>立即高速重放</td></tr><tr><td>Invalid input</td><td>重新读取 schema、修参数</td><td>原参数重试</td></tr><tr><td>Permission</td><td>请求明确授权或换只读路径</td><td>绕过 gate</td></tr><tr><td>Conflict / stale</td><td>刷新状态、重新规划</td><td>覆盖新事实</td></tr><tr><td>Invariant failure</td><td>回滚、缩小修改、升级</td><td>继续叠加改动</td></tr><tr><td>Unknown</td><td>保存 artifact、停止或隔离探测</td><td>无限自我解释</td></tr></tbody></table></div>
 
-<h2>七、复盘：一次健康的 Run 长什么样</h2>
+<h2>九、复盘：一次健康的运行长什么样</h2>
 <div class="table-wrap"><table><thead><tr><th>评审点</th><th>健康信号</th><th>危险信号</th></tr></thead><tbody><tr><td>Progress</td><td>每轮有新证据或状态差异</td><td>相同调用与错误重复</td></tr><tr><td>Done</td><td>运行前定义、运行后验证</td><td>依赖 final 语气</td></tr><tr><td>Exit</td><td>机读 reason + checkpoint</td><td>只有成功/失败布尔值</td></tr><tr><td>Budget</td><td>分项、动态、预留验证</td><td>只设 max iterations</td></tr><tr><td>Recovery</td><td>按错误类型改变策略</td><td>任何错误都 retry</td></tr><tr><td>Human</td><td>在决策与 authority 边界介入</td><td>每步审批或永不介入</td></tr></tbody></table></div>
 <p>Agent loop 负责让一次 run 有证据地收敛。下一篇把视角拉长：当任务需要多次 run、定时触发、队列选工和失败接力时，如何设计 <strong>outer loop</strong>。</p>
 <h2 id="sources">官方资料</h2><ul class="source-list"><li><a href="https://openai.com/index/unrolling-the-codex-agent-loop/">OpenAI：Unrolling the Codex agent loop</a></li><li><a href="https://openai.com/business/guides-and-resources/a-practical-guide-to-building-ai-agents/">OpenAI：A practical guide to building agents</a></li><li><a href="https://www.anthropic.com/engineering/building-effective-agents">Anthropic：Building effective agents</a></li><li><a href="https://www.anthropic.com/engineering/managed-agents">Anthropic：Managed agents</a></li></ul>
