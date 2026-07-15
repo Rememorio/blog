@@ -78,11 +78,71 @@
               The path may take twenty minutes, or hours once quotas, queues, and human review enter the picture.
             </p>
 
+            <h2>1. First, watch an ordinary backend lose the music video</h2>
             <p>
-              A backend can certainly start a goroutine after receiving an HTTP request and call that a workflow. But a browser refresh loses the live stream;
-              a pod restart loses in-memory control state; and a retry after the video provider accepted a request but lost the response may create a second paid job.
-              This is not merely missing error handling. <strong>The job has the wrong owner.</strong> It still belongs to a connection and a process instead of a durable execution identity.
+              The most direct implementation starts a goroutine after the business API receives an HTTP request: call the LLM, submit eight shots,
+              poll for results, and compose the final cut. As long as the request and process remain alive, that code can work. The trouble begins halfway through.
             </p>
+
+            <ul>
+              <li>After a browser refresh, the generation may still be running, but the user no longer knows where to find it.</li>
+              <li>After a pod restart, the current shot, retry count, and waiting state disappear with process memory.</li>
+              <li>If the video provider accepted a request but its response vanished, the backend sees only a timeout; submitting again may pay for a duplicate job.</li>
+            </ul>
+
+            <p>
+              These failures look like separate frontend, process, and network problems. They share one gap: <strong>progress exists only inside this request and process</strong>.
+              More error branches can handle failures the function observes; they cannot give state back to a process that no longer exists.
+            </p>
+
+            <h2>2. Temporal in plain language: the job can live without a living process</h2>
+            <p>
+              <strong>One-sentence definition:</strong> Temporal is a workflow platform that records long-running job progress outside the process so a new process can continue it.
+              It does not generate video, and it is not another agent framework. It remembers which job this is, what has finished, what it is waiting for, and what should happen next.
+            </p>
+
+            <p>Start with only four building blocks:</p>
+            <ul>
+              <li><strong>Job card (Workflow Execution):</strong> the durable identity of one concrete job—here, “generate this music video for user 42,” not an abstract code definition.</li>
+              <li><strong>Fact log (Event History):</strong> the job's ordered record of what started, what was scheduled, and which step completed.</li>
+              <li><strong>Flow rules (Workflow):</strong> the decisions about what comes next, such as “compose only after all eight shots finish.” They read history but do not call the outside world directly.</li>
+              <li><strong>Real action (Activity):</strong> a call to the LLM, video provider, object store, or notification API whose result goes back to the job card.</li>
+            </ul>
+
+            <p>
+              Business-hosted <strong>Worker</strong> processes run Workflow and Activity code. A Worker is not a fifth piece of durable state; it is a replaceable executor.
+              A useful memory aid is: <strong>Temporal Service keeps the job card and fact log; a Worker is only a temporary person doing the work.</strong>
+              Durable does not mean that one goroutine lives forever. It means the goroutine may disappear while the job identity and completed facts remain.
+              That is the persistence described by the official <a href="https://docs.temporal.io/workflow-execution">Workflow Execution overview</a>.
+            </p>
+
+            <figure class="figure">
+              <img src="assets/ownership-shift.png" alt="Ownership shifts from a short-lived HTTP connection and process memory to a Workflow ID, Event History, and durable state" />
+              <figcaption>The connection starts or observes work; the Workflow Execution is the durable identity.</figcaption>
+            </figure>
+
+            <h3>2.1 Follow the same music video from start to finish</h3>
+            <ol>
+              <li><strong>Create the job:</strong> the business API starts a Workflow Execution with a stable business ID, then it can return the HTTP response.</li>
+              <li><strong>Record the starting point:</strong> Temporal writes “this music video started” before handing a small decision task to a Worker.</li>
+              <li><strong>Decide the next step:</strong> the Worker runs the Workflow; seeing no treatment yet, the Workflow schedules a “write treatment” Activity.</li>
+              <li><strong>Touch the real world:</strong> another Worker runs the Activity and calls the LLM or video provider; the returned result is recorded in history.</li>
+              <li><strong>Wait and hand off:</strong> shot generation holds no Worker open. When a callback, timer, or poll result arrives, any available Worker can read history and decide what follows.</li>
+              <li><strong>Finish and observe:</strong> composition writes the video to object storage, a notification Activity sends the message, and a reopened browser queries the same execution ID.</li>
+            </ol>
+
+            <p>
+              Those six steps are the main route. Task Queues, replay, Signals, heartbeats, and idempotency keys are protections added when Workers can disappear
+              and external calls can time out.
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>Reading contract.</strong>
+                We keep following this one music video. By the end, you should be able to explain Temporal in your own words, name the four building blocks,
+                replay the job in order, and identify which external side effects still require business idempotency.
+              </p>
+            </div>
 
             <div class="note">
               <p>
@@ -95,46 +155,9 @@
               </p>
             </div>
 
-            <div class="note">
-              <p>
-                <strong>Reading contract.</strong>
-                We follow one AI music video across the request connection, Temporal Service, Workflow, Activity, Worker, video provider, and object store.
-                By the end, you should be able to name who owns each state, what replay can recover, and which side effects still require business idempotency.
-              </p>
-            </div>
-
-            <p>Five questions guide the route:</p>
-            <ol>
-              <li>What is actually missing when “the frontend dies but the backend keeps running”?</li>
-              <li>Why does Temporal separate Workflows, Activities, and Workers?</li>
-              <li>How does Event History turn an in-process function into recoverable execution?</li>
-              <li>Why can Temporal still not promise that an external video job runs exactly once?</li>
-              <li>How does it relate to tRPC-Agent-Go, queues, Argo, and cloud state machines?</li>
-            </ol>
-
-            <h2>1. Change the owner first: the job no longer belongs to HTTP</h2>
+            <h3>2.2 Three overloaded uses of “frontend” and “worker”</h3>
             <p>
-              The easiest way to understand Temporal is to start with ownership, not service names. In a request-shaped design, a connection owns a context,
-              the context owns a goroutine, and the goroutine owns the current step and local variables. Detaching cancellation may let that process continue after a browser leaves,
-              but those values still have no owner after the process exits.
-            </p>
-
-            <p>
-              Temporal first creates a <strong>Workflow Execution</strong>. It has a stable Workflow ID and a Run ID for a particular run.
-              Queries, Signals, Updates, cancellation, and recovery address that execution. The official overview calls it a durable, reliable, and scalable function execution:
-              state persists through failures and resumes from its latest recorded point. Durable does not mean that one goroutine lives forever.
-              It means the process may die while the execution identity remains. See the
-              <a href="https://docs.temporal.io/workflow-execution">Workflow Execution overview</a>.
-            </p>
-
-            <figure class="figure">
-              <img src="assets/ownership-shift.png" alt="Ownership shifts from a short-lived HTTP connection and process memory to a Workflow ID, Event History, and durable state" />
-              <figcaption>The connection starts or observes work; the Workflow Execution is the durable identity.</figcaption>
-            </figure>
-
-            <h3>1.1 Three overloaded uses of “frontend” and “worker”</h3>
-            <p>
-              The browser frontend is the user interface. Temporal's Frontend Service is the cluster API surface. A Temporal Worker is a user-hosted process that runs Workflow and Activity code.
+              With the main route established, the remaining name collision is easier to remove. The browser frontend is the user interface. Temporal's Frontend Service is the cluster API surface. A Temporal Worker is a user-hosted process that runs Workflow and Activity code.
               That worker is also different from a child agent that an agent framework may call a worker.
             </p>
 
@@ -150,9 +173,10 @@
               </table>
             </div>
 
-            <h2>2. How a start request becomes a recoverable workflow</h2>
+            <h2>3. How a start request becomes a recoverable workflow</h2>
             <p>
-              The business API uses an SDK to call <code>StartWorkflowExecution</code> with a Workflow ID, Workflow Type, Task Queue, and input.
+              Now map the first two steps to implementation. A start request answers three ordinary questions: which business job is this, which workflow rules govern it,
+              and which group of Workers can handle it. The SDK expresses those answers as Workflow ID, Workflow Type, Task Queue, and input before calling <code>StartWorkflowExecution</code>.
               The repository README is explicit that this repository contains the
               <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/README.md#L64-L65">Temporal Server</a>;
               language SDKs implement Workflows, Activities, and Workers. Temporal is a platform plus SDKs, not an imported library that silently takes over arbitrary goroutines.
@@ -163,7 +187,7 @@
               <figcaption>History/Persistence owns authoritative state; a Task Queue only hands the next small unit to a replaceable Worker.</figcaption>
             </figure>
 
-            <h3>2.1 Frontend creates an execution instead of holding a connection</h3>
+            <h3>3.1 Frontend creates an execution instead of holding a connection</h3>
             <p>
               The service entry point
               <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/frontend/workflow_handler.go#L532-L565"><code>WorkflowHandler.StartWorkflowExecution</code></a>
@@ -171,7 +195,7 @@
               <code>WorkflowExecutionStarted</code> event and schedules the first Workflow Task. Once Start succeeds, a connected browser is no longer a condition for execution.
             </p>
 
-            <h3>2.2 History records facts before Workers advance them</h3>
+            <h3>3.2 History records facts before Workers advance them</h3>
             <p>
               History Service maintains mutable state and an append-only Event History for each Workflow Execution.
               The architecture document states the central design directly: complete workflow state can be rebuilt through replay;
@@ -192,7 +216,7 @@
               shows the polling boundary that connects replaceable Workers to queued work.
             </p>
 
-            <h2>3. Workflows own control flow; Activities touch the world</h2>
+            <h2>4. Workflows own control flow; Activities touch the world</h2>
             <p>
               Why not call the LLM, video provider, storage service, and notification API directly inside the Workflow function? Recovery depends on replay.
               The same Workflow code may run many times and must emit the same Commands for the same history. Reading wall-clock time, choosing random values,
@@ -204,7 +228,7 @@
               <figcaption>The Workflow decides when, how many, and what to do after failure; Activities actually call the outside world.</figcaption>
             </figure>
 
-            <h3>3.1 Boundaries for one music video</h3>
+            <h3>4.1 Boundaries for one music video</h3>
             <div class="table-wrap">
               <table>
                 <thead><tr><th>Step</th><th>Suggested boundary</th><th>Reason</th></tr></thead>
@@ -224,7 +248,7 @@
               See <a href="https://docs.temporal.io/activities">Temporal Activities</a>.
             </p>
 
-            <h3>3.2 Waiting is not a sleeping goroutine</h3>
+            <h3>4.2 Waiting is not a sleeping goroutine</h3>
             <p>
               After the video provider returns a job ID, a Workflow may wait on a Signal, Timer, or Activity Future. The wait is reconstructible from server state and needs no pinned application thread.
               A webhook can Signal the Workflow; a user style change or cancellation can alter later control flow through Signals, Updates, or cancellation requests.
@@ -232,7 +256,7 @@
               <a href="https://docs.temporal.io/encyclopedia/workflow-message-passing">Workflow Message Passing</a>.
             </p>
 
-            <h2>4. Recovery starts after the last recorded fact</h2>
+            <h2>5. Recovery starts after the last recorded fact</h2>
             <p>
               Event History does not serialize a Worker stack. It records state transitions accepted by the Service.
               A new Worker starts the Workflow function from the beginning; the SDK supplies recorded Activity results, Timers, and Signals and checks generated Commands against history.
@@ -244,7 +268,7 @@
               <figcaption>Replay reruns Workflow code, not Activities whose completed results are already in history.</figcaption>
             </figure>
 
-            <h3>4.1 Browser, Workflow Worker, and Activity Worker failures differ</h3>
+            <h3>5.1 Browser, Workflow Worker, and Activity Worker failures differ</h3>
             <div class="table-wrap">
               <table>
                 <thead><tr><th>Failure</th><th>What Temporal observes</th><th>Recovery</th></tr></thead>
@@ -266,7 +290,7 @@
               <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/history/history_engine.go#L630-L641"><code>RecordActivityTaskHeartbeat</code></a>.
             </p>
 
-            <h2>5. The dangerous gap: the provider succeeded, but the reply vanished</h2>
+            <h2>6. The dangerous gap: the provider succeeded, but the reply vanished</h2>
             <p>
               A common misreading is that Temporal makes every step exactly once. Workflow control can produce an effectively-once execution effect through history,
               but an Activity still crosses an uncertain boundary into an external system.
@@ -284,7 +308,7 @@
               <figcaption>Temporal decides reliably whether to try again; the provider contract and business key decide whether the side effect duplicates.</figcaption>
             </figure>
 
-            <h3>5.1 Bind idempotency to the logical action</h3>
+            <h3>6.1 Bind idempotency to the logical action</h3>
             <p>
               A practical design derives a stable key from <code>workflowId + sceneId + operation</code> and asks the provider, or an internal submission ledger, to deduplicate on it.
               Persist the returned provider job ID as the Activity result and perform later waits and reads against that ID.
@@ -298,14 +322,14 @@
   "idempotency_key": "mv-20260710-42:scene-03:submit-video"
 }</code></pre>
 
-            <h3>5.2 Cancellation is a cooperation protocol, not remote kill</h3>
+            <h3>6.2 Cancellation is a cooperation protocol, not remote kill</h3>
             <p>
               Workflow cancellation can stop unscheduled work and propagate cancellation to running Activities.
               An Activity must heartbeat or check its context to receive it promptly; the provider must expose a cancellation API before business code can stop the remote GPU job.
               “Canceled in Temporal” therefore does not automatically mean “all external compute stopped instantly.”
             </p>
 
-            <h2>6. tRPC-Agent-Go builds inside a Worker; Temporal owns life outside it</h2>
+            <h2>7. tRPC-Agent-Go builds inside a Worker; Temporal owns life outside it</h2>
             <p>
               Temporal is not another GraphAgent. tRPC-Agent-Go owns models, tools, subagents, event streams, and graph-node execution.
               Temporal owns long-running identity, state, timers, retries, messages, and recovery across process boundaries.
@@ -316,7 +340,7 @@
               <figcaption>A natural composition uses Temporal as durable control plane and tRPC-Agent-Go as the Agent runtime.</figcaption>
             </figure>
 
-            <h3>6.1 The durable-looking pieces already in tRPC-Agent-Go</h3>
+            <h3>7.1 The durable-looking pieces already in tRPC-Agent-Go</h3>
             <div class="table-wrap">
               <table>
                 <thead><tr><th>Capability</th><th>What it solves now</th><th>What it does not automatically solve</th></tr></thead>
@@ -339,7 +363,7 @@
               marks unfinished runs as interrupted by a prior runtime restart instead of resuming them.
             </p>
 
-            <h3>6.2 Coarse and fine-grained integrations</h3>
+            <h3>7.2 Coarse and fine-grained integrations</h3>
             <p>
               A coarse integration runs an entire <code>runner.Run</code> as one Activity. It is easy to adopt, but a mid-run Worker crash may repeat the whole invocation,
               so LLM and tool effects need strong idempotency. A fine-grained integration models LLM calls, tool calls, video submission, and human waits as Activities or Child Workflows.
@@ -351,7 +375,7 @@
               use in-process taskrun for simple deployments and attach Temporal, a cloud state machine, or an internal scheduler when cross-node recovery becomes a product requirement.
             </p>
 
-            <h2>7. The industry has no single answer; choose by recovery pressure</h2>
+            <h2>8. The industry has no single answer; choose by recovery pressure</h2>
             <p>
               Temporal is a mature durable-execution platform descended from Uber Cadence, but a long job does not automatically require Temporal.
               A single idempotent async video API may need only a database job row and queue. Kubernetes GPU DAG pressure may favor Argo Workflows.
@@ -381,7 +405,7 @@
               They agree on the pressure—state, checkpoints, retries, recovery—and differ in programming model, deployment surface, and who operates the engine.
             </p>
 
-            <h2>8. Compress the music video into transferable rules</h2>
+            <h2>9. Compress the music video into transferable rules</h2>
             <div class="table-wrap">
               <table>
                 <thead><tr><th>If the state belongs to</th><th>Put it in</th><th>Invariant protected</th></tr></thead>

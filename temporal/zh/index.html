@@ -78,54 +78,42 @@
               整条链路可能跑二十分钟，也可能因为额度、排队和人工确认拖到几小时。
             </p>
 
+            <h2>一、先看一个普通后端会怎样丢掉这支 MV</h2>
             <p>
-              如果后端只是收到 HTTP 请求后启动一个 goroutine，这段代码确实“在跑流程”。但浏览器一刷新，前端便失去进度；
-              pod 一重启，内存里的流程就消失；视频服务已经接单而响应恰好丢失时，简单重试还可能生成两份付费任务。
-              这不是再加几个 <code>if err != nil</code> 能补齐的问题，而是<strong>任务的所有权放错了地方</strong>：
-              它仍然属于某条连接和某个进程，而没有成为一个独立、持久、可恢复的执行实体。
+              最直接的实现，是业务 API 收到 HTTP 请求后启动一个 goroutine：先调 LLM，再提交八个镜头，循环查询结果，最后合成。
+              只要请求和进程都活着，这段代码当然能工作。麻烦发生在它跑到一半的时候。
             </p>
 
-            <div class="note">
-              <p>
-                <strong>证据边界。</strong>
-                Temporal 的平台语义以官方文档和固定源码快照为准；服务内部链路来自
-                <a href="https://github.com/temporalio/temporal/tree/752e480a9882fee372ba3db28b9aa78d70ec686e">temporalio/temporal</a>。
-                对 tRPC-Agent-Go 的判断来自
-                <a href="https://github.com/trpc-group/trpc-agent-go/tree/8f8042aa8350b0fb37c93873cef1f343d462dc7a">公开源码快照</a>。
-                外部视频 provider 怎样去重、取消和回调不属于 Temporal 可见内部，本文只讨论它能约束的集成边界。
-              </p>
-            </div>
+            <ul>
+              <li>浏览器刷新后，生成任务也许还在跑，但用户已经不知道该去哪里找它。</li>
+              <li>pod 重启后，当前镜头、重试次数和等待状态都随进程内存消失。</li>
+              <li>视频服务已经接单、回执却丢失时，后端只看见超时；再次提交可能多付一份钱。</li>
+            </ul>
 
-            <div class="note">
-              <p>
-                <strong>阅读契约。</strong>
-                这篇文章跟随同一支 AI MV，依次追踪请求连接、Temporal Service、Workflow、Activity、Worker、外部视频服务和对象存储。
-                读完后，应当能回答：哪一层拥有流程状态，哪一步可以重放，哪一种副作用仍然必须由业务做幂等。
-              </p>
-            </div>
-
-            <p>全文围绕五个问题展开：</p>
-            <ol>
-              <li>“前端挂了但后端还在跑”究竟缺少哪一层能力？</li>
-              <li>Temporal 为什么要同时有 Workflow、Activity 和 Worker？</li>
-              <li>Event History 怎样把一个进程内函数变成可恢复执行？</li>
-              <li>为什么 Temporal 仍然不能承诺外部视频任务绝不重复？</li>
-              <li>它和 tRPC-Agent-Go、任务队列、Argo、Step Functions 分别是什么关系？</li>
-            </ol>
-
-            <h2>一、先换一个所有者：任务不再属于 HTTP 请求</h2>
             <p>
-              最容易理解 Temporal 的方式，不是先背服务名，而是先看所有权变化。
-              普通请求式设计里，连接持有 context，context 持有 goroutine，goroutine 持有当前步骤和局部变量。
-              用户关闭页面可能触发取消；即使使用 detached context 让它继续，进程退出后这些状态也没有新的主人。
+              这三个故障表面上分别像前端、进程和网络问题，底层却是同一个缺口：<strong>任务进度只存在于这次请求和这个进程里</strong>。
+              多写几个 <code>if err != nil</code> 只能处理函数看得见的错误，不能让一个已经消失的进程继续拥有状态。
             </p>
 
+            <h2>二、先把 Temporal 说成人话：任务活着，不要求进程一直活着</h2>
             <p>
-              Temporal 让客户端先创建一个 <strong>Workflow Execution</strong>。它有稳定的 Workflow ID 和一次运行对应的 Run ID；
-              后续查询、Signal、Update、取消和恢复都围绕这个执行实体发生。官方把它定义为 durable、reliable、scalable 的函数执行：
-              状态面对失败仍然持久，并从最近记录的位置继续。
-              这里的 durable 不是“一个 goroutine 活得很久”，而是“进程可以不活，执行身份仍然活着”。
-              参见 <a href="https://docs.temporal.io/workflow-execution">Workflow Execution 官方概念</a>。
+              <strong>一句话定义：</strong>Temporal 是一套把长任务的进度记录在进程之外，并让新的执行进程能够接着做的工作流平台。
+              它不负责生成视频，也不是另一种 Agent 框架；它负责记住“这是哪一个任务、已经完成什么、正在等什么、下一步该做什么”。
+            </p>
+
+            <p>先只认识四块积木：</p>
+            <ul>
+              <li><strong>任务卡（Workflow Execution）：</strong>某一次具体任务的持久身份。这里就是“为用户 42 生成这支 MV”，而不是一段抽象代码。</li>
+              <li><strong>事实本（Event History）：</strong>这张任务卡的事实记录。开始了什么、调度了什么、哪一步完成了，都按顺序写进去。</li>
+              <li><strong>流程规则（Workflow）：</strong>决定下一步，例如“八个镜头都完成后再合成”。它读历史并作决定，不直接调用外部世界。</li>
+              <li><strong>真实动作（Activity）：</strong>调用 LLM、视频服务、对象存储或通知接口，并把结果交回任务卡。</li>
+            </ul>
+
+            <p>
+              Workflow 和 Activity 代码都由业务部署的 <strong>Worker</strong> 进程运行。Worker 不是第五份持久状态，而是随时可以被替换的执行者。
+              可以把它记成一句更朴素的话：<strong>Temporal Service 保存任务卡和事实本；Worker 只是临时来干活的人。</strong>
+              durable 不是“一个 goroutine 活得很久”，而是“goroutine 可以消失，任务身份和已完成事实仍然存在”。
+              这正是 <a href="https://docs.temporal.io/workflow-execution">Workflow Execution 官方概念</a> 所描述的持久执行。
             </p>
 
             <figure class="figure">
@@ -138,10 +126,44 @@
               </figcaption>
             </figure>
 
-            <h3>1.1 三个容易混淆的“前端”和“worker”</h3>
+            <h3>2.1 跟着同一支 MV 从开始跑到结束</h3>
+            <ol>
+              <li><strong>创建任务：</strong>业务 API 用稳定的业务 ID 创建 Workflow Execution，然后就可以把 HTTP 响应还给前端。</li>
+              <li><strong>记录起点：</strong>Temporal 先写下“这支 MV 已开始”，再把第一小段决策工作交给 Worker。</li>
+              <li><strong>决定下一步：</strong>Worker 运行 Workflow；Workflow 看到还没有脚本，于是安排一个“生成脚本”的 Activity。</li>
+              <li><strong>执行真实动作：</strong>另一个 Worker 运行 Activity，调用 LLM 或视频 provider；结果返回后被写入历史。</li>
+              <li><strong>等待与接力：</strong>镜头生成期间不必占住 Worker。回调、计时器或下一次轮询到来时，任意可用 Worker 都能读取历史并接着判断。</li>
+              <li><strong>完成与查询：</strong>合成结果写入对象存储，通知 Activity 发出消息；浏览器即使重开，也能用同一个业务 ID 查询这次执行。</li>
+            </ol>
+
             <p>
-              在这个话题里，同一个词常常指不同东西。浏览器前端是用户界面；Temporal 源码里的 Frontend Service 是接收 gRPC API 的集群服务；
-              Temporal Worker 是用户部署、负责执行 Workflow 和 Activity 代码的进程。它又不同于 Agent 系统里被称为 worker 的子 Agent。
+              这六步就是全文主干。后面的 Task Queue、replay、Signal、heartbeat 和幂等键，都是在 Worker 会消失、外部调用会超时之后，
+              为这条主干补上的保护机制。
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>阅读契约。</strong>
+                这篇文章始终跟随同一支 AI MV。读完后，应当能用自己的话解释 Temporal 是什么、四块积木分别做什么、
+                一次任务怎样按顺序推进，以及哪一种外部副作用仍然必须由业务做幂等。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                Temporal 的平台语义以官方文档和固定源码快照为准；服务内部链路来自
+                <a href="https://github.com/temporalio/temporal/tree/752e480a9882fee372ba3db28b9aa78d70ec686e">temporalio/temporal</a>。
+                对 tRPC-Agent-Go 的判断来自
+                <a href="https://github.com/trpc-group/trpc-agent-go/tree/8f8042aa8350b0fb37c93873cef1f343d462dc7a">公开源码快照</a>。
+                外部视频 provider 怎样去重、取消和回调不属于 Temporal 可见内部，本文只讨论它能约束的集成边界。
+              </p>
+            </div>
+
+            <h3>2.2 三个容易混淆的“前端”和“worker”</h3>
+            <p>
+              主干清楚以后，再消除名字冲突。浏览器前端是用户界面；Temporal 源码里的 Frontend Service 是接收 gRPC API 的集群服务；
+              Temporal Worker 是运行 Workflow 和 Activity 代码的进程。它又不同于 Agent 系统里被称为 worker 的子 Agent。
             </p>
 
             <div class="table-wrap">
@@ -158,10 +180,11 @@
               </table>
             </div>
 
-            <h2>二、一次创建请求怎样变成可恢复的工作流</h2>
+            <h2>三、一次创建请求怎样变成可恢复的工作流</h2>
             <p>
-              现在让这支 AI MV 真正进入 Temporal。业务 API 使用 SDK 调用 <code>StartWorkflowExecution</code>，携带 Workflow ID、Workflow Type、
-              Task Queue 和输入。Temporal 仓库的 README 也明确指出：这个仓库是
+              现在把刚才的前两步落到实现。创建请求先回答三个普通问题：这是哪个业务任务、它遵循哪套流程规则、哪组 Worker 可以处理它。
+              SDK 分别用 Workflow ID、Workflow Type、Task Queue 和输入表达这些答案，再调用 <code>StartWorkflowExecution</code>。
+              Temporal 仓库的 README 也明确指出：这个仓库是
               <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/README.md#L64-L65">Temporal Server</a>，
               Workflow、Activity 和 Worker 应通过语言 SDK 编写。它不是 import 后便自动接管 goroutine 的普通库。
             </p>
@@ -176,7 +199,7 @@
               </figcaption>
             </figure>
 
-            <h3>2.1 Frontend 接受的是创建执行，不是占住连接</h3>
+            <h3>3.1 Frontend 接受的是创建执行，不是占住连接</h3>
             <p>
               服务入口
               <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/frontend/workflow_handler.go#L532-L565"><code>WorkflowHandler.StartWorkflowExecution</code></a>
@@ -185,7 +208,7 @@
               所以 Start 成功返回后，浏览器继续连着并不是执行成立的条件。
             </p>
 
-            <h3>2.2 History 先落记录，再让 Worker 推进</h3>
+            <h3>3.2 History 先落记录，再让 Worker 推进</h3>
             <p>
               History Service 为每个 Workflow Execution 维护 mutable state 和追加式 Event History。
               仓库的架构说明把核心设计写得很直白：每次执行都有 append-only history，完整状态可通过 replay 重建；
@@ -208,7 +231,7 @@
               展示的正是 worker 轮询和取任务的服务边界。
             </p>
 
-            <h2>三、Workflow 管控制流，Activity 承担真实世界</h2>
+            <h2>四、Workflow 管控制流，Activity 承担真实世界</h2>
             <p>
               为什么不能把“生成镜头、上传文件、发通知”全写在 Workflow 函数里？因为恢复依赖 replay。
               同一段 Workflow 代码可能运行多次，它必须在相同历史下产生相同 Commands；读取当前时间、随机数、直接调用视频 API，都会让重放路径漂移。
@@ -225,7 +248,7 @@
               </figcaption>
             </figure>
 
-            <h3>3.1 一支 MV 的边界应该怎样切</h3>
+            <h3>4.1 一支 MV 的边界应该怎样切</h3>
             <div class="table-wrap">
               <table>
                 <thead>
@@ -247,7 +270,7 @@
               参见 <a href="https://docs.temporal.io/activities">Temporal Activities</a>。
             </p>
 
-            <h3>3.2 等待不是让 goroutine 睡着</h3>
+            <h3>4.2 等待不是让 goroutine 睡着</h3>
             <p>
               视频 provider 返回 job ID 后，Workflow 可以等待 Signal、Timer 或 Activity Future。等待状态已经在服务端可重建，
               没有 worker 时它也不需要占住一个业务线程。外部 webhook 到达后，业务 API 把结果作为 Signal 写入 Workflow；
@@ -256,7 +279,7 @@
               <a href="https://docs.temporal.io/encyclopedia/workflow-message-passing">Workflow Message Passing</a>。
             </p>
 
-            <h2>四、恢复发生在“最后一个已记录事实”之后</h2>
+            <h2>五、恢复发生在“最后一个已记录事实”之后</h2>
             <p>
               Event History 不保存 worker 的堆栈，而是保存已经被服务端接受的状态转换。
               新 worker 取得 Workflow Task 后，从函数开头 replay；SDK 把历史中已有的 Activity 结果、Timer 和 Signal 重新喂给代码，
@@ -273,7 +296,7 @@
               </figcaption>
             </figure>
 
-            <h3>4.1 浏览器断开、Workflow Worker 崩溃、Activity Worker 崩溃并不相同</h3>
+            <h3>5.1 浏览器断开、Workflow Worker 崩溃、Activity Worker 崩溃并不相同</h3>
             <div class="table-wrap">
               <table>
                 <thead>
@@ -297,7 +320,7 @@
               <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/history/history_engine.go#L630-L641"><code>RecordActivityTaskHeartbeat</code></a>。
             </p>
 
-            <h2>五、最危险的缝：外部服务已经成功，回执却丢了</h2>
+            <h2>六、最危险的缝：外部服务已经成功，回执却丢了</h2>
             <p>
               到这里很容易产生一个误读：“用了 Temporal，每一步就 exactly once。”事实不是这样。
               Workflow 控制逻辑能通过 history 获得 effectively-once 的执行效果；Activity 与外部系统之间仍然存在经典的不确定窗口。
@@ -320,7 +343,7 @@
               </figcaption>
             </figure>
 
-            <h3>5.1 幂等键必须和逻辑动作绑定</h3>
+            <h3>6.1 幂等键必须和逻辑动作绑定</h3>
             <p>
               一个实用做法是用 <code>workflowId + sceneId + operation</code> 生成稳定幂等键，并让 provider 或自己的提交表以它去重。
               provider job ID 返回后立即作为 Activity result 持久化；后续等待和查询围绕 job ID 进行。
@@ -334,14 +357,14 @@
   "idempotency_key": "mv-20260710-42:scene-03:submit-video"
 }</code></pre>
 
-            <h3>5.2 取消也是协作协议，不是远程 kill</h3>
+            <h3>6.2 取消也是协作协议，不是远程 kill</h3>
             <p>
               Workflow 收到取消请求后，可以取消还未开始的步骤，并向正在运行的 Activity 传递 cancellation。
               但 Activity 需要 heartbeat 或主动检查 context 才能及时收到；外部 provider 还必须提供 cancel API，业务 Activity 才能真正终止远端 GPU 任务。
               因此“Temporal 中显示 Canceled”与“所有外部算力立刻停止”不能画等号。
             </p>
 
-            <h2>六、tRPC-Agent-Go 在 worker 内搭流程，Temporal 管 worker 外的生命</h2>
+            <h2>七、tRPC-Agent-Go 在 worker 内搭流程，Temporal 管 worker 外的生命</h2>
             <p>
               对 Agent 框架而言，Temporal 不是另一套 GraphAgent。两者回答的问题不同：tRPC-Agent-Go 负责模型、工具、子 Agent、事件流和图节点怎样执行；
               Temporal 负责一次长任务的身份、状态、重试、计时、消息和恢复怎样越过进程边界。
@@ -357,7 +380,7 @@
               </figcaption>
             </figure>
 
-            <h3>6.1 tRPC-Agent-Go 已经有哪些接近的积木</h3>
+            <h3>7.1 tRPC-Agent-Go 已经有哪些接近的积木</h3>
             <div class="table-wrap">
               <table>
                 <thead>
@@ -382,7 +405,7 @@
               会把它标记为被前一次 runtime restart 中断，而不是继续执行。
             </p>
 
-            <h3>6.2 两种接法的取舍</h3>
+            <h3>7.2 两种接法的取舍</h3>
             <p>
               粗粒度接法是把一次完整 <code>runner.Run</code> 作为 Activity。改造小，但 worker 在 Agent 运行中途崩溃时，整个 invocation 可能重试，
               LLM 与工具副作用需要更强幂等。细粒度接法则把 LLM call、tool call、视频提交和人工等待分别变成 Activity 或 Child Workflow；
@@ -394,7 +417,7 @@
               简单部署使用进程内 taskrun；需要跨节点恢复时接 Temporal、云状态机或业务自己的调度平台。
             </p>
 
-            <h2>七、业界没有唯一答案，先按恢复压力选层级</h2>
+            <h2>八、业界没有唯一答案，先按恢复压力选层级</h2>
             <p>
               Temporal 是成熟的 durable execution 平台，源自 Uber Cadence；但“长任务”并不自动意味着必须使用 Temporal。
               如果流程只有一个可幂等的异步视频 API，数据库任务表加消息队列可能已经足够；如果主要压力是 Kubernetes GPU DAG，Argo Workflows 更贴近算力调度；
@@ -426,7 +449,7 @@
               它们共同承认的问题是状态、checkpoint、retry 和 recovery；差别在编程模型、部署面与谁来托管执行引擎。
             </p>
 
-            <h2>八、把这支 AI MV 压缩成几条可迁移规则</h2>
+            <h2>九、把这支 AI MV 压缩成几条可迁移规则</h2>
             <div class="table-wrap">
               <table>
                 <thead>
