@@ -151,10 +151,9 @@
             <p class="eyebrow">Agent 框架源码阅读 · 第九篇</p>
             <h1>tRPC-Agent-Go 把 Go agent 做成服务端 runtime</h1>
             <p class="lead">
-              Eino 那篇讲 Go agent 怎么被收束进可组合执行图。tRPC-Agent-Go 继续往服务端 runtime 走：
-              Runner 管 session 和运行边界，GraphAgent 管确定性流程，tools / skills / codeexecutor / artifact 管副作用，
-              AG-UI、A2A 和 OpenAI-compatible server 管对外协议。后半篇再重点拆 Rememorio 推进最集中的
-              <code>summary</code> 与 <code>memory</code>。
+              一个客服 Agent 从网页接单，查询日志和工单，生成文件，等待用户第二天回来，还要记得此前进度。
+              tRPC-Agent-Go 把这些生产责任组织成一套 Go 服务端 runtime；本文先看完整框架，再重点拆 Rememorio
+              推进最集中的 <code>summary</code> 与 <code>memory</code>。
             </p>
             <div class="meta-line">
               <span>主题：tRPC-Agent-Go</span>
@@ -170,16 +169,51 @@
           </section>
 
           <section class="article-body">
+            <h2>一、先看一个客服 Agent 上线后会遇到什么</h2>
             <p>
-              如果只盯着 <code>memory</code> 和 <code>summary</code>，会误会 tRPC-Agent-Go 只是给 Go agent 加了一组长上下文插件。
-              其实它更像把 agent 产品上线后会遇到的几类 owner 都摆出来：谁负责一次运行，谁负责确定性流程，谁负责工具和代码执行，
-              谁负责文件产物，谁负责前端协议，谁负责长期状态。
+              假设一个企业客服 Agent 要帮用户排查线上错误。它先读取日志，再查询历史工单，必要时运行诊断代码，
+              最后生成一份报告。只调用一次模型并不难，困难的是把这件事连续、可靠地做完。
             </p>
 
             <p>
-              上面的图先画出后半篇重点：长上下文。先想一个真实产品场景：一个企业客服 agent 连续几天帮同一个用户排查问题。
-              第一天它看过日志，第二天它调用过内部工单工具，第三天用户说“还是昨天那个错误”。这时框架既要能服务化运行，
-              也要能把旧会话压短、把长期事实留下来、在需要时召回原始证据。
+              请求可能来自网页，也可能来自另一个 Agent；日志查询和代码执行会产生副作用与文件；确定性排查步骤不能全靠模型临场发挥；
+              服务重启后要继续原任务；第三天用户只说“还是昨天那个错误”，系统还要找回必要背景。tRPC-Agent-Go 的框架边界，
+              就是把这些“模型之外”的生产责任接进同一条运行主线。
+            </p>
+
+            <h2>二、先认识一次运行里的六个基本角色</h2>
+            <p>
+              先不看包名，把一次请求想成客服中心接单。最小运行只需要认识六个角色：
+            </p>
+            <ul>
+              <li><strong>Runner</strong> 是接单台：找到用户和会话，准备这一轮所需的服务，再启动 Agent。</li>
+              <li><strong>Agent</strong> 是处理者：读取输入，决定回答、调用工具，或把工作交给子 Agent 与执行图。</li>
+              <li><strong>Event</strong> 是过程记录：模型输出、工具调用、工具结果和状态变化都通过事件向外报告。</li>
+              <li><strong>Session</strong> 是当前工单夹：把同一次会话里的消息与事件按顺序保存，下一轮可以继续。</li>
+              <li><strong>Tool</strong> 是受控能力入口：查询日志、调用工单系统、执行代码，都不能只是模型说一句“我做了”。</li>
+              <li><strong>Artifact</strong> 是文件产物柜：报告、脚本和数据文件按版本保存，而不是全部塞进聊天文本。</li>
+            </ul>
+
+            <p>
+              Graph、Skill、Memory 和各种 Server 都是在这六个角色上继续生长：流程复杂了就用 Graph 固定路线，
+              操作可以复用就包装成 Skill，需要跨会话留下事实就交给 Memory，需要接不同客户端就加协议适配层。
+            </p>
+
+            <h2>三、让一次客服请求从入口走到下一轮</h2>
+            <ol>
+              <li>网页通过 AG-UI 发来问题；也可以由 A2A 或 OpenAI-compatible 接口发起，但最终都进入 Runner。</li>
+              <li>Runner 根据应用、用户和会话标识找到 Session，并组装这一轮的 Agent、Memory、Artifact 与插件服务。</li>
+              <li>Agent 读取用户消息和可见历史，决定直接回答，还是进入 Graph、调用 Tool 或委派子 Agent。</li>
+              <li>日志工具、CodeExecutor 与 Skill 在受控边界内执行；生成的诊断报告交给 Artifact 保存。</li>
+              <li>模型片段、工具调用、结果与状态变化不断变成 Event，一边翻译给前端，一边持久化到 Session。</li>
+              <li>本轮完成后，过长的当前会话可以异步生成 summary，稳定的用户事实可以抽进 memory。</li>
+              <li>Evolution Service 还可以复盘这次过程，把可复用的排查步骤变成候选 Skill；它学习的是做法，不是用户事实。</li>
+              <li>用户第二天回来时，Runner 重开同一 Session，processor 组合 summary、近期事件和必要 memory，Agent 从已有上下文继续。</li>
+            </ol>
+
+            <p>
+              上面的图聚焦第六到第八步，也就是长上下文怎样回到下一轮模型请求。先把整条服务生命周期放在心里，
+              就不会误以为 tRPC-Agent-Go 只是一组 <code>memory</code> 和 <code>summary</code> 插件。
             </p>
 
             <div class="note key-point">
@@ -224,7 +258,7 @@
               再讲 summary 和 memory：长上下文不是外接插件，而是一次运行结束后，session 事件、后台任务和下一轮 processor 共同形成的回路。
             </p>
 
-            <h2 id="runtime-map">一、先看整体：它把 Go agent 拆成哪些 owner</h2>
+            <h2 id="runtime-map">四、把一次运行拆回源码 owner</h2>
             <p>
               仓库 README 对自己的定位不是“memory library”，而是“building production agent systems”的 Go framework：
               它把 LLM agents、graph workflows、tool calling、session/memory state、knowledge retrieval、self-evolution、evaluation、
@@ -292,7 +326,7 @@
               这些 owner 合作出来的结果；而自进化则接在同一条完成路径后面，把 session 里的程序性经验沉淀回 skill library。
             </p>
 
-            <h2>二、从执行到学习：Graph、Skill 工作区 / Evolution、AG-UI</h2>
+            <h2>五、基础运行之外，能力怎样一层层长出来</h2>
             <p>
               这一节不平均介绍每个包。真正值得先读的，是几条会改变应用写法的运行路径：Graph 让流程控制离开 prompt，
               Skill / CodeExecutor / Artifact 让能力进入受控工作区，Evolution 把成功或有教训的运行沉淀回 skill library，
@@ -300,7 +334,7 @@
               它们共同说明一件事：tRPC-Agent-Go 的核心不是多几个工具函数，而是把生产级 agent 的状态、并发、文件、取消、恢复和事件翻译交给 runtime。
             </p>
 
-            <h3>2.1 GraphAgent：流程图先落成状态机，再回到 Agent 接口</h3>
+            <h3>5.1 GraphAgent：流程图先落成状态机，再回到 Agent 接口</h3>
             <p>
               先想一个最朴素的做法：让模型在 system prompt 里“按 A、B、C 步执行，必要时并行，最后汇总”。这个做法在 demo 里可行，
               但上线后会碰到几个硬问题：条件分支谁保证只走该走的路？并行分支什么时候算结束？中断之后如何恢复？
@@ -364,7 +398,7 @@
               summary 和 session history 不是图外面的附属品，而是在图初始 state 里被同一套 processor 投影进去。
             </p>
 
-            <h3>2.2 Skill + CodeExecutor + Artifact：把能力变成可执行工作区</h3>
+            <h3>5.2 Skill + CodeExecutor + Artifact：把能力变成可执行工作区</h3>
             <p>
               再看 <code>Skill</code>。如果把它理解成“prompt 片段库”，就会错过框架里最有价值的一层：它把一套能力拆成说明、
               可选文档、可选脚本和可执行工作区。模型不需要一开始读完所有材料，也不应该直接拿到任意 shell 权限。
@@ -439,7 +473,7 @@
               串起来读。
             </p>
 
-            <h3>2.3 Evolution Service：Skill 不只会被加载，也会被后台学习出来</h3>
+            <h3>5.3 Evolution Service：Skill 不只会被加载，也会被后台学习出来</h3>
             <p>
               有了 Skill 工作区以后，下一个问题自然出现：新 skill 从哪里来？最简单但危险的做法，是让前台 agent 在完成任务时顺手改
               <code>SKILL.md</code>。这样会把用户请求、文件写入、长期事实、一次性输出和库维护混在一起：模型可能把某个用户事实写成通用技能，
@@ -518,7 +552,7 @@
               这也解释了为什么它应该接在 Skill 之后讲：没有 Skill 的加载、执行、隔离和刷新，自进化产物就没有自然的落点。
             </p>
 
-            <h3>2.4 AG-UI：前端协议不是壳子，它重新定义输入、运行和事件翻译边界</h3>
+            <h3>5.4 AG-UI：前端协议不是壳子，它重新定义输入、运行和事件翻译边界</h3>
             <p>
               前端接 agent 时，最容易低估协议层。一个文本流接口只要把 assistant delta 往外推就行；
               但 AG-UI 还要处理用户消息、tool result 消息、多模态内容、外部工具、运行取消、runtime state、graph interrupt、
@@ -563,7 +597,7 @@
               外部 tool result 和最终完成信号，都不是模型文本天然携带的东西。AG-UI adapter 把这些运行时事件翻译成前端能稳定消费的协议事件。
             </p>
 
-            <h3>2.5 A2A 与 OpenAI-compatible：同一个 Runner，不同的 continuity contract</h3>
+            <h3>5.5 A2A 与 OpenAI-compatible：同一个 Runner，不同的 continuity contract</h3>
             <p>
               AG-UI 只是 server plane 的一种出口。A2A 和 OpenAI-compatible 也会进入同一个 Runner，但“怎样认出同一次连续工作”、
               “历史由谁携带”、“事件怎样出站”并不相同。把三者放在一起看，才能避免把协议 adapter 理解成换一个 URL。
@@ -640,10 +674,20 @@
               </p>
             </div>
 
-            <h2>三、长上下文重点：先分清三本账</h2>
+            <h2>六、长上下文重点：先分清三本账</h2>
             <p>
               很多 agent 框架都会暴露 <code>memory</code> 这个词，但这个词太宽了。tRPC-Agent-Go 的源码更像把它拆成三本账：
               原始 session events、session summary、长期 memory。读懂这三本账，后面的函数名就不会散。
+            </p>
+            <ul>
+              <li><strong>Session events 是原始工作日志</strong>：用户说过什么、查了哪份日志、工具返回什么，都按时间保留。</li>
+              <li><strong>Summary 是当前工单的交接摘要</strong>：旧记录太长时，把已经发生的部分压成短说明，让同一会话继续跑。</li>
+              <li><strong>Memory 是跨工单的客户档案</strong>：例如用户长期使用的技术栈或稳定偏好，未来新会话也可以复用。</li>
+            </ul>
+            <p>
+              仍以客服为例：昨天完整的报错行留在 events；“已排除网络问题，正在检查证书”可以进入 summary；
+              “该用户的生产环境使用 Go”可以成为 memory。若今天必须核对昨天那一行原始错误，<code>session_load</code>
+              再从 events 取回证据。Evolution 则把“遇到这类错误先检查证书”沉淀成操作方法，因此它不是第四本记忆账。
             </p>
             <pre><code>Session ledger
   Session{Events, Summaries[filterKey]*Summary}
@@ -714,7 +758,7 @@ Recall path
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/worker.go#L40-L47">worker scope comment</a>。
             </p>
 
-            <h2>四、Runner 负责把长上下文账本接到运行主线</h2>
+            <h2>七、Runner 负责把长上下文账本接到运行主线</h2>
             <p>
               tRPC-Agent-Go 的 runner 不只是调用 agent 的外壳。它在每次运行时拿到或创建 session，把当前用户消息、agent、session service、
               memory service 和插件上下文挂到 invocation 上，然后让 agent 运行。证据在
@@ -742,7 +786,7 @@ Recall path
               </p>
             </div>
 
-            <h2 id="summary-lifecycle">五、summary：压当前 session，不删原始账</h2>
+            <h2 id="summary-lifecycle">八、summary：压当前 session，不删原始账</h2>
             <p>
               summary 的第一步不是“调用模型总结全文”，而是先判断这一轮是不是该总结。summary 包暴露的接口是
               <code>ShouldSummarize</code> 和 <code>Summarize</code>，还支持带 invocation context 的版本。
@@ -823,7 +867,7 @@ Recall path
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/llmflow/llmflow.go#L1494-L1600"><code>runContextCompaction</code></a>。
             </p>
 
-            <h2 id="memory-lifecycle">六、memory：存长期事实，不替代 summary</h2>
+            <h2 id="memory-lifecycle">九、memory：存长期事实，不替代 summary</h2>
             <p>
               memory 的接口更像一个长期资料库。<code>memory.Service</code> 明确暴露 Add、Update、Delete、Clear、Read、Search、Tools、
               EnqueueAutoMemoryJob 和 Close。它保存的是 <code>KindFact</code> 或 <code>KindEpisode</code> 的条目，而不是“本轮上下文摘要”。
@@ -898,7 +942,7 @@ Recall path
               </p>
             </div>
 
-            <h2>七、session_search / session_load 是隐藏历史的回收通道</h2>
+            <h2>十、session_search / session_load 是隐藏历史的回收通道</h2>
             <p>
               一旦 summary 生效，模型主上下文里只保留 summary + cutoff 之后的增量。那旧的原始事件是不是就找不到了？
               不是。tRPC-Agent-Go 还有 session recall tools。<code>session_search</code> 可以在当前可见、当前隐藏、其他 session 等 scope
@@ -919,7 +963,7 @@ Recall path
               这样 summary 的代价就被控制住了：主上下文可以变短，但原始证据没有丢；模型需要细节时，可以通过 recall tool 回到原账本。
             </p>
 
-            <h2>八、放回 Agent 框架路线里看</h2>
+            <h2>十一、放回 Agent 框架路线里看</h2>
             <p>
               这一篇和 Eino 的关系很近，但关注点不同。Eino 先回答 Go 里怎样把 component、stream、interrupt、agent loop
               放进可组合执行图；tRPC-Agent-Go 更进一步，把 Runner、GraphAgent、tool surface、Skills、code executor、artifact store、
