@@ -114,9 +114,9 @@
             <p class="eyebrow">Agent 框架源码阅读 · 第二篇</p>
             <h1>跟 AgentScope 的 reply_stream 走一遍</h1>
             <p class="lead">
-              第一篇说，读 agent 框架要先问“谁负责”。AgentScope 很适合作为第二篇样本：
-              它先不让你画 workflow 图，也不只给你一个模型客户端，而是把一次回复拆成事件流、消息账本、
-              模型适配、工具权限、外部执行和服务化会话。
+              用户让 AgentScope 读取配置文件时，它不会只在最后交回一句答案：模型准备调用工具、系统等待确认、
+              工具开始执行和结果写回，都会成为可观察的步骤。<code>reply_stream</code> 可以先理解成
+              “一条持续报告回复进度、也能暂停和恢复的通道”。
             </p>
             <div class="meta-line">
               <span>主题：AgentScope runtime</span>
@@ -132,16 +132,47 @@
           </section>
 
           <section class="article-body">
+            <h2>一、先看一次“读取配置文件”为什么会停在半路</h2>
             <p>
-              读 AgentScope 不要从目录树开始。更直接的方式，是跟一次 <code>Agent.reply_stream</code> 走到结束：
-              用户消息先进状态，模型输入被统一准备，OpenAI 适配层把内部消息翻译成 provider wire shape，
-              流式结果被还原成 content block 和 typed event，工具调用再经过 schema、权限和外部执行边界，最后写回上下文。
+              用户说“读取配置文件并告诉我数据库地址”。模型很快提出调用 <code>read_file</code>，但产品不能见到工具名就立刻执行：
+              这个路径是否允许读取？要不要先问用户？工具是在当前进程里跑，还是交给浏览器或远端 worker？
+              如果等待确认时页面刷新，回来以后还能不能继续？
             </p>
 
             <p>
-              这条路径和 Claude Code、Codex 的阅读经验是同一种问题：coding agent 关心命令权限、sandbox、事件转发和 resume；
-              AgentScope 关心工具权限、MCP、workspace、message bus、team 和 service app。名字不同，压力相同：
-              模型只是提出下一步，runtime 必须决定这一步能不能执行、如何展示、怎么记录，以及下一轮模型能看到什么。
+              一个“输入文字、返回最终文字”的接口回答不了这些问题。应用必须看见中间状态，确认结果必须能回到原来的回复，
+              工具结果也必须和最初那次调用对应起来。AgentScope 的切入点，就是把“一次回复”从一轮模型调用提升成一段有状态的运行。
+            </p>
+
+            <h2>二、先认识一次 reply 的五个要素</h2>
+            <p>
+              <strong>AgentScope 是一个把 agent 回复、工具动作和应用事件放进同一条运行线的框架。</strong>
+              为了理解这条线，先只记五个要素：
+            </p>
+            <ul>
+              <li><strong>Reply：</strong>从用户输入开始，到最终回答结束的一次完整处理；中间可以调用模型多次。</li>
+              <li><strong>Event：</strong>回复过程对外发出的进度，例如开始、模型输出、等待确认、工具结果和结束。</li>
+              <li><strong>Msg 账本：</strong>保存用户消息、模型内容、工具调用和工具结果，让下一轮知道刚才发生了什么。</li>
+              <li><strong>模型适配：</strong>把同一份内部消息翻译成不同模型 API 要求的请求格式，再把返回值翻译回来。</li>
+              <li><strong>工具关口：</strong>在真正执行前校验参数、检查权限，并决定允许、拒绝、询问用户或交给外部系统。</li>
+            </ul>
+            <p>
+              这五个要素不是五个孤立功能。Event 报告 Reply 的进度，工具关口可以暂停 Reply，确认结果让 Reply 恢复，
+              最终所有关键步骤都写进 Msg 账本。
+            </p>
+
+            <h2>三、一次 reply 怎样走完</h2>
+            <ol>
+              <li>用户消息先写入上下文，runtime 为这次回复分配一个 <code>reply_id</code> 并发出开始事件。</li>
+              <li>AgentScope 把 system prompt、必要历史和可用工具整理成统一的模型输入。</li>
+              <li>模型适配层把统一输入翻译成当前 provider 的格式，并把流式输出逐步还原成内部内容块。</li>
+              <li>模型提出 <code>read_file</code> 后，runtime 发出工具调用事件，校验参数并进入权限判断。</li>
+              <li>如果需要确认，回复暂停；用户确认再次进入同一个 <code>reply_stream</code>，原来的工具调用继续执行。</li>
+              <li>工具结果写回 Msg 账本，模型读取结果继续回答；没有后续工具时，runtime 发出结束事件。</li>
+            </ol>
+            <p>
+              到这里再看 <code>reply_stream</code> 就不会只把它理解成“文字逐字输出”。它流动的是整个回复生命周期，
+              其中既有可展示的内容，也有会改变执行路径的事件。
             </p>
 
             <div class="note key-point">
@@ -173,7 +204,7 @@
               <li>为什么一个 example service 就能看出它不是脚本框架？</li>
             </ol>
 
-            <h2>一、reply_stream 是公开事件契约</h2>
+            <h2>四、reply_stream 是公开事件契约</h2>
             <p>
               如果一个 agent 接口只返回最终字符串，前端在中间过程里什么都看不到：不知道模型正在思考、准备调用工具、
               等待用户确认，还是已经卡住。<code>reply_stream</code> 解决的是这个问题。它接收用户消息、确认结果或外部执行结果，
@@ -266,7 +297,7 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               工具调用可以暂停，确认结果可以回灌，外部执行可以稍后返回，最终写进 <code>Msg</code> 账本后再进入下一轮模型输入。
             </p>
 
-            <h2>二、内部账本不是聊天字符串，而是 Msg 与 content blocks</h2>
+            <h2>五、内部账本不是聊天字符串，而是 Msg 与 content blocks</h2>
             <p>
               AgentScope 没有把历史记录存成一串聊天字符串。它用 <code>Msg</code> 保存 sender name、role、content block、
               message id、metadata、创建/完成时间和 usage。这样做看起来比 <code>{role, content}</code> 重，
@@ -332,7 +363,7 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               已经把这几个 owner 写得很直接。
             </p>
 
-            <h2>三、工具调用是一段可治理的 lifecycle</h2>
+            <h2>六、工具调用是一段可治理的 lifecycle</h2>
             <p>
               模型返回工具调用后，AgentScope 不会直接 <code>call_tool</code>。<code>_execute_tool_call</code> 先检查工具是否可用，
               再用 schema 解析和校验 JSON 输入；失败时会把错误作为 tool result 写回上下文，让 agent 能在下一轮看到。
@@ -367,7 +398,7 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               </p>
             </div>
 
-            <h2>四、Responses API 和 Chat Completions 的差别在哪里</h2>
+            <h2>七、Responses API 和 Chat Completions 的差别在哪里</h2>
             <p>
               先用一句话记住差别：<strong>Responses API 像一串 typed items，Chat Completions 像一串 chat messages。</strong>
               同样是“用户说话、模型调用工具、工具返回结果”，Responses API 会把 message、reasoning、function_call、
@@ -544,7 +575,7 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               </table>
             </div>
 
-            <h2>五、模型差异被归一回 ChatResponse，再变成 AgentEvent</h2>
+            <h2>八、模型差异被归一回 ChatResponse，再变成 AgentEvent</h2>
             <p>
               上一节讲了两套 wire shape，真正让上层保持稳定的是 <code>ChatResponse</code>。在 <code>_reasoning_impl</code> 里，
               AgentScope 先发 <code>ModelCallStartEvent</code>，调用 <code>_prepare_model_input</code> 和 <code>_call_model</code>；
@@ -562,7 +593,7 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               它仍覆盖 OpenAI-compatible provider、audio-capable chat models 和传统 <code>messages</code> 生态。
             </p>
 
-            <h2>六、service example 暴露的是服务平面</h2>
+            <h2>九、service example 暴露的是服务平面</h2>
             <p>
               如果 AgentScope 只是一个本地脚本库，第二篇到这里就可以结束。但它的 example service 直接把
               <code>create_app</code>、<code>RedisStorage</code>、<code>InMemoryMessageBus</code>、<code>LocalWorkspaceManager</code>、
@@ -577,7 +608,7 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               它不是最轻的 API 封装，也不是先让你画 workflow graph；它更像一个把单 agent turn 做完整、再往 service 和 team 扩展的框架。
             </p>
 
-            <h2>七、读完 AgentScope 先记住这些 invariant</h2>
+            <h2>十、读完 AgentScope 先记住这些 invariant</h2>
             <div class="table-wrap">
               <table>
                 <thead>
