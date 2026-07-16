@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent 框架源码阅读（四）：Agent 协议到底在连接谁</title>
+    <meta
+      name="description"
+      content="Agent 框架源码阅读第四篇：用一个合同续约任务讲清 MCP、A2A、AG-UI 与 Agent Client Protocol 分别连接工具、远程 agent、前端和编辑器的哪条边界。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Agent 框架源码阅读（四）：Agent 协议到底在连接谁" />
+    <meta
+      property="og:description"
+      content="协议不是框架功能清单：MCP、A2A、AG-UI 和 ACP 各自规定一条不同的系统边界。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/agent-protocol-boundaries.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-framework/zh/agent-protocols/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-framework/zh/agent-protocols/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-framework/en/agent-protocols/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-framework/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(31, 119, 123, 0.34);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Agent 框架系列</a>
+        <a href="../agentscope-runtime/">上一篇</a>
+        <a href="../adk-runtime/">下一篇</a>
+        <a href="#boundary-map">边界地图</a>
+        <a href="#comparison">对照表</a>
+        <a href="#sources">官方规范</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/agent-protocols/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Agent 框架源码阅读 · 第四篇</p>
+            <h1>Agent 协议到底在连接谁</h1>
+            <p class="lead">
+              一个合同续约助手要把进度显示在网页，读取合同和 CRM，再把专业问题交给供应商的 agent。
+              这不是“选一个协议”的问题，而是同一次运行会同时穿过几条不同边界。
+            </p>
+            <div class="meta-line">
+              <span>主题：Agent protocol boundaries</span>
+              <span>主线：前端 → runtime → 工具 / agent</span>
+              <span>重点：MCP / A2A / AG-UI / ACP</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/agent-protocol-boundaries.png"
+                alt="Agent 协议边界手绘图：中央 Agent Runtime 分别通过 AG-UI 连接前端、MCP 连接工具与数据、A2A 连接远程 Agent，编辑器通过 ACP 连接 Coding Agent，模型 Provider API 是另一条边界"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <h2>一、一个续约问题，为什么会需要四种连接</h2>
+            <p>
+              用户在网页里问：“找出合同的自动续约条款，核对我们当前套餐，如果有争议，请供应商专家确认。”
+              如果只画一个 <code>agent.run()</code>，这句话后面至少藏着四个独立问题：
+            </p>
+            <ol>
+              <li>网页怎样知道 agent 已开始、正在查合同、等待确认，还是已经失败？</li>
+              <li>Agent 怎样发现“合同搜索”和“CRM 套餐查询”，并以对方能理解的参数调用？</li>
+              <li>供应商专家是另一个独立 agent，我们怎样知道它会什么，又怎样跟踪一个可能运行几分钟的任务？</li>
+              <li>当 runtime 请求模型思考下一步时，历史、工具调用和流式返回怎样交给模型 provider？</li>
+            </ol>
+            <p>
+              这四个问题的两边都可能由不同团队、语言和产品实现。如果每次都自定义一组 JSON 和回调，
+              换前端、换工具服务或换远程 agent 都会重写适配层。协议要解决的，正是这种跨实现协作。
+            </p>
+
+            <h2>二、先给“协议”一个不绕的定义</h2>
+            <p>
+              <strong>协议是两个可以独立实现、独立升级的参与方，对“怎样发现能力、怎样发请求、怎样表示状态与结果”达成的公开约定。</strong>
+            </p>
+            <p>
+              Agent 框架与协议不在同一层。框架决定 runtime 内部由谁拥有 loop、session、tool gate、memory 和 graph；
+              协议则在某个对象需要走出这个 runtime 时，规定它怎样跨边界。同一个框架可以同时支持多种协议；
+              同一种协议也可以被很多框架实现。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <strong>阅读契约。</strong>
+                这篇只追问一件事：每个协议的两边站着谁？读完后，你应该能把同一次续约任务从前端重放到工具、远程 agent 和模型，
+                并说清哪个协议传的是 tool call、Task、UI event 还是 coding session update。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                MCP、A2A、AG-UI 和 Agent Client Protocol 的语义以各自官方架构文档和已发布规范为准。
+                文中“边界地图”和“owner”是为了比较而做的工程归纳，不代表这些协议可以互相无损转换。
+              </p>
+            </div>
+
+            <h2 id="boundary-map">三、先画边界，再放协议名字</h2>
+            <p>
+              先不看 method 名称，只看续约助手的参与方。中间是 Agent Runtime，它拥有本次运行、会话和工具循环。
+              四条边界分别是：
+            </p>
+            <ul>
+              <li><strong>用户前端 ↔ Agent Runtime：</strong>用 <a href="https://docs.ag-ui.com/introduction">AG-UI</a> 传输 run、消息、工具和状态事件。</li>
+              <li><strong>Agent Runtime ↔ 工具与数据服务：</strong>用 <a href="https://modelcontextprotocol.io/docs/learn/architecture">MCP</a> 发现和调用 tools、resources 与 prompts。</li>
+              <li><strong>Agent Runtime ↔ 远程 Agent：</strong>用 <a href="https://a2a-protocol.org/latest/specification/">A2A</a> 发现对方能力，并跟踪 Message、Task 与 Artifact。</li>
+              <li><strong>代码编辑器 ↔ Coding Agent：</strong>用 <a href="https://agentclientprotocol.com/get-started/architecture">Agent Client Protocol</a> 管理 coding session、流式更新和工具授权。</li>
+            </ul>
+            <p>
+              还有第五条边界：<strong>Agent Runtime ↔ 模型 Provider</strong>。OpenAI Responses API、Chat Completions API、Anthropic Messages API
+              都属于这一层 provider contract。它们当然也是 API 协议，但在 Agent 系统分层里，它们解决的是“runtime 怎样调模型”，
+              不是工具发现、远程 agent 协作或前端状态同步。
+            </p>
+
+            <h2>四、MCP：让 runtime 看见工具和数据</h2>
+            <h3>4.1 为什么不能只给模型一个 HTTP 地址</h3>
+            <p>
+              续约助手需要合同搜索和 CRM 查询。它不仅要知道 endpoint，还要知道对方现在暴露哪些能力、参数 schema 是什么、
+              返回内容是文本、图片还是资源引用。如果能力发生变化，runtime 还应该知道需要重新刷新工具表。
+            </p>
+            <p>
+              MCP 用 Host、Client、Server 三个角色表达这件事。续约助手是 Host；它为每个 MCP Server 维护一个 Client 连接；
+              合同库和 CRM 分别可以是 Server。Server 可以在本机通过 stdio 运行，也可以在远程通过 Streamable HTTP 服务。
+            </p>
+
+            <h3>4.2 一次 MCP 调用不是从 <code>tools/call</code> 开始</h3>
+            <ol>
+              <li>Client 与 Server 先 <code>initialize</code>，交换协议版本和 capabilities。</li>
+              <li>Client 通过 <code>tools/list</code>、<code>resources/list</code> 等方法发现对方真正提供的能力。</li>
+              <li>Runtime 把适合当前用户和会话的工具 schema 纳入模型输入。</li>
+              <li>模型选择 <code>contract_search</code> 后，runtime 路由到对应 Client，再发出 <code>tools/call</code>。</li>
+              <li>Server 返回结构化 content，runtime 决定它怎样进入会话、模型上下文与 UI。</li>
+            </ol>
+            <pre><code>{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
+  "name":"contract_search",
+  "arguments":{"customer_id":"c-42","query":"automatic renewal"}
+}}</code></pre>
+            <p>
+              这是简化后的 wire shape。关键不是 JSON-RPC 这几个字段，而是工具在调用前可发现、可协商，调用后有标准内容形状。
+            </p>
+            <div class="note key-point">
+              <p>
+                <strong>MCP 规定 context 交换，不接管 Agent Runtime。</strong>
+                官方架构文档明确说，MCP 不规定 AI 应用如何使用 LLM，也不规定如何管理已取得的 context。
+                哪些工具对当前用户可见、是否要过权限关口、结果是否持久化，仍然由 Host 与框架决定。
+              </p>
+            </div>
+            <p>
+              也不要把 MCP 压缩成“远程 function calling”。除了 Server 端的 tools、resources、prompts，它还定义 sampling、elicitation、logging 等 Client 能力，
+              并且有用于延迟结果和状态跟踪的实验性 Tasks。它的主边界仍是 runtime 与工具/数据，但边界两端可以双向协作。
+            </p>
+
+            <h2>五、A2A：把一件事交给不透明的远程 agent</h2>
+            <h3>5.1 远程 agent 不是一个大工具</h3>
+            <p>
+              CRM 查询的输入和输出很稳定，适合当工具。供应商专家不一样：它有自己的模型、工具、记忆和审批流程，也可能向人补问信息。
+              调用方不应该知道它内部的 prompt 或 tool chain，只需要知道它承诺什么能力、任务现在是什么状态、最后交付了什么。
+            </p>
+            <p>
+              A2A 正是为独立、可能不透明的 agent 系统设计的。调用方先通过 <strong>Agent Card</strong> 发现能力、支持的交互形式和安全要求，
+              再向对方发送 <strong>Message</strong>。简单回答可以直接返回 Message；需要持续跟踪的工作则进入 <strong>Task</strong>，最终结果放进 <strong>Artifact</strong>。
+            </p>
+
+            <h3>5.2 Task 把长时间协作变成有身份的资源</h3>
+            <ol>
+              <li>续约助手读取 Agent Card，确认对方具有“解释供应商续约规则”的 skill。</li>
+              <li>它发送 Message，携带条款摘要和需要确认的问题。</li>
+              <li>对方返回 Task id，状态从 submitted 走向 working，中间可能进入 input-required。</li>
+              <li>调用方可以轮询、订阅流式更新，或为长任务配置 push notification；不再需要时也可以取消。</li>
+              <li>任务完成后，对方把“续约规则说明”作为 Artifact 交付，Task history 则保留这次多轮协作。</li>
+            </ol>
+            <pre><code>Agent Card → Message → Task: working
+                         ├─ status update
+                         ├─ input-required → Message
+                         └─ completed → Artifact</code></pre>
+            <p>
+              A2A 1.0 把核心数据模型、抽象操作和具体 binding 分层。同一套 Task、Message、Agent Card 和 Artifact 语义可以映射到 JSON-RPC、gRPC 或 HTTP/REST。
+              因此“A2A 是不是 JSON-RPC”不是最重要的问题；更重要的是不同 binding 之上仍然共享同一份任务语义。
+            </p>
+
+            <h2>六、AG-UI：前端需要的不只是 token 流</h2>
+            <h3>6.1 一串文字无法还原一次 agent run</h3>
+            <p>
+              续约助手已经查了两个工具，又向远程 agent 发起任务。如果后端只向浏览器推送 assistant text delta，前端无法稳定回答：
+              这条 delta 属于哪次 run？哪个 tool call 正在等待？用户点击“批准”应该恢复哪个中断？页面重连后怎样重建状态？
+            </p>
+            <p>
+              AG-UI 把前端与 agent backend 之间的连接定义成双向事件协议。一次运行从 <code>RunAgentInput</code> 进入，
+              后端返回 <code>BaseEvent</code> 流。<code>threadId</code> 稳定标识会话线，<code>runId</code> 标识本次执行；
+              message、tool call、state 和 lifecycle 都有自己的 typed event。
+            </p>
+            <pre><code>RUN_STARTED(threadId, runId)
+→ TOOL_CALL_START(toolCallId, "contract_search")
+→ TOOL_CALL_ARGS(toolCallId, ...)
+→ TOOL_CALL_RESULT(toolCallId, ...)
+→ STATE_DELTA(...)
+→ TEXT_MESSAGE_START(messageId)
+→ TEXT_MESSAGE_CONTENT(messageId, delta)
+→ RUN_FINISHED(runId)</code></pre>
+            <p>
+              这个序列让 UI 知道什么是一次 run，哪些 delta 属于同一条消息或工具调用。<code>STATE_SNAPSHOT</code> 可以建立完整基线，
+              <code>STATE_DELTA</code> 再用 JSON Patch 传递增量变化。前端不必从一串文本反推 runtime 状态。
+            </p>
+
+            <h3>6.2 中断是 run 的结果，不是一个没发完的回答</h3>
+            <p>
+              如果 CRM 工具要求用户确认读取敏感套餐，当前 run 可以以 interrupt outcome 结束。前端显示审批界面，用户回答后用新 run 携带 resume 信息。
+              这种设计保护了两个边界：前端知道上一次 run 已经到达明确终点；runtime 也不用把一个 HTTP 请求无限期悬挂等待用户。
+            </p>
+            <div class="note key-point">
+              <p>
+                <strong>AG-UI 翻译 runtime 事件，不会自动创造 runtime 语义。</strong>
+                如果框架内部没有稳定的 run id、tool-call lifecycle、interrupt 和 state owner，adapter 只能现场猜。
+                这就是为什么上一篇先读 AgentScope 的 typed event 和暂停恢复，再读前端协议。
+              </p>
+            </div>
+
+            <h2>七、ACP：先问清楚说的是哪一个 ACP</h2>
+            <h3>7.1 Agent Client Protocol 连接编辑器与 coding agent</h3>
+            <p>
+              把案例换成 coding agent：用户在编辑器里说“修改续约提醒逻辑，然后跑测试”。编辑器需要启动或连接 agent，建立多个 session，
+              把文件和用户 prompt 交给它，持续显示消息与 tool call，并在 agent 要执行命令时弹出权限询问。
+            </p>
+            <p>
+              <a href="https://agentclientprotocol.com/get-started/introduction">Agent Client Protocol</a> 把这条边界标准化。对本地 agent，编辑器通常按需启动 agent 子进程，
+              双方通过 stdin/stdout 交换 JSON-RPC。Agent 用 notification 持续向 UI 推送 session update；又可以用双向 request 反过来请求编辑器批准工具调用。
+              协议尽量复用 MCP 类型，但 ACP 连接的两边仍然是编辑器和 coding agent，不是 MCP Client 与 MCP Server。
+            </p>
+            <pre><code>编辑器启动 agent 子进程
+→ initialize
+→ session/new
+→ session/prompt
+→ session/update ...
+← session/request_permission
+→ 用户决策
+→ session/update ...</code></pre>
+
+            <h3>7.2 历史上还有 Agent Communication Protocol</h3>
+            <p>
+              搜索 ACP 时还会找到 BeeAI 的 <a href="https://github.com/i-am-bee/acp">Agent Communication Protocol</a>。
+              它解决的是 agent、应用和人之间的远程通信，与前面的 A2A 更接近，不是编辑器协议。
+              该项目已于 2025 年归档，README 明确说明它已成为 Linux Foundation 下 A2A 的一部分。因此新文章里的 ACP 默认指 Agent Client Protocol；
+              遇到旧文档时，必须展开全称再判断。
+            </p>
+
+            <h2>八、Responses API 与 Chat Completions 为什么不和它们放在一格</h2>
+            <p>
+              上一篇 AgentScope 已经具体比较了 <a href="../agentscope-runtime/#responses-vs-chat">OpenAI Responses API 与 Chat Completions API</a>。
+              Responses 使用 typed items，可以通过 response identity 延续状态；Chat Completions 主要接收 <code>messages</code> 数组，工具调用和结果也有不同 wire shape。
+              AgentScope 需要两个 formatter 和 model adapter，再把它们归一成同一种内部 <code>ChatResponse</code>。
+            </p>
+            <p>
+              这个差异很重要，但它发生在 <strong>runtime 与模型 provider</strong> 之间。MCP 不规定你用 Responses 还是 Chat Completions 调模型；
+              A2A 对面的 agent 也可以使用完全不同的 provider；AG-UI 前端只应该消费稳定的 UI event，不该直接绑定 provider delta。
+              把 provider API 单独画一层，才能让每个 adapter 对自己真正拥有的语义负责。
+            </p>
+
+            <h2>九、把整个续约任务重放一遍</h2>
+            <ol>
+              <li>浏览器通过 AG-UI 发送 <code>RunAgentInput</code>，runtime 为它建立 thread 和 run。</li>
+              <li>Runtime 把当前模型视图翻译成 Responses 或 Chat Completions 要求的 provider payload。</li>
+              <li>模型决定查合同，runtime 经过自己的权限关口，然后用 MCP <code>tools/call</code> 请求合同 Server。</li>
+              <li>MCP 结果进入 runtime 账本，同时被翻译成 AG-UI tool result event 供前端展示。</li>
+              <li>遇到争议条款时，runtime 读取 A2A Agent Card，向供应商专家发送 Message，并记住返回的 Task id。</li>
+              <li>A2A status update 被归一成 runtime event，再由 AG-UI 向前端显示“等待供应商确认”。</li>
+              <li>对方交付 Artifact 后，runtime 合并本地工具结果与远程专家结果，再次调用模型组织答案。</li>
+              <li>最终文本与 <code>RUN_FINISHED</code> 经 AG-UI 回到浏览器。</li>
+            </ol>
+            <p>
+              如果入口是代码编辑器，最外层的 AG-UI 可能换成 Agent Client Protocol；里面的 coding agent 仍然可以使用 MCP 连接工具，
+              也可以用 A2A 委派远程 agent。这就是“主边界”的含义：协议各自有主要位置，但它们可以在一次运行里组合。
+            </p>
+
+            <h2 id="comparison">十、现在再用一张表压缩</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>边界</th>
+                    <th>主要参与方</th>
+                    <th>核心工作单元</th>
+                    <th>发现与能力</th>
+                    <th>长任务与恢复</th>
+                    <th>谁仍然拥有内部运行</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>MCP</td>
+                    <td>AI Host/Client ↔ Tool/Data Server</td>
+                    <td>tool call、resource、prompt</td>
+                    <td><code>initialize</code> + capabilities + <code>*/list</code></td>
+                    <td>notification；实验性 Tasks</td>
+                    <td>Host 拥有 agent loop、context 选择和权限。</td>
+                  </tr>
+                  <tr>
+                    <td>A2A</td>
+                    <td>Agent Client ↔ 独立远程 Agent</td>
+                    <td>Message、Task、Artifact</td>
+                    <td>Agent Card + skills + interfaces</td>
+                    <td>status、stream、poll、push、cancel</td>
+                    <td>远程 agent 保持不透明的内部实现。</td>
+                  </tr>
+                  <tr>
+                    <td>AG-UI</td>
+                    <td>User-facing App ↔ Agent Backend</td>
+                    <td>RunAgentInput + BaseEvent</td>
+                    <td>client/agent capabilities 与 adapter</td>
+                    <td>run lifecycle、interrupt/resume、state snapshot/delta</td>
+                    <td>Backend 拥有执行；Frontend 拥有用户可见状态。</td>
+                  </tr>
+                  <tr>
+                    <td>Agent Client Protocol</td>
+                    <td>Code Editor ↔ Coding Agent</td>
+                    <td>connection、session、prompt turn、update</td>
+                    <td>initialize + agent registry/config</td>
+                    <td>session identity、stream update、permission request</td>
+                    <td>Coding agent 拥有 loop；编辑器拥有 workspace UX 与授权入口。</td>
+                  </tr>
+                  <tr>
+                    <td>Provider API</td>
+                    <td>Agent Runtime ↔ Model Provider</td>
+                    <td>response/item 或 messages/completion</td>
+                    <td>model 与 API capability</td>
+                    <td>response identity 或客户端重放历史</td>
+                    <td>Runtime 拥有工具循环与产品 session；provider 拥有模型调用。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>十一、选协议时不要先问“支持吗”</h2>
+            <p>
+              一个框架在 README 里写“supports MCP/A2A/AG-UI”，只能证明它有某个接入面，不能证明所有语义都是完整的。
+              更有用的检查顺序是：
+            </p>
+            <ol>
+              <li><strong>先画参与方：</strong>这是 runtime 调工具、委派 agent、服务前端，还是编辑器启动 coding agent？</li>
+              <li><strong>再找 identity owner：</strong>tool call id、task id、run id、session id 分别由谁创建、持久化和恢复？</li>
+              <li><strong>再看终止语义：</strong>成功、失败、取消、询问用户和稍后恢复，是协议一等状态还是自定义文本？</li>
+              <li><strong>最后审安全边界：</strong>连接身份、用户授权、工具参数校验、Artifact 与 resource 的可见范围由谁强制？</li>
+            </ol>
+            <p>
+              协议不会自动带来信任。MCP Server 暴露一个 tool，不代表当前用户应该被允许调用；A2A Agent Card 声明一项 skill，不代表调用方已验证对方身份；
+              AG-UI 能传授权结果，不代表前端可以绕过后端策略。协议只是让安全信息有一个可互操作的载体，真正的决策仍由各边 owner 强制。
+            </p>
+
+            <h2>十二、带着这张地图继续读框架</h2>
+            <p>
+              后面几篇会反复出现这些协议名称，但每次都要回到边界。ADK 的 Agent 与 Workflow 先回答框架内部怎样运行；Agno 会把这条主线放进 AgentOS 和多种对外界面；
+              AutoGen 与 Microsoft Agent Framework 会把 multi-agent runtime 和生产编排放在一起比较；CrewAI 让角色协作与确定性 Flow 分开；Eino 用 Go component 与 graph 表达执行；
+              tRPC-Agent-Go 则会直接展开 MCP、A2A、AG-UI 与 OpenAI-compatible server 的不同出口。
+            </p>
+            <p>
+              <a href="../adk-runtime/">下一篇进入 ADK Python</a>。当协议边界已经分清，我们可以重新回到框架内部，看 Agent 的自主决策与 Workflow 的确定性步骤怎样在同一条 Runner/Event 主线上共存。
+            </p>
+
+            <h2 id="sources">官方规范与文档</h2>
+            <ul>
+              <li><a href="https://modelcontextprotocol.io/docs/learn/architecture">Model Context Protocol architecture</a></li>
+              <li><a href="https://a2a-protocol.org/latest/specification/">A2A latest released specification</a></li>
+              <li><a href="https://docs.ag-ui.com/introduction">AG-UI overview</a></li>
+              <li><a href="https://docs.ag-ui.com/concepts/architecture">AG-UI core architecture</a></li>
+              <li><a href="https://docs.ag-ui.com/concepts/events">AG-UI events</a></li>
+              <li><a href="https://agentclientprotocol.com/get-started/introduction">Agent Client Protocol introduction</a></li>
+              <li><a href="https://agentclientprotocol.com/get-started/architecture">Agent Client Protocol architecture</a></li>
+              <li><a href="https://agentclientprotocol.com/protocol/session-setup">Agent Client Protocol session setup</a></li>
+              <li><a href="https://agentclientprotocol.com/protocol/prompt-turn">Agent Client Protocol prompt turn</a></li>
+              <li><a href="https://github.com/i-am-bee/acp">Archived Agent Communication Protocol and A2A migration notice</a></li>
+              <li><a href="https://developers.openai.com/api/docs/guides/migrate-to-responses">OpenAI Responses API migration guide</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script src="../../table-labels.js"></script>
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        const headings = [...article.querySelectorAll("h2, h3, h4")];
+        const slugCounts = new Map();
+        const slugify = (text) => {
+          const raw = text
+            .trim()
+            .toLowerCase()
+            .replace(/<[^>]+>/g, "")
+            .replace(/[`"'“”‘’]/g, "")
+            .replace(/[^\p{Script=Han}\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          const base = raw || "section";
+          const count = slugCounts.get(base) || 0;
+          slugCounts.set(base, count + 1);
+          return count ? `${base}-${count + 1}` : base;
+        };
+        const root = document.createElement("ol");
+        root.className = "toc-list";
+        const stack = [{ level: 2, list: root }];
+        headings.forEach((heading) => {
+          if (!heading.id) heading.id = slugify(heading.textContent || "");
+          const level = Number(heading.tagName.slice(1));
+          while (stack.length && level < stack[stack.length - 1].level) stack.pop();
+          if (level > stack[stack.length - 1].level) {
+            const parent = stack[stack.length - 1].list.lastElementChild;
+            const child = document.createElement("ol");
+            child.className = "toc-sublist";
+            if (parent) parent.appendChild(child);
+            stack.push({ level, list: child });
+          }
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent || "";
+          link.className = `toc-link toc-level-${level}`;
+          item.appendChild(link);
+          stack[stack.length - 1].list.appendChild(item);
+        });
+        toc.appendChild(root);
+      })();
+    </script>
+  </body>
+</html>
