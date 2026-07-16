@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go Source Notes III: Where Does a Goroutine Actually Run?</title>
+    <meta name="description" content="Chapter III of Go from Request to Production follows fetchd's go h.fetch through Go 1.26.0 newproc, runqput, schedule, findRunnable, execute, gopark, ready, and sysmon to explain G/M/P, work stealing, preemption, and runnable latency." />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Go Source Notes III: Where Does a Goroutine Actually Run?" />
+    <meta property="og:description" content="Creating a goroutine creates a runnable G. Execution begins only when the scheduler matches it with an M and a P." />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/goroutine-scheduler-overview.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/en/goroutine-scheduler/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/goroutine-scheduler/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/goroutine-scheduler/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.route-note { border-color: rgba(31, 119, 123, 0.32); background: rgba(31, 119, 123, 0.1); }
+      .note.route-note strong { color: var(--rose); }
+      .article-body pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .source-caption { display: block; margin: -10px 0 24px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+      .article-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line); }
+      .article-pager a { color: var(--teal); font-weight: 800; text-decoration: none; }
+      @media (max-width: 760px) {
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+        .article-pager { flex-direction: column; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="Article shortcuts"><a href="../">Go series</a><a href="#newproc">newproc</a><a href="#find-runnable">findRunnable</a><a href="#evidence">Runtime evidence</a><a href="#sources">Sources</a></nav>
+      <nav class="site-actions" aria-label="Site actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="Language switch"><a href="../../zh/goroutine-scheduler/" lang="zh-CN">中文</a><a class="active" href="./" lang="en" aria-current="page">English</a></span></nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero">
+          <p class="eyebrow">Go from Request to Production · Chapter III</p>
+          <h1 class="long-title">Where Does a <code>goroutine</code> Actually Run?</h1>
+          <p class="lead">
+            <code>go h.fetch(...)</code> looks like “start another thread,” yet the source neither creates a dedicated OS thread immediately nor promises that the function begins before the next statement.
+            A <code>go</code> statement first creates a runnable G. It executes only after the scheduler matches that G with an M and a P. Tail latency often hides in the gap between “able to run” and “actually running.”
+          </p>
+          <div class="meta-line"><span>Source: Go 1.26.0</span><span>Path: newproc → runq → schedule → execute</span><span>Lab: scheduler_lab_test.go</span></div>
+          <figure class="hero-image"><img src="../assets/goroutine-scheduler-overview.png" alt="Go goroutine scheduling overview: go h.fetch passes through newproc to create a G in a run queue; the scheduler matches the G with an OS thread M and execution resources P before it becomes running" /></figure>
+        </section>
+
+        <section class="article-body">
+          <div class="note route-note"><p><strong>Reading contract:</strong> this chapter follows the ordinary user-goroutine path in Go 1.26.0 through creation, runnable, running, waiting, and wake-up. You should leave able to distinguish goroutine, thread, and P counts, waiting from runnable, and verify scheduling hypotheses with metrics and traces—without turning the internal 10 ms threshold or 256-slot run queue into language guarantees.</p></div>
+
+          <p>
+            Direct evidence is pinned to <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0</a>, primarily
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go">runtime/proc.go</a> and
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go">runtime/runtime2.go</a>.
+            Conceptual boundaries come from the official <a href="https://go.dev/src/runtime/HACKING">runtime HACKING guide</a>;
+            production observation uses <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a> and <a href="https://go.dev/doc/diagnostics">Diagnostics</a>.
+            This is the current gc runtime, not a required mapping for every Go implementation.
+          </p>
+
+          <h2>1. Separate Three Counts That Are Often Collapsed</h2>
+          <p>
+            <code>fetchd</code> starts at most eight worker goroutines for eight URLs. That does not add eight threads, nor guarantee eight workers execute Go code simultaneously.
+            The scheduler manages three distinct resources:
+          </p>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>Symbol</th><th>Runtime object</th><th>Owns</th><th>Count relationship</th></tr></thead>
+            <tbody>
+              <tr><td>G</td><td><code>runtime.g</code></td><td>Goroutine stack, saved scheduler context, state, ancestry</td><td>May far exceed threads and Ps</td></tr>
+              <tr><td>M</td><td><code>runtime.m</code></td><td>One OS thread, g0, current G, attached P</td><td>Syscalls/cgo may make M count exceed P count</td></tr>
+              <tr><td>P</td><td><code>runtime.p</code></td><td>Resources needed to run Go, local queue, allocator cache, timers</td><td>Exactly <code>GOMAXPROCS</code></td></tr>
+            </tbody>
+          </table></div>
+
+          <p>
+            The scheduler does not permanently bind a G to an M. It matches a runnable G, an M on which to execute, and a P granting the resources to execute Go.
+            An M can run different Gs; a G can resume on a different M. If an M blocks in a syscall, it can release its P so another M continues Go work.
+          </p>
+
+          <h3><code>GOMAXPROCS</code> limits parallel Go execution</h3>
+          <p>
+            Go 1.26 has one P per current <code>GOMAXPROCS</code>. With 1,000 runnable Gs and <code>GOMAXPROCS=8</code>, at most roughly eight threads execute user Go code at once,
+            while the remaining Gs wait in scheduler queues. Total threads may be higher because of syscalls, cgo, runtime work, and locked threads.
+            Since Go 1.25 the default can respond to container CPU limits; explicit environment or API settings affect that automation. Diagnose the observed metric, not only host core count.
+          </p>
+
+          <h2>2. State Is More Informative Than “Goroutine Count”</h2>
+          <p>
+            <code>runtime2.go</code> separates <code>_Grunnable</code>, <code>_Grunning</code>, <code>_Gwaiting</code>, <code>_Gsyscall</code>, and other states.
+            Equal goroutine counts can describe very different production conditions.
+          </p>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>State</th><th>Meaning</th><th>Typical source</th><th>Latency points toward</th></tr></thead>
+            <tbody>
+              <tr><td><code>_Grunnable</code></td><td>Queued and able to execute, but not executing</td><td>Creation, channel wake, I/O readiness, timer</td><td>CPU supply and scheduling competition</td></tr>
+              <tr><td><code>_Grunning</code></td><td>Matched with M/P and executing Go</td><td><code>execute</code></td><td>CPU or the running code path</td></tr>
+              <tr><td><code>_Gwaiting</code></td><td>Parked at a runtime wait point</td><td>Channel, mutex, timer, netpoll</td><td>A resource, not CPU access</td></tr>
+              <tr><td><code>_Gsyscall</code></td><td>Inside a system call</td><td>Blocking syscall/cgo boundary</td><td>Kernel or foreign code</td></tr>
+            </tbody>
+          </table></div>
+
+          <p>
+            “Many goroutines” alone is not a failure. A server may intentionally hold a large population waiting on connections; a much smaller population continuously runnable can signal CPU quota,
+            excessive fan-out, a wake-up storm, or GC competition. Start with states and wait reasons, then interpret the total.
+          </p>
+
+          <h2 id="newproc">3. How <code>go h.fetch</code> Becomes a Runnable G</h2>
+          <p>
+            The compiler lowers a <code>go</code> statement to <code>runtime.newproc</code>. Its source comment is unusually direct: create a new G running <code>fn</code> and put it on the queue of Gs waiting to run.
+          </p>
+
+          <pre><code class="language-go">// The compiler turns a go statement into a call to this.
+func newproc(fn *funcval) {
+    gp := getg()
+    pc := sys.GetCallerPC()
+    systemstack(func() {
+        newg := newproc1(fn, gp, pc, false, waitReasonZero)
+        pp := getg().m.p.ptr()
+        runqput(pp, newg, true)
+        if mainStarted {
+            wakep()
+        }
+    })
+}</code></pre>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5292-L5308">runtime.newproc</a>.</span>
+
+          <figure class="figure"><img src="../assets/go-statement-newproc.png" alt="Source path from a go statement to a runnable G: go h.fetch enters newproc and newproc1, which obtains a G, prepares its stack and goid, changes status to _Grunnable, and lets runqput use runnext, the local run queue, or global overflow" /></figure>
+
+          <h3><code>newproc1</code> reuses a G before allocating one</h3>
+          <p>
+            <code>newproc1</code> runs on the system stack. It first asks the current P's free-G pool through <code>gfget</code>; only if that fails does it call <code>malg(stackMin)</code>
+            and publish a new G. It clears <code>g.sched</code>, sets the initial SP, a PC returning through <code>goexit</code>, the function entry, parent goid, and creation PC.
+            It then assigns a goid and changes the G from <code>_Gdead</code> to <code>_Grunnable</code>.
+          </p>
+
+          <pre><code class="language-go">newg := gfget(pp)
+if newg == nil {
+    newg = malg(stackMin)
+    allgadd(newg)
+}
+
+newg.sched.sp = sp
+newg.sched.pc = abi.FuncPCABI0(goexit) + sys.PCQuantum
+gostartcallfn(&amp;newg.sched, fn)
+newg.parentGoid = callergp.goid
+newg.gopc = callerpc
+newg.goid = pp.goidcache
+casgstatus(newg, _Gdead, _Grunnable)</code></pre>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5310-L5424">runtime.newproc1</a>.</span>
+
+          <p>
+            Creation needs G metadata and an initial stack, but it commonly reuses an object and does not create a dedicated OS thread. The function body has not run yet:
+            <code>_Grunnable</code> means eligible, not started.
+          </p>
+
+          <h2>4. Local Run Queue, <code>runnext</code>, and Global Run Queue</h2>
+          <p>
+            A P currently contains a <code>[256]guintptr</code> local queue and a separate <code>runnext</code> slot. The size is a Go 1.26.0 implementation detail;
+            the useful model is that local queues preserve locality while the global queue supports overflow and fairness.
+          </p>
+
+          <h3><code>runnext</code> is not unlimited priority</h3>
+          <p>
+            <code>newproc</code> calls <code>runqput</code> with <code>next=true</code>, so the new G first tries to occupy <code>runnext</code>. When selected, it inherits the remainder of the current time slice,
+            reducing latency for communicating Gs. If the slot already has a G, the old one moves to the normal local queue. Platforms without sysmon avoid the optimization so ping-pong work cannot starve everything else.
+          </p>
+
+          <h3>What happens when the local queue is full</h3>
+          <p>
+            With room, <code>runqput</code> writes at the ring tail. When full, <code>runqputslow</code> takes half the local work and places that batch plus the new G on the global queue.
+            It redistributes a batch rather than merely putting the newest G elsewhere, making work available to other Ps.
+          </p>
+
+          <pre><code class="language-go">if t-h &lt; uint32(len(pp.runq)) {
+    pp.runq[t%uint32(len(pp.runq))].set(gp)
+    atomic.StoreRel(&amp;pp.runqtail, t+1)
+    return
+}
+runqputslow(pp, gp, h, t) // half the local Gs + new G → global</code></pre>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L7473-L7559">runqput and runqputslow</a>; queue fields in <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L772-L818">runtime.p</a>.</span>
+
+          <h2 id="find-runnable">5. How <code>schedule</code> and <code>findRunnable</code> Locate Work</h2>
+          <p>
+            One scheduler round has a small shell: <code>schedule</code> asks <code>findRunnable</code> for a G, handles special cases such as locked Ms, and enters <code>execute</code>.
+            The complicated part is discovering work.
+          </p>
+
+          <pre><code class="language-go">func schedule() {
+    gp, inheritTime, tryWakeP := findRunnable()
+    // Spinning, GC worker, and locked-M handling omitted.
+    execute(gp, inheritTime)
+}</code></pre>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L4133-L4231">runtime.schedule</a>.</span>
+
+          <figure class="figure"><img src="../assets/find-runnable-route.png" alt="The main Go findRunnable search loop checks timers, trace, and GC plus a global fairness check every 61 ticks, then the local queue, ordinary global queue, netpoll, and stealWork; before idle and park it rechecks work sources" /></figure>
+
+          <h3>This is not one FIFO</h3>
+          <p>
+            <code>findRunnable</code> checks timers near the top, then trace-reader and GC work. To stop a small set of local Gs from occupying a P indefinitely,
+            it samples the global queue whenever <code>schedtick % 61 == 0</code>. Ordinary business work then checks the local queue followed by the global queue.
+          </p>
+
+          <p>
+            With no queued G, the scheduler performs non-blocking netpoll, then allows spinning Ms to use <code>stealWork</code> across other Ps and their timers.
+            If nothing appears, it prepares to release its P and park the M, but rechecks queues, timers, and netpoll around that transition so newly submitted work cannot be left with every worker asleep.
+          </p>
+
+          <h3>Why work stealing takes a batch</h3>
+          <p>
+            <code>runqsteal</code> asks <code>runqgrab</code> for roughly half of another P's local queue. One stolen G returns immediately and the remainder populates the thief's local queue.
+            Batch balancing reduces repeated cross-P contention; randomized victim order and a cap on spinning Ms avoid turning idle search into excessive CPU use.
+          </p>
+
+          <h2>6. <code>execute</code> Turns Runnable into Running</h2>
+          <p>
+            Once a G is selected, <code>execute</code> points the M's <code>curg</code> at it, points the G's <code>m</code> back to the M, CASes
+            <code>_Grunnable</code> to <code>_Grunning</code>, clears waiting and preemption markers, and finally restores the saved context through <code>gogo(&amp;gp.sched)</code>.
+          </p>
+
+          <pre><code class="language-go">mp.curg = gp
+gp.m = mp
+casgstatus(gp, _Grunnable, _Grunning)
+gp.waitsince = 0
+gp.preempt = false
+// Trace, profiling, and time-slice work omitted.
+gogo(&amp;gp.sched)</code></pre>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3322-L3383">runtime.execute</a>.</span>
+
+          <p>
+            Because G and M are associated here, ordinary application code must not assume a goroutine identity maps to one thread. Use <code>runtime.LockOSThread</code> only for real thread-local,
+            GUI, or cgo constraints, accepting the loss of scheduler flexibility.
+          </p>
+
+          <h2>7. Blocking Need Not Block the Thread: <code>gopark</code> and <code>ready</code></h2>
+          <p>
+            When a goroutine cannot continue on a channel, mutex, timer, or netpoll, runtime code uses <code>gopark</code> to record a wait reason and
+            <code>mcall(park_m)</code> to switch to the M's g0 stack for the state transition. When the resource is ready, <code>goready</code> calls <code>ready</code> on the system stack:
+          </p>
+
+          <pre><code class="language-go">casgstatus(gp, _Gwaiting, _Grunnable)
+runqput(mp.p.ptr(), gp, next)
+wakep()</code></pre>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L445-L485">gopark and goready</a>, plus <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L1119-L1140">ready</a>.</span>
+
+          <p>
+            Chapter I's socket path lands here: netpoll changes I/O-ready Gs from waiting to runnable and injects them into scheduling. Some M/P runs them later.
+            “I/O is ready” therefore does not mean “the handler resumed”; runnable latency can still intervene.
+          </p>
+
+          <h2>8. Preemption Offers a Chance, Not a Real-Time Deadline</h2>
+          <p>
+            A G that does not block must not own a P forever. In Go 1.26, sysmon's <code>retake</code> watches each P's <code>schedtick</code>. If one tick persists beyond the internal
+            <code>forcePreemptNS = 10ms</code>, it requests <code>preemptone</code>. That sets <code>gp.preempt</code> and <code>stackguard0 = stackPreempt</code>;
+            supported platforms also request asynchronous preemption through <code>preemptM</code>.
+          </p>
+
+          <p>
+            Ten milliseconds is an implementation threshold for requesting intervention, not a maximum run duration or latency SLO. Signal delivery, safe points, runtime critical sections,
+            platform support, cgo/syscalls, and OS scheduling affect the actual handoff. Preemption improves fairness; it does not make Go hard real time.
+          </p>
+
+          <h2 id="evidence">9. Verify Scheduling with Runnable Latency</h2>
+          <figure class="figure"><img src="../assets/runnable-latency-evidence.png" alt="Go runnable-latency evidence: a G changes from waiting through ready to runnable, then eventually running; /sched/latencies:seconds, go tool trace, and schedtrace observe the runnable interval rather than I/O wait" /></figure>
+
+          <h3>What <code>/sched/latencies:seconds</code> measures</h3>
+          <p>
+            The internal <code>sched.timeToRun</code> comment defines a distribution of time from <code>_Grunnable</code> to <code>_Grunning</code>.
+            <code>runtime/metrics</code> exposes it as the cumulative histogram <code>/sched/latencies:seconds</code>. Time waiting for I/O, channels, or mutexes is outside that interval.
+          </p>
+
+          <pre><code class="language-go">samples := []metrics.Sample{
+    {Name: "/sched/gomaxprocs:threads"},
+    {Name: "/sched/goroutines/runnable:goroutines"},
+    {Name: "/sched/latencies:seconds"},
+}
+metrics.Read(samples)
+histogram := samples[2].Value.Float64Histogram()</code></pre>
+          <span class="source-caption">Metric definitions: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/metrics/description.go#L436-L475">scheduler metric descriptions</a>; internal histogram: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L1015-L1018">sched.timeToRun</a>.</span>
+
+          <h3>Run the burst, trace, and handoff benchmark</h3>
+          <p>
+            <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/scheduler_lab_test.go">scheduler_lab_test.go</a>
+            starts 64 goroutines, waits until all are parked on a <code>release</code> channel, then closes that channel to make a visible runnable burst.
+          </p>
+
+          <pre><code class="language-bash">cd go-runtime/examples/fetchd
+go test -run TestSchedulerBurst -trace scheduler.trace
+go tool trace scheduler.trace
+
+go test -run TestSchedulerMetricsAreAvailable
+go test -bench BenchmarkGoroutineHandoff -benchmem
+GODEBUG=schedtrace=1000,scheddetail=1 go test -run TestSchedulerBurst</code></pre>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>Evidence</th><th>Answers</th><th>Does not answer alone</th></tr></thead>
+            <tbody>
+              <tr><td>Scheduler metrics</td><td>Whether runnable population and latency stay abnormal</td><td>Which G waited where</td></tr>
+              <tr><td>Execution trace</td><td>G/P/M, unblock, syscall, and GC timing in one window</td><td>Long-term low-overhead trends</td></tr>
+              <tr><td><code>schedtrace</code></td><td>Coarse snapshot of P, threads, and run queues</td><td>Fine causal history</td></tr>
+              <tr><td>Goroutine profile</td><td>Stacks and wait reasons at sample time</td><td>Past runnable queuing</td></tr>
+              <tr><td>CPU profile</td><td>Where CPU went while code ran</td><td>Runnable time without CPU</td></tr>
+            </tbody>
+          </table></div>
+
+          <h2>10. Return to the <code>fetchd</code> Boundaries</h2>
+          <ol>
+            <li><strong>Concurrency is not parallelism.</strong> Fetch workers can wait on networking concurrently; CPU work remains bounded by P count and container quota.</li>
+            <li><strong>Bound fan-out before tuning the scheduler.</strong> Unbounded G creation amplifies memory, queues, pools, and wake-ups; <code>GOMAXPROCS</code> is not backpressure.</li>
+            <li><strong>Alert on waiting and runnable separately.</strong> Waiting usually points to a dependency; runnable points to execution supply or wake-up pressure.</li>
+            <li><strong>Do not use <code>runtime.Gosched</code> as a correctness fix.</strong> Correctness should come from blocking boundaries, queues, and synchronization protocols.</li>
+            <li><strong>Move from trend to window to source.</strong> Find the interval with metrics, capture a trace, then map state transitions back to source.</li>
+          </ol>
+
+          <p>
+            Keep one reusable conclusion: <strong>creating G is not creating a thread; runnable is not running; wake-up is not immediate resumption. A G must be matched with M/P before latency moves forward.</strong>
+            Chapter IV enlarges <code>fetchd</code>'s result channel and follows <code>chansend/chanrecv</code>, <code>sudog</code>, semaphores, mutexes, and select to decide when to use channels or locks and where backpressure truly forms.
+          </p>
+
+          <h2 id="sources">Source and Documentation References</h2>
+          <ul class="source-list">
+            <li><a href="https://go.dev/src/runtime/HACKING">Go runtime HACKING: scheduler structures</a></li>
+            <li><a href="https://go.dev/blog/container-aware-gomaxprocs">Container-aware GOMAXPROCS</a></li>
+            <li><a href="https://pkg.go.dev/runtime/metrics">runtime/metrics package documentation</a></li>
+            <li><a href="https://go.dev/doc/diagnostics">Diagnostics in the Go ecosystem</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L29-L72">G status definitions</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L473-L830">runtime g, m, and p structures</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5292-L5424">newproc and newproc1</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L7473-L7750">local run queues and work stealing</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3385-L3715">findRunnable</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L4133-L4231">schedule</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3322-L3383">execute</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L445-L485">gopark and goready</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L6626-L6698">sysmon retake and preemption threshold</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L6858-L6895">preemptone</a></li>
+            <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/scheduler_lab_test.go">fetchd scheduler lab</a></li>
+          </ul>
+
+          <nav class="article-pager" aria-label="Article pagination"><a href="../value-semantics/">← Chapter II: value semantics</a><a href="../">Back to series index →</a></nav>
+        </section>
+      </article></main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body"); const toc = document.querySelector("#toc"); if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => { const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim()); table.querySelectorAll("tbody tr").forEach((row) => Array.from(row.children).forEach((cell, index) => { if (headers[index]) cell.dataset.label = headers[index]; })); });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4")); if (!headings.length) return;
+        const counts = new Map(); const slugify = (value) => value.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "") || "section";
+        const list = document.createElement("ol"); list.className = "toc-list"; const links = []; const lastItems = new Map();
+        const childListFor = (item) => { let child = item.querySelector(":scope > ol"); if (!child) { child = document.createElement("ol"); child.className = "toc-sublist"; item.appendChild(child); } return child; };
+        const parentListFor = (level) => { if (level === 2) return list; if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2)); if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3)); if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2)); return list; };
+        headings.forEach((heading, index) => { if (!heading.id) { const base = slugify(heading.textContent.trim()); const seen = counts.get(base) || 0; counts.set(base, seen + 1); heading.id = seen === 0 ? base : `${base}-${seen + 1}`; } const level = Number(heading.tagName.slice(1)); const item = document.createElement("li"); const link = document.createElement("a"); link.href = `#${heading.id}`; link.textContent = heading.textContent.trim(); link.className = `toc-link toc-level-${level}`; if (index === 0) link.classList.add("active"); item.appendChild(link); parentListFor(level).appendChild(item); lastItems.set(level, item); if (level <= 2) lastItems.delete(3); if (level <= 3) lastItems.delete(4); links.push(link); });
+        toc.appendChild(list); const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === `#${id}`));
+        const observer = new IntersectionObserver((entries) => { const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top); if (visible[0]) activate(visible[0].target.id); }, { rootMargin: "-20% 0px -72% 0px", threshold: 0 }); headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

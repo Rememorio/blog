@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go 源码阅读（三）：goroutine 到底跑在哪里</title>
+    <meta name="description" content="Go 从请求到生产现场系列第三篇：从 fetchd 的 go h.fetch 出发，沿 Go 1.26.0 的 newproc、runqput、schedule、findRunnable、execute、gopark、ready 与 sysmon，解释 G/M/P、工作窃取、抢占和 runnable latency。" />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Go 源码阅读（三）：goroutine 到底跑在哪里" />
+    <meta property="og:description" content="创建 goroutine 只是创建一个 runnable G；真正执行还要匹配 M 与 P，并穿过调度器的工作搜索。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/goroutine-scheduler-overview.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/zh/goroutine-scheduler/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/goroutine-scheduler/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/goroutine-scheduler/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.route-note { border-color: rgba(31, 119, 123, 0.32); background: rgba(31, 119, 123, 0.1); }
+      .note.route-note strong { color: var(--rose); }
+      .article-body pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .source-caption { display: block; margin: -10px 0 24px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+      .article-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line); }
+      .article-pager a { color: var(--teal); font-weight: 800; text-decoration: none; }
+      @media (max-width: 760px) {
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+        .article-pager { flex-direction: column; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="文章快捷入口"><a href="../">Go 系列</a><a href="#newproc">newproc</a><a href="#find-runnable">findRunnable</a><a href="#evidence">运行证据</a><a href="#sources">参考源码</a></nav>
+      <nav class="site-actions" aria-label="站点操作"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="语言切换"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/goroutine-scheduler/" lang="en">English</a></span></nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero">
+          <p class="eyebrow">Go 从请求到生产现场 · 第三篇</p>
+          <h1 class="long-title"><code>goroutine</code> 到底跑在哪里</h1>
+          <p class="lead">
+            <code>go h.fetch(...)</code> 看起来像“再开一条线程”，但源码里既没有为它立刻创建专属 OS thread，也没有承诺下一行之前一定启动。
+            <code>go</code> 语句先制造一个 runnable G；只有调度器把它与 M、P 配成一组，它才真正执行。生产里的尾延迟，常常就藏在“已经能跑”到“终于在跑”的间隔里。
+          </p>
+          <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：newproc → runq → schedule → execute</span><span>实验：scheduler_lab_test.go</span></div>
+          <figure class="hero-image"><img src="../assets/goroutine-scheduler-overview.png" alt="Go goroutine 调度总览：go h.fetch 经 newproc 生成 G 并进入 runq；调度器将 G、OS 线程 M 和执行资源 P 匹配后进入 running" /></figure>
+        </section>
+
+        <section class="article-body">
+          <div class="note route-note"><p><strong>阅读契约：</strong>本文沿 Go 1.26.0 的普通用户 goroutine 主路径解释“创建、可运行、运行、等待与唤醒”。读完应能区分 goroutine 数、线程数、P 数、waiting 与 runnable，并能用 metric/trace 验证调度假设；不会把内部 10ms 阈值或 256 槽 runq 当成语言保证。</p></div>
+
+          <p>
+            直接证据固定到 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go">runtime/proc.go</a> 与
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go">runtime/runtime2.go</a>。
+            G/M/P 的概念边界参考官方 <a href="https://go.dev/src/runtime/HACKING">runtime HACKING</a>；生产观测参考
+            <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a> 和 <a href="https://go.dev/doc/diagnostics">Diagnostics</a>。
+            本文讨论 gc runtime 的当前实现；别的 Go implementation 可以选择不同映射。
+          </p>
+
+          <h2>一、先把三个常被混用的数量拆开</h2>
+          <p>
+            <code>fetchd</code> 最多为八个 URL 启动八个 worker goroutine。这不等于增加八条线程，更不等于八个 worker 同时执行 Go 代码。
+            调度器管理三个不同资源：
+          </p>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>符号</th><th>runtime 对象</th><th>持有什么</th><th>数量关系</th></tr></thead>
+            <tbody>
+              <tr><td>G</td><td><code>runtime.g</code></td><td>goroutine 栈、调度保存点、状态、创建关系</td><td>可远大于线程和 P</td></tr>
+              <tr><td>M</td><td><code>runtime.m</code></td><td>一条 OS thread、g0、当前 G、关联 P</td><td>系统调用/cgo 可让 M 多于 P</td></tr>
+              <tr><td>P</td><td><code>runtime.p</code></td><td>执行 Go 代码所需资源、local runq、allocator cache、timer</td><td>恰有 <code>GOMAXPROCS</code> 个</td></tr>
+            </tbody>
+          </table></div>
+
+          <p>
+            调度器的任务不是把 G 永久绑到 M，而是匹配“待运行的 G + 可执行的 M + 一个 P”。M 可以换 G，G 也可以在不同时间跑到不同 M 上。
+            M 阻塞在 syscall 时可交还 P，让另一个 M 继续执行 Go；这正是 goroutine 不等于线程的工程价值。
+          </p>
+
+          <h3><code>GOMAXPROCS</code> 限制的是并行执行 Go 代码</h3>
+          <p>
+            Go 1.26 中 P 的数量对应当前 <code>GOMAXPROCS</code>。若有 1000 个 runnable G 而 <code>GOMAXPROCS=8</code>，通常最多八条线程同时执行用户 Go 代码，
+            其余 G 等在调度器。线程总数仍可能因 syscall、cgo、runtime 工作与锁线程而更高。Go 1.25 起默认值还会感知容器 CPU limit；显式设置环境变量或调用
+            <code>runtime.GOMAXPROCS</code> 会改变自动更新行为，所以诊断时应读取实际 metric，而不是只看宿主机核心数。
+          </p>
+
+          <h2>二、状态比“goroutine 数量”更接近问题</h2>
+          <p>
+            <code>runtime2.go</code> 把 G 的关键状态区分为 <code>_Grunnable</code>、<code>_Grunning</code>、<code>_Gwaiting</code>、
+            <code>_Gsyscall</code> 等。数量相同，生产含义可能完全不同。
+          </p>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>状态</th><th>含义</th><th>常见来源</th><th>延迟解释</th></tr></thead>
+            <tbody>
+              <tr><td><code>_Grunnable</code></td><td>已在 run queue，能执行但尚未执行</td><td>新建、channel 唤醒、I/O 就绪、timer</td><td>调度/CPU 供给与竞争</td></tr>
+              <tr><td><code>_Grunning</code></td><td>已与 M/P 匹配，正在执行 Go</td><td><code>execute</code></td><td>CPU 或当前代码路径</td></tr>
+              <tr><td><code>_Gwaiting</code></td><td>停在 runtime 等待点</td><td>channel、mutex、timer、netpoll</td><td>等待资源，不是等待 CPU</td></tr>
+              <tr><td><code>_Gsyscall</code></td><td>进入系统调用</td><td>阻塞 syscall/cgo 边界</td><td>内核或外部代码</td></tr>
+            </tbody>
+          </table></div>
+
+          <p>
+            因此“goroutine 很多”本身不是故障。十万条长期 waiting 的连接可能是预期模型；几百条持续 runnable 却可能意味着 CPU quota、过度 fan-out、锁唤醒风暴或 GC 工作挤占。
+            先看状态分布和等待原因，再看总数。
+          </p>
+
+          <h2 id="newproc">三、<code>go h.fetch</code> 怎样变成一个 runnable G</h2>
+          <p>
+            编译器把 <code>go</code> 语句降为对 <code>runtime.newproc</code> 的调用。源码注释直接写着：创建一个运行 <code>fn</code> 的新 G，并把它放到等待运行的队列。
+          </p>
+
+          <pre><code class="language-go">// 编译器把 go 语句变成对此函数的调用。
+func newproc(fn *funcval) {
+    gp := getg()
+    pc := sys.GetCallerPC()
+    systemstack(func() {
+        newg := newproc1(fn, gp, pc, false, waitReasonZero)
+        pp := getg().m.p.ptr()
+        runqput(pp, newg, true)
+        if mainStarted {
+            wakep()
+        }
+    })
+}</code></pre>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5292-L5308">runtime.newproc</a>。</span>
+
+          <figure class="figure"><img src="../assets/go-statement-newproc.png" alt="go 语句到 runnable G 的源码路径：go h.fetch 经 newproc 和 newproc1 获取 G、准备 stack/goid、切换到 _Grunnable，再由 runqput 放入 runnext、local runq 或溢出到 global runq" /></figure>
+
+          <h3><code>newproc1</code> 优先复用 G，再准备初始执行现场</h3>
+          <p>
+            <code>newproc1</code> 在 system stack 上执行。它先从当前 P 的 free G 池取一个 <code>gfget</code>；没有才用 <code>malg(stackMin)</code> 创建栈并把 G 加入全局集合。
+            随后清空 <code>g.sched</code>，设置初始 SP、返回到 <code>goexit</code> 的 PC、调用入口、parent goid 与创建 PC，最后分配 goid 并把状态从 <code>_Gdead</code> 切到 <code>_Grunnable</code>。
+          </p>
+
+          <pre><code class="language-go">newg := gfget(pp)
+if newg == nil {
+    newg = malg(stackMin)
+    allgadd(newg)
+}
+
+newg.sched.sp = sp
+newg.sched.pc = abi.FuncPCABI0(goexit) + sys.PCQuantum
+gostartcallfn(&amp;newg.sched, fn)
+newg.parentGoid = callergp.goid
+newg.gopc = callerpc
+newg.goid = pp.goidcache
+casgstatus(newg, _Gdead, _Grunnable)</code></pre>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5310-L5424">runtime.newproc1</a>。</span>
+
+          <p>
+            这说明两个边界。第一，创建 goroutine 需要 G 元数据和初始栈，但通常会复用对象，不等于每次向 OS 创建线程。第二，函数体此时还没有执行；
+            <code>_Grunnable</code> 只表示它有资格被选中。
+          </p>
+
+          <h2>四、local runq、runnext 与 global runq</h2>
+          <p>
+            当前 P 持有一个 <code>[256]guintptr</code> 的 local runq 和一个单独的 <code>runnext</code> 槽。数组长度是 Go 1.26.0 实现细节，
+            但“局部队列优先保持 locality、全局队列负责溢出与公平”是理解路径的关键。
+          </p>
+
+          <h3><code>runnext</code> 不是无限优先级</h3>
+          <p>
+            <code>newproc</code> 以 <code>next=true</code> 调用 <code>runqput</code>，新 G 会先尝试占据 <code>runnext</code>。取出时它继承当前时间片剩余部分，
+            让“创建/唤醒后马上协作”的模式少一次长队等待。如果槽已有 G，旧值会被挤进普通 local runq；没有 sysmon 的平台会避免这个优化，以免 ping-pong 任务饿死别人。
+          </p>
+
+          <h3>local queue 满了怎样溢出</h3>
+          <p>
+            <code>runqput</code> 在环形数组有空间时写 tail。满时 <code>runqputslow</code> 从本地拿走一半，再连同新 G 批量放进 global queue。
+            它不是“新来的一个直接进全局”，而是重新分布一批工作，给其他 P 获取或窃取的机会。
+          </p>
+
+          <pre><code class="language-go">if t-h &lt; uint32(len(pp.runq)) {
+    pp.runq[t%uint32(len(pp.runq))].set(gp)
+    atomic.StoreRel(&amp;pp.runqtail, t+1)
+    return
+}
+runqputslow(pp, gp, h, t) // 一半 local G + 新 G → global runq</code></pre>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L7473-L7559">runqput 与 runqputslow</a>；P 的队列字段见 <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L772-L818">runtime.p</a>。</span>
+
+          <h2 id="find-runnable">五、<code>schedule</code> 与 <code>findRunnable</code> 怎样找到下一份工作</h2>
+          <p>
+            一轮调度的外壳很短：<code>schedule</code> 调用 <code>findRunnable</code>，得到 G 后处理 locked-M 等特殊情况，最后进入 <code>execute</code>。
+            真正复杂的是“从哪里找工作”。
+          </p>
+
+          <pre><code class="language-go">func schedule() {
+    gp, inheritTime, tryWakeP := findRunnable()
+    // spinning、GC worker、locked M 等处理省略
+    execute(gp, inheritTime)
+}</code></pre>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L4133-L4231">runtime.schedule</a>。</span>
+
+          <figure class="figure"><img src="../assets/find-runnable-route.png" alt="Go findRunnable 主搜索环：先处理 timers、trace 和 GC，以及每 61 tick 的全局公平检查，再查 local runq、普通 global runq、netpoll 与 stealWork；无工作时 idle/park，并在停放前重查来源" /></figure>
+
+          <h3>这不是一条简单 FIFO</h3>
+          <p>
+            <code>findRunnable</code> 顶部先检查 timer，再处理 trace reader 与 GC worker。为了防止两个不断互相唤醒的 local G 长期占满 P，
+            每当 <code>schedtick % 61 == 0</code> 且 global queue 非空，会先从全局拿一次。常规业务工作随后依次尝试 local queue 与 global queue。
+          </p>
+
+          <p>
+            队列没有工作时，调度器做一次非阻塞 netpoll；再让 spinning M 通过 <code>stealWork</code> 从其他 P 获取工作和 timer。
+            如果仍为空，它准备释放 P 并 park M，但在状态转换前后会重新检查全局/各 P 队列、timer 与 netpoll，避免“工作刚到、所有 worker 却睡了”的丢唤醒。
+          </p>
+
+          <h3>work stealing 为什么取一批而不是只拿一个</h3>
+          <p>
+            <code>runqsteal</code> 通过 <code>runqgrab</code> 尝试从另一个 P 的 local queue 取一半，把其中一个直接返回运行，其余落到自己的 local queue。
+            批量平衡减少频繁跨 P 竞争；随机选择受害 P 和 spinning M 限额则避免所有空闲线程同时扫描造成 CPU 浪费。
+          </p>
+
+          <h2>六、<code>execute</code> 才把 runnable 变成 running</h2>
+          <p>
+            选到 G 后，<code>execute</code> 把当前 M 的 <code>curg</code> 指向它、把 G 的 <code>m</code> 指回当前 M，
+            用 CAS 将状态从 <code>_Grunnable</code> 改为 <code>_Grunning</code>，清理等待与抢占标记，最后 <code>gogo(&amp;gp.sched)</code> 恢复保存现场。
+          </p>
+
+          <pre><code class="language-go">mp.curg = gp
+gp.m = mp
+casgstatus(gp, _Grunnable, _Grunning)
+gp.waitsince = 0
+gp.preempt = false
+// trace、profiling 与时间片处理省略
+gogo(&amp;gp.sched)</code></pre>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3322-L3383">runtime.execute</a>。</span>
+
+          <p>
+            因为 G 与 M 在这里才绑定，普通业务不应依赖 goroutine identity 对应固定线程。只有确有 thread-local/GUI/cgo 要求时才考虑
+            <code>runtime.LockOSThread</code>，并承担它对调度灵活性的影响。
+          </p>
+
+          <h2>七、阻塞不是停住线程：<code>gopark</code> 与 <code>ready</code></h2>
+          <p>
+            goroutine 在 channel、mutex、timer 或 netpoll 上不能继续时，runtime 通过 <code>gopark</code> 保存等待原因，并用 <code>mcall(park_m)</code>
+            切到 M 的 g0 stack 完成状态转换与调度。稍后资源就绪，<code>goready</code> 在 system stack 调用 <code>ready</code>：
+          </p>
+
+          <pre><code class="language-go">casgstatus(gp, _Gwaiting, _Grunnable)
+runqput(mp.p.ptr(), gp, next)
+wakep()</code></pre>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L445-L485">gopark 与 goready</a>、<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L1119-L1140">ready</a>。</span>
+
+          <p>
+            第一篇的 socket 路径正好落在这里：netpoll 把 I/O 就绪的 G 从 waiting 转成 runnable 并注入队列；某个 M/P 以后才会执行它。
+            “I/O 已就绪”不是“handler 已恢复”，中间仍可能存在 runnable latency。
+          </p>
+
+          <h2>八、抢占保证机会，不保证硬实时</h2>
+          <p>
+            长时间不阻塞的 G 不能永远占住 P。Go 1.26 的 sysmon 在 <code>retake</code> 中观察 P 的 <code>schedtick</code>；同一 tick 超过内部
+            <code>forcePreemptNS = 10ms</code> 会请求 <code>preemptone</code>。它设置 <code>gp.preempt</code> 与 <code>stackguard0 = stackPreempt</code>，
+            支持的平台还会通过 <code>preemptM</code> 请求异步抢占。
+          </p>
+
+          <p>
+            10ms 是当前实现触发检查的阈值，不是 goroutine 的最大运行时，也不是延迟 SLA。信号投递、安全点、runtime 临界区、平台支持、cgo/syscall 与 OS 调度都会影响实际交接。
+            抢占提供公平机会，不能把 Go 变成硬实时系统。
+          </p>
+
+          <h2 id="evidence">九、用 runnable latency 验证调度假设</h2>
+          <figure class="figure"><img src="../assets/runnable-latency-evidence.png" alt="Go runnable latency 证据图：G 从 waiting 经 ready 进入 runnable，再到 running；runnable latency 区间由 /sched/latencies:seconds、go tool trace 与 schedtrace 观察，区别于 I/O waiting" /></figure>
+
+          <h3><code>/sched/latencies:seconds</code> 测量什么</h3>
+          <p>
+            runtime 内部 <code>sched.timeToRun</code> 的注释把它定义为 G 在 <code>_Grunnable</code> 到 <code>_Grunning</code> 之间的时间分布；
+            <code>runtime/metrics</code> 以累计直方图 <code>/sched/latencies:seconds</code> 暴露。它不包含 G 在 I/O、channel 或 mutex 上的 waiting 时间。
+          </p>
+
+          <pre><code class="language-go">samples := []metrics.Sample{
+    {Name: "/sched/gomaxprocs:threads"},
+    {Name: "/sched/goroutines/runnable:goroutines"},
+    {Name: "/sched/latencies:seconds"},
+}
+metrics.Read(samples)
+histogram := samples[2].Value.Float64Histogram()</code></pre>
+          <span class="source-caption">metric 定义：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/metrics/description.go#L436-L475">scheduler metrics descriptions</a>；内部直方图：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L1015-L1018">sched.timeToRun</a>。</span>
+
+          <h3>运行 burst、trace 与 handoff benchmark</h3>
+          <p>
+            <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/scheduler_lab_test.go">scheduler_lab_test.go</a>
+            先启动 64 个 goroutine，让它们全部在 <code>release</code> channel 上 waiting；关闭 channel 会一次唤醒它们，形成清晰的 runnable burst。
+          </p>
+
+          <pre><code class="language-bash">cd go-runtime/examples/fetchd
+go test -run TestSchedulerBurst -trace scheduler.trace
+go tool trace scheduler.trace
+
+go test -run TestSchedulerMetricsAreAvailable
+go test -bench BenchmarkGoroutineHandoff -benchmem
+GODEBUG=schedtrace=1000,scheddetail=1 go test -run TestSchedulerBurst</code></pre>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>证据</th><th>回答的问题</th><th>不能单独回答</th></tr></thead>
+            <tbody>
+              <tr><td>scheduler metrics</td><td>runnable 数与延迟分布是否长期异常</td><td>哪条具体 G 在哪里等待</td></tr>
+              <tr><td>execution trace</td><td>一段窗口内 G/P/M、unblock、syscall、GC 的时间关系</td><td>长期趋势与低开销常驻监控</td></tr>
+              <tr><td><code>schedtrace</code></td><td>某时刻 P、thread、runq 的粗快照</td><td>精细因果链</td></tr>
+              <tr><td>goroutine profile</td><td>采样时各 G 的栈与 waiting reason</td><td>过去发生过的 runnable 排队</td></tr>
+              <tr><td>CPU profile</td><td>真正运行时 CPU 花在哪</td><td>没拿到 CPU 的 runnable 时间</td></tr>
+            </tbody>
+          </table></div>
+
+          <h2>十、回到 <code>fetchd</code> 的工程边界</h2>
+          <ol>
+            <li><strong>并发不是并行。</strong>八个 fetch worker 可以并发等待网络；CPU 阶段仍受 P 与容器 quota 限制。</li>
+            <li><strong>先限制 fan-out，再调调度器。</strong>无界创建 G 会放大内存、队列、连接池和唤醒压力；<code>GOMAXPROCS</code> 不是背压器。</li>
+            <li><strong>waiting 与 runnable 分开告警。</strong>前者通常指向资源依赖，后者指向执行供给或唤醒风暴。</li>
+            <li><strong>不要把 <code>runtime.Gosched</code> 当公平性修复。</strong>它可用于实验或特殊协作，业务正确性应靠阻塞边界、队列和同步协议。</li>
+            <li><strong>从趋势到窗口再到源码。</strong>先用 metrics 找异常时间，再抓 trace，还原具体 G 的状态转换，最后回到函数路径。</li>
+          </ol>
+
+          <p>
+            这一篇的可复用结论是：<strong>创建 G ≠ 创建线程，runnable ≠ running，唤醒 ≠ 立刻恢复；G 必须与 M/P 匹配，延迟才能继续向前。</strong>
+            下一篇会放大 <code>fetchd</code> 的 result channel：沿 <code>chansend/chanrecv</code>、<code>sudog</code>、semaphore、mutex 与 select，回答什么时候 channel，什么时候锁，以及背压到底发生在哪里。
+          </p>
+
+          <h2 id="sources">参考源码与文档</h2>
+          <ul class="source-list">
+            <li><a href="https://go.dev/src/runtime/HACKING">Go runtime HACKING: scheduler structures</a></li>
+            <li><a href="https://go.dev/blog/container-aware-gomaxprocs">Container-aware GOMAXPROCS</a></li>
+            <li><a href="https://pkg.go.dev/runtime/metrics">runtime/metrics package documentation</a></li>
+            <li><a href="https://go.dev/doc/diagnostics">Diagnostics in the Go ecosystem</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L29-L72">G status definitions</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L473-L830">runtime g, m, and p structures</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5292-L5424">newproc and newproc1</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L7473-L7750">local run queues and work stealing</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3385-L3715">findRunnable</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L4133-L4231">schedule</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3322-L3383">execute</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L445-L485">gopark and goready</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L6626-L6698">sysmon retake and preemption threshold</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L6858-L6895">preemptone</a></li>
+            <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/scheduler_lab_test.go">fetchd scheduler lab</a></li>
+          </ul>
+
+          <nav class="article-pager" aria-label="文章翻页"><a href="../value-semantics/">← 第二篇：值语义</a><a href="../">返回系列目录 →</a></nav>
+        </section>
+      </article></main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body"); const toc = document.querySelector("#toc"); if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => { const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim()); table.querySelectorAll("tbody tr").forEach((row) => Array.from(row.children).forEach((cell, index) => { if (headers[index]) cell.dataset.label = headers[index]; })); });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4")); if (!headings.length) return;
+        const counts = new Map(); const slugify = (value) => value.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "") || "section";
+        const list = document.createElement("ol"); list.className = "toc-list"; const links = []; const lastItems = new Map();
+        const childListFor = (item) => { let child = item.querySelector(":scope > ol"); if (!child) { child = document.createElement("ol"); child.className = "toc-sublist"; item.appendChild(child); } return child; };
+        const parentListFor = (level) => { if (level === 2) return list; if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2)); if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3)); if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2)); return list; };
+        headings.forEach((heading, index) => { if (!heading.id) { const base = slugify(heading.textContent.trim()); const seen = counts.get(base) || 0; counts.set(base, seen + 1); heading.id = seen === 0 ? base : `${base}-${seen + 1}`; } const level = Number(heading.tagName.slice(1)); const item = document.createElement("li"); const link = document.createElement("a"); link.href = `#${heading.id}`; link.textContent = heading.textContent.trim(); link.className = `toc-link toc-level-${level}`; if (index === 0) link.classList.add("active"); item.appendChild(link); parentListFor(level).appendChild(item); lastItems.set(level, item); if (level <= 2) lastItems.delete(3); if (level <= 3) lastItems.delete(4); links.push(link); });
+        toc.appendChild(list); const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === `#${id}`));
+        const observer = new IntersectionObserver((entries) => { const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top); if (visible[0]) activate(visible[0].target.id); }, { rootMargin: "-20% 0px -72% 0px", threshold: 0 }); headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
