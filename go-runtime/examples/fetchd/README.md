@@ -29,3 +29,5 @@ Run the tests with `go test ./...`. The focused labs are grouped by article:
   preservation, and reflection's addressability boundary.
 - `context_lab_test.go` traces cancellation causes, worker joining, timeout and
   detached lifetimes, `AfterFunc`, and graceful HTTP server shutdown.
+- `memory_lab_test.go` compares stack-shaped values, escaping pointers, slice
+  growth and preallocation, then verifies the runtime metrics used for GC evidence.

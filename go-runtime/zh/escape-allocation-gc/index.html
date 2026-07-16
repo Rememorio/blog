@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go 源码阅读（七）：一个请求为什么在堆上</title>
+    <meta name="description" content="Go 从请求到生产现场系列第七篇：沿 fetchd 阅读 Go 1.26.0 的逃逸分析、slice 分配、mallocgc、mcache、并发 GC、写屏障、mark assist、GOGC 与 GOMEMLIMIT。" />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Go 源码阅读（七）：一个请求为什么在堆上" />
+    <meta property="og:description" content="堆不是语法选择，而是生命周期证明的结果；分配成本也不止一次 malloc，还会进入 size class、GC 目标与 mutator assist。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/request-memory-journey.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/zh/escape-allocation-gc/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/escape-allocation-gc/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/escape-allocation-gc/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.route-note { border-color: rgba(31, 119, 123, 0.32); background: rgba(31, 119, 123, 0.1); }
+      .note.route-note strong { color: var(--rose); }
+      .article-body pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .source-caption { display: block; margin: -10px 0 24px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+      .article-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line); }
+      .article-pager a { color: var(--teal); font-weight: 800; text-decoration: none; }
+      @media (max-width: 760px) {
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+        .article-pager { flex-direction: column; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="文章快捷入口"><a href="../">Go 系列</a><a href="#escape">逃逸</a><a href="#allocator">分配器</a><a href="#gc">GC</a><a href="#evidence">运行证据</a><a href="#sources">参考源码</a></nav>
+      <nav class="site-actions" aria-label="站点操作"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="语言切换"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/escape-allocation-gc/" lang="en">English</a></span></nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero">
+          <p class="eyebrow">Go 从请求到生产现场 · 第七篇</p>
+          <h1 class="long-title">一个请求为什么在堆上</h1>
+          <p class="lead">
+            <code>new</code> 不等于堆，返回值也不等于栈。编译器先证明对象能否活在某个 stack frame；
+            证明不了才让它逃逸。真正进入堆后，一次请求的成本还会穿过 size class、每 P 的 <code>mcache</code>、
+            并发标记、写屏障与 mark assist。
+          </p>
+          <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：escape graph → mallocgc / mcache → pacer / assist</span><span>实验：memory_lab_test.go</span></div>
+          <figure class="hero-image"><img src="../assets/request-memory-journey.png" alt="一个 fetchd 请求的内存旅程：逃逸分析决定栈或堆，mallocgc 从 mcache size class 分配，切片增长与预分配产生不同分配量，GC 依据 heap goal 标记、协助和清扫" /></figure>
+        </section>
+
+        <section class="article-body">
+          <div class="note route-note"><p><strong>阅读契约：</strong>本文固定到 Go 1.26.0 的编译器与 runtime 实现，回答四件事：对象为什么逃逸、一次小对象分配怎样拿到 slot、分配如何变成 GC 工作、怎样用编译器报告、benchmark、profile、metrics 与 trace 交叉验证。逃逸结果、size class 和分配器布局是实现细节，不是 Go 语言 ABI。</p></div>
+
+          <p>
+            实现证据来自 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go">escape.go</a>、
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go">malloc.go</a>、
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go">mgc.go</a> 与
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcpacer.go">mgcpacer.go</a>。
+            测量接口来自官方 <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a>、
+            <a href="https://pkg.go.dev/runtime/pprof">runtime/pprof</a> 与 <a href="https://go.dev/doc/diagnostics">Diagnostics 文档</a>。
+          </p>
+
+          <h2>一、先优化证据，不先优化“堆”</h2>
+          <p>
+            一次 heap allocation 不是天然 bug。把响应对象留到 handler 返回之后、把数据装入 channel 或 slice backing array，本来就可能需要比当前 frame 更长的生命周期。
+            真正值得追的是请求路径上的<strong>分配速率、存活集合和延迟</strong>：每次操作分配多少对象与字节，GC 时仍有多少 live bytes，mark assist 是否落到用户 goroutine，以及这些工作是否处在延迟预算内。
+          </p>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>问题</th><th>第一份证据</th><th>不能单独推出</th></tr></thead>
+            <tbody>
+              <tr><td>为什么在堆上</td><td><code>-gcflags='-m=2'</code> 与源码生命周期</td><td>它是否值得优化</td></tr>
+              <tr><td>一条路径分配多少</td><td><code>Benchmark</code> + <code>-benchmem</code></td><td>生产中是谁长期存活</td></tr>
+              <tr><td>谁占住了堆</td><td>heap profile（in-use）</td><td>历史累计分配速率</td></tr>
+              <tr><td>谁制造分配流量</td><td>allocs profile（累计）</td><td>当前 live heap</td></tr>
+              <tr><td>GC 是否影响延迟</td><td>metrics、<code>gctrace</code>、execution trace</td><td>单个对象该放栈还是堆</td></tr>
+            </tbody>
+          </table></div>
+
+          <h2 id="escape">二、栈或堆是生命周期证明，不是语法分类</h2>
+          <p>
+            Go 规范描述值、地址与可达行为，却不要求实现把某种语法固定放在栈或堆。编译器 escape analysis 的两条核心不变量直接写在源码注释里：
+            <strong>指向 stack object 的指针不能被存入 heap；指针不能比它指向的 stack object 活得更久。</strong>
+            只要编译器能证明地址不越过 frame 生命周期，<code>new(T)</code> 也可以落栈；反过来，普通局部变量被返回地址、放入更长寿命对象或闭包后就可能进堆。
+          </p>
+
+          <pre><code class="language-go">//go:noinline
+func stackResultChecksum() int64 {
+    result := fetchResult{
+        URL: "https://go.dev", Status: 200, Bytes: 42,
+    }
+    return result.Bytes + int64(len(result.URL))
+}
+
+//go:noinline
+func escapingResult() *fetchResult {
+    return &amp;fetchResult{
+        URL: "https://go.dev", Status: 200, Bytes: 42,
+    }
+}</code></pre>
+
+          <p>
+            “返回指针一定慢”也不是可靠规则：inline、调用点传播与未来编译器版本都可能改变结果。这里加 <code>//go:noinline</code> 是为了让实验形状稳定，不是生产优化建议。
+            结论必须读当前构建的报告，再用 allocation count 验证；不能把某次 <code>-m</code> 输出当语言保证。
+          </p>
+
+          <h2>三、编译器建立带权 location graph</h2>
+          <p>
+            escape 包先把变量和隐式分配映射为 location，再把赋值建成有向边。边权是“解引用次数减取地址次数”：
+            <code>p = &amp;q</code> 为 -1，<code>p = q</code> 为 0，<code>p = *q</code> 为 +1。
+            随后沿图查找可能破坏两条不变量的路径；某个地址流到 heap 或可能活得更久的位置时，对应 location 被标为必须 heap allocate。
+            跨函数信息则压缩成 parameter tags，供静态调用点继续传播。
+          </p>
+
+          <figure class="figure"><img src="../assets/escape-analysis-graph.png" alt="Go escape analysis 带权 location graph：取地址边为负一、普通赋值为零、解引用为正一；返回地址或 slice backing array 可把 result 连到 heap，编译器报告 moved to heap 与 append escapes" /></figure>
+          <span class="source-caption">算法不变量、边权和过程：<a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go#L19-L89">escape.go L19-L89</a>；批量分析入口：<a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go#L138-L188">Batch</a>。</span>
+
+          <p>
+            图是保守近似，并不区分 struct 的不同字段或 slice 的不同元素；源码也明确说明分析通常不具备完整的 flow、path 或 context sensitivity。
+            “escapes to heap”因此表示编译器没有足够证明把它安全留在当前 frame，不表示这个对象一定泄漏，更不表示 GC 当前就有压力。
+          </p>
+
+          <h2>四、读 <code>-m=2</code>：看流向，不数关键词</h2>
+          <p>
+            对整个 <code>fetchd</code> 运行构建报告时，
+            <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/memory_lab_test.go">memory_lab_test.go</a>
+            中会出现 <code>&amp;fetchResult{...} escapes to heap</code>，以及带运行时长度的
+            <code>make([]fetchResult, 0, count)</code> backing array 逃逸；真实 handler 的 batch 聚合还会报告
+            <code>append escapes to heap</code>。重点不是“出现 heap 三次”，而是解释每条数据的 owner 和最长寿命：
+            指针离开函数、slice backing array 由返回值持有、append 可能发布一个新数组。
+          </p>
+
+          <pre><code class="language-bash">cd go-runtime/examples/fetchd
+go test -run '^$' -gcflags='-m=2' ./...</code></pre>
+
+          <p>
+            编译器还可能报告 interface 装箱、闭包捕获或日志参数的逃逸；它们中有些在热路径值得处理，有些是一次性初始化噪声。
+            按函数调用链过滤，再与 benchmark 的 <code>allocs/op</code> 对齐。如果报告说可能逃逸而测量仍为 0 alloc/op，优先相信最终生成代码和稳定测量，同时检查 inline、常量折叠与 benchmark 是否被优化掉。
+          </p>
+
+          <h2>五、slice 预分配减少的是 backing array 迁移</h2>
+          <p>
+            slice header 只有 pointer、len、cap；预分配并没有把 header “改成堆对象”，而是让已知上界的结果集合一次拿到足够 backing array。
+            从空 slice 连续 append 时，容量不足会调用 <code>growslice</code>，新建更大数组并复制旧元素。增长策略是当前 runtime 实现，不能把“永远翻倍”写进业务正确性。
+          </p>
+
+          <pre><code class="language-go">// growth path
+var results []fetchResult
+for i := 0; i &lt; count; i++ {
+    results = append(results, fetchResult{N: i})
+}
+
+// one backing allocation for a known upper bound
+results := make([]fetchResult, 0, count)
+for i := 0; i &lt; count; i++ {
+    results = append(results, fetchResult{N: i})
+}</code></pre>
+
+          <p>
+            本实验聚合 64 个结果时，按需增长稳定为 <strong>7 allocs/op、约 9.1 KiB/op</strong>，预分配为
+            <strong>1 alloc/op、约 4.8 KiB/op</strong>；返回指针为 1 alloc/op、64 B/op，而只计算校验和的值路径为 0 alloc/op。
+            这些数字是该实验形状的证据，不是跨平台常量。预分配过大同样会扩大 live heap；更好的输入是可信上界，而不是“越大越安全”。
+          </p>
+
+          <h2 id="allocator">六、<code>mallocgc</code> 先按大小和指针形状分流</h2>
+          <p>
+            Go 1.26.0 的 <code>mallocgc</code> 先处理零大小请求：返回共享的 <code>zerobase</code>。常规路径中，小对象不超过约 32 KiB；
+            无指针且小于 16 B 的对象可进入 tiny allocator，把多个对象装进一个 16 B block。其他小对象按 size class 和 scan/noscan 分流，
+            大对象直接从 heap pages 分配。含指针对象还需要正确的 bitmap/zeroing，让 GC 知道哪些 word 需要扫描。
+          </p>
+
+          <figure class="figure"><img src="../assets/mallocgc-allocation-path.png" alt="Go mallocgc 分配路径：零大小到 zerobase，tiny noscan 对象共享十六字节块，小对象按 scan 或 noscan size class 从 per-P mcache 的 mspan 取空闲 slot，满后 refill 到 mcentral，大对象从 mheap pages 分配" /></figure>
+
+          <pre><code class="language-go">if size == 0 {
+    return unsafe.Pointer(&amp;zerobase)
+}
+if gcBlackenEnabled != 0 {
+    deductAssistCredit(size)
+}
+// small noscan / small scan / large routing follows</code></pre>
+          <span class="source-caption">入口与分流：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go#L1097-L1217">mallocgc</a>。Go 1.26 还包含受 experiment 与 sanitizer 条件控制的 size-specialized 路径；它属于当前内部实现，不应被应用代码依赖。</span>
+
+          <p>
+            size class 让固定大小 slot 可以批量管理，却也引入 <code>elemsize - requested size</code> 的内部碎片。tiny allocator 则有另一项权衡：
+            同一 16 B block 里的任一对象仍可达，整块就不能回收，所以它只适用于 noscan 小对象。应用真正能控制的是对象形状、批量大小与复用边界，不是直接选择 runtime 的 span。
+          </p>
+
+          <h2>七、快路径是当前 P 的 <code>mcache</code> 与 <code>mspan</code></h2>
+          <p>
+            <code>nextFreeFast</code> 从当前 span 的 <code>allocCache</code> 找 trailing zero，推进 <code>freeindex</code> 并计算 slot 地址。
+            这条路径不需要去全局 heap 找空间。cached span 满时，<code>mcache.nextFree</code> 调用 <code>refill</code>；
+            refill 把已满 span 归还给 central，再用 <code>mcentral.cacheSpan</code> 获取有空位的 span。源码要求这段运行在 non-preemptible context，
+            因为 mcache 的 owner 与 P 绑定，抢占后 P 可能改变。
+          </p>
+
+          <pre><code class="language-go">func nextFreeFast(s *mspan) gclinkptr {
+    theBit := sys.TrailingZeros64(s.allocCache)
+    if theBit &lt; 64 {
+        result := s.freeindex + uint16(theBit)
+        // advance cache and return s.base + result*s.elemsize
+    }
+    return 0
+}</code></pre>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go#L1021-L1092">nextFreeFast 与 mcache.nextFree</a>；<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mcache.go#L160-L206">mcache.refill</a>。</span>
+
+          <p>
+            “小对象分配很快”描述的是常见 fast path，不代表没有系统成本：refill 可能触发 sweep 工作与 GC trigger 检查，内存清零和 sanitizer 也有成本；
+            最重要的是累计 allocation rate 最终会推进 heap goal。一次只看纳秒很便宜的分配，在高 QPS 下仍可能把大量 CPU 变成标记与清扫。
+          </p>
+
+          <h2 id="gc">八、GC 是两段短 STW 之间的并发标记</h2>
+          <p>
+            runtime 文档把循环写得很清楚：先完成 sweep termination 并短暂停顿，切到 <code>_GCmark</code>、准备 root jobs、启用 write barrier 与 mark workers；
+            mutator 恢复后并发标记。达到 mark completion 条件后再次 STW，进入 <code>_GCmarktermination</code> 完成标记与统计，
+            再切回 <code>_GCoff</code>，关闭 write barrier，让 sweep 在后台并发进行。
+          </p>
+
+          <figure class="figure"><img src="../assets/concurrent-gc-pacer.png" alt="Go 并发 GC：heap goal 由 GOGC 目标与内存限制目标共同约束，短暂停顿后并发标记，后台 worker、混合写屏障和分配协助共同完成工作，标记终止短暂停顿后并发清扫复用" /></figure>
+
+          <p>
+            因此“Go GC 是并发的”和“Go GC 有 STW”都只说了一半。关键是把暂停、并发 CPU、assist 落在哪个请求、以及 live heap 变化一起看。
+            只记录 pause quantile，可能漏掉请求 goroutine 亲自做 GC work 的尾延迟；只看 GC CPU，也可能把业务分配激增误判为 collector 回归。
+          </p>
+          <span class="source-caption">phase 与完整循环：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L22-L79">mgc.go 概览</a>；<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L733-L879">gcStart</a>。</span>
+
+          <h2>九、混合写屏障防止 mutator 隐藏白对象</h2>
+          <p>
+            concurrent mark 时，应用还在改 heap pointer。Go 的 hybrid write barrier 在发布新指针前 shade 旧 slot 指向的对象；
+            当当前 goroutine 的 stack 仍是 grey 时，也 shade 新指针。这样 mutator 不能通过把唯一指针从 heap 移到已扫描或未扫描 stack 的组合中，让白对象从标记器视野消失。
+            barrier 对当前 stack frame 的写入可由编译器省略，但 heap pointer 发布必须遵守 pre-publication 约束。
+          </p>
+
+          <pre><code class="language-text">writePointer(slot, ptr):
+    shade(*slot)
+    if current stack is grey:
+        shade(ptr)
+    *slot = ptr</code></pre>
+          <span class="source-caption">算法、正确性解释与省略条件：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mbarrier.go#L19-L121">runtime/mbarrier.go</a>。</span>
+
+          <p>
+            这也是 pointer-rich object 与 pointer-free buffer 成本不同的一部分：后者无需让 GC 扫描其内容。不要为了“少扫描”把指针偷偷编码成 <code>uintptr</code>；
+            那会破坏可达性与移动/生命周期规则。应通过紧凑数据结构、减少无意义对象图和缩短 owner 生命周期来改善扫描量。
+          </p>
+
+          <h2>十、分配过快时，用户 goroutine 要做 mark assist</h2>
+          <p>
+            并发标记不是免费后台服务。GC active 时，<code>mallocgc</code> 先按分配大小扣减 assist credit；
+            当前 goroutine 的 debt 为负时，<code>gcAssistAlloc</code> 尝试从全局 background credit 偿还，仍不足就直接扫描对象图。
+            这把“谁制造分配压力”与“谁承担部分标记工作”连接起来，帮助 collector 在 heap goal 之前完成标记。
+          </p>
+
+          <pre><code class="language-text">allocation
+  → deductAssistCredit(size)
+  → assist debt below zero
+  → steal background scan credit or gcAssistAlloc1
+  → goroutine pays marking work before continuing</code></pre>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcmark.go#L485-L586">gcAssistAlloc</a> 与 <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcmark.go#L711-L806">gcAssistAlloc1</a>。</span>
+
+          <p>
+            execution trace 中 allocation-heavy goroutine 出现 GC assist，是比“GC 偶尔抖一下”更有行动价值的证据。优先减少请求路径上可避免的 allocation bytes，
+            再讨论调 <code>GOGC</code>；否则只是改变付款时间，没有改变账单。
+          </p>
+
+          <h2>十一、<code>GOGC</code> 与 <code>GOMEMLIMIT</code> 控制不同约束</h2>
+          <p>
+            <code>GOGC</code> 让下一轮 heap goal 随上一轮 live heap 成比例增长；默认 100 可近似理解为允许新分配量接近当前 live heap 后完成下一轮回收。
+            <code>GOMEMLIMIT</code> 则给 runtime 一个软内存限制，控制器从 runtime 管理的总映射内存估计 memory-limit heap goal，并预留 headroom。
+            实际目标取 GOGC-derived goal 与 memory-limit-derived goal 的更紧者。
+          </p>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>旋钮</th><th>主要交换</th><th>错误理解</th></tr></thead>
+            <tbody>
+              <tr><td>更低 GOGC</td><td>更小 heap、更多 GC CPU</td><td>自动降低业务分配量</td></tr>
+              <tr><td>更高 GOGC</td><td>更大 heap、通常更少 GC</td><td>消除内存上限风险</td></tr>
+              <tr><td>GOMEMLIMIT</td><td>用更多 GC 压力守住软目标</td><td>heap 的硬上限或容器 limit 同义词</td></tr>
+              <tr><td>两者一起</td><td>比例目标与环境约束取更紧者</td><td>设置 limit 后 GOGC 完全失效</td></tr>
+            </tbody>
+          </table></div>
+
+          <p>
+            soft limit 不是 OOM 保险：non-Go memory、mmap、cgo、kernel page cache 与容器统计口径可能不同；极端 limit 下 runtime 还必须避免 GC thrashing 把应用完全饿死。
+            生产值应基于容器余量、live set、峰值流量与 CPU budget 联合压测，不要照抄单一百分比。
+          </p>
+          <span class="source-caption">pacer 目标、25% background utilization 与 memory-limit headroom：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcpacer.go#L22-L92">mgcpacer.go</a>；配置契约：<a href="https://pkg.go.dev/runtime/debug#SetGCPercent">SetGCPercent</a> 与 <a href="https://pkg.go.dev/runtime/debug#SetMemoryLimit">SetMemoryLimit</a>。</span>
+
+          <h2 id="evidence">十二、把 allocation rate 与 live heap 分开观测</h2>
+          <p>
+            实验通过 <code>runtime/metrics</code> 读取 <code>/gc/heap/allocs:bytes</code>、
+            <code>/gc/heap/allocs:objects</code>、<code>/gc/heap/live:bytes</code> 和 <code>/gc/cycles/total:gc-cycles</code>。
+            前两项是累计分配，live bytes 是上一轮 GC 确认仍存活的集合，cycles 是回收节奏；它们的定义和采样时间不同，不能拿 allocs 减 live 直接当精确 reclaimed bytes。
+          </p>
+
+          <pre><code class="language-go">samples := []metrics.Sample{
+    {Name: "/gc/heap/allocs:bytes"},
+    {Name: "/gc/heap/allocs:objects"},
+    {Name: "/gc/heap/live:bytes"},
+    {Name: "/gc/cycles/total:gc-cycles"},
+}
+metrics.Read(samples)</code></pre>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>工具</th><th>适合回答</th><th>使用边界</th></tr></thead>
+            <tbody>
+              <tr><td><code>go test -benchmem</code></td><td>受控路径的 B/op、allocs/op</td><td>不是生产流量分布</td></tr>
+              <tr><td>heap profile</td><td>采样时谁仍占用内存</td><td>默认看 in-use，不是全部历史分配</td></tr>
+              <tr><td>allocs profile</td><td>累计由谁制造 allocation traffic</td><td>高累计不等于当前泄漏</td></tr>
+              <tr><td><code>runtime/metrics</code></td><td>服务级趋势与告警</td><td>先读 metric description 与 kind</td></tr>
+              <tr><td><code>GODEBUG=gctrace=1</code></td><td>单进程 GC cycle 摘要</td><td>更适合临时诊断，不替代 tracing</td></tr>
+              <tr><td>execution trace</td><td>assist、STW 与 goroutine 时间关系</td><td>有采集开销，需限定窗口</td></tr>
+            </tbody>
+          </table></div>
+
+          <pre><code class="language-bash">cd go-runtime/examples/fetchd
+go test -run 'Test(AllocationShape|RuntimeMetrics)' -count=20
+go test -bench BenchmarkAllocationShapes -benchmem -count=3
+go test ./...
+go test -race ./...
+go vet ./...</code></pre>
+
+          <h2>十三、回到 <code>fetchd</code> 的内存清单</h2>
+          <ol>
+            <li><strong>先定 owner 与寿命。</strong>请求内临时值尽量不离开 handler；必须异步持有的对象明确交给 process/session owner。</li>
+            <li><strong>用报告解释流向，用 benchmark 判断价值。</strong><code>-m=2</code> 不是性能排行榜。</li>
+            <li><strong>已知上界就合理预分配。</strong>避免 slice backing array 反复迁移，也避免按不可信输入无限预留。</li>
+            <li><strong>减少 bytes 往往比只减少 object count 更重要。</strong>两者都测，连同 CPU 和延迟一起看。</li>
+            <li><strong>区分 allocation rate 与 live heap。</strong>前者驱动 GC 工作，后者决定基础扫描与目标规模。</li>
+            <li><strong>把 mark assist 放进请求延迟模型。</strong>GC CPU 不只在后台 worker。</li>
+            <li><strong>调 GOGC/GOMEMLIMIT 前先压测余量。</strong>同时记录容器 RSS、runtime memory、GC CPU 和 tail latency。</li>
+            <li><strong>不要依赖 runtime 内部布局。</strong>size class、tiny packing 与 specialized malloc 都可能随版本和 experiment 改变。</li>
+          </ol>
+
+          <p>
+            可复用结论是：<strong>逃逸分析决定对象能否安全留在 frame；allocation rate 决定应用制造多少回收工作；live heap 决定 collector 必须持续照看的对象图。</strong>
+            下一篇会把这条请求送回网络：连接能否复用、HTTP/2 怎样在一条连接上并发，以及如何把 httptrace、pprof、trace、metrics 与 race 组合成一次完整诊断。
+          </p>
+
+          <h2 id="sources">参考源码与文档</h2>
+          <ul class="source-list">
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go#L19-L89">Go 1.26.0 escape analysis invariants and location graph</a></li>
+            <li><a href="https://go.dev/doc/gc-guide">A Guide to the Go Garbage Collector</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go#L1021-L1217">nextFreeFast, mcache.nextFree, and mallocgc</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mcache.go#L160-L206">mcache.refill</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L22-L79">Concurrent GC cycle overview</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mbarrier.go#L19-L121">Hybrid write barrier</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcmark.go#L485-L586">Mark assists</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcpacer.go#L22-L92">GC pacer and memory-limit headroom</a></li>
+            <li><a href="https://pkg.go.dev/runtime/metrics">runtime/metrics package documentation</a></li>
+            <li><a href="https://go.dev/blog/pprof">Profiling Go Programs</a></li>
+            <li><a href="https://go.dev/doc/diagnostics">Diagnostics</a></li>
+            <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/memory_lab_test.go">fetchd memory lab</a></li>
+          </ul>
+
+          <nav class="article-pager" aria-label="文章翻页"><a href="../context-cancellation/">← 第六篇：context 结束协议</a><a href="../">返回系列目录 →</a></nav>
+        </section>
+      </article></main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body"); const toc = document.querySelector("#toc"); if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => { const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim()); table.querySelectorAll("tbody tr").forEach((row) => Array.from(row.children).forEach((cell, index) => { if (headers[index]) cell.dataset.label = headers[index]; })); });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4")); if (!headings.length) return;
+        const counts = new Map(); const slugify = (value) => value.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "") || "section";
+        const list = document.createElement("ol"); list.className = "toc-list"; const links = []; const lastItems = new Map();
+        const childListFor = (item) => { let child = item.querySelector(":scope > ol"); if (!child) { child = document.createElement("ol"); child.className = "toc-sublist"; item.appendChild(child); } return child; };
+        const parentListFor = (level) => { if (level === 2) return list; if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2)); if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3)); if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2)); return list; };
+        headings.forEach((heading, index) => { if (!heading.id) { const base = slugify(heading.textContent.trim()); const seen = counts.get(base) || 0; counts.set(base, seen + 1); heading.id = seen === 0 ? base : base + "-" + (seen + 1); } const level = Number(heading.tagName.slice(1)); const item = document.createElement("li"); const link = document.createElement("a"); link.href = "#" + heading.id; link.textContent = heading.textContent.trim(); link.className = "toc-link toc-level-" + level; if (index === 0) link.classList.add("active"); item.appendChild(link); parentListFor(level).appendChild(item); lastItems.set(level, item); if (level <= 2) lastItems.delete(3); if (level <= 3) lastItems.delete(4); links.push(link); });
+        toc.appendChild(list); const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === "#" + id));
+        const observer = new IntersectionObserver((entries) => { const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top); if (visible[0]) activate(visible[0].target.id); }, { rootMargin: "-20% 0px -72% 0px", threshold: 0 }); headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
