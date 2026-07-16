@@ -1,9 +1,9 @@
 # Rememorio Blog
 
 Source for [rememorio.github.io/blog](https://rememorio.github.io/blog/), a
-static technical essay site about AI coding agents, runtime design, context
-management, tool execution, permissions, long-term memory, and prompt-cache
-behavior.
+static technical essay site about Go runtime internals, AI coding agents,
+runtime design, context management, tool execution, permissions, long-term
+memory, and prompt-cache behavior.
 
 The repository is intentionally plain: hand-authored HTML, shared CSS, local
 PNG figures, and a small set of writing rules. There is no application
@@ -15,6 +15,7 @@ and GitHub Pages.
 | Area | Description | Entry points |
 | --- | --- | --- |
 | Blog home | Language gateway and bilingual home pages. | [Gateway](https://rememorio.github.io/blog/) / [中文](https://rememorio.github.io/blog/zh/) / [English](https://rememorio.github.io/blog/en/) |
+| Go from Request to Production | Bilingual source-reading series that follows one HTTP request through Go language semantics, `net/http`, the runtime, the kernel boundary, and production diagnostics. | [Gateway](https://rememorio.github.io/blog/go-runtime/) / [中文](https://rememorio.github.io/blog/go-runtime/zh/) / [English](https://rememorio.github.io/blog/go-runtime/en/) |
 | AI Engineering | Bilingual systems series on prompts, context, harnesses, loops, and evals. | [Gateway](https://rememorio.github.io/blog/ai-engineering/) / [中文](https://rememorio.github.io/blog/ai-engineering/zh/) / [English](https://rememorio.github.io/blog/ai-engineering/en/) |
 | Agent Framework Source Notes | Bilingual source-reading series comparing agent frameworks by runtime ownership, including [agentscope-ai/agentscope](https://github.com/agentscope-ai/agentscope), [earendil-works/pi](https://github.com/earendil-works/pi), [google/adk-python](https://github.com/google/adk-python), [agno-agi/agno](https://github.com/agno-agi/agno), [microsoft/autogen](https://github.com/microsoft/autogen), [crewAIInc/crewAI](https://github.com/crewAIInc/crewAI), [cloudwego/eino](https://github.com/cloudwego/eino), and [trpc-group/trpc-agent-go](https://github.com/trpc-group/trpc-agent-go). | [Gateway](https://rememorio.github.io/blog/agent-framework/) / [中文](https://rememorio.github.io/blog/agent-framework/zh/) / [English](https://rememorio.github.io/blog/agent-framework/en/) |
 | Claude Code Source Notes | Bilingual source-reading series on the public [Rememorio/claude-code](https://github.com/Rememorio/claude-code) mirror. | [Gateway](https://rememorio.github.io/blog/claude-code/) / [中文](https://rememorio.github.io/blog/claude-code/zh/) / [English](https://rememorio.github.io/blog/claude-code/en/) |
@@ -33,6 +34,11 @@ stay stable as new essays are added.
 ├── index.html                  # Site language gateway
 ├── zh/                         # Chinese blog home
 ├── en/                         # English blog home
+├── go-runtime/                 # Go from Request to Production series
+│   ├── index.html              # Series language gateway
+│   ├── examples/fetchd/        # Continuous standard-library example
+│   ├── zh/                     # Chinese articles and figures
+│   └── en/                     # English articles and figures
 ├── ai-engineering/             # AI Engineering systems series
 │   ├── index.html              # Series language gateway
 │   ├── assets/                 # Shared language-neutral figures and styles
