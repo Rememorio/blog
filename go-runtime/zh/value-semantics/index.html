@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go 源码阅读（二）：赋值复制了什么，slice 又共享了什么</title>
+    <meta
+      name="description"
+      content="Go 从请求到生产现场系列第二篇：从 fetchd 的 URL slice、result channel 与 JSON 聚合出发，沿 Go 1.26.0 源码解释值复制、别名、append 扩容、channel 元素复制、map、interface 与 range 变量。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Go 源码阅读（二）：赋值复制了什么，slice 又共享了什么" />
+    <meta property="og:description" content="Go 总在复制值；真正需要追问的是，被复制的值里是否还装着指向共享数据的引用。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/value-semantics-overview.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/zh/value-semantics/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/value-semantics/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/value-semantics/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.route-note { border-color: rgba(31, 119, 123, 0.32); background: rgba(31, 119, 123, 0.1); }
+      .note.route-note strong { color: var(--rose); }
+      .shape-example { margin: 28px 0; }
+      .shape-example pre { margin-bottom: 8px; }
+      .article-body pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .shape-example figcaption, .source-caption { color: var(--muted); font-size: 14px; line-height: 1.55; }
+      .source-caption { display: block; margin: -10px 0 24px; }
+      .article-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line); }
+      .article-pager a { color: var(--teal); font-weight: 800; text-decoration: none; }
+      @media (max-width: 760px) {
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+        .article-pager { flex-direction: column; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Go 系列</a>
+        <a href="#slice">slice 与 append</a>
+        <a href="#channel">channel</a>
+        <a href="#experiments">运行实验</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/value-semantics/" lang="en">English</a></span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Go 从请求到生产现场 · 第二篇</p>
+            <h1 class="long-title">赋值复制了什么，<code>slice</code> 又共享了什么</h1>
+            <p class="lead">
+              “Go 只有值传递”没错，却常常什么也没解释：两个 slice 为什么能改到同一批元素，<code>append</code> 后为什么又突然互不影响，
+              channel 发送结构体后到底隔离了什么？答案不是再造一套“引用类型”术语，而是逐层辨认<strong>被复制的值长什么样，它内部是否仍携带引用</strong>。
+            </p>
+            <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：language spec → runtime.slice → runtime.chan</span><span>实验：fetchd/value_semantics_test.go</span></div>
+            <figure class="hero-image"><img src="../assets/value-semantics-overview.png" alt="Go 值语义总览：整数、数组和结构体完成值复制；slice、map、channel 与 interface 的值被复制后仍可能指向共享底层数据" /></figure>
+          </section>
+
+          <section class="article-body">
+            <div class="note route-note">
+              <p><strong>阅读契约：</strong>本文只证明 Go 1.26.0 的语言与实现边界。读完应能从任意赋值、参数、返回值或 channel 发送出发，先画出“复制了哪个值”，再判断值内引用是否形成别名；不会用“slice 是引用传递”替代分析。</p>
+            </div>
+
+            <p>
+              直接证据分三层：语义以 <a href="https://go.dev/ref/spec#Representation_of_values">Go 语言规范的 Representation of values</a>、
+              <a href="https://go.dev/ref/spec#Slice_types">Slice types</a> 和 <a href="https://go.dev/ref/spec#For_statements">for 语句</a>为准；
+              实现固定到 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>；可观察行为由仓库中的
+              <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/value_semantics_test.go">值语义测试</a>覆盖。
+              runtime 布局是解释当前实现的证据，不是让业务用 <code>unsafe</code> 依赖内部字段的承诺。
+            </p>
+
+            <h2>一、先修正一句容易误导的真话</h2>
+            <p>
+              Go 的赋值、函数传参、返回值和 channel 发送都在传递<strong>值</strong>。但“值”不等于“整棵对象图”。
+              规范明确区分了两类表示：布尔、数值、数组、结构体这样的值包含其数据的完整副本；指针、函数、slice、map、channel 的非 nil 值含有对底层数据的引用。
+              interface 则取决于它装入的动态值。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>表达式的静态形状</th><th>赋值直接复制</th><th>复制后可能共享</th><th>第一检查点</th></tr></thead>
+                <tbody>
+                  <tr><td><code>int</code>、<code>bool</code></td><td>数值本身</td><td>无</td><td>无需追别名</td></tr>
+                  <tr><td>数组、结构体</td><td>整个数组/结构体值</td><td>字段内部携带的引用</td><td>递归查看字段</td></tr>
+                  <tr><td><code>string</code></td><td>字符串值</td><td>不可修改的字节序列</td><td>切片与转换是否分配</td></tr>
+                  <tr><td><code>slice</code></td><td>指针、长度、容量</td><td>backing array</td><td>范围与容量</td></tr>
+                  <tr><td><code>map</code>、<code>channel</code></td><td>指向 runtime 状态的值</td><td>同一张表/同一个 channel</td><td>同步与 owner</td></tr>
+                  <tr><td><code>interface</code></td><td>动态类型与动态数据</td><td>取决于动态值</td><td>类型和值都要看</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              “结构体被完整复制”也不是深拷贝承诺。若 <code>struct</code> 含 <code>[]byte</code> 字段，结构体值和 slice 头都被复制，
+              两个 slice 头仍可能指向同一个数组。分析应逐层展开，而不是按最外层类型贴“值/引用”标签。
+            </p>
+
+            <h2>二、回到 <code>fetchd</code>：一次请求里发生了哪些复制</h2>
+            <p>
+              第一篇的 handler 只有几十行，却同时出现四种典型边界：query 返回 URL slice；range 把每个字符串值交给 goroutine；
+              worker 把 <code>fetchResult</code> 发进 channel；聚合器再 append 到结果 slice。
+            </p>
+
+            <pre><code class="language-go">targets := r.URL.Query()["url"]
+
+results := make(chan fetchResult, len(targets))
+for _, target := range targets {
+    go h.fetch(ctx, target, results)
+}
+
+batch := make([]fetchResult, 0, len(targets))
+for range targets {
+    batch = append(batch, &lt;-results)
+}</code></pre>
+
+            <p>
+              这里不是“一条引用一路传到底”。<code>targets</code> 是一个 slice 值；每轮 <code>target</code> 是一个 string 值；
+              goroutine 调用参数再得到 string 值；channel 复制一个 <code>fetchResult</code> 值；<code>append</code> 把收到的元素写入 batch 的 backing array。
+              每一步都复制值，但隔离程度由值的内部表示决定。
+            </p>
+
+            <h2 id="slice">三、slice：复制三元组，共享 backing array</h2>
+            <p>
+              规范把 slice 描述为底层数组一个连续区段的 descriptor，具有长度和容量。当前 runtime 的内部结构把这件事直接写成三字段：
+            </p>
+
+            <pre><code class="language-go">// src/runtime/slice.go
+type slice struct {
+    array unsafe.Pointer
+    len   int
+    cap   int
+}</code></pre>
+            <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L16-L20">runtime.slice</a>。这是 runtime 内部布局，不是公共 API。</span>
+
+            <p>
+              执行 <code>b := a</code> 时，<code>b</code> 得到自己的三元组；修改 <code>b</code> 的长度不会改变 <code>a.len</code>。
+              但两个 <code>array</code> 字段起初相同，所以索引写会穿过各自的头，落到同一块数组。
+            </p>
+
+            <pre><code class="language-go">original := make([]string, 2, 4)
+copyOfHeader := original
+
+copyOfHeader[0] = "changed"          // original[0] 也变了
+copyOfHeader = append(copyOfHeader, "gamma")
+
+len(original) == 2                   // 每个头有自己的 len
+original[:3][2] == "gamma"           // 但 append 仍写入共享数组</code></pre>
+
+            <figure class="figure"><img src="../assets/slice-append-ownership.png" alt="slice 复制与 append 所有权图：两个 ptr len cap 头指向同一数组；容量足够时 append 继续使用同一数组，容量不足时 growslice 经 mallocgc 和 memmove 生成新数组" /></figure>
+
+            <h3><code>append</code> 为什么必须接住返回值</h3>
+            <p>
+              <code>append</code> 返回一个新的 slice 值。若旧容量足够，新值仍指向旧数组；若 <code>newLen &gt; oldCap</code>，编译器生成的路径会进入
+              <code>runtime.growslice</code>。因此调用方必须写 <code>s = append(s, x)</code>：即使底层没换，长度也只存在返回的新头里；若扩容，更必须接住新指针。
+            </p>
+
+            <h3>沿 <code>growslice</code> 看一次扩容</h3>
+            <pre><code class="language-go">func growslice(oldPtr unsafe.Pointer, newLen, oldCap, num int, et *_type) slice {
+    oldLen := newLen - num
+    newcap := nextslicecap(newLen, oldCap)
+    // 按元素尺寸计算 capmem，并检查溢出
+    p := mallocgc(capmem, et, true)
+    memmove(p, oldPtr, lenmem)
+    return slice{p, newLen, newcap}
+}</code></pre>
+            <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L178-L286">growslice</a> 与 <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L325-L357">nextslicecap</a>。</span>
+
+            <p>
+              真源码还会区分元素是否包含指针、执行 race/msan/asan 检查、做写屏障和分配器尺寸取整。<code>nextslicecap</code> 对较小 slice 倾向翻倍，
+              对较大 slice 平滑过渡到约 1.25 倍；但最终容量还受元素大小和 size class 影响。<strong>增长公式是实现策略，不是语言契约。</strong>
+            </p>
+
+            <h3>别名 bug 通常不是“slice 会变”，而是 owner 没说清</h3>
+            <p>
+              函数接收 <code>[]T</code> 时得到的是头的副本。它可以改共享范围内的元素；它对局部 slice 重新切片或 append，并不会自动更新调用方的头。
+              若 API 要拥有输入，应明确 clone：<code>owned := append([]T(nil), input...)</code> 或 <code>slices.Clone(input)</code>；若只借用，应约定调用期间谁能改、能否保留。
+            </p>
+
+            <h2 id="channel">四、channel 发送复制元素，不承诺深拷贝</h2>
+            <p>
+              <code>results &lt;- result</code> 发送的是一个 <code>fetchResult</code> 值。对有空位的 buffered channel，
+              <code>chansend</code> 找到环形缓冲的目标槽位后，用 <code>typedmemmove</code> 把元素复制进去：
+            </p>
+
+            <pre><code class="language-go">if c.qcount &lt; c.dataqsiz {
+    qp := chanbuf(c, c.sendx)
+    typedmemmove(c.elemtype, qp, ep)
+    c.sendx++
+    c.qcount++
+    unlock(&amp;c.lock)
+    return true
+}</code></pre>
+            <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L229-L249">runtime.chansend 的缓冲路径</a>。无缓冲直接交接会走 <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L382-L403">sendDirect</a> 的屏障与 <code>memmove</code>。</span>
+
+            <figure class="figure"><img src="../assets/channel-value-copy.png" alt="channel 元素复制图：fetchResult 经 chansend 和 typedmemmove 写入缓冲区，结构体字段被复制；若字段是字节 slice，两个 slice 头仍可能指向同一底层数据" /></figure>
+
+            <p>
+              当前 <code>fetchResult</code> 的字段是 string、int、int64。发送后再给发送方的 <code>result.Status</code> 赋值，不会改掉缓冲里的副本。
+              但若以后加入 <code>Body []byte</code>，channel 只会复制结构体和 slice 头；发送后继续修改 <code>Body</code> 的元素，就可能与接收方并发访问同一数组。
+              “通过 channel 传递所有权”是设计协议，不是 runtime 自动深拷贝。
+            </p>
+
+            <h2>五、map 与 interface：复制值后还要看动态状态</h2>
+            <h3>map 赋值共享同一张表</h3>
+            <p>
+              规范说 map 值是对实现特定数据结构的引用。<code>second := first</code> 复制 map 值，两者仍指向同一张映射；
+              用其中一个更新键，另一个会观察到。复制 map 变量既不快照，也不提供并发安全。跨 goroutine 共享普通 map 时仍需 mutex、单 owner 或不可变发布协议。
+            </p>
+
+            <h3>interface 的 nil 必须同时看类型与数据</h3>
+            <p>
+              Go 1.26 runtime 把非空 interface 表示为 <code>tab + data</code>，空 interface 表示为 <code>_type + data</code>。
+              这解释了 typed nil：把 <code>(*fetchResult)(nil)</code> 装进 <code>any</code> 后，data 可以是 nil，但动态类型仍是 <code>*fetchResult</code>，所以 interface 整体不等于 nil。
+            </p>
+
+            <pre><code class="language-go">type iface struct {
+    tab  *itab
+    data unsafe.Pointer
+}
+
+type eface struct {
+    _type *_type
+    data  unsafe.Pointer
+}</code></pre>
+            <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L184-L195">runtime.iface 与 runtime.eface</a>。业务判断应使用语言级类型断言，而不是读取此布局。</span>
+
+            <pre><code class="language-go">var pointer *fetchResult
+var value any = pointer
+
+value == nil                  // false：动态类型存在
+typed, ok := value.(*fetchResult)
+ok &amp;&amp; typed == nil            // true</code></pre>
+
+            <h2>六、Go 1.22+ 的 range 变量：旧陷阱已变，别名问题没消失</h2>
+            <p>
+              <code>fetchd</code> 在 <code>for _, target := range targets</code> 中启动 goroutine。自 Go 1.22 起，range clause 用 <code>:=</code>
+              声明的迭代变量每轮各有一个新变量；模块声明 <code>go 1.26.0</code>，所以闭包捕获的是不同的 <code>target</code>，无需再写历史上的 <code>target := target</code> 补丁。
+            </p>
+
+            <figure class="figure"><img src="../assets/range-variable-iterations.png" alt="Go 1.22 之后的 range 变量图：target1、target2、target3 分属不同迭代，闭包分别捕获；值内部的引用是否共享仍需单独判断" /></figure>
+
+            <p>
+              边界有两个。第一，若迭代变量在循环外预先声明，再用 <code>=</code> 赋值，仍然复用已有变量。第二，每轮变量新建不等于深拷贝动态数据：
+              range 一个 <code>[][]byte</code> 时，每轮 slice 变量各自独立，仍可能指向重叠数组。语言修复的是变量捕获语义，不是所有权协议。
+            </p>
+
+            <h2 id="experiments">七、把“复制”变成可运行实验</h2>
+            <p>仓库测试把容易混在一起的现象拆成六个独立断言：</p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>测试</th><th>固定条件</th><th>证明</th><th>不证明</th></tr></thead>
+                <tbody>
+                  <tr><td><code>TestSliceHeaderCopySharesBackingArray</code></td><td>预留 cap</td><td>头独立、数组共享</td><td>所有 append 都共享</td></tr>
+                  <tr><td><code>TestAppendMaySplitBackingArray</code></td><td>cap 已满</td><td>扩容后数组可分裂</td><td>固定增长倍数</td></tr>
+                  <tr><td><code>TestChannelSendCopiesElementValue</code></td><td>buffered channel</td><td>结构体复制、slice 字段浅共享</td><td>channel 自动转移所有权</td></tr>
+                  <tr><td><code>TestMapAssignmentSharesState</code></td><td>同一 map 值</td><td>更新共享</td><td>并发更新安全</td></tr>
+                  <tr><td><code>TestInterfaceHoldingTypedNilIsNotNil</code></td><td>typed nil pointer</td><td>类型存在时 interface 非 nil</td><td>任意反射布局稳定</td></tr>
+                  <tr><td><code>TestRangeVariablesArePerIteration</code></td><td>Go 1.26、<code>:=</code></td><td>每轮变量地址不同</td><td>值内部没有别名</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <pre><code class="language-bash">cd go-runtime/examples/fetchd
+go test ./...
+go test -race ./...
+go vet ./...</code></pre>
+
+            <p>
+              race 通过不等于所有权自动正确；这里的测试按顺序制造共享。若把 slice 元素的读写放到不同 goroutine 且没有 happens-before，
+              race detector 才会报告数据竞争。测试的价值是把“复制字节”和“共享状态”分开观察。
+            </p>
+
+            <h2>八、从值语义推导 API 设计规则</h2>
+            <ol>
+              <li><strong>参数先写借用还是拥有。</strong>只读借用就不要保留；需要跨调用保存就 clone，并把成本写进 API。</li>
+              <li><strong>返回 slice/map 要说明可变性。</strong>直接暴露内部集合会把调用方变成别名 owner；必要时返回副本或只读操作。</li>
+              <li><strong>channel 消息按递归字段审计。</strong>结构体传值不等于字段深拷贝；可变 slice、map、pointer 都需要协议。</li>
+              <li><strong>总是接住 append。</strong>不要依赖容量碰巧足够，也不要依赖某个 runtime 增长倍数。</li>
+              <li><strong>升级 Go 时按模块语义读 range。</strong>先看 <code>go.mod</code> 与 <code>:=</code>/<code>=</code>，再判断闭包捕获。</li>
+            </ol>
+
+            <p>
+              这一篇最终只留下一个问题模板：<strong>此处复制的直接值是什么？它内部有哪些引用？这些引用指到哪里？谁能改，活多久，用什么同步？</strong>
+              下一篇把相同方法用到 goroutine：不把 goroutine 说成“轻量线程”，而是沿 <code>newproc → runq → schedule → execute</code>
+              看它何时 runnable、真正跑在哪里，以及生产里的 runnable latency 从何而来。
+            </p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul class="source-list">
+              <li><a href="https://go.dev/ref/spec#Representation_of_values">Go Language Specification: Representation of values</a></li>
+              <li><a href="https://go.dev/ref/spec#Slice_types">Go Language Specification: Slice types</a></li>
+              <li><a href="https://go.dev/ref/spec#For_statements">Go Language Specification: For statements</a></li>
+              <li><a href="https://go.dev/blog/slices-intro">Go Slices: usage and internals</a></li>
+              <li><a href="https://go.dev/blog/slices">Arrays, slices (and strings): The mechanics of append</a></li>
+              <li><a href="https://go.dev/blog/loopvar-preview">Fixing For Loops in Go 1.22</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L16-L20">runtime.slice</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L178-L286">runtime.growslice</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L325-L357">runtime.nextslicecap</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L157-L249">runtime.chansend</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L382-L403">runtime.sendDirect</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L184-L195">runtime interface layouts</a></li>
+              <li><a href="https://github.com/Rememorio/blog/tree/main/go-runtime/examples/fetchd">fetchd 可运行示例</a></li>
+            </ul>
+
+            <nav class="article-pager" aria-label="文章翻页"><a href="../overview/">← 第一篇：请求总路线</a><a href="../">返回系列目录 →</a></nav>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim());
+          table.querySelectorAll("tbody tr").forEach((row) => Array.from(row.children).forEach((cell, index) => { if (headers[index]) cell.dataset.label = headers[index]; }));
+        });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+        const counts = new Map();
+        const slugify = (value) => value.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "") || "section";
+        const list = document.createElement("ol"); list.className = "toc-list";
+        const links = []; const lastItems = new Map();
+        const childListFor = (item) => { let child = item.querySelector(":scope > ol"); if (!child) { child = document.createElement("ol"); child.className = "toc-sublist"; item.appendChild(child); } return child; };
+        const parentListFor = (level) => { if (level === 2) return list; if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2)); if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3)); if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2)); return list; };
+        headings.forEach((heading, index) => {
+          if (!heading.id) { const base = slugify(heading.textContent.trim()); const seen = counts.get(base) || 0; counts.set(base, seen + 1); heading.id = seen === 0 ? base : `${base}-${seen + 1}`; }
+          const level = Number(heading.tagName.slice(1)); const item = document.createElement("li"); const link = document.createElement("a");
+          link.href = `#${heading.id}`; link.textContent = heading.textContent.trim(); link.className = `toc-link toc-level-${level}`; if (index === 0) link.classList.add("active");
+          item.appendChild(link); parentListFor(level).appendChild(item); lastItems.set(level, item); if (level <= 2) lastItems.delete(3); if (level <= 3) lastItems.delete(4); links.push(link);
+        });
+        toc.appendChild(list);
+        const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === `#${id}`));
+        const observer = new IntersectionObserver((entries) => { const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top); if (visible[0]) activate(visible[0].target.id); }, { rootMargin: "-20% 0px -72% 0px", threshold: 0 });
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

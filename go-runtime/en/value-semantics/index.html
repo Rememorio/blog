@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go Source Notes II: What Assignment Copies and What Slices Share</title>
+    <meta name="description" content="Chapter II of Go from Request to Production uses fetchd's URL slice, result channel, and JSON aggregation to explain value copying, aliases, append growth, channel element copies, maps, interfaces, and range variables in Go 1.26.0." />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Go Source Notes II: What Assignment Copies and What Slices Share" />
+    <meta property="og:description" content="Go always copies a value. The next question is whether that copied value still carries references to shared data." />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/value-semantics-overview.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/en/value-semantics/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/value-semantics/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/value-semantics/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.route-note { border-color: rgba(31, 119, 123, 0.32); background: rgba(31, 119, 123, 0.1); }
+      .note.route-note strong { color: var(--rose); }
+      .shape-example { margin: 28px 0; }
+      .shape-example pre { margin-bottom: 8px; }
+      .article-body pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .shape-example figcaption, .source-caption { color: var(--muted); font-size: 14px; line-height: 1.55; }
+      .source-caption { display: block; margin: -10px 0 24px; }
+      .article-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line); }
+      .article-pager a { color: var(--teal); font-weight: 800; text-decoration: none; }
+      @media (max-width: 760px) {
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+        .article-pager { flex-direction: column; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Go series</a><a href="#slice">slice and append</a><a href="#channel">channel</a><a href="#experiments">Run the lab</a><a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch"><a href="../../zh/value-semantics/" lang="zh-CN">中文</a><a class="active" href="./" lang="en" aria-current="page">English</a></span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Go from Request to Production · Chapter II</p>
+            <h1 class="long-title">What Assignment Copies and What a <code>slice</code> Shares</h1>
+            <p class="lead">
+              “Go only passes by value” is true, but it often explains nothing: why can two slices update the same elements, why can an <code>append</code>
+              suddenly separate them, and what does a channel isolate when it sends a struct? The useful answer is to identify <strong>the value being copied and every reference carried inside it</strong>.
+            </p>
+            <div class="meta-line"><span>Source: Go 1.26.0</span><span>Path: language spec → runtime.slice → runtime.chan</span><span>Lab: fetchd/value_semantics_test.go</span></div>
+            <figure class="hero-image"><img src="../assets/value-semantics-overview.png" alt="Go value-semantics overview: integers, arrays, and structs are copied as values, while copied slice, map, channel, and interface values may still reach shared underlying data" /></figure>
+          </section>
+
+          <section class="article-body">
+            <div class="note route-note"><p><strong>Reading contract:</strong> this chapter proves language and implementation boundaries for Go 1.26.0. After it, you should be able to start at any assignment, argument, return, or channel send, draw the immediate value copy, and then decide whether nested references create aliases—without hiding the analysis behind “slices are passed by reference.”</p></div>
+
+            <p>
+              Evidence has three layers. Semantics come from the Go specification sections on
+              <a href="https://go.dev/ref/spec#Representation_of_values">representation of values</a>, <a href="https://go.dev/ref/spec#Slice_types">slice types</a>, and
+              <a href="https://go.dev/ref/spec#For_statements">for statements</a>. Implementation claims are pinned to the
+              <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>. Observable behavior is captured by the repository's
+              <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/value_semantics_test.go">value-semantics tests</a>.
+              Runtime layouts explain this version; they are not a promise that application code should access them through <code>unsafe</code>.
+            </p>
+
+            <h2>1. Repair a True but Misleading Sentence</h2>
+            <p>
+              Assignment, arguments, returns, and channel sends all transfer <strong>values</strong> in Go. A value, however, is not necessarily an entire object graph.
+              The specification distinguishes self-contained values such as booleans, numbers, arrays, and structs from non-nil pointer, function, slice, map, and channel values that contain references to underlying data. An interface depends on its dynamic value.
+            </p>
+
+            <div class="table-wrap"><table>
+              <thead><tr><th>Static shape</th><th>Immediate copy</th><th>May remain shared</th><th>First question</th></tr></thead>
+              <tbody>
+                <tr><td><code>int</code>, <code>bool</code></td><td>The scalar</td><td>Nothing</td><td>No alias to follow</td></tr>
+                <tr><td>Array, struct</td><td>The full array/struct value</td><td>References inside fields</td><td>Recurse into fields</td></tr>
+                <tr><td><code>string</code></td><td>The string value</td><td>Immutable byte sequence</td><td>Did slicing/conversion allocate?</td></tr>
+                <tr><td><code>slice</code></td><td>Pointer, length, capacity</td><td>Backing array</td><td>Range and capacity</td></tr>
+                <tr><td><code>map</code>, <code>channel</code></td><td>A value referring to runtime state</td><td>The same map/channel</td><td>Owner and synchronization</td></tr>
+                <tr><td><code>interface</code></td><td>Dynamic type and data</td><td>Depends on dynamic value</td><td>Inspect both parts</td></tr>
+              </tbody>
+            </table></div>
+
+            <p>
+              Even “the struct is copied in full” is not a deep-copy guarantee. If the struct contains a <code>[]byte</code>, the struct and slice header are copied;
+              both headers may still point at one array. Expand the representation one layer at a time instead of labeling only the outer type.
+            </p>
+
+            <h2>2. Find Every Copy in <code>fetchd</code></h2>
+            <p>
+              The handler from Chapter I is small, yet it crosses four useful boundaries: a query returns a URL slice; range gives a string value to each goroutine;
+              a worker sends a <code>fetchResult</code> through a channel; and the collector appends received elements to a result slice.
+            </p>
+
+            <pre><code class="language-go">targets := r.URL.Query()["url"]
+
+results := make(chan fetchResult, len(targets))
+for _, target := range targets {
+    go h.fetch(ctx, target, results)
+}
+
+batch := make([]fetchResult, 0, len(targets))
+for range targets {
+    batch = append(batch, &lt;-results)
+}</code></pre>
+
+            <p>
+              This is not one reference flowing unchanged. <code>targets</code> is a slice value; each <code>target</code> is a string value; the goroutine call gets another string value;
+              the channel copies a <code>fetchResult</code>; and <code>append</code> writes the received element into the batch backing array. Values are copied at every boundary, while isolation depends on their representations.
+            </p>
+
+            <h2 id="slice">3. Slices: Copy the Triple, Share the Backing Array</h2>
+            <p>
+              The specification describes a slice as a descriptor for a contiguous segment of an underlying array, with a length and capacity. The current runtime writes that model as three internal fields:
+            </p>
+
+            <pre><code class="language-go">// src/runtime/slice.go
+type slice struct {
+    array unsafe.Pointer
+    len   int
+    cap   int
+}</code></pre>
+            <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L16-L20">runtime.slice</a>. This is an internal layout, not a public API.</span>
+
+            <p>
+              After <code>b := a</code>, <code>b</code> has its own triple. Reslicing <code>b</code> does not change <code>a.len</code>. Initially, however, both <code>array</code>
+              fields match, so indexed writes pass through different headers into the same array.
+            </p>
+
+            <pre><code class="language-go">original := make([]string, 2, 4)
+copyOfHeader := original
+
+copyOfHeader[0] = "changed"          // original[0] changes too
+copyOfHeader = append(copyOfHeader, "gamma")
+
+len(original) == 2                   // each header owns its len
+original[:3][2] == "gamma"           // append still wrote into shared storage</code></pre>
+
+            <figure class="figure"><img src="../assets/slice-append-ownership.png" alt="Slice copy and append ownership: two ptr len cap headers address one array; append keeps it when capacity is available, while growslice uses mallocgc and memmove to create a new array when capacity is exhausted" /></figure>
+
+            <h3>Why <code>append</code>'s result must be assigned</h3>
+            <p>
+              <code>append</code> returns a new slice value. With spare capacity it still addresses the old array. When <code>newLen &gt; oldCap</code>, compiler-generated code enters
+              <code>runtime.growslice</code>. The caller must write <code>s = append(s, x)</code>: the returned header owns the new length even without growth, and owns the new pointer when growth occurs.
+            </p>
+
+            <h3>Walk one growth through <code>growslice</code></h3>
+            <pre><code class="language-go">func growslice(oldPtr unsafe.Pointer, newLen, oldCap, num int, et *_type) slice {
+    oldLen := newLen - num
+    newcap := nextslicecap(newLen, oldCap)
+    // Compute capmem by element size and reject overflow.
+    p := mallocgc(capmem, et, true)
+    memmove(p, oldPtr, lenmem)
+    return slice{p, newLen, newcap}
+}</code></pre>
+            <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L178-L286">growslice</a> and <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L325-L357">nextslicecap</a>.</span>
+
+            <p>
+              The real path also separates pointer-bearing elements, runs race/msan/asan hooks, applies write barriers, and rounds allocator size classes.
+              <code>nextslicecap</code> tends to double small slices and transitions smoothly toward roughly 1.25× for larger ones, but element size and allocator rounding affect the result.
+              <strong>The growth formula is an implementation policy, not a language contract.</strong>
+            </p>
+
+            <h3>Alias bugs are ownership bugs in disguise</h3>
+            <p>
+              A function receiving <code>[]T</code> gets a header copy. It can update elements in the shared range; local reslicing or appending does not update the caller's header.
+              If an API must own input, say so and clone with <code>append([]T(nil), input...)</code> or <code>slices.Clone</code>. If it borrows, define who may mutate and whether the callee may retain it.
+            </p>
+
+            <h2 id="channel">4. A Channel Send Copies the Element, Not an Object Graph</h2>
+            <p>
+              <code>results &lt;- result</code> sends one <code>fetchResult</code> value. On the buffered fast path, <code>chansend</code> locates a ring-buffer slot and calls
+              <code>typedmemmove</code> to copy the element into it:
+            </p>
+
+            <pre><code class="language-go">if c.qcount &lt; c.dataqsiz {
+    qp := chanbuf(c, c.sendx)
+    typedmemmove(c.elemtype, qp, ep)
+    c.sendx++
+    c.qcount++
+    unlock(&amp;c.lock)
+    return true
+}</code></pre>
+            <span class="source-caption">Pinned source: the buffered path in <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L229-L249">runtime.chansend</a>. An unbuffered direct handoff uses barriers and <code>memmove</code> in <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L382-L403">sendDirect</a>.</span>
+
+            <figure class="figure"><img src="../assets/channel-value-copy.png" alt="A fetchResult passes through chansend and typedmemmove into a channel buffer; the struct is copied, while copied byte-slice headers may still point at shared backing storage" /></figure>
+
+            <p>
+              Today's <code>fetchResult</code> contains strings and integer fields. Reassigning the sender's <code>result.Status</code> after the send cannot rewrite the buffered copy.
+              If a future version adds <code>Body []byte</code>, however, the channel copies the struct and slice header; mutations to <code>Body</code> elements may race with the receiver.
+              “Transfer ownership through the channel” is a design protocol, not an automatic runtime deep copy.
+            </p>
+
+            <h2>5. Maps and Interfaces: Follow Dynamic State</h2>
+            <h3>Map assignment shares one map</h3>
+            <p>
+              The specification defines a map value as a reference to an implementation-specific structure. <code>second := first</code> copies the map value, so both names address one map.
+              Updating through either is visible through the other. Copying a map variable is neither a snapshot nor synchronization; concurrent sharing still needs a mutex, a single owner, or immutable publication.
+            </p>
+
+            <h3>An interface nil has both a type and data question</h3>
+            <p>
+              Go 1.26 represents a non-empty interface as <code>tab + data</code> and an empty interface as <code>_type + data</code>. This explains a typed nil:
+              after <code>(*fetchResult)(nil)</code> enters <code>any</code>, data may be nil while the dynamic type remains <code>*fetchResult</code>, so the interface itself is not nil.
+            </p>
+
+            <pre><code class="language-go">type iface struct {
+    tab  *itab
+    data unsafe.Pointer
+}
+
+type eface struct {
+    _type *_type
+    data  unsafe.Pointer
+}</code></pre>
+            <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L184-L195">runtime.iface and runtime.eface</a>. Application code should use language-level assertions, not inspect this layout.</span>
+
+            <pre><code class="language-go">var pointer *fetchResult
+var value any = pointer
+
+value == nil                  // false: a dynamic type is present
+typed, ok := value.(*fetchResult)
+ok &amp;&amp; typed == nil            // true</code></pre>
+
+            <h2>6. Go 1.22+ Range Variables: One Old Trap Changed</h2>
+            <p>
+              <code>fetchd</code> launches goroutines inside <code>for _, target := range targets</code>. Since Go 1.22, iteration variables declared by a range clause with
+              <code>:=</code> are new variables for each iteration. This module declares <code>go 1.26.0</code>, so the closures capture distinct <code>target</code> variables; the historical
+              <code>target := target</code> patch is unnecessary here.
+            </p>
+
+            <figure class="figure"><img src="../assets/range-variable-iterations.png" alt="Range variables since Go 1.22: target1, target2, and target3 belong to separate iterations and closures capture them separately; references nested inside those values remain a separate ownership question" /></figure>
+
+            <p>
+              Two boundaries remain. Variables declared before the loop and assigned with <code>=</code> are reused. And a fresh iteration variable is not a deep copy:
+              ranging over <code>[][]byte</code> yields distinct slice variables that may still address overlapping arrays. The language change repairs variable capture, not ownership.
+            </p>
+
+            <h2 id="experiments">7. Turn “Copy” into Runnable Experiments</h2>
+            <p>The repository test file separates six observations that are often conflated:</p>
+            <div class="table-wrap"><table>
+              <thead><tr><th>Test</th><th>Controlled condition</th><th>Proves</th><th>Does not prove</th></tr></thead>
+              <tbody>
+                <tr><td><code>TestSliceHeaderCopySharesBackingArray</code></td><td>Spare capacity</td><td>Independent headers, shared array</td><td>Every append shares</td></tr>
+                <tr><td><code>TestAppendMaySplitBackingArray</code></td><td>Capacity exhausted</td><td>Growth can separate arrays</td><td>A fixed growth ratio</td></tr>
+                <tr><td><code>TestChannelSendCopiesElementValue</code></td><td>Buffered channel</td><td>Struct copy, shallow slice field</td><td>Automatic ownership transfer</td></tr>
+                <tr><td><code>TestMapAssignmentSharesState</code></td><td>One map value</td><td>Updates are shared</td><td>Concurrent safety</td></tr>
+                <tr><td><code>TestInterfaceHoldingTypedNilIsNotNil</code></td><td>Typed nil pointer</td><td>Interface is non-nil with a type</td><td>Stable reflection internals</td></tr>
+                <tr><td><code>TestRangeVariablesArePerIteration</code></td><td>Go 1.26 and <code>:=</code></td><td>Distinct iteration variables</td><td>No nested aliases</td></tr>
+              </tbody>
+            </table></div>
+
+            <pre><code class="language-bash">cd go-runtime/examples/fetchd
+go test ./...
+go test -race ./...
+go vet ./...</code></pre>
+
+            <p>
+              A clean race run does not make ownership automatically correct; these tests create sharing sequentially. If slice-element reads and writes move to different goroutines without a happens-before edge,
+              the race detector can then report the conflict. The lab's job is to separate byte copying from state sharing.
+            </p>
+
+            <h2>8. Derive API Rules from Value Semantics</h2>
+            <ol>
+              <li><strong>State borrow or ownership for parameters.</strong> Do not retain a read-only borrow; clone data that must outlive the call and expose the cost.</li>
+              <li><strong>Document mutability of returned slices and maps.</strong> Exposing an internal collection makes the caller an alias owner; copy or offer operations when needed.</li>
+              <li><strong>Audit channel messages recursively.</strong> A struct-by-value message does not deep-copy mutable slice, map, or pointer fields.</li>
+              <li><strong>Always keep the result of append.</strong> Do not depend on spare capacity or a runtime growth ratio.</li>
+              <li><strong>Read range semantics with the module version.</strong> Check <code>go.mod</code> and <code>:=</code> versus <code>=</code> before diagnosing captures.</li>
+            </ol>
+
+            <p>
+              Keep one reusable question set: <strong>What immediate value is copied here? Which references live inside it? What do they reach? Who may mutate that state, for how long, under which synchronization?</strong>
+              Chapter III applies the same discipline to goroutines: instead of calling one a “lightweight thread,” it follows
+              <code>newproc → runq → schedule → execute</code> to show when work becomes runnable, where it runs, and where runnable latency comes from.
+            </p>
+
+            <h2 id="sources">Source and Documentation References</h2>
+            <ul class="source-list">
+              <li><a href="https://go.dev/ref/spec#Representation_of_values">Go Language Specification: Representation of values</a></li>
+              <li><a href="https://go.dev/ref/spec#Slice_types">Go Language Specification: Slice types</a></li>
+              <li><a href="https://go.dev/ref/spec#For_statements">Go Language Specification: For statements</a></li>
+              <li><a href="https://go.dev/blog/slices-intro">Go Slices: usage and internals</a></li>
+              <li><a href="https://go.dev/blog/slices">Arrays, slices (and strings): The mechanics of append</a></li>
+              <li><a href="https://go.dev/blog/loopvar-preview">Fixing For Loops in Go 1.22</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L16-L20">runtime.slice</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L178-L286">runtime.growslice</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/slice.go#L325-L357">runtime.nextslicecap</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L157-L249">runtime.chansend</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L382-L403">runtime.sendDirect</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L184-L195">runtime interface layouts</a></li>
+              <li><a href="https://github.com/Rememorio/blog/tree/main/go-runtime/examples/fetchd">Runnable fetchd example</a></li>
+            </ul>
+
+            <nav class="article-pager" aria-label="Article pagination"><a href="../overview/">← Chapter I: request route</a><a href="../">Back to series index →</a></nav>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body"); const toc = document.querySelector("#toc"); if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => { const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim()); table.querySelectorAll("tbody tr").forEach((row) => Array.from(row.children).forEach((cell, index) => { if (headers[index]) cell.dataset.label = headers[index]; })); });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4")); if (!headings.length) return;
+        const counts = new Map(); const slugify = (value) => value.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "") || "section";
+        const list = document.createElement("ol"); list.className = "toc-list"; const links = []; const lastItems = new Map();
+        const childListFor = (item) => { let child = item.querySelector(":scope > ol"); if (!child) { child = document.createElement("ol"); child.className = "toc-sublist"; item.appendChild(child); } return child; };
+        const parentListFor = (level) => { if (level === 2) return list; if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2)); if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3)); if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2)); return list; };
+        headings.forEach((heading, index) => { if (!heading.id) { const base = slugify(heading.textContent.trim()); const seen = counts.get(base) || 0; counts.set(base, seen + 1); heading.id = seen === 0 ? base : `${base}-${seen + 1}`; } const level = Number(heading.tagName.slice(1)); const item = document.createElement("li"); const link = document.createElement("a"); link.href = `#${heading.id}`; link.textContent = heading.textContent.trim(); link.className = `toc-link toc-level-${level}`; if (index === 0) link.classList.add("active"); item.appendChild(link); parentListFor(level).appendChild(item); lastItems.set(level, item); if (level <= 2) lastItems.delete(3); if (level <= 3) lastItems.delete(4); links.push(link); });
+        toc.appendChild(list); const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === `#${id}`));
+        const observer = new IntersectionObserver((entries) => { const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top); if (visible[0]) activate(visible[0].target.id); }, { rootMargin: "-20% 0px -72% 0px", threshold: 0 }); headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
