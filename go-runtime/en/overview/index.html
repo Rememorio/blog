@@ -1,0 +1,916 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go Source Notes I: How One Request Crosses net/http and the Runtime</title>
+    <meta
+      name="description"
+      content="The first chapter of Go from Request to Production follows one concurrent fetch request through Server.Serve, conn.serve, readRequest, ServeHTTP, Transport, internal/poll, runtime netpoll, and the scheduler."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Go Source Notes I: How One Request Crosses net/http and the Runtime" />
+    <meta
+      property="og:description"
+      content="Build a source route through Go's standard library and runtime: connection goroutines, request contexts, outbound Transport, nonblocking I/O, and netpoll."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/go-request-runtime-overview.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/en/overview/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/overview/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/overview/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.route-note {
+        border-color: rgba(31, 119, 123, 0.32);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .note.route-note strong {
+        color: var(--rose);
+      }
+
+      .shape-example {
+        margin: 28px 0;
+      }
+
+      .shape-example pre {
+        margin-bottom: 8px;
+      }
+
+      .article-body pre code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .shape-example figcaption,
+      .source-caption {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      .source-caption {
+        display: block;
+        margin: -10px 0 24px;
+      }
+
+      .article-body kbd {
+        padding: 2px 6px;
+        border: 1px solid rgba(24, 55, 82, 0.18);
+        border-bottom-width: 2px;
+        border-radius: 5px;
+        background: rgba(255, 253, 246, 0.9);
+        color: var(--navy);
+        font: 750 0.88em/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Go series</a>
+        <a href="#server-serve">Server entry</a>
+        <a href="#netpoll">netpoll</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switcher">
+          <a href="../../zh/overview/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Go from Request to Production · Chapter I</p>
+            <h1 class="long-title">How one request crosses <code>net/http</code> and the runtime</h1>
+            <p class="lead">
+              Starting a Go HTTP service is easy: register a <code>Handler</code>, call <code>ListenAndServe</code>, and it runs.
+              Production questions are harder. Who calls <code>Accept</code>? Are goroutines created per connection or per request?
+              Who stops work after a client disconnects? Why does a stalled outbound request not waste an operating-system thread?
+              We will answer those questions by following one request, not by memorizing runtime terms.
+            </p>
+            <div class="meta-line">
+              <span>Source: Go 1.26.0</span>
+              <span>Route: net/http → internal/poll → runtime</span>
+              <span>Example: fetchd</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/go-request-runtime-overview.png"
+                alt="Overview of one request crossing Go through Server.Serve, conn.serve, ServeHTTP, Transport, and netpoll, with scheduling, memory, and diagnostics as cross-cutting concerns"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              We will keep one scenario throughout the chapter. A small service named <code>fetchd</code> accepts several URLs,
+              fetches them concurrently under one deadline, collects status codes and response sizes, and returns JSON.
+              It is small enough to read in one sitting yet contains boundaries that appear in real services: inbound connections,
+              request contexts, child goroutines, an outbound connection pool, socket waits, and response writes.
+            </p>
+
+            <div class="note route-note">
+              <p>
+                The central claim comes first: <strong>application code sees blocking function calls; the standard library and runtime
+                remove network waiting from the execution thread.</strong> At the same time, <code>net/http</code> gives connections,
+                requests, and outbound exchanges different lifetimes. Understanding those owners is the shortest route to cancellation,
+                timeout, leak, and tail-latency bugs.
+              </p>
+            </div>
+
+            <p>
+              The evidence boundary is explicit. Direct source claims are pinned to the public
+              <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>. API contracts come from the
+              <a href="https://pkg.go.dev/net/http">net/http documentation</a>,
+              <a href="https://pkg.go.dev/context">context documentation</a>, and
+              <a href="https://go.dev/doc/diagnostics">Go diagnostics documentation</a>.
+              The main route is ordinary HTTP/1.x over pollable network descriptors. HTTP/2 branches at ALPN or an alternate
+              RoundTripper. Windows uses IOCP, BSD and macOS use kqueue, and Linux uses epoll; the epoll section is one concrete
+              platform implementation, not a universal source path.
+            </p>
+
+            <p>By the end, a reader opening Go source for the first time should be able to answer five questions:</p>
+            <ol>
+              <li>Does <code>Server.Serve</code> create one goroutine per request or one per connection?</li>
+              <li>Where does <code>Request.Context()</code> come from, and who cancels it after the handler returns?</li>
+              <li>How does <code>client.Do</code> acquire or establish a reusable outbound connection?</li>
+              <li>When <code>Read</code> has no data, what happens to the goroutine, thread, and file descriptor?</li>
+              <li>For a slow request, should we first inspect the handler, connection pool, netpoll, scheduler, or GC?</li>
+            </ol>
+
+            <h2>1. Split the request by owner first</h2>
+            <p>
+              “One request” is a user-facing story, not one object in the source. Inside the process it crosses at least five owners.
+              Each owns different state and ends at a different moment.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Layer</th>
+                    <th>Main owner</th>
+                    <th>Owned state</th>
+                    <th>Typical end condition</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Inbound listener</td>
+                    <td><code>http.Server</code></td>
+                    <td>Listener, server configuration, accept loop</td>
+                    <td><code>Close</code> / <code>Shutdown</code> closes the listener</td>
+                  </tr>
+                  <tr>
+                    <td>Connection</td>
+                    <td><code>net/http.conn</code></td>
+                    <td>Socket, buffers, TLS, keep-alive state</td>
+                    <td>Peer close, protocol error, idle timeout, shutdown</td>
+                  </tr>
+                  <tr>
+                    <td>Request</td>
+                    <td><code>response</code> + handler</td>
+                    <td><code>Request</code>, request context, response state</td>
+                    <td><code>ServeHTTP</code> returns or the connection ends</td>
+                  </tr>
+                  <tr>
+                    <td>Outbound exchange</td>
+                    <td><code>Transport</code> + <code>persistConn</code></td>
+                    <td>Pool, dial, read/write loops, response body</td>
+                    <td>Body closed/read, cancellation, broken connection</td>
+                  </tr>
+                  <tr>
+                    <td>Network wait</td>
+                    <td><code>internal/poll</code> + runtime</td>
+                    <td>Poll descriptor, waiting goroutine, readiness event</td>
+                    <td>I/O ready, deadline, descriptor close</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              This table is also a debugging index. More connections do not automatically prove a goroutine leak. Ending a request
+              context does not imply that the TCP connection cannot be reused. A goroutine in <code>IO wait</code> is not necessarily
+              consuming an OS thread. Find the owner before interpreting the symptom.
+            </p>
+
+            <figure class="shape-example">
+              <pre><code class="language-go">// The request shape used throughout this series
+GET /fetch?url=https://go.dev/&amp;url=https://pkg.go.dev/net/http
+
+incoming request
+  ├─ request deadline: 1.5s
+  ├─ child goroutine: fetch go.dev
+  ├─ child goroutine: fetch pkg.go.dev
+  └─ JSON aggregation</code></pre>
+              <figcaption>The same example will cross the server entry, context, Transport, netpoll, and diagnostics boundaries.</figcaption>
+            </figure>
+
+            <h2>2. Make <code>fetchd</code> real before reading internals</h2>
+            <p>
+              The complete example lives in <a href="https://github.com/Rememorio/blog/tree/main/go-runtime/examples/fetchd">go-runtime/examples/fetchd</a>.
+              Its core handler uses only the standard library. It derives a 1.5-second context from the inbound request,
+              starts a bounded number of goroutines, and gives every outbound request the same context.
+            </p>
+
+            <pre><code class="language-go">func (h fetchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    targets := r.URL.Query()["url"]
+
+    ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
+    defer cancel()
+
+    results := make(chan fetchResult, len(targets))
+    for _, target := range targets {
+        go h.fetch(ctx, target, results)
+    }
+
+    batch := make([]fetchResult, 0, len(targets))
+    for range targets {
+        batch = append(batch, &lt;-results)
+    }
+    json.NewEncoder(w).Encode(batch)
+}</code></pre>
+
+            <p>
+              Three constraints are intentional. First, at most eight URLs are accepted, so “one goroutine per input” cannot become
+              unbounded amplification. Second, the result channel is buffered to the task count, so a future early return does not
+              immediately strand every child at its send. Third, <code>NewRequestWithContext</code> carries inbound cancellation into
+              the outbound <code>Transport</code>.
+            </p>
+
+            <pre><code class="language-go">transport := http.DefaultTransport.(*http.Transport).Clone()
+transport.MaxConnsPerHost = 16
+transport.MaxIdleConnsPerHost = 8
+transport.IdleConnTimeout = 90 * time.Second
+transport.ResponseHeaderTimeout = time.Second
+
+server := &amp;http.Server{
+    Addr:              ":8080",
+    Handler:           handler,
+    ReadHeaderTimeout: 2 * time.Second,
+    WriteTimeout:      3 * time.Second,
+    IdleTimeout:       60 * time.Second,
+}</code></pre>
+
+            <p>
+              These are not universal production defaults. They make boundaries visible: the server limits header reads, response
+              writes, and idle connections; the client limits per-host connections, idle reuse, and response-header waiting.
+              Real values must follow traffic, upstream SLOs, body sizes, and retry policy.
+            </p>
+
+            <h2 id="server-serve">3. <code>Server.Serve</code> accepts connections</h2>
+            <p>
+              <code>ListenAndServe</code> performs two essential actions: <code>net.Listen("tcp", addr)</code>, then hands the listener
+              to <code>Server.Serve</code>. The actual concurrency boundary sits in the accept loop.
+            </p>
+
+            <pre><code class="language-go">// net/http/server.go, reduced to the main route
+ctx := context.WithValue(baseCtx, ServerContextKey, s)
+for {
+    rw, err := l.Accept()
+    // shutdown and temporary accept-error handling omitted
+    connCtx := ctx
+    if cc := s.ConnContext; cc != nil {
+        connCtx = cc(connCtx, rw)
+    }
+    c := s.newConn(rw)
+    c.setState(c.rwc, StateNew, runHooks)
+    go c.serve(connCtx)
+}</code></pre>
+            <span class="source-caption">
+              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L3404-L3465">Server.Serve</a>.
+            </span>
+
+            <p>
+              The <code>go</code> appears in front of <code>c.serve</code>, so the direct HTTP/1 fact is:
+              <strong>the base service goroutine is created per connection, not per request.</strong> Ten sequential keep-alive requests
+              on one TCP connection reuse that connection service path. Ten simultaneous connections create ten such paths.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../assets/server-connection-lifecycle.png"
+                alt="Go HTTP server connection lifecycle: Server.Serve moves through Accept, newConn, and go c.serve, then sequentially runs readRequest, ServeHTTP, and finishRequest before looping for keep-alive"
+              />
+            </figure>
+
+            <h3>Why the HTTP/1 handler runs in the connection goroutine</h3>
+            <p>
+              After TLS routing and buffer setup, <code>conn.serve</code> enters its HTTP/1 loop. The key call is not
+              <code>go handler.ServeHTTP(...)</code>; it calls the handler directly.
+            </p>
+
+            <pre><code class="language-go">for {
+    w, err := c.readRequest(ctx)
+    // parsing and error responses omitted
+
+    inFlightResponse = w
+    serverHandler{c.server}.ServeHTTP(w, w.req)
+    inFlightResponse = nil
+
+    w.cancelCtx()
+    w.finishRequest()
+    if !w.shouldReuseConnection() {
+        return
+    }
+    c.setState(c.rwc, StateIdle, runHooks)
+    c.bufr.Peek(4) // wait for the next request to arrive
+}</code></pre>
+            <span class="source-caption">
+              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L1994-L2114">the HTTP/1 loop in conn.serve</a>.
+            </span>
+
+            <p>
+              The source comment explains the choice: ordinary HTTP/1 cannot read the next request while the current response is still
+              being produced, so another handler goroutine would add ownership without useful protocol concurrency. Application code
+              may create child goroutines as <code>fetchd</code> does, but that is handler-owned concurrency; it must bound work,
+              propagate cancellation, and collect results. HTTP/2 multiplexing follows a different path.
+            </p>
+
+            <h3>The panic boundary belongs to the connection owner</h3>
+            <p>
+              A defer at the top of <code>conn.serve</code> recovers ordinary panics, records the current goroutine stack, and closes a
+              non-hijacked connection. <code>ErrAbortHandler</code> is the special no-stack signal. This protects the HTTP connection
+              loop; it is not a transaction that rolls back external side effects already performed by the handler.
+            </p>
+
+            <h2>4. How <code>Request.Context</code> is installed and canceled</h2>
+            <p>
+              Request cancellation does not begin at the call to <code>r.Context()</code>. A connection context sits above it, outbound
+              work sits below it, and the source links the lifetimes with nested contexts.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../assets/request-context-ownership.png"
+                alt="Go HTTP context ownership: baseCtx contains connCtx, which contains a request context; readRequest stores the cancel function on response, ServeHTTP return cancels the request, connection end cancels connCtx, and I/O deadlines remain separate"
+              />
+            </figure>
+
+            <h3><code>readRequest</code> creates the request cancel function</h3>
+            <p>
+              <code>Server.Serve</code> obtains a root from <code>BaseContext</code>; <code>ConnContext</code> can attach values for one
+              connection. <code>conn.serve</code> adds <code>context.WithCancel</code> and defers its cancel until the connection service
+              ends. After parsing and validating request headers, <code>readRequest</code> creates the inner request context.
+            </p>
+
+            <pre><code class="language-go">ctx, cancelCtx := context.WithCancel(ctx)
+req.ctx = ctx
+req.RemoteAddr = c.remoteAddr
+req.TLS = c.tlsState
+
+w = &amp;response{
+    conn:      c,
+    cancelCtx: cancelCtx,
+    req:       req,
+    reqBody:   req.Body,
+    // ...
+}</code></pre>
+            <span class="source-caption">
+              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L976-L1072">conn.readRequest</a> and
+              the connection cancel in <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L1966-L1995">conn.serve</a>.
+            </span>
+
+            <p>
+              The handler never receives the cancel function; <code>response</code> stores it. After the handler returns, the connection
+              loop calls <code>w.cancelCtx()</code>. Background work that keeps the request context therefore observes <code>Done</code>
+              after handler return. Work that must outlive a request belongs in a queue or worker with an independent lifetime, not in a
+              goroutine that silently ignores cancellation.
+            </p>
+
+            <h3>Cancellation, request deadlines, and socket deadlines differ</h3>
+            <p>
+              <code>fetchd</code> adds a 1.5-second business deadline with <code>context.WithTimeout</code>.
+              <code>http.Server.ReadHeaderTimeout</code> and <code>WriteTimeout</code> are translated by <code>readRequest</code> into
+              <code>SetReadDeadline</code> and <code>SetWriteDeadline</code> on the connection. Those socket deadlines do not guarantee
+              that <code>r.Context().Deadline()</code> exposes the same time.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Signal</th>
+                    <th>Set by</th>
+                    <th>First observer</th>
+                    <th>Application response</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Request context cancellation</td>
+                    <td>Handler return, disconnect, or explicit parent cancel</td>
+                    <td>Business work and Transport waiting on <code>ctx.Done()</code></td>
+                    <td>Stop derived work and return the appropriate cause</td>
+                  </tr>
+                  <tr>
+                    <td>Business deadline</td>
+                    <td><code>context.WithTimeout</code></td>
+                    <td>The context tree</td>
+                    <td>Apply one budget to the call tree</td>
+                  </tr>
+                  <tr>
+                    <td>I/O deadline</td>
+                    <td><code>http.Server</code> / <code>net.Conn</code></td>
+                    <td>Socket read or write</td>
+                    <td>Turn network waiting into a timeout error; do not replace business cancellation</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>5. After the handler, outbound work enters <code>Transport</code></h2>
+            <p>
+              <code>serverHandler.ServeHTTP</code> is deliberately thin. It selects the configured <code>Server.Handler</code>, falls
+              back to <code>DefaultServeMux</code>, and calls <code>handler.ServeHTTP</code>. In <code>fetchd</code>, that enters our
+              handler and eventually reaches <code>h.client.Do(req)</code>.
+            </p>
+
+            <pre><code class="language-go">func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
+    handler := sh.srv.Handler
+    if handler == nil {
+        handler = DefaultServeMux
+    }
+    handler.ServeHTTP(rw, req)
+}</code></pre>
+            <span class="source-caption">
+              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L3302-L3312">serverHandler.ServeHTTP</a>.
+            </span>
+
+            <h3><code>RoundTrip</code> gets a connection, then selects the protocol path</h3>
+            <p>
+              <code>Client.Do</code> owns redirects, cookies, and other higher-level behavior. One HTTP exchange reaches
+              <code>Transport.RoundTrip</code>. In Go 1.26 the exported method validates its receiver and enters <code>roundTrip</code>,
+              whose loop checks the request and context, computes the connection method, obtains a connection, then selects HTTP/2 or
+              HTTP/1 <code>persistConn</code>.
+            </p>
+
+            <pre><code class="language-go">for {
+    select {
+    case &lt;-ctx.Done():
+        return nil, context.Cause(ctx)
+    default:
+    }
+
+    treq := &amp;transportRequest{Request: req, ctx: ctx, cancel: cancel}
+    cm, err := t.connectMethodForRequest(treq)
+    pconn, err := t.getConn(treq, cm)
+
+    if pconn.alt != nil {
+        resp, err = pconn.alt.RoundTrip(req) // HTTP/2 or another alternate path
+    } else {
+        resp, err = pconn.roundTrip(treq)    // HTTP/1
+    }
+}</code></pre>
+            <span class="source-caption">
+              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/roundtrip.go#L22-L34">Transport.RoundTrip</a> and
+              <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L590-L717">Transport.roundTrip</a>.
+            </span>
+
+            <p>
+              <code>getConn</code> first tries an idle connection, then queues a dial. With <code>MaxConnsPerHost</code>, a request may
+              wait in a per-host queue before any DNS or socket work begins. Many goroutines near <code>getConn</code> in a profile do not
+              prove slow dialing; connection limits and upstream latency may be building a queue together.
+            </p>
+
+            <p>
+              The source reveals a subtler ownership split. The dial context uses <code>context.WithoutCancel</code> to retain request
+              values while temporarily detaching from that request's cancellation because another request may reuse the connection.
+              <code>wantConn</code> still has its own cancel path, and the caller stops waiting on <code>treq.ctx.Done()</code>.
+              “This request stopped waiting” and “this connection is no longer worth establishing” are related but separate decisions.
+            </p>
+
+            <p>
+              Once HTTP/1 obtains a <code>persistConn</code>, <code>roundTrip</code> sends writes to <code>writech</code> and response waits
+              to <code>reqch</code>. The connection's read and write loops own the socket while the calling goroutine waits for a response
+              or cancellation. A synchronous-looking <code>client.Do</code> therefore sits above a pool, dial goroutines, and persistent
+              connection loops.
+            </p>
+
+            <h2 id="netpoll">6. Beneath blocking <code>Read</code>, the goroutine returns the thread</h2>
+            <p>
+              This is the part often compressed into “Go uses nonblocking I/O.” Application and standard-library code still use a
+              blocking interface: if no response data exists, <code>Read</code> waits. For a pollable network descriptor, the bottom layer
+              first attempts a nonblocking syscall. Only <code>EAGAIN</code> transfers the wait to the poller.
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../assets/outbound-netpoll-path.png"
+                alt="Outbound Go HTTP source route to netpoll: Transport reaches persistConn, netFD, and syscall.Read; EAGAIN enters waitRead and runtime_pollWait, parks the goroutine, and netpoll readiness later makes it runnable"
+              />
+            </figure>
+
+            <h3><code>netFD</code> delegates the connection to <code>internal/poll.FD</code></h3>
+            <p>
+              <code>net.(*netFD).Read</code> is a thin wrapper. The retry loop lives in <code>internal/poll.(*FD).Read</code>.
+            </p>
+
+            <pre><code class="language-go">for {
+    n, err := ignoringEINTRIO(syscall.Read, fd.Sysfd, p)
+    if err != nil {
+        n = 0
+        if err == syscall.EAGAIN &amp;&amp; fd.pd.pollable() {
+            if err = fd.pd.waitRead(fd.isFile); err == nil {
+                continue
+            }
+        }
+    }
+    return n, fd.eofError(n, err)
+}</code></pre>
+            <span class="source-caption">
+              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/fd_posix.go#L67-L71">netFD.Read</a> and
+              <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/poll/fd_unix.go#L141-L173">internal/poll.FD.Read</a>.
+            </span>
+
+            <p>
+              If the first syscall finds data, it returns immediately and never parks the goroutine. Only when the kernel says the call
+              would block does <code>waitRead</code> enter <code>pollDesc.wait('r')</code>. Netpoll is not a mandatory central queue for
+              every read and write; the syscall fast path matters.
+            </p>
+
+            <h3><code>runtime_pollWait</code> is the narrow bridge into the runtime</h3>
+            <p>
+              <code>internal/poll</code> declares <code>runtime_pollWait</code>; the runtime supplies it through <code>go:linkname</code>.
+              The implementation first checks close and deadline state, then <code>netpollblock</code> places the current goroutine in the
+              poll descriptor's read or write wait slot.
+            </p>
+
+            <pre><code class="language-go">// internal/poll
+res := runtime_pollWait(pd.runtimeCtx, mode)
+
+// runtime
+func poll_runtime_pollWait(pd *pollDesc, mode int) int {
+    if errcode := netpollcheckerr(pd, int32(mode)); errcode != pollNoError {
+        return errcode
+    }
+    for !netpollblock(pd, int32(mode), false) {
+        // recheck after deadline/readiness races
+    }
+    return pollNoError
+}</code></pre>
+            <span class="source-caption">
+              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/poll/fd_poll_runtime.go#L80-L100">pollDesc.wait</a> and
+              <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/netpoll.go#L336-L360">poll_runtime_pollWait</a>.
+            </span>
+
+            <p>
+              Parking a goroutine is not sleeping a thread. Once the G is waiting, the M can re-enter scheduling and run another runnable
+              G on a P. This is one reason many network waits can coexist. The cost does not vanish; it moves from one-thread-per-wait to
+              goroutine stacks, poll descriptors, connection state, timers, and wake-up scheduling.
+            </p>
+
+            <h3>How a readiness event reaches the scheduler</h3>
+            <p>
+              On Linux, <code>runtime.netpoll</code> calls <code>epollwait</code>, maps each event back to a <code>pollDesc</code>, and lets
+              <code>netpollready</code> collect goroutines that can run. <code>findRunnable</code> performs a nonblocking network poll and,
+              when no other work exists, may block with a delay. It transitions one G from <code>_Gwaiting</code> to
+              <code>_Grunnable</code> and injects the remaining list into runnable queues.
+            </p>
+
+            <pre><code class="language-go">// Linux: runtime/netpoll_epoll.go
+n, errno := linux.EpollWait(epfd, events[:], int32(len(events)), waitms)
+// ...
+delta += netpollready(&amp;toRun, pd, mode)
+
+// scheduler: runtime/proc.go
+list, delta := netpoll(0)
+gp := list.pop()
+injectglist(&amp;list)
+casgstatus(gp, _Gwaiting, _Grunnable)</code></pre>
+            <span class="source-caption">
+              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/netpoll_epoll.go#L91-L175">Linux netpoll</a>,
+              <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3486-L3510">nonblocking poll in findRunnable</a>, and
+              <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3738-L3772">blocking poll while idle</a>.
+            </span>
+
+            <p>
+              When the goroutine resumes, <code>internal/poll.FD.Read</code> returns from <code>waitRead</code> and retries the syscall.
+              Epoll readiness is not treated as a guarantee that this read must succeed; readiness can change before the G runs, so the
+              retry loop is part of the contract.
+            </p>
+
+            <h2>7. Where scheduling and GC belong on this route</h2>
+            <p>
+              This first chapter establishes owners rather than turning the scheduler and GC into encyclopedias. For our request, the
+              scheduler runs accept, connection, handler, and Transport goroutines; switches away when they wait on channels, mutexes,
+              timers, or netpoll; then arranges ready Gs on an executable P/M combination. <code>schedule → findRunnable</code> is the
+              later entry point for G-M-P, local and global run queues, work stealing, and preemption.
+            </p>
+
+            <p>
+              GC crosses every allocation on the path. Request parsing creates headers, URLs, and response state. JSON aggregation creates
+              slices and strings. Transport and the pool retain request and connection objects. Escape, heap growth, concurrent marking,
+              and GC assist can affect CPU and tail latency. But observing a GC interval does not prove that GC caused one slow request;
+              profiles, traces, and runtime metrics must establish the relationship.
+            </p>
+
+            <div class="note">
+              <p>
+                A useful first split: many network waits with low CPU often produce <code>IO wait</code> stacks; many runnable goroutines
+                with saturated CPU point toward scheduling or computation; rising allocation rate, heap, and GC CPU together justify a
+                deeper allocation and collection investigation.
+              </p>
+            </div>
+
+            <h2>8. Choose production evidence by symptom</h2>
+            <p>
+              Source reading should not make an incident start at line one of <code>server.go</code>. Start with evidence selected for the
+              symptom, then map the observation back to the owner route.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Symptom</th>
+                    <th>Inspect first</th>
+                    <th>Likely owner</th>
+                    <th>Premature conclusion to avoid</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Tail latency rises; CPU stays low</td>
+                    <td>Trace, goroutine profile, <code>httptrace</code>, upstream phase latency</td>
+                    <td>Pool queue, DNS/dial, response headers/body, netpoll</td>
+                    <td>“Many goroutines mean a slow scheduler”</td>
+                  </tr>
+                  <tr>
+                    <td>CPU remains saturated</td>
+                    <td>CPU profile, trace runnable latency</td>
+                    <td>Handler algorithm, serialization, lock contention, GC assist</td>
+                    <td>“An HTTP service must be I/O-bound”</td>
+                  </tr>
+                  <tr>
+                    <td>Goroutine count only grows</td>
+                    <td>Repeated goroutine profiles, creation stacks, blocking sites</td>
+                    <td>Unjoined children, channels, unclosed response bodies</td>
+                    <td>“The runtime garbage-collects goroutines”</td>
+                  </tr>
+                  <tr>
+                    <td>Connections or FDs near the limit</td>
+                    <td>Connection states, Transport settings, body close behavior, OS FD metrics</td>
+                    <td>Listener, idle pool, upstream connections, leaks</td>
+                    <td>“Raising ulimit completes the fix”</td>
+                  </tr>
+                  <tr>
+                    <td>Memory and GC CPU rise together</td>
+                    <td>Heap/alloc profiles, runtime metrics, trace GC intervals</td>
+                    <td>Parsing, aggregation, buffers, caches, connection state</td>
+                    <td>“Lower GOGC is always faster”</td>
+                  </tr>
+                  <tr>
+                    <td>Shared state fails intermittently</td>
+                    <td><kbd>go test -race</kbd>, minimal reproduction, owner design</td>
+                    <td>Handler children, shared caches or maps</td>
+                    <td>“Adding sleep proves there is no race”</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Each diagnostic tool has an observation boundary. Pprof aggregates samples and answers “where are resources spent?”
+              Trace preserves temporal relationships among goroutines, scheduling, network blocking, syscalls, and GC and answers “why
+              did this work not run then?” The race detector instruments memory access for concurrency conflicts and is not a performance
+              profile. Source gives a mechanism hypothesis; tools provide runtime evidence.
+            </p>
+
+            <h2>9. Keep all eight chapters on the same request</h2>
+            <p>
+              The series will not switch among eight unrelated demos. Later chapters keep <code>fetchd</code> and the same production
+              request, enlarge one owner at a time, and add a reproducible experiment plus verified source.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Chapter</th>
+                    <th>Core question</th>
+                    <th>Source entry</th>
+                    <th>Experiment</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>I</td>
+                    <td>How one request crosses the standard library and runtime</td>
+                    <td><code>net/http</code>, <code>internal/poll</code>, <code>runtime</code></td>
+                    <td>Complete fetchd request</td>
+                  </tr>
+                  <tr>
+                    <td>II</td>
+                    <td>What does a Go value actually copy?</td>
+                    <td>Slices, maps, interfaces, method sets, ABI</td>
+                    <td>Aliasing, growth, escape</td>
+                  </tr>
+                  <tr>
+                    <td>III</td>
+                    <td>Where does a goroutine actually run?</td>
+                    <td><code>newproc</code>, <code>schedule</code>, <code>findRunnable</code></td>
+                    <td>Runnable latency and preemption</td>
+                  </tr>
+                  <tr>
+                    <td>IV</td>
+                    <td>When should we use channels or locks?</td>
+                    <td>Channel, sema, mutex, select</td>
+                    <td>Backpressure, contention, starvation</td>
+                  </tr>
+                  <tr>
+                    <td>V</td>
+                    <td>How should a request end?</td>
+                    <td>Context, timers, net/http cancellation</td>
+                    <td>Timeout, cancellation, goroutine leaks</td>
+                  </tr>
+                  <tr>
+                    <td>VI</td>
+                    <td>Why does an allocation reach the heap?</td>
+                    <td>Compiler escape, allocator, GC</td>
+                    <td><code>-gcflags=-m</code> and alloc profiles</td>
+                  </tr>
+                  <tr>
+                    <td>VII</td>
+                    <td>Why is <code>net/http</code> fast, and why does it stall?</td>
+                    <td>Transport, persistConn, HTTP/2</td>
+                    <td>Connection pools and slow upstreams</td>
+                  </tr>
+                  <tr>
+                    <td>VIII</td>
+                    <td>How do we diagnose Go performance with evidence?</td>
+                    <td>Pprof, trace, runtime metrics, race</td>
+                    <td>A complete performance investigation</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The first chapter should leave three reusable rules, not a pile of function names:
+              <strong>find the lifecycle owner; separate the synchronous API from the waiting mechanism underneath; validate source
+              hypotheses with runtime evidence.</strong> Chapter II will begin with <code>fetchd</code>'s URL slice, result channel, and
+              JSON aggregation to ask which bytes Go value semantics copy and which underlying state remains shared.
+            </p>
+
+            <h2 id="sources">Source and documentation references</h2>
+            <ul class="source-list">
+              <li><a href="https://go.dev/blog/go1.26">Go 1.26 release notes overview</a></li>
+              <li><a href="https://pkg.go.dev/net/http">net/http package documentation</a></li>
+              <li><a href="https://pkg.go.dev/context">context package documentation</a></li>
+              <li><a href="https://go.dev/doc/diagnostics">Diagnostics in the Go ecosystem</a></li>
+              <li><a href="https://go.dev/blog/context">Go Concurrency Patterns: Context</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L3340-L3465">ListenAndServe and Server.Serve</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L1896-L2115">conn.serve</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L976-L1072">conn.readRequest</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L3302-L3312">serverHandler.ServeHTTP</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/roundtrip.go#L22-L34">Transport.RoundTrip</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L590-L717">Transport.roundTrip</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1512-L1645">getConn and dial queue</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L2813-L2891">persistConn.roundTrip</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/internal/poll/fd_unix.go#L141-L173">internal/poll.FD.Read</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/internal/poll/fd_poll_runtime.go#L80-L100">pollDesc.wait</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/netpoll.go#L336-L360">poll_runtime_pollWait</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/netpoll_epoll.go#L91-L175">Linux epoll netpoll implementation</a></li>
+              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3385-L3510">findRunnable and nonblocking netpoll</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim());
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (value) => {
+          const base = value
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const base = slugify(heading.textContent.trim());
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
