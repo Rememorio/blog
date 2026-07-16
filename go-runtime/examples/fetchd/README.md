@@ -25,3 +25,5 @@ Run the tests with `go test ./...`. The focused labs are grouped by article:
 - `scheduler_lab_test.go` creates runnable bursts and reads scheduler metrics.
 - `concurrency_lab_test.go` makes channel backpressure, cancellation, and
   mutex-protected state observable.
+- `interface_lab_test.go` compares interface values, typed nil, generic type
+  preservation, and reflection's addressability boundary.

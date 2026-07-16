@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go Source Notes V: Interface, Generics, and Reflection Boundaries</title>
+    <meta name="description" content="Chapter V of Go from Request to Production: trace interface words, typed nil, itabs, convT, generic shapes and dictionaries, and the mutation boundary of reflect.Value through Go 1.26.0 source." />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Go Source Notes V: Interface, Generics, and Reflection Boundaries" />
+    <meta property="og:description" content="Interfaces select runtime behavior, generics reuse a static algorithm, and reflection interprets a runtime schema. They solve different problems." />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/abstraction-boundaries-overview.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/en/abstraction-boundaries/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/abstraction-boundaries/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/abstraction-boundaries/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.route-note { border-color: rgba(31, 119, 123, 0.32); background: rgba(31, 119, 123, 0.1); }
+      .note.route-note strong { color: var(--rose); }
+      .article-body pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .source-caption { display: block; margin: -10px 0 24px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+      .article-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line); }
+      .article-pager a { color: var(--teal); font-weight: 800; text-decoration: none; }
+      @media (max-width: 760px) {
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+        .article-pager { flex-direction: column; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="Article shortcuts"><a href="../">Go series</a><a href="#interface">Interface</a><a href="#generics">Generics</a><a href="#reflection">Reflection</a><a href="#evidence">Evidence</a><a href="#sources">Sources</a></nav>
+      <nav class="site-actions" aria-label="Site actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="Language switcher"><a href="../../zh/abstraction-boundaries/" lang="zh-CN">中文</a><a class="active" href="./" lang="en" aria-current="page">English</a></span></nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">On this page</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero">
+          <p class="eyebrow">Go from Request to Production · Chapter V</p>
+          <h1 class="long-title"><code>Interface</code>, generics, and reflection boundaries</h1>
+          <p class="lead">
+            <code>fetchd</code> can let distinct results implement one behavior, reuse a filter over any named slice, or mutate data by a field name known only at runtime.
+            Those jobs belong to interfaces, generics, and reflection. All three abstract over types, but preserve type information at different times and fail in different ways.
+          </p>
+          <div class="meta-line"><span>Source: Go 1.26.0</span><span>Route: ITab → getitab / gc shape → dictionary / Value → Set</span><span>Lab: interface_lab_test.go</span></div>
+          <figure class="hero-image"><img src="../assets/abstraction-boundaries-overview.png" alt="Three Go abstraction boundaries: interfaces select behavior by dynamic type, generics reuse one algorithm over static types, and reflection inspects a runtime schema" /></figure>
+        </section>
+
+        <section class="article-body">
+          <div class="note route-note"><p><strong>Reading contract:</strong> this chapter separates language guarantees, the Go 1.26.0 runtime representation, and the current gc compiler implementation. By the end, you should be able to explain typed nil, interface conversion and allocation, why a type parameter is not merely a faster interface, and why a readable <code>reflect.Value</code> may still be immutable. The benchmark describes one controlled shape; it does not rank the abstractions.</p></div>
+
+          <p>
+            Language evidence comes from the <a href="https://go.dev/ref/spec#Interface_types">Go specification</a>. Implementation evidence is pinned to the
+            <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>: 
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go">internal/abi/iface.go</a>,
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go">runtime/iface.go</a>, the
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go">compiler noder</a>, and
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go">reflect/value.go</a>.
+          </p>
+
+          <h2>1. First decide how long type information must survive</h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Abstraction</th><th>Selection point</th><th>Good fit</th><th>Main risk</th></tr></thead>
+            <tbody>
+              <tr><td><code>interface</code></td><td>Dynamic concrete type at runtime</td><td>A caller depends on behavior while implementations vary</td><td>Typed nil, boxing and escape, broad interfaces</td></tr>
+              <tr><td>Generics</td><td>Type arguments and type sets at compile time</td><td>One algorithm or structure serves a family of static types</td><td>Abstraction without reuse, constraints that leak structure</td></tr>
+              <tr><td>Reflection</td><td>Runtime types, names, or tags</td><td>Serialization, DI, and schema-driven frameworks</td><td>Invalid Values, unsettable fields, panics, cost and opacity</td></tr>
+            </tbody>
+          </table></div>
+
+          <p>
+            If a function merely calls <code>describe()</code>, accept the smallest useful interface. If one filter should preserve a named slice such as <code>resultBatch</code>, use type parameters. Only hand a field name to reflection when the schema truly arrives at runtime.
+            The official <a href="https://go.dev/blog/when-generics">When To Use Generics</a> reaches the same boundary: ordinary functions and interfaces express behavior; generics serve a shared implementation; reflection remains for runtime variation neither can express cleanly.
+          </p>
+
+          <h2 id="interface">2. An interface value is not one pointer to an object</h2>
+          <p>
+            The specification describes an interface value by its dynamic type and dynamic value. In the runtime, an empty interface <code>eface</code> stores <code>_type + data</code>, while a method-bearing <code>iface</code> stores <code>itab + data</code>.
+            The itab connects the interface type, concrete type, and method entries. Once those two words are explicit, typed nil, assertions, and conversions stop looking like unrelated exceptions.
+          </p>
+
+          <pre><code class="language-go">// runtime/runtime2.go
+type iface struct {
+    tab  *itab
+    data unsafe.Pointer
+}
+
+type eface struct {
+    _type *_type
+    data  unsafe.Pointer
+}</code></pre>
+          <span class="source-caption">Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L184-L192">runtime iface / eface</a>; stable internal layouts in <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go#L9-L33">internal/abi InterfaceType, ITab, and EmptyInterface</a>.</span>
+
+          <h2>3. Typed nil: Data can be nil while the type word is not</h2>
+          <p>
+            <code>var p *fetchProblem</code> makes <code>p</code> a nil pointer whose static type is <code>*fetchProblem</code>. Assigning it to <code>error</code> records <code>*fetchProblem</code> as the dynamic type and nil as the dynamic value.
+            An interface equals nil only when neither exists, so <code>err != nil</code>. That follows from the specification's interface-value and comparison rules, not from an incidental runtime quirk.
+          </p>
+
+          <figure class="figure"><img src="../assets/interface-typed-nil.png" alt="The two interface words: both type and data are empty in a nil interface, while a typed nil retains an ITab for fetchProblem and has nil Data, so err is not nil" /></figure>
+
+          <pre><code class="language-go">var empty any
+fmt.Println(empty == nil) // true
+
+var problem *fetchProblem
+var err error = problem
+fmt.Println(err == nil)   // false
+fmt.Printf("%T\n", err)   // *main.fetchProblem</code></pre>
+
+          <p>
+            Do not let a function returning <code>error</code> place a nil typed pointer directly into the interface. Test the pointer at the return boundary and return a literal <code>nil</code>, or give the zero receiver complete semantics.
+            Reflection exposes the companion edge: <code>reflect.ValueOf(nil)</code> is the zero Value, while a typed nil produces a valid pointer Value that must be checked with <code>IsNil</code>.
+          </p>
+
+          <h2>4. <code>getitab</code> maps a type pair to a method table</h2>
+          <p>
+            Converting a concrete value to a non-empty interface needs an <code>ITab</code> for the pair “interface type × concrete type.” <code>getitab</code> begins with a lock-free lookup, then locks and retries before allocating persistent storage and publishing the result in <code>itabTable</code>.
+            A missing-method result can also be cached; a conversion that must panic may reinitialize the entry only to recover the precise missing method name.
+          </p>
+
+          <pre><code class="language-go">type ITab struct {
+    Inter *InterfaceType
+    Type  *Type
+    Hash  uint32
+    Fun   [1]uintptr
+}</code></pre>
+          <span class="source-caption">Layout: <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go#L14-L21">abi.ITab</a>; lookup and publication: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L44-L103">runtime.getitab</a>.</span>
+
+          <p>
+            <code>itabInit</code> exploits the fact that interface and concrete method lists are both sorted. Two cursors merge them in O(ni+nt), writing concrete entry points into <code>Fun[k]</code>. A missing method leaves <code>Fun[0] == 0</code> and returns its name.
+            The important result is that ordinary interface calls do not search methods by string: table construction or lookup establishes a fixed slot first.
+          </p>
+
+          <figure class="figure"><img src="../assets/itab-conversion-assertion.png" alt="Go interface source path: getitab and itabInit match sorted methods and cache an ITab, convT prepares Data, and a type assertion checks the dynamic type" /></figure>
+
+          <h2>5. Storing a value in an interface may copy it and may make it escape</h2>
+          <p>
+            The ITab answers “how to call”; Data still needs the dynamic value. General <code>convT</code> allocates storage with <code>mallocgc</code> and copies the value using <code>typedmemmove</code>.
+            The runtime also has specialized conversions for 16-, 32-, and 64-bit values, strings, and slices, and can reuse static storage for small integers or zero values. Actual heap allocation still depends on call shape, inlining, and escape analysis. Seeing <code>mallocgc</code> here does not mean every interface call allocates.
+          </p>
+
+          <pre><code class="language-go">func convT(t *_type, v unsafe.Pointer) unsafe.Pointer {
+    x := mallocgc(t.Size_, t, true)
+    typedmemmove(t, x, v)
+    return x
+}</code></pre>
+          <span class="source-caption">Conversion helpers: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L332-L446">convT and specialized conversions</a>.</span>
+
+          <p>
+            A type assertion checks whether the dynamic type implements the target interface or equals the target non-interface type. <code>assertE2I</code> and <code>typeAssert</code> implement that edge and maintain assertion caches. A comma-ok failure returns the zero value and false; the single-result form panics.
+            Cache shape and helper choice are implementation details; programs depend only on assertion semantics.
+          </p>
+
+          <h2 id="generics">6. Generics retain a family of static types</h2>
+          <p>
+            An interface parameter places each value in a common dynamic container. A generic call first chooses concrete type arguments. Its constraints are interface-shaped type sets that describe permitted types and operations.
+            In <code>filterBatch[S ~[]E, E any]</code>, <code>~[]E</code> accepts named types whose underlying type is <code>[]E</code>. Returning <code>S</code> therefore preserves <code>resultBatch</code> instead of degrading it to <code>[]fetchResult</code>.
+          </p>
+
+          <pre><code class="language-go">type resultBatch []fetchResult
+
+func filterBatch[S ~[]E, E any](values S, keep func(E) bool) S {
+    filtered := make(S, 0, len(values))
+    for _, value := range values {
+        if keep(value) {
+            filtered = append(filtered, value)
+        }
+    }
+    return filtered
+}</code></pre>
+
+          <p>
+            That is a good generic boundary: the algorithm needs no runtime branch on element type, while callers retain their static type. If code only calls <code>Read</code>, <code>Write</code>, or <code>describe</code> on one value, replacing the interface with a lone type parameter usually complicates the signature. The official guidance explicitly keeps those behavior abstractions as interfaces.
+          </p>
+
+          <h2>7. The current gc implementation: shape body plus dictionary</h2>
+          <p>
+            The Go specification does not require monomorphization, erasure, or dictionary passing. In Go 1.26.0, gc can select a shape for shared code and emit a runtime dictionary. Entries may include method expressions for type parameters, subdictionaries, runtime types, and itabs.
+            <code>readerDict</code>/<code>writerDict</code> read and write those entries, while <code>shapify</code> chooses shapes. They explain the current binary and profiles; they are not a supported ABI for application code.
+          </p>
+
+          <figure class="figure"><img src="../assets/generic-shape-dictionary.png" alt="Go 1.26 gc generics implementation: concrete calls use a shared shape function and a dictionary containing method expressions, runtime types, and itabs; this is an implementation, not a language guarantee" /></figure>
+
+          <p>Disabling inlining for the lab package and inspecting its symbols reveals both concrete dictionaries and shape functions:</p>
+
+          <pre><code class="language-text">...dict.sumGeneric[...fetchResult]
+...dict.filterBatch[...resultBatch,...fetchResult]
+sumGeneric[go.shape.struct {...}]
+filterBatch[go.shape.[]fetchResult,go.shape.struct {...}]</code></pre>
+          <span class="source-caption">Compiler paths: <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L157-L210">readerDict</a>, <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L891-L960">shapify</a>, and <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/writer.go#L897-L968">objDict</a>.</span>
+
+          <p>
+            “Uses a dictionary” does not mean “slow on every call,” just as “has an itab” does not mean “allocates on every call.” Inlining, devirtualization, escape behavior, constraint operations, and CPU effects all matter. Optimize the observed hot path, not an abstraction's name.
+          </p>
+
+          <h2 id="reflection">8. Reflection unpacks an interface into a <code>Value</code></h2>
+          <p>
+            The first law of reflection goes from interface to reflection object. <code>ValueOf</code> returns the zero Value for nil and otherwise uses <code>unpackEface</code> to recover type and data.
+            A <code>reflect.Value</code> stores <code>typ_</code>, <code>ptr</code>, and <code>flag</code>. Low flag bits encode Kind; other bits record read-only status, indirect storage, addressability, and method values. The second law, <code>Interface()</code>, packs a Value back into an interface.
+          </p>
+
+          <pre><code class="language-go">type Value struct {
+    typ_ *abi.Type
+    ptr  unsafe.Pointer
+    flag
+}</code></pre>
+          <span class="source-caption">Layout and flags: <a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L40-L70">reflect.Value</a>; conversion: <a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L122-L169">packEface / unpackEface</a>.</span>
+
+          <p>
+            <code>packEface</code> also exposes a subtle alias boundary. When exporting an addressable, indirect Value as an interface, reflect may copy it into fresh storage so later Value mutations cannot change the boxed value.
+            That is an implementation mechanism; callers should rely on the public addressability, settability, and export rules.
+          </p>
+
+          <h2>9. The third law: mutation requires a settable Value</h2>
+          <p>
+            <code>reflect.ValueOf(result)</code> receives the struct copy stored in an interface. Its field is not addressable, so <code>CanSet() == false</code>. Passing <code>&amp;result</code> and calling <code>Elem()</code> yields a Value pointing at the original variable and marks it addressable. An exported field with no read-only flag can then be set.
+            <code>CanSet</code> is essentially the test that <code>flagAddr</code> is present and neither read-only bit is.
+          </p>
+
+          <figure class="figure"><img src="../assets/reflect-value-boundary.png" alt="The reflect.Value mutation boundary: a field from ValueOf(result) is unsettable, while ValueOf(&result).Elem() is addressable and its exported field can be changed with SetInt" /></figure>
+
+          <pre><code class="language-go">func (v Value) CanSet() bool {
+    return v.flag&amp;(flagAddr|flagRO) == flagAddr
+}
+
+func (v Value) Set(x Value) {
+    v.mustBeAssignable()
+    x.mustBeExported()
+    var target unsafe.Pointer
+    if v.kind() == Interface {
+        target = v.ptr
+    }
+    x = x.assignTo("reflect.Set", v.typ(), target)
+    if x.flag&amp;flagIndir != 0 {
+        typedmemmove(v.typ(), v.ptr, x.ptr)
+    } else {
+        *(*unsafe.Pointer)(v.ptr) = x.ptr
+    }
+}</code></pre>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L339-L355">CanAddr / CanSet</a>, <a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L1216-L1259">Elem</a>, and <a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L2146-L2167">Set</a>.</span>
+
+          <p>
+            Go 1.26 also provides generic <code>reflect.TypeAssert[T](v)</code>. It is semantically equivalent to <code>v.Interface().(T)</code>, but can use <code>abi.TypeFor[T]()</code> for more direct paths and avoid allocation when an interface assertion fails.
+            It makes the exit from reflection to a static type explicit; it does not remove validity, export, or settability checks.
+          </p>
+
+          <h2 id="evidence">10. Experiments test semantics, not a universal ranking</h2>
+          <p>
+            <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/interface_lab_test.go">interface_lab_test.go</a>
+            contains four repeatable checks: an interface retains its dynamic type and value; typed nil differs from nil; a generic filter preserves a named slice; and reflection mutates only an exported field reached through an addressable pointer.
+          </p>
+
+          <pre><code class="language-bash">cd go-runtime/examples/fetchd
+go test -run 'Test(Interface|TypedNil|Generic|Reflection)'
+go test -race ./...
+go vet ./...
+go test -run '^$' -bench BenchmarkAbstractionBoundaries -benchmem</code></pre>
+
+          <p>
+            The 64-element benchmark constructs its interface slice outside the timed loop. Both the generic constraint and pre-boxed interface calls report 0 allocs/op; reflection also allocates nothing per iteration but field-name traversal is substantially slower.
+            In this one shape, the pre-boxed interface call is even slightly faster than the generic method constraint. That is exactly why generics should not be advertised as “faster interfaces.” Move boxing, slice construction, or an escape into the loop and the benchmark asks a different question.
+          </p>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>Evidence</th><th>What it answers</th><th>What it cannot answer</th></tr></thead>
+            <tbody>
+              <tr><td>Specification</td><td>Dynamic types, assertions, comparison, and type-set semantics</td><td>How many code bodies this binary has</td></tr>
+              <tr><td>Runtime and reflect source</td><td>Go 1.26.0 layouts, caches, copies, and flags</td><td>A stable ABI for future versions</td></tr>
+              <tr><td>Compiler symbols</td><td>This build contains shapes and dictionaries</td><td>Every other call shares the same shape</td></tr>
+              <tr><td>Benchmark and allocs</td><td>Cost for a fixed input and call shape</td><td>A universal winner among abstractions</td></tr>
+            </tbody>
+          </table></div>
+
+          <h2>11. Engineering rules for <code>fetchd</code></h2>
+          <ol>
+            <li><strong>Define small interfaces at the consumer.</strong> If the caller needs only <code>describe()</code>, do not demand ten unrelated methods.</li>
+            <li><strong>Eliminate typed nil at error boundaries.</strong> Return a genuine <code>nil</code> when the pointer is nil.</li>
+            <li><strong>Use generics for one implementation.</strong> Containers, filtering, reduction, and preserving named types are strong signals; one behavior call is not.</li>
+            <li><strong>Constrain necessary operations, not accidental structure.</strong> Prefer a method set over forcing callers to expose field layout.</li>
+            <li><strong>Keep reflection at an edge.</strong> Resolve fields, tags, or schemas once, then give the business loop a checked descriptor or static function.</li>
+            <li><strong>Validate every reflective write.</strong> Check validity, Kind, nil, addressability, settability, export status, and conversion.</li>
+            <li><strong>Bind performance claims to call shape.</strong> Inspect escape reports, allocations, profiles, and generated symbols before changing the abstraction.</li>
+          </ol>
+
+          <p>
+            The reusable conclusion is: <strong>an interface leaves “which concrete implementation” to runtime, generics admit a family of types to one compile-time algorithm, and reflection turns type structure itself into runtime data.</strong>
+            Choose by where the boundary lives, not by which syntax is newer. The next chapter makes <code>fetchd</code> terminate correctly by tracing request-context cancellation, timers, <code>AfterFunc</code>, causes, worker cleanup, and shutdown.
+          </p>
+
+          <h2 id="sources">Source and documentation</h2>
+          <ul class="source-list">
+            <li><a href="https://go.dev/ref/spec#Interface_types">Go Specification: interface types and values</a></li>
+            <li><a href="https://go.dev/blog/when-generics">When To Use Generics</a></li>
+            <li><a href="https://go.dev/blog/intro-generics">An Introduction To Generics</a></li>
+            <li><a href="https://go.dev/blog/laws-of-reflection">The Laws of Reflection</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go#L9-L33">ABI interface and ITab layouts</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L44-L103">runtime.getitab</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L198-L256">runtime.itabInit</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L332-L475">interface conversion and assertion helpers</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L157-L210">gc runtime dictionaries</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L891-L960">gc shaping</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L40-L169">reflect.Value layout and interface conversion</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L1481-L1587">Interface and TypeAssert</a></li>
+            <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/interface_lab_test.go">fetchd abstraction boundary lab</a></li>
+          </ul>
+
+          <nav class="article-pager" aria-label="Article navigation"><a href="../channels-and-locks/">← Chapter IV: channels and locks</a><a href="../">Back to the series →</a></nav>
+        </section>
+      </article></main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body"); const toc = document.querySelector("#toc"); if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => { const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim()); table.querySelectorAll("tbody tr").forEach((row) => Array.from(row.children).forEach((cell, index) => { if (headers[index]) cell.dataset.label = headers[index]; })); });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4")); if (!headings.length) return;
+        const counts = new Map(); const slugify = (value) => value.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "") || "section";
+        const list = document.createElement("ol"); list.className = "toc-list"; const links = []; const lastItems = new Map();
+        const childListFor = (item) => { let child = item.querySelector(":scope > ol"); if (!child) { child = document.createElement("ol"); child.className = "toc-sublist"; item.appendChild(child); } return child; };
+        const parentListFor = (level) => { if (level === 2) return list; if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2)); if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3)); if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2)); return list; };
+        headings.forEach((heading, index) => { if (!heading.id) { const base = slugify(heading.textContent.trim()); const seen = counts.get(base) || 0; counts.set(base, seen + 1); heading.id = seen === 0 ? base : `${base}-${seen + 1}`; } const level = Number(heading.tagName.slice(1)); const item = document.createElement("li"); const link = document.createElement("a"); link.href = `#${heading.id}`; link.textContent = heading.textContent.trim(); link.className = `toc-link toc-level-${level}`; if (index === 0) link.classList.add("active"); item.appendChild(link); parentListFor(level).appendChild(item); lastItems.set(level, item); if (level <= 2) lastItems.delete(3); if (level <= 3) lastItems.delete(4); links.push(link); });
+        toc.appendChild(list); const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === `#${id}`));
+        const observer = new IntersectionObserver((entries) => { const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top); if (visible[0]) activate(visible[0].target.id); }, { rootMargin: "-20% 0px -72% 0px", threshold: 0 }); headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

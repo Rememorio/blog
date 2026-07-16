@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go 源码阅读（五）：interface、泛型与反射的边界</title>
+    <meta name="description" content="Go 从请求到生产现场系列第五篇：沿 fetchd 阅读 Go 1.26.0 的 interface 两个 word、typed nil、itab、convT、泛型 shape 与字典，以及 reflect.Value 的可修改边界。" />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Go 源码阅读（五）：interface、泛型与反射的边界" />
+    <meta property="og:description" content="interface 选择运行时行为，泛型复用静态算法，反射解释运行时模式；三者解决的不是同一个问题。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/abstraction-boundaries-overview.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/zh/abstraction-boundaries/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/abstraction-boundaries/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/abstraction-boundaries/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.route-note { border-color: rgba(31, 119, 123, 0.32); background: rgba(31, 119, 123, 0.1); }
+      .note.route-note strong { color: var(--rose); }
+      .article-body pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .source-caption { display: block; margin: -10px 0 24px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+      .article-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line); }
+      .article-pager a { color: var(--teal); font-weight: 800; text-decoration: none; }
+      @media (max-width: 760px) {
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+        .article-pager { flex-direction: column; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="文章快捷入口"><a href="../">Go 系列</a><a href="#interface">interface</a><a href="#generics">泛型</a><a href="#reflection">反射</a><a href="#evidence">运行证据</a><a href="#sources">参考源码</a></nav>
+      <nav class="site-actions" aria-label="站点操作"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="语言切换"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/abstraction-boundaries/" lang="en">English</a></span></nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero">
+          <p class="eyebrow">Go 从请求到生产现场 · 第五篇</p>
+          <h1 class="long-title"><code>interface</code>、泛型与反射的边界</h1>
+          <p class="lead">
+            <code>fetchd</code> 可以让不同结果实现同一行为，可以对任意命名 slice 复用过滤算法，也可以按运行时字段名修改数据。
+            这三件事分别对应 interface、泛型和反射：它们都在“抽象”，却把类型信息保留在完全不同的时刻，也承担完全不同的失败方式。
+          </p>
+          <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：ITab → getitab / gc shape → dictionary / Value → Set</span><span>实验：interface_lab_test.go</span></div>
+          <figure class="hero-image"><img src="../assets/abstraction-boundaries-overview.png" alt="Go 三种抽象边界：interface 按动态类型选择行为，泛型对静态类型复用同一算法，反射按运行时模式检查字段" /></figure>
+        </section>
+
+        <section class="article-body">
+          <div class="note route-note"><p><strong>阅读契约：</strong>本文把语言保证、Go 1.26.0 runtime 表示和当前 gc 编译器实现分开。读完应能解释 typed nil 为什么不等于 nil、interface 转换何时可能复制或分配、类型参数为什么不是“更快的 interface”，以及一个 <code>reflect.Value</code> 为什么可读却不可写。基准只描述当前实验形状，不为三种抽象排总榜。</p></div>
+
+          <p>
+            规范证据来自 <a href="https://go.dev/ref/spec#Interface_types">Go Language Specification</a>；实现证据固定到
+            <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go">internal/abi/iface.go</a>、
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go">runtime/iface.go</a>、
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go">编译器 noder</a> 与
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go">reflect/value.go</a>。
+          </p>
+
+          <h2>一、先问类型信息要保留到什么时候</h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th>抽象</th><th>选择发生在哪里</th><th>适合的问题</th><th>主要风险</th></tr></thead>
+            <tbody>
+              <tr><td><code>interface</code></td><td>运行时动态具体类型</td><td>调用方只依赖行为，具体实现可替换</td><td>typed nil、装箱/逃逸、过宽接口</td></tr>
+              <tr><td>泛型</td><td>编译期类型参数与 type set</td><td>同一算法或数据结构作用于一族静态类型</td><td>为“抽象”而抽象、约束泄漏实现细节</td></tr>
+              <tr><td>反射</td><td>运行时类型、字段名或 tag</td><td>序列化、依赖注入、schema 驱动框架</td><td>无效 Value、不可设、panic、性能与可读性</td></tr>
+            </tbody>
+          </table></div>
+
+          <p>
+            如果函数只需要调用 <code>describe()</code>，让参数成为一个最小 interface；如果同一段过滤逻辑要保留 <code>resultBatch</code> 这样的命名 slice 类型，类型参数正合适；只有输入模式到运行时才知道时，才把字段名交给反射。
+            官方文章 <a href="https://go.dev/blog/when-generics">When To Use Generics</a> 也给出同样的方向：先用普通函数或 interface 表达行为，泛型用于相同实现，运行时类型变化且两者都不合适时再考虑反射。
+          </p>
+
+          <h2 id="interface">二、interface value 不是“指向对象的一个指针”</h2>
+          <p>
+            规范把 interface value 描述为一对信息：动态类型和动态值。runtime 里，空接口 <code>eface</code> 保存 <code>_type + data</code>，有方法的接口 <code>iface</code> 保存 <code>itab + data</code>。
+            <code>itab</code> 又连接 interface 类型、具体类型和方法入口。理解这两个 word，typed nil、类型断言和 interface 转换就不再是特例合集。
+          </p>
+
+          <pre><code class="language-go">// runtime/runtime2.go
+type iface struct {
+    tab  *itab
+    data unsafe.Pointer
+}
+
+type eface struct {
+    _type *_type
+    data  unsafe.Pointer
+}</code></pre>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L184-L192">runtime iface / eface</a>；稳定 ABI 形状见 <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go#L9-L33">internal/abi InterfaceType、ITab 与 EmptyInterface</a>。</span>
+
+          <h2>三、typed nil：Data 可以为空，类型 word 仍不为空</h2>
+          <p>
+            <code>var p *fetchProblem</code> 让 <code>p</code> 成为类型为 <code>*fetchProblem</code> 的 nil pointer；赋给 <code>error</code> 后，interface 的动态类型是 <code>*fetchProblem</code>，动态值才是 nil。
+            interface 只有在动态类型和动态值都不存在时才等于 nil，所以 <code>err != nil</code>。这不是 runtime 偶然行为，而是规范的 interface value 与比较规则。
+          </p>
+
+          <figure class="figure"><img src="../assets/interface-typed-nil.png" alt="Go interface 两个 word：nil interface 的类型和数据都为空；typed nil 的 ITab 指向 fetchProblem 而 Data 为空，因此 err 不等于 nil" /></figure>
+
+          <pre><code class="language-go">var empty any
+fmt.Println(empty == nil) // true
+
+var problem *fetchProblem
+var err error = problem
+fmt.Println(err == nil)   // false
+fmt.Printf("%T\n", err)   // *main.fetchProblem</code></pre>
+
+          <p>
+            工程上不要让一个返回 <code>error</code> 的函数把 typed nil pointer 直接装进接口。要么在返回点显式判断 pointer 并返回字面量 <code>nil</code>，要么让零值接收者本身有完整语义。
+            反射还有第二个坑：<code>reflect.ValueOf(nil)</code> 返回 zero Value，不能先无条件调用 <code>Kind</code> 之外的很多方法；而 typed nil 的 Value 是有效的 pointer Value，需再问 <code>IsNil</code>。
+          </p>
+
+          <h2>四、<code>getitab</code> 把类型对映射成方法表</h2>
+          <p>
+            把具体类型转成非空 interface 时，runtime 需要这对“interface 类型 × 具体类型”的 <code>ITab</code>。<code>getitab</code> 先走无锁查表快路径；未命中时加锁重试，再从 persistent allocator 建表并加入全局 <code>itabTable</code>。
+            如果具体类型缺方法，失败结果也可被缓存；强制转换需要 panic 的完整缺失方法名时才重新初始化以得到诊断。
+          </p>
+
+          <pre><code class="language-go">type ITab struct {
+    Inter *InterfaceType
+    Type  *Type
+    Hash  uint32
+    Fun   [1]uintptr
+}</code></pre>
+          <span class="source-caption">布局：<a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go#L14-L21">abi.ITab</a>；查找与发布：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L44-L103">runtime.getitab</a>。</span>
+
+          <p>
+            <code>itabInit</code> 利用 interface 方法列表和 concrete 方法列表都按名称排序的事实，用两个游标线性归并，复杂度是 O(ni+nt)。匹配时把具体方法入口写到 <code>Fun[k]</code>；找不到时保留 <code>Fun[0] == 0</code> 并返回缺失方法名。
+            这比把每个调用都做成按名字搜索更重要：一次建立/查表之后，接口调用沿已确定的槽位跳到函数入口。
+          </p>
+
+          <figure class="figure"><img src="../assets/itab-conversion-assertion.png" alt="Go interface 源码路径：getitab 和 itabInit 匹配有序方法并缓存 ITab，convT 准备 Data，类型断言再检查动态类型" /></figure>
+
+          <h2>五、装进 interface 时，值可能复制，也可能逃逸</h2>
+          <p>
+            <code>ITab</code> 只解决“怎样调用”；<code>Data</code> 仍要保存动态值。通用 <code>convT</code> 用 <code>mallocgc</code> 分配一块按具体类型布局的存储，再用 <code>typedmemmove</code> 复制值。
+            runtime 还为 16/32/64 位整数、string 和 slice 提供专门转换，并可复用小整数或零值的静态存储。是否真的发生 heap allocation 仍取决于调用形状、内联和逃逸分析，不能从源码里看到 <code>mallocgc</code> 就推断每次 interface 调用都分配。
+          </p>
+
+          <pre><code class="language-go">func convT(t *_type, v unsafe.Pointer) unsafe.Pointer {
+    x := mallocgc(t.Size_, t, true)
+    typedmemmove(t, x, v)
+    return x
+}</code></pre>
+          <span class="source-caption">转换实现：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L332-L446">convT 与专用转换函数</a>。</span>
+
+          <p>
+            类型断言的语言语义是检查动态类型是否实现目标接口或是否与目标非接口类型一致。runtime 的 <code>assertE2I</code>/<code>typeAssert</code> 对应这条边界，并维护断言缓存；带 comma-ok 的断言失败返回零值和 false，不带 ok 的失败 panic。
+            缓存和转换 helper 都是实现细节，代码只能依赖断言语义。
+          </p>
+
+          <h2 id="generics">六、泛型保留的是一族静态类型</h2>
+          <p>
+            interface 参数把每个值装进共同的动态容器；类型参数则让一次调用先选定具体类型实参。约束是 interface 形式的 type set，说明允许哪些类型和操作。
+            <code>filterBatch[S ~[]E, E any]</code> 里的 <code>~[]E</code> 不只是接受 slice：它接受底层类型为 <code>[]E</code> 的命名类型，因此返回值仍是 <code>S</code>，<code>resultBatch</code> 不会退化成 <code>[]fetchResult</code>。
+          </p>
+
+          <pre><code class="language-go">type resultBatch []fetchResult
+
+func filterBatch[S ~[]E, E any](values S, keep func(E) bool) S {
+    filtered := make(S, 0, len(values))
+    for _, value := range values {
+        if keep(value) {
+            filtered = append(filtered, value)
+        }
+    }
+    return filtered
+}</code></pre>
+
+          <p>
+            这就是泛型的好用边界：算法对元素具体类型没有额外运行时分支，调用者还保留静态类型。相反，如果代码只是对一个值调用 <code>Read</code>、<code>Write</code> 或 <code>describe</code>，把 interface 换成单一类型参数通常只会让签名更复杂；官方指南明确建议这类行为抽象继续用 interface。
+          </p>
+
+          <h2>七、当前 gc 编译器怎样落地：shape body + dictionary</h2>
+          <p>
+            Go 规范不规定泛型必须单态化、擦除还是传字典。Go 1.26.0 的 gc 编译器会为可共享实现选择 shape，并写出运行时 dictionary；dictionary 可包含类型参数的方法表达式、子字典、runtime type 和 itab。
+            <code>readerDict</code>/<code>writerDict</code> 负责读写这些条目，<code>shapify</code> 选择 shape。它们是理解当前二进制和 profile 的源码证据，不是可被业务代码依赖的 ABI。
+          </p>
+
+          <figure class="figure"><img src="../assets/generic-shape-dictionary.png" alt="Go 1.26 gc 泛型实现：具体调用进入共享 shape function，并通过 dictionary 提供 method expression、runtime type 和 itab；这是实现而非语言保证" /></figure>
+
+          <p>
+            对实验包禁用内联并查看符号，可以同时看到具体的 dictionary 与 shape 函数：
+          </p>
+
+          <pre><code class="language-text">...dict.sumGeneric[...fetchResult]
+...dict.filterBatch[...resultBatch,...fetchResult]
+sumGeneric[go.shape.struct {...}]
+filterBatch[go.shape.[]fetchResult,go.shape.struct {...}]</code></pre>
+          <span class="source-caption">编译器入口：<a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L157-L210">readerDict</a>、<a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L891-L960">shapify</a> 与 <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/writer.go#L897-L968">objDict</a>。</span>
+
+          <p>
+            “有字典”也不等于“每次都慢”，正如“interface 有 itab”不等于“每次都分配”。内联、去虚拟化、逃逸、具体约束操作和 CPU 前端都会改变结果；要优化的是真实 hot path，而不是某个抽象名字。
+          </p>
+
+          <h2 id="reflection">八、反射把 interface 拆成 <code>Value</code></h2>
+          <p>
+            反射第一定律是 interface 到 reflection object：<code>ValueOf</code> 对 nil 返回 zero Value，否则用 <code>unpackEface</code> 取出类型和数据。
+            <code>reflect.Value</code> 自身保存 <code>typ_</code>、<code>ptr</code> 与 <code>flag</code>；flag 的低位编码 Kind，另外还记录只读、间接存储、可寻址和 method value 等状态。第二定律是 <code>Interface()</code> 把 Value 再打包回 interface。
+          </p>
+
+          <pre><code class="language-go">type Value struct {
+    typ_ *abi.Type
+    ptr  unsafe.Pointer
+    flag
+}</code></pre>
+          <span class="source-caption">布局与 flag：<a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L40-L70">reflect.Value</a>；打包/拆包：<a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L122-L169">packEface / unpackEface</a>。</span>
+
+          <p>
+            <code>packEface</code> 还展示了一个不容易从 API 表面猜到的边界：把一个可寻址、间接的 Value 暴露为 interface 时，reflect 可能先复制到新存储，避免后来通过 Value 修改已经装箱的值。
+            这种别名控制属于实现机制；调用者应只依赖 <code>CanAddr</code>、<code>CanSet</code> 和导出规则。
+          </p>
+
+          <h2>九、第三定律：要修改，Value 必须可设置</h2>
+          <p>
+            <code>reflect.ValueOf(result)</code> 接收的是 interface 中的 struct 副本，得到的字段不可寻址，所以 <code>CanSet() == false</code>。传 <code>&amp;result</code> 后，pointer Value 的 <code>Elem()</code> 指向原变量，runtime 把它标成 addressable；导出字段且没有只读标志时才可设置。
+            <code>CanSet</code> 的实现本质上就是检查 <code>flagAddr</code> 已置位且没有只读位。
+          </p>
+
+          <figure class="figure"><img src="../assets/reflect-value-boundary.png" alt="reflect.Value 可修改边界：ValueOf(result) 的字段不可设置；ValueOf(&result).Elem() 可寻址且导出字段可设置，随后可 SetInt 并再转回 interface" /></figure>
+
+          <pre><code class="language-go">func (v Value) CanSet() bool {
+    return v.flag&amp;(flagAddr|flagRO) == flagAddr
+}
+
+func (v Value) Set(x Value) {
+    v.mustBeAssignable()
+    x.mustBeExported()
+    var target unsafe.Pointer
+    if v.kind() == Interface {
+        target = v.ptr
+    }
+    x = x.assignTo("reflect.Set", v.typ(), target)
+    if x.flag&amp;flagIndir != 0 {
+        typedmemmove(v.typ(), v.ptr, x.ptr)
+    } else {
+        *(*unsafe.Pointer)(v.ptr) = x.ptr
+    }
+}</code></pre>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L339-L355">CanAddr / CanSet</a>、<a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L1216-L1259">Elem</a> 与 <a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L2146-L2167">Set</a>。</span>
+
+          <p>
+            Go 1.26 还提供泛型函数 <code>reflect.TypeAssert[T](v)</code>，语义等价于 <code>v.Interface().(T)</code>，但实现可用 <code>abi.TypeFor[T]()</code> 走更直接的路径，并在 interface 断言失败时避免为了失败结果分配。
+            它让“从反射世界返回静态类型”更清楚，却不会取消 Value 的有效性、导出性和可设置性检查。
+          </p>
+
+          <h2 id="evidence">十、实验：分别验证语义，不给抽象排总榜</h2>
+          <p>
+            <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/interface_lab_test.go">interface_lab_test.go</a>
+            有四组可重复测试：interface 保留动态类型和值；typed nil 不等于 nil；generic filter 保留命名 slice；反射只有通过可寻址 pointer 的导出字段才能修改。
+          </p>
+
+          <pre><code class="language-bash">cd go-runtime/examples/fetchd
+go test -run 'Test(Interface|TypedNil|Generic|Reflection)'
+go test -race ./...
+go vet ./...
+go test -run '^$' -bench BenchmarkAbstractionBoundaries -benchmem</code></pre>
+
+          <p>
+            64 个 <code>fetchResult</code> 的微基准把装箱好的 interface slice 放在计时循环外：generic constraint 和 interface 调用都为 0 alloc/op，reflection 也没有每轮分配，但按字段名迭代明显更慢。
+            在这一个构造里，预装箱 interface 甚至略快于 generic method constraint；这正说明不能把泛型宣传成“更快的 interface”。如果把装箱、构造 slice 或逃逸移进循环，结论会随实验问题变化。
+          </p>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>证据</th><th>它能回答</th><th>它不能回答</th></tr></thead>
+            <tbody>
+              <tr><td>规范</td><td>动态类型、断言、比较、type set 的语言语义</td><td>当前二进制用几份代码</td></tr>
+              <tr><td>runtime/reflect 源码</td><td>Go 1.26.0 的布局、缓存、复制与 flag</td><td>未来版本稳定 ABI</td></tr>
+              <tr><td>编译器符号</td><td>该构建里确实存在 shape 与 dictionary</td><td>其他调用一定共享相同 shape</td></tr>
+              <tr><td>benchmark + allocs</td><td>固定输入和调用形状的成本</td><td>三种抽象的普遍胜负</td></tr>
+            </tbody>
+          </table></div>
+
+          <h2>十一、回到 <code>fetchd</code> 的工程规则</h2>
+          <ol>
+            <li><strong>interface 由消费者定义，而且尽量小。</strong>只需要 <code>describe()</code> 就不要要求十个无关方法。</li>
+            <li><strong>error 返回点消灭 typed nil。</strong>pointer 为空时返回真正的 <code>nil</code>，不要把它先装进 <code>error</code>。</li>
+            <li><strong>泛型用于同一实现。</strong>容器、过滤、归约和保持命名类型是好信号；只调用一个行为通常不是。</li>
+            <li><strong>约束描述必要能力，不描述偶然结构。</strong>能用方法集合就不要让调用者暴露字段布局。</li>
+            <li><strong>反射留在边界层。</strong>把字段/tag/schema 解析封装一次，业务循环拿到已验证的静态函数或 descriptor。</li>
+            <li><strong>每次反射写入先检查。</strong>有效性、Kind、nil、addressable、settable、exported 和转换规则缺一不可。</li>
+            <li><strong>性能结论跟调用形状绑定。</strong>先看逃逸、allocs、profile 和生成符号，再决定是否改抽象。</li>
+          </ol>
+
+          <p>
+            可复用结论是：<strong>interface 把“哪个具体实现”留到运行时，泛型让“同一算法”在编译期接受一族类型，反射才把类型结构本身变成运行时数据。</strong>
+            选择它们的依据是边界在哪里，不是哪个语法更新。下一篇会让 <code>fetchd</code> 正确结束：从 request context 的取消树读到 timer、<code>AfterFunc</code>、cause、worker 回收与 shutdown。
+          </p>
+
+          <h2 id="sources">参考源码与文档</h2>
+          <ul class="source-list">
+            <li><a href="https://go.dev/ref/spec#Interface_types">Go Specification: interface types and values</a></li>
+            <li><a href="https://go.dev/blog/when-generics">When To Use Generics</a></li>
+            <li><a href="https://go.dev/blog/intro-generics">An Introduction To Generics</a></li>
+            <li><a href="https://go.dev/blog/laws-of-reflection">The Laws of Reflection</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go#L9-L33">ABI interface and ITab layouts</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L44-L103">runtime.getitab</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L198-L256">runtime.itabInit</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L332-L475">interface conversion and assertion helpers</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L157-L210">gc runtime dictionaries</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L891-L960">gc shaping</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L40-L169">reflect.Value layout and interface conversion</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L1481-L1587">Interface and TypeAssert</a></li>
+            <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/interface_lab_test.go">fetchd abstraction boundary lab</a></li>
+          </ul>
+
+          <nav class="article-pager" aria-label="文章翻页"><a href="../channels-and-locks/">← 第四篇：channel 与锁</a><a href="../">返回系列目录 →</a></nav>
+        </section>
+      </article></main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body"); const toc = document.querySelector("#toc"); if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => { const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim()); table.querySelectorAll("tbody tr").forEach((row) => Array.from(row.children).forEach((cell, index) => { if (headers[index]) cell.dataset.label = headers[index]; })); });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4")); if (!headings.length) return;
+        const counts = new Map(); const slugify = (value) => value.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "") || "section";
+        const list = document.createElement("ol"); list.className = "toc-list"; const links = []; const lastItems = new Map();
+        const childListFor = (item) => { let child = item.querySelector(":scope > ol"); if (!child) { child = document.createElement("ol"); child.className = "toc-sublist"; item.appendChild(child); } return child; };
+        const parentListFor = (level) => { if (level === 2) return list; if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2)); if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3)); if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2)); return list; };
+        headings.forEach((heading, index) => { if (!heading.id) { const base = slugify(heading.textContent.trim()); const seen = counts.get(base) || 0; counts.set(base, seen + 1); heading.id = seen === 0 ? base : `${base}-${seen + 1}`; } const level = Number(heading.tagName.slice(1)); const item = document.createElement("li"); const link = document.createElement("a"); link.href = `#${heading.id}`; link.textContent = heading.textContent.trim(); link.className = `toc-link toc-level-${level}`; if (index === 0) link.classList.add("active"); item.appendChild(link); parentListFor(level).appendChild(item); lastItems.set(level, item); if (level <= 2) lastItems.delete(3); if (level <= 3) lastItems.delete(4); links.push(link); });
+        toc.appendChild(list); const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === `#${id}`));
+        const observer = new IntersectionObserver((entries) => { const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top); if (visible[0]) activate(visible[0].target.id); }, { rootMargin: "-20% 0px -72% 0px", threshold: 0 }); headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
