@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go 源码阅读（八）：连接复用之后，瓶颈藏在哪里</title>
+    <meta name="description" content="Go 从请求到生产现场系列第八篇：沿 fetchd 阅读 Go 1.26.0 Transport 连接池、persistConn、bodyEOFSignal、HTTP/2 stream 与 flow control，并联合 httptrace、runtime metrics、pprof、trace 和 race 诊断。" />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Go 源码阅读（八）：连接复用之后，瓶颈藏在哪里" />
+    <meta property="og:description" content="HTTP/1 的复用取决于底层 body EOF；HTTP/2 把并发移进 stream 与 flow window。诊断必须把请求阶段、runtime 压力、owner 和时间线对齐。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/connection-diagnosis-route.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/zh/transport-http2-diagnostics/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/transport-http2-diagnostics/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/transport-http2-diagnostics/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.route-note { border-color: rgba(31, 119, 123, 0.32); background: rgba(31, 119, 123, 0.1); }
+      .note.route-note strong { color: var(--rose); }
+      .article-body pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .source-caption { display: block; margin: -10px 0 24px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+      .article-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line); }
+      .article-pager a { color: var(--teal); font-weight: 800; text-decoration: none; }
+      @media (max-width: 760px) {
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+        .article-pager { flex-direction: column; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="文章快捷入口"><a href="../">Go 系列</a><a href="#http1">HTTP/1</a><a href="#http2">HTTP/2</a><a href="#diagnosis">联合诊断</a><a href="#lab">运行实验</a><a href="#sources">参考源码</a></nav>
+      <nav class="site-actions" aria-label="站点操作"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="语言切换"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/transport-http2-diagnostics/" lang="en">English</a></span></nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero">
+          <p class="eyebrow">Go 从请求到生产现场 · 第八篇</p>
+          <h1 class="long-title">连接复用之后，瓶颈藏在哪里</h1>
+          <p class="lead">
+            <code>http.Client</code> 返回响应，不代表这条连接已经可复用。HTTP/1 要等底层 body 读到 EOF；
+            HTTP/2 则把一个连接拆成多个 stream，还要共同受 stream slot、两级 flow window 和 TCP 的约束。
+            真正的生产诊断不能只看“连接数”，必须把请求阶段、runtime 压力、资源 owner 与事件时间线对齐。
+          </p>
+          <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：Transport.getConn → persistConn / bodyEOFSignal → HTTP/2 clientStream</span><span>实验：transport_lab_test.go</span></div>
+          <figure class="hero-image"><img src="../assets/connection-diagnosis-route.png" alt="fetchd outbound request 经 Transport.getConn 竞争 idle connection 和 dial queue；HTTP/1 persistConn 依赖真实 EOF 回池，HTTP/2 在一条 TLS 连接上复用多个 stream，右侧用 httptrace、metrics、pprof、trace 和 race 联合取证" /></figure>
+        </section>
+
+        <section class="article-body">
+          <div class="note route-note"><p><strong>阅读契约：</strong>本文固定到 Go 1.26.0 的 <code>net/http</code> 实现，讨论标准 <code>Transport</code> 的 HTTP/1.1 与 HTTPS 上的 HTTP/2 client 路径。HTTP/3、代理专用协议与自定义 RoundTripper 不在范围内。内部 queue、persistConn 字段和 bundled HTTP/2 布局可能变化；公开配置与 Response.Body 契约才是应用可依赖的边界。</p></div>
+
+          <p>
+            源码证据来自 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go">net/http/transport.go</a>、
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go">h2_bundle.go</a> 与
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/httptrace/trace.go">httptrace/trace.go</a>。
+            诊断契约来自 <a href="https://pkg.go.dev/net/http/httptrace">httptrace</a>、
+            <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a>、
+            <a href="https://pkg.go.dev/net/http/pprof">net/http/pprof</a> 与 <a href="https://go.dev/doc/diagnostics">Diagnostics</a>。
+          </p>
+
+          <h2>一、连接池不是一个装满 socket 的桶</h2>
+          <p>
+            一个共享 <code>Transport</code> 同时维护按 connect method 分组的 idle connection、等待 idle 的请求票据、
+            正在 dial 的票据和 per-host 总连接计数。cache key 不只是裸 hostname，还受 scheme、address、proxy 与是否强制 HTTP/1 等连接方法影响。
+            所以两个 URL 看起来同域，不代表一定命中同一池；反过来，为每次请求新建 Transport，则会把所有复用状态主动丢掉。
+          </p>
+
+          <pre><code class="language-go">transport := http.DefaultTransport.(*http.Transport).Clone()
+transport.MaxConnsPerHost = 16
+transport.MaxIdleConnsPerHost = 8
+transport.IdleConnTimeout = 90 * time.Second
+
+client := &amp;http.Client{Transport: transport} // 进程内共享</code></pre>
+
+          <p>
+            <code>http.Client</code> 和 <code>Transport</code> 都设计为并发安全、可长期复用。这里的“共享”也明确了 owner：
+            进程负责创建和关闭 idle connections，请求只借用连接或 stream。把 client 建在 handler 内，不仅重复 DNS/TCP/TLS 工作，也让
+            <code>MaxConnsPerHost</code> 失去全局约束意义。
+          </p>
+
+          <h2>二、<code>getConn</code> 让 idle 与 dial 竞争同一张票据</h2>
+          <p>
+            <code>getConn</code> 先为请求建立 <code>wantConn</code>，调用 <code>queueForIdleConn</code>；若没有立即交付，再进入
+            <code>queueForDial</code>。此时 idle connection 可能先出现，也可能 dial 先完成，<code>w.tryDeliver</code> 保证只有一方赢得票据。
+            这就是源码注释引用的 socket late binding：请求不必在一开始就押注“等旧连接”还是“建新连接”。
+          </p>
+
+          <pre><code class="language-go">if delivered := t.queueForIdleConn(w); !delivered {
+    t.queueForDial(w)
+}
+select {
+case r := &lt;-w.result:
+    return r.pc, r.err
+case &lt;-treq.ctx.Done():
+    return nil, context.Cause(treq.ctx)
+}</code></pre>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1516-L1592">Transport.getConn</a> 与票据等待。</span>
+
+          <p>
+            还有一个容易错读的细节：dial context 用 <code>context.WithoutCancel</code> 从 request context 脱离，再单独加内部 cancel。
+            当前请求取消后，<code>getConn</code> 会返回取消错误，但已经开始的 dial 可以继续，因为刚建好的连接可能交付给未来请求。
+            这不是忽略 deadline；它是在 request owner 与 pool owner 之间转移连接创建的生命周期。
+          </p>
+
+          <h2>三、三个限制分别控制“总量”和“留下多少”</h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th>配置</th><th>计数范围</th><th>达到上限</th><th>常见误读</th></tr></thead>
+            <tbody>
+              <tr><td><code>MaxConnsPerHost</code></td><td>dialing + active + idle</td><td>新 dial 排队</td><td>只限制 idle</td></tr>
+              <tr><td><code>MaxIdleConnsPerHost</code></td><td>单 host 保留的 idle</td><td>多余 idle 关闭</td><td>限制并发请求</td></tr>
+              <tr><td><code>MaxIdleConns</code></td><td>所有 host 的 idle 总量</td><td>按 LRU 清理</td><td>总连接硬上限</td></tr>
+              <tr><td><code>IdleConnTimeout</code></td><td>连接保持 idle 的时长</td><td>超时关闭</td><td>请求总 timeout</td></tr>
+            </tbody>
+          </table></div>
+
+          <p>
+            <code>queueForDial</code> 在 <code>MaxConnsPerHost</code> 为 0 时直接 dial；有上限时先检查当前计数，满了把票据压进
+            <code>connsPerHostWait</code>。取消请求会让票据不再 waiting，队列清理时跳过它。这个等待时间不会在默认 metrics 中自动出现，
+            需要应用通过 httptrace 的 GetConn/GotConn 差值或显式 wrapper 记录。
+          </p>
+          <span class="source-caption">配置契约：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L194-L232">Transport fields</a>；排队：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1594-L1655">queueForDial</a>。</span>
+
+          <h2 id="http1">四、HTTP/1 的 <code>persistConn</code> 是一读一写两条循环</h2>
+          <p>
+            dial 成功后，HTTP/1 路径建立 <code>persistConn</code>，由一个 <code>writeLoop</code> 串行写 request，一个 <code>readLoop</code>
+            读取对应 response。keep-alive 让多个请求<strong>顺序</strong>复用同一连接，并没有在同一 HTTP/1 pipe 上把多个 response 任意交错。
+            <code>readLoop</code> 还负责判断连接是否健康、response body 是否完成，以及何时调用 <code>tryPutIdleConn</code>。
+          </p>
+
+          <pre><code class="language-text">request goroutine
+  → persistConn.roundTrip
+  → writeLoop writes request
+  → readLoop parses response
+  → caller owns Response.Body
+  → readLoop waits for body EOF decision</code></pre>
+
+          <p>
+            没有 body 的 response 可以在交付前回池；有 body 时，readLoop 包一层 <code>bodyEOFSignal</code>，然后停在
+            <code>waitForBodyRead</code>。调用方读到底层 <code>io.EOF</code> 才发送 true；在 EOF 前 Close 发送 false。
+            只有 true、连接未见 socket EOF、request 写成功且连接仍健康时，才进入 <code>tryPutIdleConn</code>。
+          </p>
+
+          <h2>五、<code>Close</code> 是释放资源，不自动等于可复用</h2>
+          <figure class="figure"><img src="../assets/http1-connection-reuse.png" alt="Transport.getConn 先找 idle connection 再排 dial，MaxConnsPerHost 满时等待；HTTP/1 persistConn 的 bodyEOFSignal 只有看到底层 io.EOF 才 tryPutIdleConn，EOF 前 Close 会关闭连接，LimitReader 到 N 不等于底层 EOF" /></figure>
+
+          <pre><code class="language-go">waitForBodyRead := make(chan bool, 2)
+resp.Body = &amp;bodyEOFSignal{
+    body: resp.Body,
+    earlyCloseFn: func() error {
+        waitForBodyRead &lt;- false
+        &lt;-eofc
+        return nil
+    },
+    fn: func(err error) error {
+        isEOF := err == io.EOF
+        waitForBodyRead &lt;- isEOF
+        // ...
+        return err
+    },
+}</code></pre>
+          <span class="source-caption">完整判断：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L2291-L2468">persistConn.readLoop</a>；wrapper：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L3052-L3114">bodyEOFSignal</a>。</span>
+
+          <p>
+            这正好解释 <code>fetchd</code> 的资源边界：<code>io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))</code>
+            对小于 1 MiB 的正常响应会读到真实 body EOF，连接可复用；若上游仍有数据而读取达到上限，<code>LimitReader</code> 在自己的 N 归零时返回 EOF，
+            却没有让被包装的 <code>resp.Body</code> 再读到 EOF。随后 defer Close 会走 early-close 分支，HTTP/1 连接不复用。
+          </p>
+
+          <p>
+            这不是简单 bug，而是防止不可信大响应无限消耗带宽的正确取舍。可以在已知安全的小尾部上做有界 drain，但不能为了复用连接无上限地读攻击者数据。
+            应把“因 response cap 丢弃复用”的次数作为应用指标，并让结果显式标记 truncated；是否值得 drain 要用连接建立成本与额外流量共同决定。
+          </p>
+
+          <h2>六、<code>tryPutIdleConn</code> 先服务 waiter，再留下 idle</h2>
+          <p>
+            回池不是简单 append。<code>tryPutIdleConn</code> 先拒绝禁用 keep-alive 或 broken 的连接，再标记 reused；
+            若已有请求在 <code>idleConnWait</code> 等待，HTTP/1 connection 直接交付给第一个仍 waiting 的票据。
+            无 waiter 才进入 per-host idle list，应用 <code>MaxIdleConnsPerHost</code>、global LRU 和 IdleConnTimeout。
+          </p>
+
+          <p>
+            HTTP/2 在这里已经出现分叉：<code>pconn.alt != nil</code> 的连接不会像 HTTP/1 那样从 idle list “取走”，
+            因为同一连接能同时交付给所有等待者，还会继续留给未来请求。这不是 idle 一词的日常含义，而是 Transport 把可共享 alternative protocol connection
+            放在同一套池接口下的实现选择。
+          </p>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1057-L1178">tryPutIdleConn</a> 与 HTTP/1/HTTP/2 waiter 分支。</span>
+
+          <h2 id="http2">七、HTTP/2 把“一连接一请求”变成“一连接多 stream”</h2>
+          <p>
+            一个 <code>http2ClientConn</code> 持有底层 TLS connection、<code>streams map[uint32]*http2clientStream</code>、
+            <code>nextStreamID</code>、<code>maxConcurrentStreams</code>、connection-level flow window 与写锁。
+            每次 <code>RoundTrip</code> 创建独立 clientStream，保存 request context、response header channel、body pipe、stream flow window 和 abort state，
+            再启动 <code>go cs.doRequest</code>。客户端发起的 stream ID 使用递增奇数 1、3、5……
+          </p>
+
+          <figure class="figure"><img src="../assets/http2-stream-multiplexing.png" alt="HTTP/2 client connection 在一条 TLS 连接上保存 stream map，stream 1、3、5 并发传输，各自有 stream window 并共享 connection window；读 response body 返回 WINDOW_UPDATE，取消当前请求发送 RST_STREAM，其他 stream 继续" /></figure>
+
+          <pre><code class="language-go">type http2ClientConn struct {
+    tconn                net.Conn
+    flow                 http2outflow
+    inflow               http2inflow
+    streams              map[uint32]*http2clientStream
+    nextStreamID         uint32
+    maxConcurrentStreams uint32
+    reqHeaderMu          chan struct{}
+}
+
+type http2clientStream struct {
+    cc    *http2ClientConn
+    ctx   context.Context
+    ID    uint32
+    flow  http2outflow
+    inflow http2inflow
+    abort chan struct{}
+}</code></pre>
+          <span class="source-caption">当前字段布局：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L7603-L7752">http2ClientConn 与 clientStream</a>。</span>
+
+          <h2>八、并发上限是 stream slot，不只是 TCP 连接数</h2>
+          <p>
+            connection 可接新请求的条件包括未收到 GOAWAY、未 closing、stream ID 未耗尽且不过 idle timeout。
+            当前占用数包含 active streams、reserved slots 和等待确认的 reset streams；达到 peer 的
+            <code>SETTINGS_MAX_CONCURRENT_STREAMS</code> 后不能继续在这条连接开 stream。
+          </p>
+
+          <p>
+            默认 <code>StrictMaxConcurrentStreams=false</code> 时，Transport 可以新建 TCP connection，让每条连接分别服从 peer 的 per-connection stream limit；
+            strict=true 时把该 limit 视作全局限制，RoundTrip 必要时等待。前者提高并行度但增加 socket/TLS 和 upstream 压力，后者提供更硬的并发边界却可能形成 queue。
+            因此“HTTP/2 只需要一条连接”不是契约，只是低于 stream limit 且连接健康时的常见结果。
+          </p>
+          <span class="source-caption">可用性与 slot：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L8369-L8410">isUsableLocked / availableLocked</a>；strict 契约：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L7430-L7446">StrictMaxConcurrentStreams</a>。</span>
+
+          <h2>九、两级 flow control 让“没读 body”影响更大</h2>
+          <p>
+            每条 stream 有自己的 window，connection 还有所有 stream 共享的 window。接收 DATA 会消耗两者；
+            应用从 response body 读取后，client 才累计 credit 并发送 <code>WINDOW_UPDATE</code> 给 stream 与 connection。
+            单个不读的巨大 response 先卡住自己的 stream；若持续占满 connection-level receive window，也会压住同连接的其他 stream。
+          </p>
+
+          <p>
+            <code>reqHeaderMu</code> 是发送新 request header block 的 semaphore，避免 header block 交错，不代表整条 HTTP/2 connection 串行。
+            DATA frame 仍会在 stream 间 multiplex。HTTP/2 消除了 HTTP/1 请求级队头阻塞，却没有消除 TCP loss 的传输层队头阻塞：一个丢包仍会阻塞同一 TCP connection 上所有 stream 的有序字节。
+          </p>
+          <span class="source-caption">两级 inflow/outflow：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L1471-L1591">HTTP/2 flow control</a>；response body 返还 credit：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L9845-L9898">transportResponseBody.Read</a>。</span>
+
+          <h2>十、取消一个 stream，通常保留整条连接</h2>
+          <p>
+            <code>roundTrip</code> 同时等待 response headers、stream abort、request context 和旧式 Request.Cancel。
+            context 取消时先 <code>abortStream</code>，writer 发送 <code>RST_STREAM</code>；当前 stream 结束，但其他 stream 继续使用同一连接。
+            reset 还会计入并发 slot，直到 runtime 通过 bundled PING 确认 peer 收到，避免对完全无响应的连接无限发送 reset 后的新请求。
+          </p>
+
+          <p>
+            GOAWAY 是 connection 级状态：不再创建新 stream，已被 server 接受的旧 stream 仍可能完成；客户端按 stream ID 和错误决定可否安全 retry。
+            应用不能把所有错误都无脑重试，特别是 request body 不可重放或非幂等操作。使用 <code>Request.GetBody</code>、幂等键与明确 retry budget，
+            而不是把 Transport 的内部重试当业务 exactly-once。
+          </p>
+          <span class="source-caption">每请求 stream 与取消 select：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L8602-L8726">http2ClientConn.roundTrip</a>；reset 写入：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L10360-L10424">writeStreamReset</a>。</span>
+
+          <h2 id="lab">十一、实验同时证明复用、排队和 multiplex</h2>
+          <p>
+            <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/transport_lab_test.go">transport_lab_test.go</a>
+            先用 <code>httptrace.GotConn</code> 验证 HTTP/1：第一条请求读到底层 EOF 并 Close 后，第二条请求的
+            <code>Reused=true</code> 且获得同一个 <code>net.Conn</code>；如果第一条 body 在 EOF 前 Close，第二条得到新连接。
+          </p>
+
+          <pre><code class="language-go">trace := &amp;httptrace.ClientTrace{
+    GotConn: func(info httptrace.GotConnInfo) {
+        gotConn = info.Conn
+        reused = info.Reused
+    },
+    PutIdleConn: func(err error) {
+        putIdle &lt;- err
+    },
+}</code></pre>
+
+          <p>
+            per-host queue 测试把 <code>MaxConnsPerHost</code> 设为 1，保留第一条 HTTP/1 response body 不读；
+            第二条请求进入 GetConn 后取消，必须以 <code>context.Canceled</code> 返回，server 只看到一条请求。
+            HTTP/2 测试先 warm 一条 TLS connection，再让两个 handler 同时到达 barrier；两条请求都报告 HTTP/2、共享 warm connection，
+            server 的 StateNew 计数仍为 1。测试用 channel 证明并发，不用 sleep 猜时序。
+          </p>
+
+          <pre><code class="language-bash">cd go-runtime/examples/fetchd
+go test -run 'Test(Transport|EarlyBody|MaxConns|HTTP2)' -count=20
+go test ./...
+go test -race ./...
+go vet ./...</code></pre>
+
+          <h2 id="diagnosis">十二、联合诊断从“在哪一层慢”开始</h2>
+          <p>
+            P99 上升时先写一个可证伪假设：在 GetConn 排队、DNS/Connect/TLS、等待 upstream headers、读取 body、runtime runnable、锁、GC assist，
+            还是数据竞争？每个工具只回答一层，不能拿一张 goroutine dump 同时证明网络、池配置和 GC。
+            最小证据顺序是 request phase → 持续趋势 → owner/stack → timeline → 并发安全。
+          </p>
+
+          <figure class="figure"><img src="../assets/joint-diagnosis-evidence.png" alt="生产诊断五层证据：用 httptrace 定位请求阶段，应用指标与 runtime metrics 判断持续压力，pprof 找 owner 和阻塞，execution trace 对齐 netpoll、runnable、GC assist 和 block，race 在测试或预发验证并发访问；用 request ID、时间与版本对齐" /></figure>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>现象</th><th>最小证据</th><th>优先假设</th><th>不要先做</th></tr></thead>
+            <tbody>
+              <tr><td>GetConn → GotConn 变长</td><td>httptrace + in-flight / queue wait</td><td>连接上限、body 未 EOF、stream slot</td><td>直接加 MaxIdleConns</td></tr>
+              <tr><td>Reused 下降，Connect/TLS 上升</td><td>GotConnInfo + body outcome</td><td>Transport 被重建、idle timeout、early Close</td><td>先怪 DNS</td></tr>
+              <tr><td>GotConn 快，FirstByte 慢</td><td>WroteRequest → GotFirstResponseByte</td><td>upstream queue / compute / proxy</td><td>只调客户端连接池</td></tr>
+              <tr><td>HTTP/2 body 卡住</td><td>trace + per-request bytes + server evidence</td><td>stream/connection flow window、TCP loss</td><td>假设 multiplex 无阻塞</td></tr>
+              <tr><td>runnable 与 GC assist 同升</td><td>runtime metrics + execution trace</td><td>CPU 饱和、allocation burst</td><td>只盯 STW</td></tr>
+              <tr><td>block/mutex profile 集中</td><td>开启采样后的 delta profile</td><td>channel/lock contention</td><td>用 heap profile 解释锁等待</td></tr>
+            </tbody>
+          </table></div>
+
+          <h2>十三、<code>httptrace</code> 切开 client request phases</h2>
+          <p>
+            <code>ClientTrace</code> 提供 DNSStart/Done、ConnectStart/Done、TLSHandshakeStart/Done、GetConn、GotConn、
+            WroteRequest 和 GotFirstResponseByte 等 hooks。<code>GotConnInfo</code> 还给出 Reused、WasIdle 与 IdleTime。
+            它非常适合回答“时间花在哪一段”，但它是 client 观察，不是 upstream server 的执行真相。
+          </p>
+
+          <pre><code class="language-go">trace := &amp;httptrace.ClientTrace{
+    GetConn: func(hostPort string) { phase("get_conn", hostPort) },
+    GotConn: func(info httptrace.GotConnInfo) {
+        gauge("conn_reused", boolToFloat(info.Reused))
+        observe("idle_seconds", info.IdleTime.Seconds())
+    },
+    GotFirstResponseByte: func() { phase("first_byte", "") },
+}
+req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))</code></pre>
+          <span class="source-caption">hook 契约：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/httptrace/trace.go#L80-L209">ClientTrace</a>。callback 可能在不同 goroutine 调用，记录器自身必须并发安全且轻量。</span>
+
+          <p>
+            phase 之间要用 monotonic duration，同一次请求挂 request ID；不能给每个请求无上限写高基数 metrics label。
+            推荐把细粒度 phase 放进 trace/span，把 reuse ratio、queue duration histogram 和 timeout reason 做有界聚合。
+            server-side timing 需要 upstream 自己的 span/log，二者用 trace ID 对齐。
+          </p>
+
+          <h2>十四、metrics 看趋势，pprof 找 owner</h2>
+          <p>
+            HTTP pool 的 in-flight、GetConn wait、reuse ratio、early-close reason 属于<strong>应用指标</strong>；标准
+            <code>runtime/metrics</code> 没有 Transport pool 指标。runtime 一侧可看
+            <code>/sched/goroutines/runnable:goroutines</code>、<code>/sched/latencies:seconds</code>、
+            <code>/sync/mutex/wait/total:seconds</code> 与 <code>/cpu/classes/gc/mark/assist:cpu-seconds</code>，
+            用来判断 pool 症状背后是否还有 CPU、锁或 GC 压力。
+          </p>
+
+          <p>
+            pprof 再回答“谁”：goroutine profile 看大量请求卡在哪个 stack；heap/allocs 区分 retained 与 allocation traffic；
+            CPU 找计算热点；block 和 mutex 找同步等待。block/mutex 默认可能没有足够样本，必须有意识调用
+            <code>runtime.SetBlockProfileRate</code> / <code>SetMutexProfileFraction</code>，控制开销并在窗口结束后恢复。
+          </p>
+
+          <pre><code class="language-bash">go tool pprof 'http://admin/debug/pprof/goroutine'
+go tool pprof 'http://admin/debug/pprof/heap'
+go tool pprof 'http://admin/debug/pprof/block?seconds=30'
+go tool pprof 'http://admin/debug/pprof/mutex?seconds=30'
+go tool pprof 'http://admin/debug/pprof/profile?seconds=30'</code></pre>
+
+          <p>
+            <strong>pprof 必须放在独立管理 listener、认证与网络访问控制之后。</strong>goroutine stack、command line 与 profile 都可能泄漏内部路径和请求信息；
+            不要因为方便把 <code>net/http/pprof</code> 暴露到公网业务端口。采 profile 也有开销，先限定时间、复现窗口与样本率。
+          </p>
+
+          <h2>十五、execution trace 串时间线，race 验证访问安全</h2>
+          <p>
+            execution trace 能在同一时间轴看到 goroutine runnable、network blocking/netpoll、syscall、GC 与 mark assist。
+            用 <code>trace.NewTask</code> 为一次 fetch batch 建 task，用 <code>trace.WithRegion</code> 标记每个 outbound fetch，
+            再把 request ID 写进 structured log。这样 GetConn wait、worker runnable、GC assist 和 response 完成能在同一窗口解释，而不是靠多张截图猜先后。
+          </p>
+
+          <pre><code class="language-go">ctx, task := trace.NewTask(ctx, "fetch-batch")
+defer task.End()
+
+trace.WithRegion(ctx, "outbound-fetch", func() {
+    h.fetch(ctx, target, results)
+})</code></pre>
+
+          <p>
+            race detector 回答另一类问题：观测到的执行路径上是否发生未同步冲突访问。它不会证明没有 race，也不会替代 memory model 推理；
+            运行时开销也不适合默认挂在生产实例。把真实并发负载缩成测试或 staging replay，结合 <code>go test -race</code>，
+            让 transport config reload、metrics map、trace callback 与 shutdown registry 等路径被真正执行。
+          </p>
+
+          <h2>十六、一次可复现 incident 的交付物</h2>
+          <ol>
+            <li><strong>症状窗口：</strong>P50/P99、timeout reason、请求量、版本与 deploy 时间。</li>
+            <li><strong>request phase：</strong>GetConn wait、reuse、DNS/Connect/TLS、first byte、body duration。</li>
+            <li><strong>资源趋势：</strong>in-flight、queue、connections/streams、runnable G、mutex wait、GC assist CPU。</li>
+            <li><strong>owner 证据：</strong>同一窗口的 goroutine/CPU/heap 或 delta block/mutex profile。</li>
+            <li><strong>时间线：</strong>5–10 秒受控 execution trace，带 task/region 与 request ID。</li>
+            <li><strong>最小复现：</strong>像 transport lab 一样用 channel/barrier 证明状态，不用 sleep 猜。</li>
+            <li><strong>单变量修正：</strong>先修 body 生命周期、owner 或热点，再单独改变连接/stream 参数。</li>
+            <li><strong>回归条件：</strong>正确性测试、race、资源上限与 tail latency 同时达标。</li>
+          </ol>
+
+          <p>
+            至此，一条 <code>fetchd</code> 请求完成了整个系列的闭环：从值怎样复制、goroutine 怎样调度、channel 与锁怎样协调、
+            interface/泛型/反射怎样保存类型，到 context 怎样结束工作、对象怎样进入 heap、GC 怎样追上分配，最后回到连接复用与生产证据。
+            可复用的总原则只有一句：<strong>先用源码建立机制模型，再用最小实验与生产证据证明当前系统真的走了那条路径。</strong>
+          </p>
+
+          <h2 id="sources">参考源码与文档</h2>
+          <ul class="source-list">
+            <li><a href="https://pkg.go.dev/net/http#Transport">net/http Transport documentation</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1516-L1655">getConn and per-host dial queue</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1057-L1178">Idle connection delivery and pooling</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L2291-L2468">persistConn.readLoop and body EOF decision</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L3052-L3114">bodyEOFSignal</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L7603-L7752">HTTP/2 client connection and stream state</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L8602-L8726">HTTP/2 RoundTrip and cancellation</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L1471-L1591">HTTP/2 connection and stream flow control</a></li>
+            <li><a href="https://pkg.go.dev/net/http/httptrace">net/http/httptrace documentation</a></li>
+            <li><a href="https://pkg.go.dev/runtime/metrics">runtime/metrics documentation</a></li>
+            <li><a href="https://pkg.go.dev/net/http/pprof">net/http/pprof documentation</a></li>
+            <li><a href="https://go.dev/doc/diagnostics">Go diagnostics</a></li>
+            <li><a href="https://go.dev/doc/articles/race_detector">Data race detector</a></li>
+            <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/transport_lab_test.go">fetchd transport lab</a></li>
+          </ul>
+
+          <nav class="article-pager" aria-label="文章翻页"><a href="../escape-allocation-gc/">← 第七篇：内存与 GC</a><a href="../">返回系列目录 →</a></nav>
+        </section>
+      </article></main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body"); const toc = document.querySelector("#toc"); if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => { const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim()); table.querySelectorAll("tbody tr").forEach((row) => Array.from(row.children).forEach((cell, index) => { if (headers[index]) cell.dataset.label = headers[index]; })); });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4")); if (!headings.length) return;
+        const counts = new Map(); const slugify = (value) => value.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "") || "section";
+        const list = document.createElement("ol"); list.className = "toc-list"; const links = []; const lastItems = new Map();
+        const childListFor = (item) => { let child = item.querySelector(":scope > ol"); if (!child) { child = document.createElement("ol"); child.className = "toc-sublist"; item.appendChild(child); } return child; };
+        const parentListFor = (level) => { if (level === 2) return list; if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2)); if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3)); if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2)); return list; };
+        headings.forEach((heading, index) => { if (!heading.id) { const base = slugify(heading.textContent.trim()); const seen = counts.get(base) || 0; counts.set(base, seen + 1); heading.id = seen === 0 ? base : base + "-" + (seen + 1); } const level = Number(heading.tagName.slice(1)); const item = document.createElement("li"); const link = document.createElement("a"); link.href = "#" + heading.id; link.textContent = heading.textContent.trim(); link.className = "toc-link toc-level-" + level; if (index === 0) link.classList.add("active"); item.appendChild(link); parentListFor(level).appendChild(item); lastItems.set(level, item); if (level <= 2) lastItems.delete(3); if (level <= 3) lastItems.delete(4); links.push(link); });
+        toc.appendChild(list); const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === "#" + id));
+        const observer = new IntersectionObserver((entries) => { const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top); if (visible[0]) activate(visible[0].target.id); }, { rootMargin: "-20% 0px -72% 0px", threshold: 0 }); headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>

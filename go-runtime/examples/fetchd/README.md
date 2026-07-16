@@ -31,3 +31,5 @@ Run the tests with `go test ./...`. The focused labs are grouped by article:
   detached lifetimes, `AfterFunc`, and graceful HTTP server shutdown.
 - `memory_lab_test.go` compares stack-shaped values, escaping pointers, slice
   growth and preallocation, then verifies the runtime metrics used for GC evidence.
+- `transport_lab_test.go` makes HTTP/1 response-body reuse, per-host connection
+  limits, cancellation, `httptrace`, and HTTP/2 stream multiplexing observable.

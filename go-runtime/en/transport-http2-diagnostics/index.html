@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go Source Notes VIII: Where Does the Bottleneck Hide After Connection Reuse?</title>
+    <meta name="description" content="Chapter VIII of Go from Request to Production: trace Go 1.26.0 Transport pools, persistConn, bodyEOFSignal, HTTP/2 streams and flow control, then combine httptrace, runtime metrics, pprof, execution trace, and race." />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Go Source Notes VIII: Where Does the Bottleneck Hide After Connection Reuse?" />
+    <meta property="og:description" content="HTTP/1 reuse depends on underlying body EOF. HTTP/2 moves concurrency into streams and flow windows. Diagnosis must align request phases, runtime pressure, owners, and timelines." />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/connection-diagnosis-route.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/en/transport-http2-diagnostics/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/transport-http2-diagnostics/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/transport-http2-diagnostics/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.route-note { border-color: rgba(31, 119, 123, 0.32); background: rgba(31, 119, 123, 0.1); }
+      .note.route-note strong { color: var(--rose); }
+      .article-body pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .source-caption { display: block; margin: -10px 0 24px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+      .article-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line); }
+      .article-pager a { color: var(--teal); font-weight: 800; text-decoration: none; }
+      @media (max-width: 760px) {
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+        .article-pager { flex-direction: column; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="Article shortcuts"><a href="../">Go series</a><a href="#http1">HTTP/1</a><a href="#http2">HTTP/2</a><a href="#diagnosis">Diagnosis</a><a href="#lab">Lab</a><a href="#sources">Sources</a></nav>
+      <nav class="site-actions" aria-label="Site actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="Language switcher"><a href="../../zh/transport-http2-diagnostics/" lang="zh-CN">中文</a><a class="active" href="./" lang="en" aria-current="page">English</a></span></nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero">
+          <p class="eyebrow">Go from Request to Production · Chapter VIII</p>
+          <h1 class="long-title">Where does the bottleneck hide after connection reuse?</h1>
+          <p class="lead">
+            An <code>http.Client</code> response does not mean its connection is reusable. HTTP/1 waits for the underlying body EOF.
+            HTTP/2 splits one connection into streams that still share stream slots, two levels of flow windows, and TCP.
+            Production diagnosis therefore needs more than a connection count: align request phases, runtime pressure, resource
+            owners, and the event timeline.
+          </p>
+          <div class="meta-line"><span>Source: Go 1.26.0</span><span>Route: Transport.getConn → persistConn / bodyEOFSignal → HTTP/2 clientStream</span><span>Lab: transport_lab_test.go</span></div>
+          <figure class="hero-image"><img src="../assets/connection-diagnosis-route.png" alt="A fetchd outbound request enters Transport.getConn and races an idle connection against a dial queue; HTTP/1 persistConn returns to the pool only after underlying EOF, HTTP/2 reuses one TLS connection across streams, and httptrace, metrics, pprof, trace, and race provide combined evidence" /></figure>
+        </section>
+
+        <section class="article-body">
+          <div class="note route-note"><p><strong>Reading contract:</strong> this chapter pins implementation claims to Go 1.26.0 and covers the standard <code>Transport</code> HTTP/1.1 path plus HTTP/2 over HTTPS. HTTP/3, proxy-specific protocols, and custom RoundTrippers are outside the scope. Internal queues, persistConn fields, and bundled HTTP/2 layout can change; public configuration and Response.Body contracts are application boundaries.</p></div>
+
+          <p>
+            Source evidence comes from the <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>:
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go">net/http/transport.go</a>,
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go">h2_bundle.go</a>, and
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/httptrace/trace.go">httptrace/trace.go</a>.
+            Diagnostic contracts come from <a href="https://pkg.go.dev/net/http/httptrace">httptrace</a>,
+            <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a>,
+            <a href="https://pkg.go.dev/net/http/pprof">net/http/pprof</a>, and <a href="https://go.dev/doc/diagnostics">Diagnostics</a>.
+          </p>
+
+          <h2>1. A connection pool is not a bucket of sockets</h2>
+          <p>
+            A shared <code>Transport</code> coordinates idle connections grouped by connect method, request tickets waiting for an
+            idle connection, in-progress dials, and per-host total connection counts. The cache key is more than a hostname: scheme,
+            address, proxy, and forced HTTP/1 state can matter. URLs that look like one origin need not share one entry; creating a
+            Transport per request deliberately discards every opportunity to reuse state.
+          </p>
+
+          <pre><code class="language-go">transport := http.DefaultTransport.(*http.Transport).Clone()
+transport.MaxConnsPerHost = 16
+transport.MaxIdleConnsPerHost = 8
+transport.IdleConnTimeout = 90 * time.Second
+
+client := &amp;http.Client{Transport: transport} // shared by the process</code></pre>
+
+          <p>
+            Both <code>http.Client</code> and <code>Transport</code> are safe for concurrent long-lived use. Sharing also defines
+            ownership: the process creates and retires idle connections; requests borrow a connection or stream. Constructing the
+            client inside a handler repeats DNS, TCP, and TLS work and makes <code>MaxConnsPerHost</code> meaningless as a process
+            boundary.
+          </p>
+
+          <h2>2. <code>getConn</code> lets idle and dial race for one ticket</h2>
+          <p>
+            <code>getConn</code> creates a <code>wantConn</code> for the request and calls <code>queueForIdleConn</code>. If no
+            connection is immediately delivered, it also calls <code>queueForDial</code>. An idle connection may appear first or
+            the dial may finish first; <code>w.tryDeliver</code> permits only one winner. The source calls this socket late binding:
+            a request does not have to commit early to waiting for an old connection or building a new one.
+          </p>
+
+          <pre><code class="language-go">if delivered := t.queueForIdleConn(w); !delivered {
+    t.queueForDial(w)
+}
+select {
+case r := &lt;-w.result:
+    return r.pc, r.err
+case &lt;-treq.ctx.Done():
+    return nil, context.Cause(treq.ctx)
+}</code></pre>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1516-L1592">Transport.getConn</a> and ticket waiting.</span>
+
+          <p>
+            One subtle detail is that the dial context is detached from request cancellation with
+            <code>context.WithoutCancel</code>, then gets its own internal cancel. A canceled request returns its cancellation error,
+            while an already-started dial may continue because a future request can use the new connection. This does not ignore
+            the request deadline; it transfers connection-creation lifetime from the request owner to the pool owner.
+          </p>
+
+          <h2>3. Total limits and retained-idle limits are different</h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Setting</th><th>What it counts</th><th>At the limit</th><th>Common misread</th></tr></thead>
+            <tbody>
+              <tr><td><code>MaxConnsPerHost</code></td><td>Dialing + active + idle</td><td>New dials queue</td><td>Only limits idle</td></tr>
+              <tr><td><code>MaxIdleConnsPerHost</code></td><td>Idle retained for one host</td><td>Extra idle closes</td><td>Limits concurrent requests</td></tr>
+              <tr><td><code>MaxIdleConns</code></td><td>Idle across all hosts</td><td>LRU eviction</td><td>A hard total-connection cap</td></tr>
+              <tr><td><code>IdleConnTimeout</code></td><td>Time a connection remains idle</td><td>Connection closes</td><td>Total request timeout</td></tr>
+            </tbody>
+          </table></div>
+
+          <p>
+            With zero <code>MaxConnsPerHost</code>, <code>queueForDial</code> starts a dial directly. With a limit it checks the
+            current count, then enqueues the ticket in <code>connsPerHostWait</code> when full. Cancellation makes a ticket stop
+            waiting so queue cleanup can skip it. This wait is not automatically exported by the default metrics; applications
+            need the GetConn-to-GotConn interval from httptrace or an explicit wrapper.
+          </p>
+          <span class="source-caption">Configuration contract: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L194-L232">Transport fields</a>; queueing: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1594-L1655">queueForDial</a>.</span>
+
+          <h2 id="http1">4. HTTP/1 <code>persistConn</code> has one read loop and one write loop</h2>
+          <p>
+            After dialing, the HTTP/1 path creates a <code>persistConn</code>. One <code>writeLoop</code> serializes requests and one
+            <code>readLoop</code> reads corresponding responses. Keep-alive lets requests reuse one connection
+            <strong>sequentially</strong>; it does not arbitrarily interleave multiple HTTP/1 responses in one pipe. The read loop
+            also decides whether the connection remains healthy and when it can call <code>tryPutIdleConn</code>.
+          </p>
+
+          <pre><code class="language-text">request goroutine
+  → persistConn.roundTrip
+  → writeLoop writes request
+  → readLoop parses response
+  → caller owns Response.Body
+  → readLoop waits for body EOF decision</code></pre>
+
+          <p>
+            A response with no body can return to the pool before delivery. With a body, readLoop wraps it in
+            <code>bodyEOFSignal</code> and waits on <code>waitForBodyRead</code>. Reading the underlying <code>io.EOF</code> sends
+            true; closing before EOF sends false. Only true, no socket EOF, a successfully written request, and a healthy connection
+            lead to <code>tryPutIdleConn</code>.
+          </p>
+
+          <h2>5. <code>Close</code> releases resources; it does not promise reuse</h2>
+          <figure class="figure"><img src="../assets/http1-connection-reuse.png" alt="Transport.getConn first seeks an idle connection and then queues a dial; MaxConnsPerHost waits when full; HTTP/1 persistConn returns through tryPutIdleConn only when bodyEOFSignal sees underlying io.EOF, while Close before EOF closes the connection and a LimitReader reaching N is not underlying EOF" /></figure>
+
+          <pre><code class="language-go">waitForBodyRead := make(chan bool, 2)
+resp.Body = &amp;bodyEOFSignal{
+    body: resp.Body,
+    earlyCloseFn: func() error {
+        waitForBodyRead &lt;- false
+        &lt;-eofc
+        return nil
+    },
+    fn: func(err error) error {
+        isEOF := err == io.EOF
+        waitForBodyRead &lt;- isEOF
+        // ...
+        return err
+    },
+}</code></pre>
+          <span class="source-caption">Full decision: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L2291-L2468">persistConn.readLoop</a>; wrapper: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L3052-L3114">bodyEOFSignal</a>.</span>
+
+          <p>
+            This explains a concrete <code>fetchd</code> boundary:
+            <code>io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))</code> reaches the real body EOF for a normal
+            response below 1 MiB, so the connection can be reused. If an upstream response still has data when the limit is reached,
+            <code>LimitReader</code> returns its own EOF without asking the wrapped <code>resp.Body</code> for underlying EOF.
+            Deferred Close follows the early-close branch, so HTTP/1 reuse is sacrificed.
+          </p>
+
+          <p>
+            That is not automatically a bug; it is a valid defense against an untrusted response consuming unlimited bandwidth.
+            A bounded drain can help when a small safe tail is known, but reading attacker-controlled data without limit merely to
+            save a connection is wrong. Record “reuse lost to response cap” as an application metric, mark the result as truncated,
+            and compare connection setup cost against extra traffic before choosing a drain policy.
+          </p>
+
+          <h2>6. <code>tryPutIdleConn</code> serves waiters before retaining idle</h2>
+          <p>
+            Returning to the pool is not an append. <code>tryPutIdleConn</code> first rejects disabled keep-alive or a broken
+            connection, then marks it reused. If requests wait in <code>idleConnWait</code>, an HTTP/1 connection goes directly to
+            the first live ticket. Only with no waiter does it enter the per-host idle list and face per-host capacity, global LRU,
+            and idle timeout.
+          </p>
+
+          <p>
+            HTTP/2 already branches here. A <code>pconn.alt != nil</code> connection is not removed from the idle list like HTTP/1,
+            because the same connection can be delivered to every waiter simultaneously and remain available to future requests.
+            “Idle” here is an implementation interface for a shareable alternative-protocol connection, not its everyday meaning.
+          </p>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1057-L1178">tryPutIdleConn</a> and its HTTP/1/HTTP/2 waiter branches.</span>
+
+          <h2 id="http2">7. HTTP/2 turns one connection into many streams</h2>
+          <p>
+            One <code>http2ClientConn</code> owns the TLS connection, a
+            <code>streams map[uint32]*http2clientStream</code>, <code>nextStreamID</code>,
+            <code>maxConcurrentStreams</code>, a connection-level flow window, and write coordination.
+            Each <code>RoundTrip</code> creates a clientStream with request context, response-header channel, body pipe, stream
+            flow window, and abort state, then starts <code>go cs.doRequest</code>. Client-initiated IDs use increasing odd values:
+            1, 3, 5, and so on.
+          </p>
+
+          <figure class="figure"><img src="../assets/http2-stream-multiplexing.png" alt="An HTTP/2 client connection keeps a stream map on one TLS connection; streams 1, 3, and 5 run concurrently with individual stream windows and one shared connection window; response reads return WINDOW_UPDATE credit, while cancel sends RST_STREAM and leaves other streams running" /></figure>
+
+          <pre><code class="language-go">type http2ClientConn struct {
+    tconn                net.Conn
+    flow                 http2outflow
+    inflow               http2inflow
+    streams              map[uint32]*http2clientStream
+    nextStreamID         uint32
+    maxConcurrentStreams uint32
+    reqHeaderMu          chan struct{}
+}
+
+type http2clientStream struct {
+    cc     *http2ClientConn
+    ctx    context.Context
+    ID     uint32
+    flow   http2outflow
+    inflow http2inflow
+    abort  chan struct{}
+}</code></pre>
+          <span class="source-caption">Current layout: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L7603-L7752">http2ClientConn and clientStream</a>.</span>
+
+          <h2>8. The concurrency limit is a stream slot, not just a TCP count</h2>
+          <p>
+            A connection can take a new request only while it has no GOAWAY, is not closing, has stream IDs available, and has not
+            exceeded idle rules. Current occupancy includes active streams, reserved slots, and reset streams awaiting
+            acknowledgment. At the peer's <code>SETTINGS_MAX_CONCURRENT_STREAMS</code>, the connection cannot open another stream.
+          </p>
+
+          <p>
+            With the default <code>StrictMaxConcurrentStreams=false</code>, Transport may create another TCP connection so each
+            connection independently obeys the peer's per-connection stream limit. With strict=true, it treats that limit globally
+            and RoundTrip waits when needed. The default raises parallelism but adds sockets, TLS, and upstream pressure; strict mode
+            creates a harder concurrency boundary but can form a queue. “HTTP/2 uses exactly one connection” is not a contract.
+          </p>
+          <span class="source-caption">Usability and slots: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L8369-L8410">isUsableLocked / availableLocked</a>; strict contract: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L7430-L7446">StrictMaxConcurrentStreams</a>.</span>
+
+          <h2>9. Two levels of flow control make unread bodies consequential</h2>
+          <p>
+            Each stream has a window and the connection has another window shared by all streams. Receiving DATA consumes both.
+            Only as the application reads response body data does the client accumulate credit and send <code>WINDOW_UPDATE</code>
+            for stream and connection. A large unread response first stalls its stream; if it occupies the connection receive
+            window, it can pressure other streams on that connection.
+          </p>
+
+          <p>
+            <code>reqHeaderMu</code> is a semaphore for sending new request header blocks without interleaving them; it does not
+            serialize every response. DATA frames still multiplex. HTTP/2 removes HTTP/1 request-level head-of-line blocking, but
+            not TCP transport head-of-line blocking: one lost packet delays ordered bytes for every stream on that TCP connection.
+          </p>
+          <span class="source-caption">Connection and stream flow: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L1471-L1591">HTTP/2 flow control</a>; returning credit while reading: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L9845-L9898">transportResponseBody.Read</a>.</span>
+
+          <h2>10. Canceling one stream normally preserves the connection</h2>
+          <p>
+            <code>roundTrip</code> waits on response headers, stream abort, request context, and the legacy Request.Cancel channel.
+            Context cancellation calls <code>abortStream</code> and the writer sends <code>RST_STREAM</code>. That stream ends while
+            other streams continue on the connection. A reset still occupies a concurrency slot until the runtime's bundled PING
+            confirms the peer received it, limiting new requests sent to a completely unresponsive connection.
+          </p>
+
+          <p>
+            GOAWAY is connection state: no new streams begin, while existing accepted streams may finish. The client uses stream ID
+            and error state to decide whether a retry is safe. Applications cannot retry every error blindly, especially with a
+            non-replayable body or non-idempotent operation. Use <code>Request.GetBody</code>, idempotency keys, and a retry budget
+            instead of treating internal Transport retries as business exactly-once.
+          </p>
+          <span class="source-caption">Per-request stream and cancellation select: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L8602-L8726">http2ClientConn.roundTrip</a>; reset writing: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L10360-L10424">writeStreamReset</a>.</span>
+
+          <h2 id="lab">11. The lab proves reuse, queueing, and multiplexing</h2>
+          <p>
+            <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/transport_lab_test.go">transport_lab_test.go</a>
+            first uses <code>httptrace.GotConn</code> to verify HTTP/1. After the first request reads underlying EOF and closes, the
+            second gets <code>Reused=true</code> and the same <code>net.Conn</code>. If the first body closes before EOF, the second
+            obtains a new connection.
+          </p>
+
+          <pre><code class="language-go">trace := &amp;httptrace.ClientTrace{
+    GotConn: func(info httptrace.GotConnInfo) {
+        gotConn = info.Conn
+        reused = info.Reused
+    },
+    PutIdleConn: func(err error) {
+        putIdle &lt;- err
+    },
+}</code></pre>
+
+          <p>
+            The per-host queue test sets <code>MaxConnsPerHost</code> to one and leaves the first HTTP/1 body unread. A second request
+            enters GetConn, gets canceled, and must return <code>context.Canceled</code>; the server sees only one request.
+            The HTTP/2 test warms one TLS connection, then lets two handlers reach a barrier concurrently. Both requests report
+            HTTP/2, both share the warm connection, and the server's StateNew count remains one. Channels prove concurrency without
+            guessing with sleeps.
+          </p>
+
+          <pre><code class="language-bash">cd go-runtime/examples/fetchd
+go test -run 'Test(Transport|EarlyBody|MaxConns|HTTP2)' -count=20
+go test ./...
+go test -race ./...
+go vet ./...</code></pre>
+
+          <h2 id="diagnosis">12. Joint diagnosis starts by locating the slow layer</h2>
+          <p>
+            When P99 rises, write a falsifiable hypothesis: GetConn queueing, DNS/Connect/TLS, upstream response headers, body
+            reading, runtime runnable delay, locks, GC assist, or a data race? Each tool answers one layer. A goroutine dump cannot
+            simultaneously prove network, pool configuration, and GC. The minimum sequence is request phase → sustained trend →
+            owner/stack → timeline → concurrent-access safety.
+          </p>
+
+          <figure class="figure"><img src="../assets/joint-diagnosis-evidence.png" alt="Five layers of production evidence: httptrace locates client request phases; application and runtime metrics identify sustained pressure; pprof finds owners and blocking; execution trace aligns netpoll, runnable, GC assist, and block; race checks executed concurrent access in tests or staging; request ID, timestamp, and version align the evidence" /></figure>
+
+          <div class="table-wrap"><table>
+            <thead><tr><th>Symptom</th><th>Minimum evidence</th><th>First hypothesis</th><th>Do not start with</th></tr></thead>
+            <tbody>
+              <tr><td>GetConn → GotConn grows</td><td>httptrace + in-flight / queue wait</td><td>Connection cap, body not at EOF, stream slot</td><td>Increasing MaxIdleConns</td></tr>
+              <tr><td>Reuse falls; Connect/TLS rises</td><td>GotConnInfo + body outcome</td><td>Rebuilt Transport, idle timeout, early Close</td><td>Blaming DNS first</td></tr>
+              <tr><td>GotConn fast; FirstByte slow</td><td>WroteRequest → GotFirstResponseByte</td><td>Upstream queue, compute, or proxy</td><td>Only tuning the client pool</td></tr>
+              <tr><td>HTTP/2 body stalls</td><td>Trace + per-request bytes + server evidence</td><td>Stream/connection flow window, TCP loss</td><td>Assuming multiplexing cannot block</td></tr>
+              <tr><td>Runnable and GC assist rise</td><td>Runtime metrics + execution trace</td><td>CPU saturation, allocation burst</td><td>Watching only STW</td></tr>
+              <tr><td>Block/mutex profile clusters</td><td>Configured delta profile</td><td>Channel or lock contention</td><td>Using heap to explain lock waits</td></tr>
+            </tbody>
+          </table></div>
+
+          <h2>13. <code>httptrace</code> splits client request phases</h2>
+          <p>
+            <code>ClientTrace</code> exposes DNSStart/Done, ConnectStart/Done, TLSHandshakeStart/Done, GetConn, GotConn,
+            WroteRequest, and GotFirstResponseByte hooks. <code>GotConnInfo</code> adds Reused, WasIdle, and IdleTime.
+            It is excellent for “where was time spent?” but remains the client's observation, not server-side execution truth.
+          </p>
+
+          <pre><code class="language-go">trace := &amp;httptrace.ClientTrace{
+    GetConn: func(hostPort string) { phase("get_conn", hostPort) },
+    GotConn: func(info httptrace.GotConnInfo) {
+        gauge("conn_reused", boolToFloat(info.Reused))
+        observe("idle_seconds", info.IdleTime.Seconds())
+    },
+    GotFirstResponseByte: func() { phase("first_byte", "") },
+}
+req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))</code></pre>
+          <span class="source-caption">Hook contract: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/httptrace/trace.go#L80-L209">ClientTrace</a>. Callbacks may arrive from different goroutines, so the recorder must be concurrent-safe and lightweight.</span>
+
+          <p>
+            Compute phase durations with monotonic time and attach one request ID. Do not create unbounded metric labels per request.
+            Fine phases belong in traces or spans; reuse ratio, queue-duration histograms, and timeout reasons belong in bounded
+            aggregates. Upstream execution requires the server's own span or log, aligned through a trace ID.
+          </p>
+
+          <h2>14. Metrics show trends; pprof finds owners</h2>
+          <p>
+            HTTP pool in-flight, GetConn wait, reuse ratio, and early-close reason are <strong>application metrics</strong>.
+            Standard <code>runtime/metrics</code> does not export Transport pool state. Runtime signals such as
+            <code>/sched/goroutines/runnable:goroutines</code>, <code>/sched/latencies:seconds</code>,
+            <code>/sync/mutex/wait/total:seconds</code>, and <code>/cpu/classes/gc/mark/assist:cpu-seconds</code> reveal whether
+            pool symptoms coexist with CPU, lock, or GC pressure.
+          </p>
+
+          <p>
+            pprof answers “who.” Goroutine profiles show where requests accumulate; heap and allocs distinguish retention from
+            allocation traffic; CPU finds computation; block and mutex locate synchronization waits. The latter two may have too
+            little data by default. Deliberately configure <code>runtime.SetBlockProfileRate</code> and
+            <code>SetMutexProfileFraction</code>, bound the collection window, and restore settings afterward.
+          </p>
+
+          <pre><code class="language-bash">go tool pprof 'http://admin/debug/pprof/goroutine'
+go tool pprof 'http://admin/debug/pprof/heap'
+go tool pprof 'http://admin/debug/pprof/block?seconds=30'
+go tool pprof 'http://admin/debug/pprof/mutex?seconds=30'
+go tool pprof 'http://admin/debug/pprof/profile?seconds=30'</code></pre>
+
+          <p>
+            <strong>Put pprof behind a separate admin listener, authentication, and network access control.</strong> Goroutine
+            stacks, command lines, and profiles can expose internal paths and request data. Convenience does not justify publishing
+            <code>net/http/pprof</code> on the public service listener. Profiles also cost resources, so bound time and sampling.
+          </p>
+
+          <h2>15. Execution trace supplies the timeline; race checks access safety</h2>
+          <p>
+            Execution traces place goroutine runnable states, network blocking/netpoll, syscalls, GC, and mark assists on one
+            timeline. Create a <code>trace.NewTask</code> for one fetch batch and a <code>trace.WithRegion</code> around each
+            outbound fetch, then align structured logs with the request ID. GetConn wait, worker runnable delay, assist, and response
+            completion can then explain one another instead of relying on screenshot order.
+          </p>
+
+          <pre><code class="language-go">ctx, task := trace.NewTask(ctx, "fetch-batch")
+defer task.End()
+
+trace.WithRegion(ctx, "outbound-fetch", func() {
+    h.fetch(ctx, target, results)
+})</code></pre>
+
+          <p>
+            The race detector answers a different question: did an executed path contain an unsynchronized conflicting access?
+            It cannot prove the absence of races and does not replace memory-model reasoning. Its overhead also makes it unsuitable
+            as a default production mode. Turn real concurrency into tests or staging replay and run <code>go test -race</code> so
+            transport reload, metric maps, trace callbacks, and shutdown registries are actually exercised.
+          </p>
+
+          <h2>16. Deliverables for a reproducible incident</h2>
+          <ol>
+            <li><strong>Symptom window:</strong> P50/P99, timeout reasons, request rate, version, and deploy time.</li>
+            <li><strong>Request phases:</strong> GetConn wait, reuse, DNS/Connect/TLS, first byte, and body duration.</li>
+            <li><strong>Resource trends:</strong> in-flight, queue, connections/streams, runnable G, mutex wait, and GC assist CPU.</li>
+            <li><strong>Owner evidence:</strong> goroutine/CPU/heap or delta block/mutex profiles from the same window.</li>
+            <li><strong>Timeline:</strong> a controlled 5–10 second execution trace carrying tasks, regions, and request IDs.</li>
+            <li><strong>Minimum reproduction:</strong> use channels and barriers like the transport lab, not sleeps that guess state.</li>
+            <li><strong>One-variable correction:</strong> fix body lifetime, ownership, or a hotspot before changing connection and stream controls separately.</li>
+            <li><strong>Regression gate:</strong> correctness, race, resource caps, and tail latency all pass.</li>
+          </ol>
+
+          <p>
+            The <code>fetchd</code> request now closes the series loop: values and aliases, goroutine scheduling, channels and locks,
+            interface/generic/reflection boundaries, context termination, allocation and GC, then connection reuse and production
+            evidence. The reusable rule is simple: <strong>use source to build a mechanism model, then prove that the current system
+            actually takes that path with a minimum experiment and production evidence.</strong>
+          </p>
+
+          <h2 id="sources">Source and documentation map</h2>
+          <ul class="source-list">
+            <li><a href="https://pkg.go.dev/net/http#Transport">net/http Transport documentation</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1516-L1655">getConn and per-host dial queue</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1057-L1178">Idle connection delivery and pooling</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L2291-L2468">persistConn.readLoop and body EOF decision</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L3052-L3114">bodyEOFSignal</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L7603-L7752">HTTP/2 client connection and stream state</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L8602-L8726">HTTP/2 RoundTrip and cancellation</a></li>
+            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L1471-L1591">HTTP/2 connection and stream flow control</a></li>
+            <li><a href="https://pkg.go.dev/net/http/httptrace">net/http/httptrace documentation</a></li>
+            <li><a href="https://pkg.go.dev/runtime/metrics">runtime/metrics documentation</a></li>
+            <li><a href="https://pkg.go.dev/net/http/pprof">net/http/pprof documentation</a></li>
+            <li><a href="https://go.dev/doc/diagnostics">Go diagnostics</a></li>
+            <li><a href="https://go.dev/doc/articles/race_detector">Data race detector</a></li>
+            <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/transport_lab_test.go">fetchd transport lab</a></li>
+          </ul>
+
+          <nav class="article-pager" aria-label="Article navigation"><a href="../escape-allocation-gc/">← Chapter VII: memory and GC</a><a href="../">Back to the series →</a></nav>
+        </section>
+      </article></main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body"); const toc = document.querySelector("#toc"); if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => { const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim()); table.querySelectorAll("tbody tr").forEach((row) => Array.from(row.children).forEach((cell, index) => { if (headers[index]) cell.dataset.label = headers[index]; })); });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4")); if (!headings.length) return;
+        const counts = new Map(); const slugify = (value) => value.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "") || "section";
+        const list = document.createElement("ol"); list.className = "toc-list"; const links = []; const lastItems = new Map();
+        const childListFor = (item) => { let child = item.querySelector(":scope > ol"); if (!child) { child = document.createElement("ol"); child.className = "toc-sublist"; item.appendChild(child); } return child; };
+        const parentListFor = (level) => { if (level === 2) return list; if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2)); if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3)); if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2)); return list; };
+        headings.forEach((heading, index) => { if (!heading.id) { const base = slugify(heading.textContent.trim()); const seen = counts.get(base) || 0; counts.set(base, seen + 1); heading.id = seen === 0 ? base : base + "-" + (seen + 1); } const level = Number(heading.tagName.slice(1)); const item = document.createElement("li"); const link = document.createElement("a"); link.href = "#" + heading.id; link.textContent = heading.textContent.trim(); link.className = "toc-link toc-level-" + level; if (index === 0) link.classList.add("active"); item.appendChild(link); parentListFor(level).appendChild(item); lastItems.set(level, item); if (level <= 2) lastItems.delete(3); if (level <= 3) lastItems.delete(4); links.push(link); });
+        toc.appendChild(list); const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === "#" + id));
+        const observer = new IntersectionObserver((entries) => { const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top); if (visible[0]) activate(visible[0].target.id); }, { rootMargin: "-20% 0px -72% 0px", threshold: 0 }); headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  </body>
+</html>
