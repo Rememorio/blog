@@ -27,3 +27,5 @@ Run the tests with `go test ./...`. The focused labs are grouped by article:
   mutex-protected state observable.
 - `interface_lab_test.go` compares interface values, typed nil, generic type
   preservation, and reflection's addressability boundary.
+- `context_lab_test.go` traces cancellation causes, worker joining, timeout and
+  detached lifetimes, `AfterFunc`, and graceful HTTP server shutdown.
