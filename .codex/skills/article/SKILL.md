@@ -844,6 +844,22 @@ For any article change:
    code/table scrolling.
 8. Keep the README public index current for new public entry points.
 
+Treat the blog home as an explicit publication inventory, not an accidental
+sample. Choose one exposure mode per series and keep it consistent:
+
+- In chapter-level mode, give every completed chapter one home post card in
+  each published language. After every addition, removal, or reordering,
+  compare normalized route sets and counts against the series index instead of
+  checking only that one representative card exists. Keep the series index in
+  reading order; follow the established home chronology, usually newest first.
+- In series-level mode, expose one landing card and no stray individual chapter
+  card. Do not silently mix series-level and chapter-level modes.
+- Treat topic shortcuts as navigation only. A shortcut to the series index does
+  not prove that the article-card inventory is complete.
+- When the home hero represents the newest chapter, update its visible cover
+  and `og:image` together. If it deliberately represents the stable series
+  overview instead, keep both surfaces aligned to that identity.
+
 For language-structure changes, also verify:
 
 - root gateway page, each language page, and the blog index all link to the
