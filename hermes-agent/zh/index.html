@@ -91,6 +91,11 @@
             </p>
 
             <p>
+              可以先把 Hermes Agent 理解成<strong>包在模型外面的一套任务运行系统</strong>。模型负责判断下一步该做什么；工具负责真正读取文件、修改代码、运行命令；
+              Hermes 负责把用户要求、项目规则和工具结果组织成一轮可以继续、可以恢复、也可以追溯的工作。这里说的“运行时”，就是这层负责协调模型、工具和状态的程序。
+            </p>
+
+            <p>
               Hermes Agent 在
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/README.md#L18-L29">README 的功能地图</a>
               里把自己描述成 self-improving agent：它既能在终端和消息入口里工作，也能执行定时任务、把工作交给子任务，并从完成的任务里沉淀经验。
@@ -99,27 +104,21 @@
 
             <div class="note">
               <p>
-                <strong>证据边界。</strong>
-                本文只使用公开 README、配置文件和当前可见源码快照。直接事实来自固定源码链接；设计意图只在调用链、
-                数据形状和源码注释能够支撑的范围内推断。README 是功能地图，具体机制以源码为准；例如
-                <code>session_search</code> 工具本身在当前源码中明确走 SQLite/FTS5 并返回真实消息，不在工具内做 LLM 调用。
+                <strong>阅读契约。</strong>
+                全文只跟踪同一个“修复失败测试”的任务。读完后，你应该能用自己的话复述：一轮从哪里开始、在哪里结束；模型与工具怎样来回接力；
+                为什么原始记录和本轮工作副本必须分开；任务交付后，经验又怎样进入 Memory、SessionDB 或 Skills。
               </p>
             </div>
 
             <p>
-              这篇文章的读法不是先背名词，而是带着五个问题往下走：
+              <strong>证据边界。</strong>本文只使用公开 README、配置文件和固定源码快照。直接事实来自文中的源码链接；设计意图只在调用链、
+              数据形状和源码注释能够支撑的范围内推断。README 是功能地图，具体机制以源码为准。例如 <code>session_search</code> 在当前快照中走
+              SQLite/FTS5 并返回真实消息，工具内部没有再调用一次模型。
             </p>
 
-            <ol>
-              <li>一轮用户消息进来时，Hermes 先保证什么东西不会丢？</li>
-              <li>为什么“永久保存的原话”和“这一轮临时给模型看的材料”必须分开？</li>
-              <li>为什么小事实、过去的原始证据、可复用流程不能全塞进一个“记忆库”？</li>
-              <li>后台学习为什么要等回答交付后再做，而且只能改少数几类长期状态？</li>
-              <li>终端、定时任务和子任务从不同地方进入时，怎样共用同一套运行规则？</li>
-            </ol>
-
             <p>
-              只要这五个问题串起来，Hermes 的“自进化”就不再像一个抽象口号。它更像一套状态纪律：先交付当前任务，
+              接下来先不急着讨论“自进化”。我们会先看清一句用户要求经过哪些位置，再完整走完一轮任务，然后才拆开长期规则、历史、工具和后台学习。
+              当这条主线连起来，Hermes 的“自进化”就不再像一个抽象口号，而是一套状态纪律：先交付当前任务，
               再把可复用的东西沉淀到合适账本里；下一轮需要时再按来源、寿命和风险拿回来。
             </p>
 
@@ -197,70 +196,96 @@
               SessionDB、Memory 和 Skills。开头总览图里最重要的也不是节点数量，而是方向：入口不直接写长期知识，后台 review 不抢前台回答。
             </p>
 
-            <h2>二、一轮消息先要活下来，然后才谈智能</h2>
+            <h2>二、跟着一次修复任务走完一轮</h2>
             <p>
-              现在看第一轮真正发生的事。一个天真的 agent loop 可能会这样写：收到用户消息，调用模型，跑工具，得到最终回答，
-              最后再把所有东西写入历史。这个写法在 demo 里没问题，但在真实 runtime 里很脆：模型调用失败、工具执行卡住、
-              进程被杀，都会让刚刚发生的事情消失。
+              现在把开头的任务真正跑一次。你说“修复这个失败测试”，Hermes 最终回答“已修改两个文件，测试通过”。从收到这条用户消息到交付这段回答，
+              叫作一个 <strong>turn</strong>，也就是一轮。<strong>一轮不等于一次模型调用</strong>：为了完成任务，模型可能先要求读文件，看到结果后再要求改代码，
+              跑完测试后还可能根据错误继续修改。Hermes 要负责的是整段生命周期，而不是其中某一次思考。
             </p>
 
             <p>
-              Hermes 的前台入口是
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L371-L461"><code>run_conversation</code></a>。
-              它不是一上来就调用模型，而是先进入 <code>build_turn_context</code>：恢复 runtime 绑定、清理用户消息、恢复或构造 system prompt、
-              做早期持久化、准备插件上下文和外部 memory 预取。这个 turn context 的职责可以从
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_context.py#L64-L130"><code>TurnContext</code> 定义</a>
-              和
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_context.py#L177-L240">构造过程</a>
-              看到。
+              最简单的实现会等一切成功后再保存历史，但模型报错、工具卡住或进程退出都可能让整轮消失。因此 Hermes 把一轮拆成四个容易检查的阶段：
+              先接住并保存任务，再准备模型本轮看到的材料，然后让模型和工具接力，最后交付回答并分发状态。下面逐段走。
+            </p>
+
+            <h3>2.1 接住任务：先建立本轮工作台，再保存用户原话</h3>
+            <p>
+              用户消息到达后，Hermes 先建立一份“本轮工作台”。它找回之前的会话、确定当前项目规则和可用工具、给这一轮分配标识，
+              同时把用户刚说的原话尽早写入持久化记录。这样即使后面的模型调用失败，系统仍然知道用户要求过什么，也能从这里恢复。
             </p>
 
             <p>
-              这里的第一条工程判断是：用户消息进入回合后，要尽早落盘。否则 agent 越能跑工具，越容易在失败时丢掉最关键的上下文。
-              run_agent 里的
+              概念清楚后再看源码名：前台入口是
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L371-L461"><code>run_conversation</code></a>，
+              每轮准备工作集中在 <code>build_turn_context</code>。它返回的
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_context.py#L64-L130"><code>TurnContext</code></a>
+              装着这一轮后续要用的消息、system prompt、任务标识和预取材料；
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/run_agent.py#L1479-L1489"><code>_persist_session</code></a>
-              负责把消息写入日志和 SQLite。它不让“回答完成”成为保存历史的前提。
+              则让“回答成功”不再是保存用户原话的前提。
             </p>
 
-            <pre><code class="language-text">user message arrives
--> build turn context
--> persist early
--> call model
--> execute tools
--> append tool results
--> finalize response
--> sync stores
--> maybe spawn review</code></pre>
+            <h3>2.2 准备第一次模型调用：从档案复制出工作副本</h3>
+            <p>
+              真实档案不能直接等同于模型这一次要看的材料。修测试时，档案里保存用户原话和已经发生的操作；但模型做当前判断时，还可能临时需要
+              “这个仓库的生成文件清单”或插件补充的项目提示。Hermes 因此从真实消息复制出一份本轮工作副本，再把这些临时材料贴到副本上。
+            </p>
+
+            <p>
+              这份工作副本就是<strong>模型 view</strong>，真实档案就是 <strong>transcript</strong>。Hermes 在进入 provider 前复制 messages，
+              把外部 memory 预取和插件上下文只加到当前用户消息的 API 副本，不改原始列表。对应过程见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L606-L670"><code>conversation_loop.py</code></a>。
+              如果省掉这次复制，下一轮就无法分清哪些话来自用户，哪些只是 runtime 为上一次判断临时补充的材料。
+            </p>
+
+            <h3>2.3 模型和工具怎样来回接力</h3>
+            <p>
+              准备好第一次请求后，Hermes 才调用模型。模型本身不会直接打开文件或运行测试；它返回的是“请调用哪个工具、传入什么参数”。
+              Hermes 检查并执行这个请求，把成功结果或错误结果按原顺序追加到本轮消息里，再把更新后的工作副本交给模型。模型据此决定下一步：
+              继续调用工具，或者材料已经足够，给出最终回答。
+            </p>
+
+            <p>
+              因此，一轮内部其实是一个可能重复多次的小循环。源码里的主循环从
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L461-L520"><code>while</code> 回合预算</a>
+              开始；工具执行层负责真正运行调用，并把结果按模型请求的顺序放回 messages，这个顺序保证可从
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/tool_executor.py#L243-L260"><code>tool_executor.py</code></a>
+              看到。把它翻译成开头那个任务，就是：
+            </p>
+
+            <pre><code class="language-text">用户：修复这个失败测试
+Hermes：保存原话，准备项目规则和可用工具
+模型：请读取测试文件和相关实现
+Hermes：执行读取，把结果记回本轮
+模型：请修改实现并运行测试
+Hermes：执行修改和测试，把成功或错误记回本轮
+模型：材料足够，给出最终回答</code></pre>
 
             <figure class="figure">
               <img
                 src="assets/turn-loop.png"
-                alt="Hermes 前台回合图，展示 User、Context、Prompt、Model、Tools、Finalize 以及 Persist、Sync、Review 后置动作"
+                alt="Hermes 前台回合图，展示用户消息先建立上下文并持久化，再由模型和工具循环接力，最后完成回答、同步状态并按条件触发 review"
               />
               <figcaption>
-                一轮消息先被组织成可恢复的 turn，再进入模型和工具循环；持久化、同步和 review 是生命周期里的明确步骤。
+                图里的 Model 与 Tools 之间可以往返多次；整条从用户输入到最终回答的可恢复流程，才是一轮。
               </figcaption>
             </figure>
 
-            <h3>2.1 模型 view 不是 transcript 原文</h3>
+            <h3>2.4 回答交付后：finalizer 才开始分发状态</h3>
             <p>
-              下一步要区分两个很容易混在一起的东西：transcript 是恢复和审计用的真实记录；API-bound view 是这一次发给模型看的请求副本。
-              Hermes 在进入 provider 前会复制一份 messages。源码在
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L606-L670"><code>conversation_loop.py</code></a>
-              里做了一个关键动作：外部 memory 预取结果和插件上下文只追加到当前用户消息的 API 副本上，不改原始 <code>messages</code>。
+              当模型返回最终回答，前台任务可以交付，但 Hermes 还要收尾：确认返回给用户的内容，整理这一轮的真实消息，
+              同步外部状态，并检查是否达到后台 review 的触发条件。这个收尾者叫作
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_finalizer.py#L263-L401">finalizer</a>。
+              review 即使触发，也拿消息快照在回答之后运行；它不回头改变用户已经收到的结果。
             </p>
 
             <p>
-              这一步解决的是一个非常实际的问题：本轮需要的召回信息，不一定应该成为永久历史；插件临时提供的提示，也不应该污染 transcript。
-              如果把这些东西直接写回真实消息列表，下一轮 agent 就很难分清“用户真的说过什么”和“上一轮为了推理临时拼进去什么”。
+              这里还要分清最后两个动作。“同步状态”是把已经完成的回合送到会话存储或外部 memory provider，保证以后能恢复和检索；
+              “启动 review”才是另开一条后台路径，判断其中有没有值得长期保留的经验，而且允许最后什么也不写。前者保存发生过的事，后者筛选未来可能复用的东西。
             </p>
 
-            <h3>2.2 回合结束不是结束，而是状态分发点</h3>
             <p>
-              当模型终于给出 final response，Hermes 还没有真正结束这一轮。
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_finalizer.py#L263-L328">finalizer</a>
-              会组装 result、执行 post hook、同步外部 memory，再根据条件决定是否触发后台 review。
-              这就是为什么自进化不应该被理解成“模型一边回答一边反思自己”：在 Hermes 里，它更像前台回合完成后的后置状态分发。
+              现在可以完整复述一轮了：<strong>接住并保存用户消息 → 组装模型工作副本 → 模型与工具反复接力 → 交付最终回答 → 同步状态并按条件复盘</strong>。
+              后面所有机制都能放回这条路线：system prompt 决定工作副本里的长期规则，SessionDB 保存真实经过，Memory 与 Skills 则接住交付后筛选出的经验。
             </p>
 
             <h2>三、给模型的长期规则为什么要分层</h2>

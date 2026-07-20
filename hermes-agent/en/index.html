@@ -94,6 +94,13 @@
             </p>
 
             <p>
+              A useful first definition is that Hermes Agent is <strong>a task runtime wrapped around a model</strong>.
+              The model decides what should happen next. Tools read files, edit code, and run commands. Hermes assembles
+              the user's request, project rules, and tool results into work that can continue, recover, and be audited.
+              In this article, <em>runtime</em> means that coordinating layer around the model and its tools.
+            </p>
+
+            <p>
               Hermes Agent describes itself in the
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/README.md#L18-L29">README feature map</a>
               as a self-improving agent. It can work through terminals and messaging gateways, run scheduled jobs,
@@ -104,27 +111,25 @@
 
             <div class="note">
               <p>
-                <strong>Evidence boundary.</strong>
-                This article uses the public README, configuration, and visible source snapshot only. Direct claims come
-                from fixed source links. Design intent is inferred only where call chains, data shapes, or source
-                comments support it. README is the map; source is the mechanism. For example, the visible
-                <code>session_search</code> tool uses SQLite/FTS5 and returns real message windows. It does not call an
-                LLM inside that tool path.
+                <strong>Reading contract.</strong>
+                The whole article follows one task: fix a failing test. By the end, you should be able to replay where a
+                turn begins and ends, how the model and tools hand work back and forth, why the durable record differs
+                from the model's working copy, and how post-delivery experience reaches Memory, SessionDB, or Skills.
               </p>
             </div>
 
-            <p>Read the article with five questions in mind:</p>
-
-            <ol>
-              <li>When a user message enters the system, what must Hermes preserve first?</li>
-              <li>Why must the permanent record of what the user said stay separate from temporary material shown to the model?</li>
-              <li>Why can stable facts, past evidence, and reusable procedures not share one generic memory bucket?</li>
-              <li>Why does background learning wait until after delivery, and why may it change only a narrow set of durable state?</li>
-              <li>How do terminal sessions, scheduled jobs, and delegated tasks reuse one runtime without inventing their own rules?</li>
-            </ol>
+            <p>
+              <strong>Evidence boundary.</strong> This article uses the public README, configuration, and a fixed source
+              snapshot. Direct claims come from linked source. Design intent is inferred only where call chains, data
+              shapes, or comments support it. README is the map; source is the mechanism. For example, the visible
+              <code>session_search</code> path uses SQLite/FTS5 and returns real message windows without another LLM call
+              inside the tool.
+            </p>
 
             <p>
-              Once those questions connect, "self-evolving" stops sounding like a vague slogan. It becomes a state
+              We will not begin with "self-evolution." First we will follow one instruction through its different
+              locations, then replay a complete turn, and only afterward separate standing rules, history, tools, and
+              background learning. Once that route connects, "self-evolving" stops sounding like a vague slogan. It becomes a state
               discipline: deliver the current task first, write reusable material into the right ledger afterward, and
               let future turns retrieve it according to source, lifetime, and risk.
             </p>
@@ -212,72 +217,112 @@
               and background review does not compete with the foreground answer.
             </p>
 
-            <h2>2. A turn has to survive before it can be clever</h2>
+            <h2>2. Walk one repair task through a complete turn</h2>
             <p>
-              Follow the first message into the runtime. A naive loop might receive the request, call the model, run
-              tools, produce an answer, and save everything at the end. That works in a demo. In a real process, a model
-              error, a stuck tool, or a terminated process can erase the event before the final save.
+              Now run the task from the opening. You say, "Fix this failing test." Hermes eventually answers, "I changed
+              two files and the test now passes." Everything from receiving the user message to delivering that answer
+              is one <strong>turn</strong>. <strong>A turn is not one model call.</strong> The model may first request files,
+              inspect their contents, request an edit, run a test, and react to another failure. Hermes owns that whole
+              lifecycle rather than any single decision inside it.
             </p>
 
             <p>
-              Hermes enters the foreground turn through
+              A naive implementation saves history only after everything succeeds. A model error, stuck tool, or process
+              exit can then erase the turn. Hermes instead makes four stages visible: receive and preserve the task,
+              prepare what the model should see, let the model and tools hand work back and forth, then deliver the
+              answer and distribute state. Follow them in order.
+            </p>
+
+            <h3>2.1 Receive the task: build the workbench and preserve the request</h3>
+            <p>
+              When the message arrives, Hermes first creates a workbench for this turn. It restores the prior session,
+              identifies project rules and available tools, assigns turn identifiers, and persists the user's original
+              words early. If a later model call fails, the system still knows what the user requested and where
+              recovery should begin.
+            </p>
+
+            <p>
+              The source names now have a job to attach to. The foreground entry is
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L371-L461"><code>run_conversation</code></a>,
-              but it does not call the model immediately. <code>build_turn_context</code> restores runtime bindings, cleans
-              the user message, restores or builds standing instructions, persists early state, and prepares plugin and
-              recall context. The responsibilities are visible in the
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_context.py#L64-L130"><code>TurnContext</code> shape</a>
-              and its
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_context.py#L177-L240">construction path</a>.
+              and per-turn setup lives in <code>build_turn_context</code>. Its
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_context.py#L64-L130"><code>TurnContext</code></a>
+              carries the messages, standing prompt, identifiers, and prefetched context used later in the turn. The
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/run_agent.py#L1479-L1489"><code>_persist_session</code> path</a>
+              means that a successful answer is not a prerequisite for preserving the request.
+            </p>
+
+            <h3>2.2 Prepare the first model call: copy a working view from the record</h3>
+            <p>
+              The durable record is not identical to what the model needs for its next decision. The record should keep
+              the user's words and events that really occurred. For this repair, however, the model may temporarily need
+              a list of generated files or plugin-supplied project guidance. Hermes copies the real messages into a
+              working view and attaches that temporary material to the copy.
             </p>
 
             <p>
-              The engineering rule is simple: persist enough state soon after the user message arrives. The
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/run_agent.py#L1479-L1489"><code>_persist_session</code> path</a>
-              writes messages to logs and SQLite without making a successful final answer a prerequisite.
+              That working copy is the <strong>model view</strong>; the durable record is the <strong>transcript</strong>.
+              Before a provider call, Hermes copies messages and adds external recall and plugin context only to the API
+              copy of the current user message. It leaves the original list unchanged. The transition is visible in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L606-L670"><code>conversation_loop.py</code></a>.
+              Without the copy, a later turn could not reliably distinguish user evidence from temporary runtime help.
             </p>
 
-            <pre><code class="language-text">user message arrives
--> build turn context
--> persist early
--> call model
--> execute tools
--> append tool results
--> finalize response
--> sync stores
--> maybe spawn review</code></pre>
+            <h3>2.3 Let the model and tools hand work back and forth</h3>
+            <p>
+              Only now does Hermes call the model. The model does not directly open a file or run a test; it returns a
+              request naming a tool and its arguments. Hermes checks and executes that request, appends either the result
+              or the error to the turn in order, and gives the updated working view back to the model. The model then
+              chooses again: request another tool, or produce the final answer when it has enough evidence.
+            </p>
+
+            <p>
+              A turn therefore contains a smaller loop that may repeat several times. The source loop begins at the
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L461-L520">turn budget and <code>while</code> condition</a>.
+              The tool layer executes calls and returns results in the model's original order, an invariant stated in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/tool_executor.py#L243-L260"><code>tool_executor.py</code></a>.
+              In the running example, the exchange reads naturally:
+            </p>
+
+            <pre><code class="language-text">User: Fix this failing test
+Hermes: Preserve the request and prepare project rules and tools
+Model: Read the test and the related implementation
+Hermes: Run the read tools and append their results
+Model: Edit the implementation and run the test
+Hermes: Run the tools and append success or failure
+Model: The evidence is sufficient; return the final answer</code></pre>
 
             <figure class="figure">
               <img
                 src="assets/turn-loop.png"
-                alt="One Hermes foreground turn from user input through context, prompt, model, tools, finalization, persistence, sync, and review"
+                alt="A Hermes foreground turn preserves the user request, prepares context, lets model and tools iterate, then finalizes the answer, synchronizes state, and conditionally starts review"
               />
               <figcaption>
-                A turn is not one model call. It is the recoverable lifecycle that surrounds model calls and tool calls.
+                Model and Tools may exchange control several times. The recoverable route from user input to final answer is the turn.
               </figcaption>
             </figure>
 
-            <h3>2.1 The model view is not the raw transcript</h3>
+            <h3>2.4 After delivery: the finalizer distributes state</h3>
             <p>
-              Now separate two things that are easy to collapse. The transcript is the durable record used for recovery
-              and audit. The model view is a request copy assembled for this decision. Before calling the provider,
-              Hermes copies the messages and attaches external-memory prefetch and plugin context to the current user
-              message in that copy, without rewriting the original list. The path is visible in
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L606-L670"><code>conversation_loop.py</code></a>.
+              When the model returns a final answer, foreground work can be delivered, but Hermes still has to close the
+              turn. It confirms the response, assembles the real message record, synchronizes external state, and checks
+              whether background review is due. This owner is the
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_finalizer.py#L263-L401">finalizer</a>.
+              If review starts, it runs from a message snapshot after delivery and cannot revise the answer the user
+              already received.
             </p>
 
             <p>
-              The distinction solves a practical problem. Recalled material may help this turn without deserving a place
-              in permanent history; plugin guidance should not pretend to be user text. Writing either back into the
-              transcript would make the next turn unable to tell what the user said from what the runtime supplied.
+              The last two actions are different. Synchronizing stores sends the completed turn to session storage or an
+              external memory provider so it can later be recovered and searched. Starting review opens a separate
+              background path that asks whether any experience deserves long-term reuse, and that path may write nothing.
+              One preserves what happened; the other filters what might help in the future.
             </p>
 
-            <h3>2.2 The end of a turn is a distribution point</h3>
             <p>
-              Turn finalization is where Hermes decides what to return, what to persist, what to sync, and whether a
-              background review may run. The relevant hook lives in
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_finalizer.py#L375-L401">the finalizer review trigger</a>.
-              That placement explains a lot of the design: current task delivery is foreground work; learning from the
-              turn is a post-delivery side effect.
+              The complete replay is now short: <strong>receive and preserve the request → assemble the model's working
+              view → iterate between model and tools → deliver the final answer → synchronize state and conditionally
+              review</strong>. Every later mechanism belongs on this route. The system prompt supplies standing rules to
+              the working view; SessionDB preserves what happened; Memory and Skills receive selected experience after delivery.
             </p>
 
             <h2>3. Why the model's standing instructions need layers</h2>
