@@ -3,19 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Agent 框架源码阅读（十）：tRPC-Agent-Go 把 Go agent 做成服务端 runtime</title>
+    <title>Agent 框架源码阅读（十）：tRPC-Agent-Go Runner 与上下文治理</title>
     <meta
       name="description"
-      content="Agent 框架源码阅读第十篇：跟着一次客服排障 run，看 Runner 怎样组织 Agent、Model、Session、Memory、Artifact、工具执行、协议适配与长上下文治理。"
+      content="Agent 框架源码阅读第十篇：先读 tRPC-Agent-Go 的 Runner runtime，再沿 Summary、Context Compaction 与 Session Recall 讲清上下文怎样压缩、重建和找回。"
     />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Agent 框架源码阅读（十）：tRPC-Agent-Go 把 Go agent 做成服务端 runtime" />
+    <meta property="og:title" content="tRPC-Agent-Go Runner 与上下文治理" />
     <meta
       property="og:description"
-      content="从一次完整 run 出发，看 Runner 怎样搭起运行工作台，Agent 怎样让 Model 与工具接力，Session、Memory、Artifact 和 Evolution 又怎样接住状态。"
+      content="从 Runner 的完整 run 出发，理解 Summary 的持久边界、Context Compaction 的临界减压与 Session Recall 的原始证据恢复。"
     />
     <meta property="og:type" content="article" />
-    <meta property="og:image" content="../assets/trpc-agent-go-memory-summary.png" />
+    <meta property="og:image" content="../assets/trpc-agent-go-three-states.png" />
     <link rel="canonical" href="https://rememorio.github.io/blog/agent-framework/zh/trpc-agent-go/" />
     <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-framework/zh/trpc-agent-go/" />
     <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-framework/en/trpc-agent-go/" />
@@ -126,8 +126,9 @@
         <a href="../">Agent 框架系列</a>
         <a href="../eino-execution-graph/">上一篇</a>
         <a href="#runtime-map">runtime 地图</a>
-        <a href="#summary-lifecycle">summary</a>
-        <a href="#memory-lifecycle">memory</a>
+        <a href="../trpc-agent-go-memory/">下一篇：Memory</a>
+        <a href="#context-compaction">compaction</a>
+        <a href="#context-benchmark">benchmark</a>
         <a href="#sources">参考源码</a>
       </nav>
       <nav class="site-actions" aria-label="站点操作">
@@ -149,24 +150,24 @@
         <article class="article-card">
           <section class="article-hero">
             <p class="eyebrow">Agent 框架源码阅读 · 第十篇</p>
-            <h1>tRPC-Agent-Go 把 Go agent 做成服务端 runtime</h1>
+            <h1>tRPC-Agent-Go Runner 与上下文治理</h1>
             <p class="lead">
               一个客服 Agent 从网页接单，查询日志和工单，生成文件，等待用户第二天回来，还要记得此前进度。
               tRPC-Agent-Go 把这些生产责任组织成一套 Go 服务端 runtime；本文跟着一次完整 run，看 Runner 怎样给 Agent
-              准备会话、长期资料和文件服务，Agent 又怎样让 Model 与工具接力，最后再重点拆 Rememorio 推进最集中的
-              <code>summary</code> 与 <code>memory</code>。
+              准备会话、长期资料和文件服务，Agent 又怎样让 Model 与工具接力。作为三篇深读的第一篇，后半篇重点拆 Rememorio
+              推进的 <code>summary</code>、<code>context compaction</code> 与 <code>session recall</code>：平时怎样压，临界时怎样重建，丢掉的细节怎样找回。
             </p>
             <div class="meta-line">
               <span>主题：tRPC-Agent-Go</span>
               <span>运行入口：Runner</span>
               <span>执行：Agent / Model / Tool</span>
               <span>状态服务：Session / Memory / Artifact</span>
-              <span>重点：summary / memory / session_load</span>
+              <span>重点：summary / compaction / recall</span>
             </div>
             <figure class="hero-image">
               <img
-                src="../assets/trpc-agent-go-memory-summary.png"
-                alt="tRPC-Agent-Go 记忆账本手绘图：Session 的 events 经过 summary 写入 summary store 并进入 model view；Memory 的 facts 和 tools 写入 memory store，经 preload/search 进入 model view；session_load 从隐藏历史抽屉向 model view 召回。底部结论是 summary 压会话，memory 存事实。"
+                src="../assets/trpc-agent-go-three-states.png"
+                alt="tRPC-Agent-Go 三种状态手绘图：当前会话由 events 经 summary 进入模型视图，session recall 保留恢复抽屉；跨会话知识以 Fact 和 Episode 写入 memory store；任务 outcome 经 review 和 revision gate 形成 managed skill。"
               />
             </figure>
           </section>
@@ -176,15 +177,16 @@
               <p>
                 <strong>阅读契约。</strong>
                 全文只跟踪同一个任务：“继续排查昨天的证书错误，并生成一份报告。”读完后，你应该能复述这次工作从哪里开始、
-                模型和工具怎样接力、进度与文件保存到哪里，以及本轮结束后哪些内容会进入会话摘要、长期资料或可复用方法。
+                模型和工具怎样接力、进度与文件保存到哪里，以及 Summary、Context Compaction 与 Session Recall 怎样围绕同一本事件账本分工。
               </p>
             </div>
 
             <div class="note">
               <p>
                 <strong>证据边界。</strong>
-                源码链接固定到公开快照 <code>d3b50fd90d60b4ece8a78e89cf890a4f06d78235</code>。
-                文中“工作台”“账本”“投影”是帮助理解的工程归纳；具体调用、持久化和完成路径都以文中链接的公开源码为准。
+                框架总览链接固定到公开快照 <code>d3b50fd90d60b4ece8a78e89cf890a4f06d78235</code>；上下文深读补充到
+                <code>0c7774187da9330144df2a038ef18ee89ef2ae1c</code>，实验固定到 <code>c9aabe56c0eb1cb80e927d2a34ecc72658173cbe</code>。
+                文中“工作台”“账本”“投影”是帮助理解的工程归纳，具体行为以链接源码与实验报告为准。
               </p>
             </div>
 
@@ -445,8 +447,8 @@ Model：材料足够，生成最终说明</code></pre>
 
             <p>
               表格只是在压缩已经走过的流程。真正要记住的是：Runner 搭工作台并持有服务，Agent 接工作单，Model 只生成下一步，
-              Tool 真正行动，Event 把过程带回 Session。后面的 summary 与 memory，就是这张工作台在“当前工单太长”和“未来工单还需稳定事实”
-              两种压力下长出来的机制。
+              Tool 真正行动，Event 把过程带回 Session。后面的三篇深读，就是沿着这本事件账，依次处理“当前会话太长”、
+              “未来会话仍需稳定事实”和“以后任务要复用方法”三种压力。
             </p>
 
             <h2>五、这张运行工作台怎样扩展成完整框架</h2>
@@ -763,359 +765,403 @@ Model：材料足够，生成最终说明</code></pre>
 
             <div class="note key-point">
               <p>
-                <strong>先有 runtime 地图，再看 memory 才不会偏。</strong>
+                <strong>先有 runtime 地图，再看上下文治理才不会偏。</strong>
                 Graph、Skill 工作区、Evolution 和 AG-UI 都在说明同一个边界：模型不是 runtime。
-                summary 和 memory 不是孤立功能，而是 Runner 持久化事件、processor 组装模型请求、tool surface 暴露召回入口、
-                server 层持续承接会话之后，才自然冒出来的长上下文 owner。
+                Summary、Compaction 和 Recall 也不是孤立功能，而是 Runner 持久化事件、processor 组装模型请求、tool surface 暴露恢复入口、
+                server 层持续承接会话之后，才自然形成的一条上下文治理链路。
               </p>
             </div>
 
-            <h2>六、长上下文重点：先分清三本账</h2>
+            <h2>六、先把三篇放进同一张时间地图</h2>
             <p>
-              很多 agent 框架都会暴露 <code>memory</code> 这个词，但这个词太宽了。tRPC-Agent-Go 的源码更像把它拆成三本账：
-              原始 session events、session summary、长期 memory。读懂这三本账，后面的函数名就不会散。
-            </p>
-            <ul>
-              <li><strong>Session events 是原始工作日志</strong>：用户说过什么、查了哪份日志、工具返回什么，都按时间保留。</li>
-              <li><strong>Summary 是当前工单的交接摘要</strong>：旧记录太长时，把已经发生的部分压成短说明，让同一会话继续跑。</li>
-              <li><strong>Memory 是跨工单的客户档案</strong>：例如用户长期使用的技术栈或稳定偏好，未来新会话也可以复用。</li>
-            </ul>
-            <p>
-              仍以客服为例：昨天完整的报错行留在 events；“已排除网络问题，正在检查证书”可以进入 summary；
-              “该用户的生产环境使用 Go”可以成为 memory。若今天必须核对昨天那一行原始错误，<code>session_load</code>
-              再从 events 取回证据。Evolution 则把“遇到这类错误先检查证书”沉淀成操作方法，因此它不是第四本记忆账。
-            </p>
-            <pre><code>Session ledger
-  Session{Events, Summaries[filterKey]*Summary}
-  Summary{Summary, Topics, Boundary{FilterKey, CutoffAt, LastEventID}}
-
-Memory ledger
-  Entry{ID, AppName, UserID, Memory, CreatedAt, UpdatedAt}
-  Memory{Memory, Topics, Kind(fact|episode), EventTime, Participants}
-
-Evolution path
-  LearningJob{Session, Outcome?, Scope}
-  ReviewDecision{Skills, Updates, Deletions}
-
-Recall path
-  session_search / session_load
-  current visible history + current_hidden history + other searchable scopes</code></pre>
-            <p>
-              这四行能防止一个常见误读：session summary、memory 和 evolution 都会读会话，但它们不是同一个东西。
-              summary 写回 session summary；memory 写 app/user 维度的事实或 episode；evolution 写 managed skill library；
-              session_load 则回到原始事件账本找被 summary 隐掉的证据。
+              到这里，证书排障已经能运行、落盘并产出文件。接下来真正棘手的问题是：昨天的对话越来越长，今天还要继续；
+              用户下周新开会话时，系统仍应知道他的稳定环境；以后遇到同类故障，Agent 最好还能复用这次排查方法。
+              这不是一个名为 <code>memory</code> 的开关，而是三个时间尺度不同的问题。
             </p>
 
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>账本</th>
-                    <th>它保存什么</th>
-                    <th>什么时候进模型</th>
-                    <th>第一眼源码</th>
+                    <th>时间尺度</th>
+                    <th>读者真正要解决的问题</th>
+                    <th>主要机制</th>
+                    <th>写到哪里</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr>
-                    <td>Session events</td>
-                    <td>一次会话里的用户消息、assistant 事件、tool 结果、状态变化和轨迹。</td>
-                    <td>默认按事件顺序进入上下文；当 summary 有边界时，只取边界之后的增量。</td>
-                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/session.go#L60-L88"><code>Session</code> 字段</a></td>
+                    <td>当前会话</td>
+                    <td>旧消息太长时，怎样继续推理，又怎样找回被压掉的原文？</td>
+                    <td>Summary、Context Compaction、Session Recall</td>
+                    <td>Session 的原始 Events 与 Summary 边界</td>
                   </tr>
                   <tr>
-                    <td>Session summary</td>
-                    <td>对当前 session 某个 filter key 下旧事件的压缩文本，以及压缩到哪里的边界。</td>
-                    <td>由 content processor 注入为模型可见上下文，同时只追加 summary 边界之后的消息。</td>
-                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/session.go#L60-L88"><code>Summaries</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/processor/content.go#L731-L787"><code>appendSessionMessages</code></a></td>
+                    <td>跨会话</td>
+                    <td>用户下次回来时，怎样带回稳定事实与过去经历？</td>
+                    <td>Memory 抽取、检索与更新</td>
+                    <td>app/user 维度的 Fact 与 Episode</td>
                   </tr>
                   <tr>
-                    <td>Memory</td>
-                    <td>跨 session 的事实和 episode，带 app、user、kind、时间、topic、metadata。</td>
-                    <td>可以通过 preload 放进上下文，也可以由 <code>memory_search</code> / <code>memory_load</code> 工具按需读取。</td>
-                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L155-L196"><code>memory.Service</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L202-L236"><code>Memory</code> / <code>Entry</code></a></td>
+                    <td>未来任务</td>
+                    <td>这次成功或失败的做法，怎样变成以后可复用的技能？</td>
+                    <td>Evolution review、revision 与 gate</td>
+                    <td>受管理的 Skill 版本</td>
                   </tr>
                 </tbody>
               </table>
             </div>
 
             <p>
-              这张表的关键不是“有三个结构体”。关键是：<strong>summary 不是长期记忆，memory 也不是聊天摘要。</strong>
-              summary 的任务是让当前会话继续跑；memory 的任务是让未来会话还能拿到稳定事实。
+              因此，tRPC-Agent-Go 的深读拆成三篇：本篇先解决<strong>当前会话怎样变短且可恢复</strong>；
+              下一篇讲<a href="../trpc-agent-go-memory/">长期 Memory 怎样跨会话保存事实</a>；最后一篇讲
+              <a href="../trpc-agent-go-evolution/">Evolution 怎样把运行结果变成可验证的技能修订</a>。
+              三条链路都可能读取同一段会话，但写入对象、可见时间和失败代价都不同。
             </p>
 
+            <h2>七、上下文不是原始记录，而是这一轮给模型看的投影</h2>
             <p>
-              这里顺手把 evolution 的位置摆正：它也读 session delta，但它不是第四本“记忆账”。源码里的
-              <code>ReviewDecision</code> 注释明确说 evolution 不抽取 durable facts，fact-style memory 属于 <code>memory.Service</code>
-              和 auto-memory extractor；evolution 只拥有 skill library。也就是说，同一段会话可以同时被 summary 压短、被 memory 抽事实、
-              被 evolution 抽流程，但三者写入的目标完全不同。证据在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/types.go#L176-L181"><code>ReviewDecision</code> boundary</a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/worker.go#L40-L47">worker scope comment</a>。
+              用户第二天说“继续昨天的证书问题”时，Session 里仍保留昨天的用户消息、模型回复和工具结果。
+              如果每一轮都把它们原样塞给模型，请求会不断膨胀；如果直接删除旧记录，模型一旦需要某个证书序列号，系统又无处可查。
+              tRPC-Agent-Go 的解法是先分清<strong>原始账本</strong>和<strong>模型视图</strong>。
             </p>
 
-            <h2>七、Runner 让三本账在 run 前后接力</h2>
-            <p>
-              回到开头的工作台，三本账不是在同一时刻一起塞给模型。run 开始时，Runner 先恢复当前 Session，并把会话与可用服务放进 Invocation；
-              Agent 准备模型请求时，processor 才把 summary、边界之后的 Events 和必要 Memory 投影成这一刻的模型视图。
-              run 进行中，新 Event 继续写回 Session；run 完成后，Runner 再判断是否排 summary、auto memory 与 evolution 后台任务。
-            </p>
+            <pre><code>持久层：Session.Events
+  昨天的提问 -> 日志工具调用 -> 12 KB 工具结果 -> 初步结论 -> 今天的追问
+
+摘要边界：Summary{Text, CutoffAt, LastEventID}
+  “已排除网络问题，正在核对证书链” + “压缩到 event-42”
+
+本轮模型视图
+  Summary 文本 + event-42 之后的新消息 + 当前用户输入</code></pre>
 
             <p>
-              因此 Runner 拥有的是账本与运行之间的交接，而不是模型推理。若执行者是 LLMAgent，LLM flow 最终才会调用
-              <code>Invocation.Model.GenerateContent</code>。证据在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L510-L754"><code>Run</code></a>
-              、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L756-L793"><code>newRunInvocation</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/llmflow/llmflow.go#L2330-L2387">provider call</a>。
-            </p>
-
-            <p>
-              真正有意思的是事件落盘之后发生什么。<code>handleEventPersistence</code> 过滤 partial、无效事件、tool result 等特殊情况，
-              把有效事件写进 session，然后按事件的 <code>FilterKey</code> 触发 summary job；runner 完成事件之后，又会触发 auto memory 抽取，
-              也会在配置了 evolution service 时排一个 evolution learning job。
-              这些入口分别在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L2419-L2519"><code>handleEventPersistence</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L2849-L2856">runner completion</a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L3910-L3930"><code>enqueueEvolutionLearningJob</code></a>。
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/session.go#L62-L75"><code>Session</code></a>
+              同时持有 <code>Events</code> 与按 filter key 保存的 <code>Summaries</code>；
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/content.go#L795-L900">content processor</a>
+              组装请求时先读取 Summary 边界，再只追加边界之后的 Events。换句话说，Summary 改的是模型这一轮看到什么，
+              不是把 Session 的原始事件改写成一段短文本。
             </p>
 
             <div class="note key-point">
               <p>
-                <strong>这里的设计味道是“运行时自动收账”。</strong>
-                应用不需要在每一轮手写“如果上下文太长就总结一下，再顺便抽取长期记忆，最后复盘能不能沉淀技能”。runner 把事件持久化、
-                summary 调度、auto memory 调度和 evolution 学习入口都接在运行主线后面，但每条后台管线写入不同 owner。
+                <strong>先守住一个不变量：压缩可以有损，原始证据不能因此消失。</strong>
+                后面的 Summary、Context Compaction 与 Session Recall，分别负责“概括旧事实”“丢掉昂贵载荷”和“按需回原账本取证”。
               </p>
             </div>
 
-            <h2 id="summary-lifecycle">八、summary：压当前 session，不删原始账</h2>
+            <h2 id="summary-lifecycle">八、Summary 平时滚动推进，而不是反复总结全文</h2>
             <p>
-              summary 的第一步不是“调用模型总结全文”，而是先判断这一轮是不是该总结。summary 包暴露的接口是
-              <code>ShouldSummarize</code> 和 <code>Summarize</code>，还支持带 invocation context 的版本。
-              接口定义在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/summary.go#L22-L58"><code>SessionSummarizer</code></a>。
+              第一次排障进行到一定长度后，系统可以把“已经完成的部分”压成一段交接说明。下一次再触发总结时，最笨的做法是把全部历史重新交给模型；
+              会话越长，总结本身越贵，也更容易把旧事实反复改写。Rememorio 实现的滚动 Summary 保存了一个边界，下一次只处理边界之后的新事件。
             </p>
 
-            <h3>1. 先过触发门槛</h3>
-            <p>
-              summary 不应该每来一句话就运行。应用可以按累计事件、token 数或经过时间设置固定门槛，也可以让门槛参考当前模型的上下文窗口：
-              小窗口更早压缩，大窗口则多保留一些原文。前者适合做可预测的成本控制，后者适合在真正接近模型上限时再行动。
-              两类配置分别见
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/options.go#L129-L172">threshold options</a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/options.go#L267-L302">上下文感知门槛</a>。
-            </p>
-
-            <p>
-              如果配置了异步 worker，summary job 会被放进 hash 分片队列；队列满、worker 不存在或配置要求 fallback 时，再走同步总结。
-              <code>EnqueueJob</code> 会 detach context、按 session/filter 路由，并保留 cascade full-session summary 的兜底路径。
-              证据在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/summary/async.go#L120-L164"><code>AsyncSummaryWorker.EnqueueJob</code></a>。
-            </p>
-
-            <h3>2. 只总结边界之后的增量</h3>
-            <p>
-              进入真正总结时，内部逻辑会先拿锁，避免同一个 session/filter 的总结并发重复。然后它读取上一次 summary，
-              计算 boundary 之后的 delta，把旧 summary 作为上下文前缀拼回去，再构造临时 session 给 summarizer 判断。
-              这段在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/summary/summary.go#L163-L228"><code>SummarizeSession</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/summary/summary.go#L307-L330"><code>buildSummaryInput</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/summary/summary.go#L404-L486">summary lock</a>。
-            </p>
-
-            <p>
-              summarizer 本身也不是只拼文本内容。它会过滤要总结的事件、跳过最近几条、把用户/assistant 文本、tool call、tool result
-              都抽成对话文本，再调用模型生成 summary。关键代码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/summarizer.go#L307-L374"><code>Summarize</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/summarizer.go#L417-L446"><code>filterEventsForSummary</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/summarizer.go#L581-L650"><code>extractConversationText</code></a>。
-            </p>
-
-            <h3>3. summary 进入模型视图，而不是替代 session</h3>
-            <p>
-              生成出来的 summary 会写回 session summary store，并记录边界。下一轮组装模型请求时，
-              content processor 会先取 summary 文本和 cutoff，再把 summary 注入系统消息或用户消息，最后只追加 cutoff 之后的 session messages。
-              源码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/summary/summary.go#L354-L372"><code>writeSummary</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/processor/content.go#L824-L846"><code>appendSummaryContext</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/processor/content.go#L869-L890"><code>sessionMessagesAfterCutoff</code></a>。
-            </p>
-
-            <p>
-              这就是“summary 压会话”的准确含义：它压的是模型可见上下文，不是删除原始事件。原始 events 仍然在 session 里，
-              后面 <code>session_search</code> 和 <code>session_load</code> 还能回头找。
-            </p>
-
-            <h3>4. cache-safe fork 解决的不是语义，而是 provider 请求形状</h3>
-            <p>
-              这里有个很工程化的细节。普通总结可以把抽出的对话文本放进一个新的 summary prompt 里；但当 provider 有 prompt cache、
-              reasoning、工具定义或特殊 request shape 时，完全新开的总结请求可能破坏缓存形状。<code>WithCacheSafeForking</code>
-              会在有 parent model request 时克隆父请求，再追加一个“压缩当前上下文”的用户消息；没有父请求时才退回 standalone prompt。
-              证据在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/options.go#L62-L85"><code>WithCacheSafeForking</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/cache_safe_fork.go#L19-L182">cache-safe fork request clone</a>。
-            </p>
-
-            <p>
-              pre-LLM context compaction 也沿着这个思想走：在真正调用模型前判断上下文是否需要压缩，必要时同步创建 summary，
-              把 parent request 附给 summary context，然后重建模型请求。证据在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/llmflow/llmflow.go#L1435-L1492"><code>maybeCompactContextBeforeLLM</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/llmflow/llmflow.go#L1494-L1600"><code>runContextCompaction</code></a>。
-            </p>
-
-            <h2 id="memory-lifecycle">九、memory：存长期事实，不替代 summary</h2>
-            <p>
-              memory 更像跨工单使用的长期资料库：它既允许明确地增删改查，也能提供给 Agent 检索，还能在 run 完成后排队抽取新记忆。
-              条目分成“稳定事实”和“发生过的经历”两类，并按应用与用户隔离；它们不是当前 Session 的压缩副本。
-              服务边界和条目结构见
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L155-L196"><code>Service</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L202-L236">memory entry</a>。
-            </p>
-
-            <h3>1. 工具入口是显式的</h3>
-            <p>
-              Agent 不会自动看到整个资料库，而是通过一组明确的工具使用它。写入类工具负责新增、修订或清理条目；读取类工具负责搜索相关记忆，
-              或按标识加载某一条。每次调用都会从当前 Invocation 取得应用和用户身份，因此不会把甲用户的证书环境偏好带给乙用户。
-              搜索结果也是结构化条目，不是把所有 memory 粘进 prompt。完整工具名和上下文取值可见
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L22-L30">tool names</a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/tool/tool.go#L249-L364">搜索与加载</a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/tool/tool.go#L472-L517">context lookup</a>。
-            </p>
-
-            <p>
-              search 的默认行为也透露出它的定位：它会构造 <code>SearchOptions</code>，默认开启 deduplicate 和 hybrid search，
-              支持 kind、时间范围、最大条数、相似度阈值、排序和 RRF。证据在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L266-L309"><code>SearchOptions</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/tool/tool.go#L537-L571"><code>buildSearchOptions</code></a>。
-            </p>
-
-            <h3>2. auto memory 是“跑完后抽取”，不是“每条消息立刻写事实”</h3>
-            <p>
-              runner 完成一次运行后会调用 <code>enqueueAutoMemoryJob</code>；memory service 如果配置了 extractor，
-              就把当前 session 交给 auto memory worker。源码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L3898-L3908"><code>enqueueAutoMemoryJob</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/inmemory/service.go#L58-L105"><code>NewMemoryService</code></a>。
-            </p>
-
-            <p>
-              worker 不会盲目把整段历史扔给模型。<code>EnqueueJob</code> 先读取上次抽取位置，扫描 delta，
-              只保留用户和 assistant 文本，排除 tool messages 和 tool calls；再根据阈值检查是否值得抽取。
-              证据在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/internal/memory/auto.go#L264-L333"><code>AutoMemoryWorker.EnqueueJob</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/internal/memory/auto.go#L675-L721"><code>scanDeltaSince</code></a>。
-            </p>
-
-            <p>
-              真正抽取时，它先用用户消息构造查询，搜索已有相关 memories；再把“现有记忆 + 新对话”交给 extractor，
-              让模型产出 add/update/delete/clear 操作；最后通过 reconcile 和 enabled tool gate 执行。源码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/internal/memory/auto.go#L391-L468"><code>createAutoMemory</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/extractor/memory.go#L110-L183"><code>Extract</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/internal/memory/auto.go#L537-L627"><code>executeOperation</code></a>。
-            </p>
-
-            <h3>3. preload 是给模型一小块长期背景</h3>
-            <p>
-              如果开启 preload memory，content processor 会先构造 memory prompt，把选中的长期记忆以规则化格式放进上下文。
-              它不是把所有 memory 一次性塞满，而是提供“可用背景”和“如何使用这些记忆”的提示。
-              证据在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/processor/content.go#L362-L394"><code>WithPreloadMemory</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/processor/preload_memory_prompt.go#L19-L74">preload memory prompt</a>。
-            </p>
-
-            <div class="note key-point">
-              <p>
-                <strong>memory 的边界很重要。</strong>
-                它负责“以后也可能用到的事实和 episode”，不负责把当前 session 的每个旧事件压缩给下一轮模型。
-                当前 session 的压缩是 summary 的事；长期事实的沉淀才是 memory 的事。
-              </p>
+            <h3>8.1 一次滚动更新具体发生什么</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>步骤</th>
+                    <th>证书排障里的变化</th>
+                    <th>源码责任</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>1. 判断是否触发</td>
+                    <td>事件数、token 或上下文占用没有过线时，本轮什么也不做。</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/summary/summary.go#L22-L59"><code>SessionSummarizer</code></a></td>
+                  </tr>
+                  <tr>
+                    <td>2. 计算增量</td>
+                    <td>读取旧 Summary，只挑上次边界之后新增的证书检查记录。</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go#L165-L229"><code>SummarizeSession</code></a></td>
+                  </tr>
+                  <tr>
+                    <td>3. 合并交接说明</td>
+                    <td>把旧 Summary 当作已知背景，用新事件更新结论，而不是重读整本账。</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go#L310-L350"><code>buildSummaryInput</code></a></td>
+                  </tr>
+                  <tr>
+                    <td>4. 推进边界</td>
+                    <td>写回新 Summary，并记录它已经覆盖到哪个事件。</td>
+                    <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go#L165-L229">boundary selection</a></td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
 
-            <h2>十、session_search / session_load 是隐藏历史的回收通道</h2>
             <p>
-              一旦 summary 生效，模型主上下文里只保留 summary + cutoff 之后的增量。那旧的原始事件是不是就找不到了？
-              不是。tRPC-Agent-Go 还有 session recall tools。<code>session_search</code> 可以在当前可见、当前隐藏、其他 session 等 scope
-              里查找，<code>current_hidden</code> 会结合 summary boundary，只搜当前 session 里被 summary 隐掉的历史。
-              源码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/session/tool/recall/search.go#L166-L235"><code>searchCurrentHidden</code></a>。
+              这套设计允许异步总结：正常情况下，Runner 持久化事件后排一个 Summary job，前台回复不必等待。
+              但异步也带来边界：当前请求已经逼近模型窗口时，排队稍后总结来不及救它。因此框架还需要一条请求内的临界减压路径，
+              这就是 Context Compaction。
             </p>
 
+            <h2 id="context-compaction">九、Context Compaction 先清理工具载荷，再决定是否同步总结</h2>
             <p>
-              <code>session_load</code> 则负责把命中的 anchor 周围一段原始事件窗口加载回来。窗口逻辑按事件顺序切片，
-              不是让模型凭 summary 猜。源码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/session/tool/recall/load.go#L118-L153"><code>resolveLoadAnchorEventID</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/internal/window/window.go#L22-L88"><code>EventWindowFromOrderedEvents</code></a>。
-            </p>
-
-            <p>
-              这样 summary 的代价就被控制住了：主上下文可以变短，但原始证据没有丢；模型需要细节时，可以通过 recall tool 回到原账本。
-            </p>
-
-            <h2>十一、放回 Agent 框架路线里看</h2>
-            <p>
-              这一篇和 Eino 的关系很近，但关注点不同。Eino 先回答 Go 里怎样把 component、stream、interrupt、agent loop
-              放进可组合执行图；tRPC-Agent-Go 继续追问：这张图或一个普通 LLMAgent 要怎样被服务化运行？它用 Runner 搭起工作台，
-              在 run 前后接住会话、长期资料、文件、协议翻译与后台学习。GraphAgent 只是 Runner 可以选择的一种执行者，
-              不是整套 runtime 的骨架。本文后半篇重点看的，就是这张工作台里最容易混淆的 summary、memory、evolution 与隐藏历史召回。
+              继续看同一个任务。日志工具刚返回 12 KB 原文，其中绝大多数已经被模型读过并形成“证书链缺少中间证书”的结论。
+              旧工具结果通常是请求里最胖、又最容易安全减重的部分。tRPC-Agent-Go 因而不是一过阈值就立刻把整段会话重新总结，
+              而是先在构造模型视图时做三轮由便宜到昂贵的处理。
             </p>
 
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>容易误解的说法</th>
-                    <th>更准确的读法</th>
+                    <th>轮次</th>
+                    <th>什么时候改</th>
+                    <th>怎样改</th>
+                    <th>保护什么</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr>
-                    <td>memory 就是把聊天记录总结一下。</td>
-                    <td>summary 压当前 session；memory 存跨 session 的事实和 episode。</td>
+                    <td>Pass 0：策略清理</td>
+                    <td>应用明确把某类工具列为可清理。</td>
+                    <td>把命中的结果替换成成功占位符。</td>
+                    <td>应用自己的工具语义。</td>
                   </tr>
                   <tr>
-                    <td>有 summary 就可以删旧事件。</td>
-                    <td>summary 只改变模型主上下文；旧事件仍服务于 session_search / session_load。</td>
+                    <td>Pass 1：历史结果清理</td>
+                    <td>旧工具结果超过阈值；默认阈值 1024 token。</td>
+                    <td>保留最近 1 个已完成请求，其余大结果替换为可恢复占位符。</td>
+                    <td>最近推理连续性，避免重复副作用工具。</td>
                   </tr>
                   <tr>
-                    <td>auto memory 每句话都写入长期记忆。</td>
-                    <td>runner 完成后触发 worker，扫描 delta、过阈值、搜索已有记忆、再抽取操作。</td>
-                  </tr>
-                  <tr>
-                    <td>self-evolution 就是模型自己改 prompt 或记住用户事实。</td>
-                    <td>evolution 只维护 managed skill library：review session delta，生成 skill create/update/delete，经过 reconciler 和 gate 后发布。</td>
-                  </tr>
-                  <tr>
-                    <td>长上下文模型出来后 summary 不重要。</td>
-                    <td>summary 还承担成本、缓存形状、工具 transcript 和恢复边界治理。</td>
+                    <td>Pass 2：超大结果截断</td>
+                    <td>任何工具结果超过应用显式配置的上限。</td>
+                    <td>保留头尾，中间换成截断标记；推荐值 8192，但默认关闭。</td>
+                    <td>当前请求不会被单个极端结果撑爆。</td>
                   </tr>
                 </tbody>
               </table>
             </div>
 
             <p>
-              所以这篇的结论要分两层。<strong>整体上，tRPC-Agent-Go 是一套以 Runner 为运行 owner 的 Go agent 服务端 runtime。</strong>
-              Runner 搭工作台并持有服务；Agent 接下工作单；Model 只生成某一步，Tool 真正行动。
-              Session 保存当前工单经过，Memory 保存跨工单事实，Artifact 保存版本化文件，Evolution 在交付后学习方法。
-              <strong>长上下文也不是一个 memory 开关：</strong>原始 Events 提供证据，summary 压短当前 Session，Memory 留下长期事实，
-              <code>session_load</code> 再把被 summary 隐掉的细节找回来。
+              三轮顺序与默认值写在
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/context_compact.go#L21-L56"><code>context_compact.go</code> 的常量与占位符</a>
+              以及
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/context_compact.go#L288-L365"><code>compactIncrementEvents</code></a>。
+              占位符不会只写一句“内容已删除”：它说明工具曾成功执行、结果已经被消费，还携带 <code>event_id</code>、
+              <code>tool_call_id</code> 与工具名。若当前工具面暴露了 <code>session_load</code>，模型就能按引用找回原载荷；
+              否则提示只允许重跑只读或幂等工具。这个细节是在保护副作用边界，避免模型把“被压掉”误解成“调用失败”而重复执行。
             </p>
 
+            <h3>9.1 工具结果清理后仍然过线，才同步推进 Summary</h3>
+            <p>
+              请求投影完成后，LLM flow 会估算消息 token。默认在达到模型上下文窗口的 70% 时触发同步检查；
+              条件不满足、没有 Session Service、不能安全重建请求时都直接跳过。真正触发后，它把当前完整请求作为 parent request
+              交给 cache-safe Summary，等待 Summary 边界推进，然后从 content processor 之前保存的快照重新构造请求。
+            </p>
+
+            <pre><code>旧请求：旧 Summary + 大量边界后事件 + 当前输入 + tools
+                   |
+                   | token >= 0.7 * context window
+                   v
+cache-safe Summary：沿用 parent request 的稳定前缀，只追加压缩指令
+                   |
+                   v
+新请求：新 Summary + 新边界后的少量事件 + 当前输入 + tools</code></pre>
+
+            <p>
+              触发判断、同步 Summary 与重建分别见
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/llmflow/llmflow.go#L1526-L1583"><code>maybeCompactContextBeforeLLM</code></a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/llmflow/llmflow.go#L1585-L1702"><code>runContextCompaction</code></a>
+              和
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/llmflow/llmflow.go#L1704-L1734"><code>rebuildRequestForContextCompaction</code></a>。
+              这里最容易混淆的边界是：<strong>Summary 是可持久化的滚动状态；Context Compaction 是在请求压力下组织清理、触发 Summary 并重建模型视图的运行策略。</strong>
+            </p>
+
+            <h2>十、Session Recall 让压缩后的模型回原始账本取证</h2>
+            <p>
+              Summary 说“证书链有问题”足以维持大多数对话，但用户若追问“昨天日志里的序列号到底是什么”，摘要可能没有这个细节。
+              直接把全部旧历史重新塞回上下文，会抹掉压缩收益；让模型凭摘要猜，则会破坏事实性。Session Recall 提供两步取证：先搜索，
+              再围绕命中的事件加载一小段原文窗口。
+            </p>
+
+            <pre><code>session_search(query="certificate serial", scope="current_hidden")
+  -> 命中 Summary 边界之前的 event-37
+
+session_load(event_id="event-37", before=1, after=1)
+  -> 只取回该事件附近的用户消息、工具调用与工具结果</code></pre>
+
+            <p>
+              <code>current_hidden</code> 不是搜索“所有没显示的内容”，而是根据当前 Summary boundary，把检索时间限制在 cutoff 之前，
+              再过滤为当前会话里真正被 Summary 遮住的事件。实现见
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/session/tool/recall/search.go#L198-L235"><code>searchCurrentHidden</code></a>。
+              命中后，
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/session/tool/recall/load.go#L123-L180"><code>session_load</code></a>
+              按 event ID 读取前后窗口，也能在需要时用 tool-call ID 解析锚点。
+            </p>
+
+            <p>
+              框架还有另一条 preload 路径：在模型第一次作答前，用当前用户问题搜索<strong>其他会话</strong>的原始事件，把少量结果预先注入请求。
+              它适合“上周那个证书问题”这种跨会话追问；按需的 <code>current_hidden</code> 则适合同一长会话里找回被摘要遮住的细节。
+              两条路径的范围不同，不能只用一个“recall”名词带过。preload 逻辑见
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/content.go#L3338-L3389"><code>getPreloadSessionRecallMessage</code></a>。
+            </p>
+
+            <h2 id="context-benchmark">十一、Benchmark 要同时回答省多少、丢多少、能否找回</h2>
+            <p>
+              只报告“prompt 变短了”无法证明上下文治理有效。Rememorio 的 benchmark 把问题拆成三层：
+              MT-Bench-101 检查滚动 Summary 的总体成本与连续性；QMSum 检查长会议被压缩后还能不能回答指定问题；
+              LongMemEval 检查跨大量会话的精确事实能否通过按需 Recall 找回。以下结果来自已合入的
+              <a href="https://github.com/trpc-group/trpc-agent-go-benchmark/blob/c9aabe56c0eb1cb80e927d2a34ecc72658173cbe/summary/results/REPORT.md">Summary benchmark report</a>。
+            </p>
+
+            <h3>11.1 MT-Bench-101：短会话可能不值得总结</h3>
+            <p>
+              MT-Bench-101 包含 917 个案例、9 类多轮任务。实验使用 DeepSeek-V3.2，每两轮生成一次 Summary，比较长上下文基线与滚动 Summary。
+              总 token 减少 12.89%，其中 prompt token 减少 24.47%；一致性得分为 0.853，第一轮通过率为 92.3%。
+              但 329 个案例出现负节省，约占 35.9%。
+              分组后原因很清楚：四轮以上会话通常能省 28% 到 40%，两轮以内则可能因为“总结调用本身”比原历史还贵。
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>实验给出的不是“永远开启 Summary”，而是一条触发规则。</strong>
+                对短会话，最好的 Summary 是不运行；只有历史足够长，滚动边界才开始回本。
+              </p>
+            </div>
+
+            <h3>11.2 QMSum：按需找回能换回大部分答案质量</h3>
+            <p>
+              QMSum 原始测试集载入 244 个会议问答，实验保留答案证据距离会议尾部至少 80 条消息的 189 个案例，
+              避免最近窗口直接看到答案。模型为 GPT-4o-mini；Summary 在 40 条消息触发，主视图保留最近 20 条。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>模式</th>
+                    <th>ROUGE-L</th>
+                    <th>F1</th>
+                    <th>平均 prompt token</th>
+                    <th>平均延迟</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td>完整长上下文</td><td>0.1930</td><td>0.3132</td><td>18,986</td><td>4,556 ms</td></tr>
+                  <tr><td>仅 Summary</td><td>0.1516</td><td>0.2238</td><td>888</td><td>2,994 ms</td></tr>
+                  <tr><td>Summary + 按需 Recall</td><td>0.1770</td><td>0.2774</td><td>3,857</td><td>8,656 ms</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              按需 Recall 在仍节省 76.69% prompt token 的同时，挽回了仅 Summary 相对长上下文损失的 61.5% ROUGE-L 与 59.9% F1。
+              代价也很明确：搜索和再次加载让延迟高于另外两组。Recall 是质量兜底，不是免费加速器。
+            </p>
+
+            <h3>11.3 LongMemEval：原文召回决定精确事实题能不能答</h3>
+            <p>
+              LongMemEval 的 single-session-user 子集有 70 个案例；每个案例平均约 50 个会话、500 轮对话和 10.3 万 token。
+              这组数据刻意模拟“用户很久以后追问过去某个细节”，因此比普通多轮聊天更能暴露摘要丢失精确信息的问题。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>模式</th>
+                    <th>ROUGE-L</th>
+                    <th>LLM Judge</th>
+                    <th>Exact Match</th>
+                    <th>平均 prompt token</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td>完整长上下文</td><td>0.1192</td><td>0.7386</td><td>0.6571</td><td>103,565</td></tr>
+                  <tr><td>仅 Summary</td><td>0.0477</td><td>0.0907</td><td>0.0143</td><td>445</td></tr>
+                  <tr><td>Summary + 按需 Recall</td><td>0.2694</td><td>0.9000</td><td>0.7571</td><td>6,182</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这组实验里，Summary + Recall 相对完整长上下文节省 94.04% prompt token，同时三项质量指标都更高。
+              原因不是“摘要比原文准确”，而是检索先从 10 万 token 里找证据，再让模型围绕少量相关原文作答。
+              实验还试过九段式结构化 Summary 并逐字保留用户消息，ROUGE-L 反而从紧凑 Summary 的 0.2694 降到 0.2528；
+              更长、更规整的摘要并不会自动胜过“短 Summary + 原文取证”。
+            </p>
+
+            <p>
+              LoCoMo 上的补充实验也显示 Session Recall 与长期 Memory 不是替代关系：Session Recall 的总体 F1 为 0.549，
+              高于完整长上下文和优化 Memory 的 0.469；但时间推理类别中，优化 Memory 为 0.247，Session Recall 只有 0.174。
+              原始事件擅长还原措辞和局部证据，结构化 Memory 更擅长把跨会话时间关系整理成可检索事实。后者留到下一篇展开。
+            </p>
+
+            <h2>十二、放到 Claude Code 与 Codex 旁边看，差别在恢复路径</h2>
+            <p>
+              Claude Code、Codex 与 tRPC-Agent-Go 都不会把“上下文”简单等同于完整会话记录。它们都保留更耐久的运行历史，
+              再为模型构造一个可以裁剪或替换的视图；真正不同的是压力出现时先牺牲什么，以及压缩后怎样恢复。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>系统</th>
+                    <th>压力到来时</th>
+                    <th>压缩后的主视图</th>
+                    <th>细节恢复</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>tRPC-Agent-Go</td>
+                    <td>先替换旧工具结果，再按阈值同步推进 Session Summary。</td>
+                    <td>Summary + 边界后的 Events。</td>
+                    <td><code>session_search</code> / <code>session_load</code> 回原始事件。</td>
+                  </tr>
+                  <tr>
+                    <td>Claude Code</td>
+                    <td>沿工具预算、局部清理与 auto compact 逐级减压。</td>
+                    <td>以 compact boundary 为界的恢复记录与后续消息。</td>
+                    <td>依赖持久 transcript、恢复记录与工具再读取。</td>
+                  </tr>
+                  <tr>
+                    <td>Codex</td>
+                    <td>先做输出截断与 prompt 投影，必要时执行 compaction。</td>
+                    <td>用 replacement history 安装压缩后的 rollout。</td>
+                    <td>持久 history 与 rollout 恢复链路负责续跑。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这里只比较所有权，不重复另外两篇的源码细节。Claude Code 的边界、microcompact 与 auto compact 见
+              <a href="https://rememorio.github.io/blog/claude-code/zh/context-management/">Claude Code 上下文管理篇</a>；
+              Codex 的 prompt projection、replacement history 与 rollout 恢复见
+              <a href="https://rememorio.github.io/blog/codex/zh/context-management/">Codex 上下文管理篇</a>。
+              tRPC-Agent-Go 的独特组合是：把 Summary 作为 Session 的持久状态，再给被压缩的工具载荷和旧事件留下显式 Recall 工具面。
+            </p>
+
+            <h2>十三、把这套设计带回自己的 Agent</h2>
+            <p>
+              如果要把同样的思路落到别的框架，不必照搬类型名，可以按压力顺序做六个决定：先保存可恢复的原始事件；
+              每轮只投影模型真正需要的视图；优先清理已经消费过的大工具结果；接近窗口上限时再滚动 Summary；
+              为精确信息保留搜索与窗口加载入口；最后才把跨会话事实和可复用方法分别交给 Memory 与 Evolution。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <strong>上下文治理的目标不是把历史压到最短，而是在预算内保留正确的恢复路径。</strong>
+                下一篇沿同一个证书排障任务进入<a href="../trpc-agent-go-memory/">长期 Memory</a>：哪些内容值得跨会话保存，
+                写入前为什么要先检索旧记忆，以及 LoCoMo benchmark 如何验证检索、更新与时间推理。
+              </p>
+            </div>
             <h2 id="sources">参考源码与文档</h2>
             <ul>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/tree/0c7774187da9330144df2a038ef18ee89ef2ae1c">tRPC-Agent-Go 上下文机制快照</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/context_compact.go">请求侧工具结果压缩</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go">滚动 Summary 与边界推进</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/session/tool/recall/search.go">Session Recall 搜索</a>与 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/session/tool/recall/load.go">原始事件窗口加载</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go-benchmark/blob/c9aabe56c0eb1cb80e927d2a34ecc72658173cbe/summary/results/REPORT.md">Summary / Session Recall benchmark 报告</a></li>
+              <li><a href="https://rememorio.github.io/blog/claude-code/zh/context-management/">Claude Code 上下文管理源码阅读</a></li>
+              <li><a href="https://rememorio.github.io/blog/codex/zh/context-management/">Codex 上下文管理源码阅读</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/tree/d3b50fd90d60b4ece8a78e89cf890a4f06d78235">tRPC-Agent-Go repository snapshot</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/README.md">project README feature map</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/agent.go">agent interface</a></li>
