@@ -6,13 +6,13 @@
     <title>Agent 框架源码阅读（十）：tRPC-Agent-Go 把 Go agent 做成服务端 runtime</title>
     <meta
       name="description"
-      content="Agent 框架源码阅读第十篇：先沿 Runner、Agent、Model 的执行主干读懂 tRPC-Agent-Go，再拆 Session、Memory、Artifact、tools、codeexecutor、协议适配与长上下文治理。"
+      content="Agent 框架源码阅读第十篇：跟着一次客服排障 run，看 Runner 怎样组织 Agent、Model、Session、Memory、Artifact、工具执行、协议适配与长上下文治理。"
     />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Agent 框架源码阅读（十）：tRPC-Agent-Go 把 Go agent 做成服务端 runtime" />
     <meta
       property="og:description"
-      content="从 Runner 驱动 Agent、Agent 调用 Model 的主干出发，看 Session、Memory、Artifact、tools、Graph 与协议服务怎样组成 Go-native agent runtime。"
+      content="从一次完整 run 出发，看 Runner 怎样搭起运行工作台，Agent 怎样让 Model 与工具接力，Session、Memory、Artifact 和 Evolution 又怎样接住状态。"
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/trpc-agent-go-memory-summary.png" />
@@ -152,13 +152,15 @@
             <h1>tRPC-Agent-Go 把 Go agent 做成服务端 runtime</h1>
             <p class="lead">
               一个客服 Agent 从网页接单，查询日志和工单，生成文件，等待用户第二天回来，还要记得此前进度。
-              tRPC-Agent-Go 把这些生产责任组织成一套 Go 服务端 runtime；本文先沿 Runner、Agent、Model
-              这条执行主干看完整框架，再重点拆 Rememorio 推进最集中的 <code>summary</code> 与 <code>memory</code>。
+              tRPC-Agent-Go 把这些生产责任组织成一套 Go 服务端 runtime；本文跟着一次完整 run，看 Runner 怎样给 Agent
+              准备会话、长期资料和文件服务，Agent 又怎样让 Model 与工具接力，最后再重点拆 Rememorio 推进最集中的
+              <code>summary</code> 与 <code>memory</code>。
             </p>
             <div class="meta-line">
               <span>主题：tRPC-Agent-Go</span>
-              <span>主干：Runner / Agent / Model</span>
-              <span>服务：Session / Memory / Artifact</span>
+              <span>运行入口：Runner</span>
+              <span>执行：Agent / Model / Tool</span>
+              <span>状态服务：Session / Memory / Artifact</span>
               <span>重点：summary / memory / session_load</span>
             </div>
             <figure class="hero-image">
@@ -173,9 +175,8 @@
             <div class="note key-point">
               <p>
                 <strong>阅读契约。</strong>
-                这篇先回答三个问题：谁建立并收尾一次 run，谁决定这一轮怎样执行，谁只负责根据请求生成下一步。
-                读完以后，你应该能把 Runner、Agent、Model 放回正确调用顺序，并说明 Session、Memory、Artifact、Tool、
-                CodeExecutor、Graph 和协议 adapter 分别接在哪一侧。
+                全文只跟踪同一个任务：“继续排查昨天的证书错误，并生成一份报告。”读完后，你应该能复述这次工作从哪里开始、
+                模型和工具怎样接力、进度与文件保存到哪里，以及本轮结束后哪些内容会进入会话摘要、长期资料或可复用方法。
               </p>
             </div>
 
@@ -183,8 +184,7 @@
               <p>
                 <strong>证据边界。</strong>
                 源码链接固定到公开快照 <code>d3b50fd90d60b4ece8a78e89cf890a4f06d78235</code>。
-                文中“owner”“主干”“账本”“投影”是工程归纳；直接行为以公开源码中的 runner、agent、model、session service、
-                event、memory、artifact、tool、graph、evolution、server 和 processor 为准。
+                文中“工作台”“账本”“投影”是帮助理解的工程归纳；具体调用、持久化和完成路径都以文中链接的公开源码为准。
               </p>
             </div>
 
@@ -200,116 +200,177 @@
               就是把这些“模型之外”的生产责任接进同一条运行主线。
             </p>
 
-            <h2>二、先抓住三层主干：Runner、Agent、Model</h2>
             <p>
-              如果把 package 名都摆在同一排，最容易把 Event、Session、Tool、Graph 和 Agent 误当成平级“角色”。
-              更清楚的读法，是先沿调用方向抓住三层主干，再把服务和组件挂回它们真正出现的位置：
-            </p>
-            <pre><code>请求边界
-  -&gt; Runner：建立 run、选择 Agent、挂载服务、收集结果
-       -&gt; Agent.Run(invocation)：决定这一轮怎样执行
-            -&gt; Model.GenerateContent(request)：生成文本或 tool call
-            -&gt; Tool / CodeExecutor：执行外部动作
-       &lt;- Event stream：把进度与结果交回 Runner
-  -&gt; SessionService：持久化 Session、Event、State、Summary
-
-旁路服务：MemoryService / ArtifactService / EvolutionService
-边界适配：AG-UI / A2A / OpenAI-compatible server</code></pre>
-            <p>
-              这张形状图表达的是 owner，不是“所有调用都只有一条直线”。关键结论是：
-              <strong>Runner 驱动 Agent，Agent 才驱动 Model；Event 是返回路径上的数据载体，Session 是被服务管理的运行记录。</strong>
+              可以先把它理解成<strong>包在 Agent 外面的一套任务运行系统</strong>。模型只负责根据当前材料生成下一步；
+              Agent 负责把下一步变成一段可执行工作；tRPC-Agent-Go 还要接住入口、会话、工具、文件、恢复和收尾。
+              从外部请求被接住，到最终结果持续返回并完成持久化，这一整段生命周期叫作一次 <strong>run</strong>。
+              一次 run 可能经历多次模型调用和工具执行，不能把它误解成一次 completion。
             </p>
 
-            <h3>2.1 Runner：谁把一个请求变成一次可管理的 run</h3>
+            <h2>二、Runner 不是一根管道，而是一张运行工作台</h2>
             <p>
-              Runner 站在应用入口和 Agent 之间。它先按 app、user、session 找到或创建会话，再选择本次要运行的 Agent，
-              最后建立 Invocation，把当前消息和可选服务交给 Agent。Agent 返回事件流后，Runner 继续负责取消、持久化、插件回调与对外转发。
-              因此 Runner 拥有的是<strong>一次 run 的生命周期</strong>，不是模型推理本身。源码可以从
+              用户说“继续查昨天的证书错误”时，系统不能立刻把这句话丢给模型。它要先认出用户和会话，找回昨天的记录，
+              选择负责排障的 Agent，准备长期资料与文件存储，再保证执行过程可以取消、持久化和向外流式返回。
+              tRPC-Agent-Go 把这张工作台交给 <strong>Runner</strong> 管理。
+            </p>
+
+            <pre><code>Runner 管理的一次 run
+  1. 认出用户，打开当前工单
+  2. 选择 Agent，建立本轮工作单
+  3. 准备长期资料与文件服务
+  4. 接收执行进度，持久化并流式返回
+  5. 完成后判断是否要总结、抽取事实或复盘方法</code></pre>
+
+            <p>
+              这不是另一张 package 清单，而是一张工作分配图。Session、Memory 和 Artifact 不是远离 Runner 的“旁路服务”：
+              Runner 自己持有这些 service，并在建立本轮工作单时把它们交给 Agent 使用。Evolution 也由 Runner 持有，
+              但它不进入前台工作单，而是在 run 完成后接手复盘。
+            </p>
+
+            <h3>2.1 Runner：先开工单，再监督整轮工作</h3>
+            <p>
+              Runner 做的第一件事不是推理，而是把一次请求变成可管理的工作。它找回或创建 Session，选择 Agent，保存本轮输入，
+              然后登记这次 run，后面才能处理取消、并发和完成状态。可以把它想成客服中心的值班主管：主管不亲自判断证书为什么失效，
+              但他要确保工单、处理人、资料、产物和回报渠道都在。
+            </p>
+
+            <p>
+              源码里的 <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L299-L323"><code>runner</code> 字段</a>
+              直接保存 Agent 注册表以及 Session、Memory、Artifact、Evolution 等 service。
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L510-L754"><code>Run</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L756-L793"><code>newRunInvocation</code></a>
-              开始读。
+              负责从会话装载一路走到 <code>Agent.Run</code>；它创建的本轮工作单叫作
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/invocation.go#L119-L173"><code>Invocation</code></a>。
+              Invocation 不是另一位执行者，而是把“谁来做、处理哪条消息、使用哪个会话和哪些服务”装在一起的运行上下文。
             </p>
 
-            <h3>2.2 Agent：谁决定这一轮采用哪种执行方式</h3>
+            <h3>2.2 Agent：拿到工作单后，决定怎样把任务做完</h3>
             <p>
-              <code>agent.Agent</code> 的核心契约是 <code>Run</code> 返回事件 channel，外加可用 tools、描述信息和 sub-agents。
-              这意味着 Agent 是框架统一的<strong>可执行单元</strong>，但它不等于“一个 LLM 循环”。
-              <code>LLMAgent</code> 会调用模型和工具；<code>GraphAgent</code> 会执行状态图；Chain、Parallel、Cycle 等实现则组合其他 Agent。
-              Runner 只依赖同一个
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/agent.go#L61-L83"><code>Agent</code> interface</a>，
-              不需要把每种执行策略写进自己。
+              Agent 是真正接下工作单的执行者。排查证书时，它决定先读历史还是先查日志、什么时候调用诊断工具、
+              什么时候材料已经足够并交付答案。不同任务需要不同执行方式，因此 Agent 不等于一个固定的模型循环：
+              LLMAgent 会让模型和工具反复接力，GraphAgent 按预先编译的状态图推进，Chain、Parallel、Cycle 则组合多个 Agent。
             </p>
 
-            <h3>2.3 Model：谁把模型供应商差异收束成生成接口</h3>
             <p>
-              <code>model.Model</code> 的公开职责很窄：接收 <code>model.Request</code>，流式返回 <code>model.Response</code>，并报告模型信息。
-              OpenAI、Anthropic、Gemini 等 adapter 可以有不同 wire shape，但 Agent flow 面向同一
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/model/model.go#L45-L57"><code>Model</code> interface</a>。
-              <code>LLMAgent</code> 在运行开始时把选中的模型放进 Invocation，随后
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/llmflow/llmflow.go#L2330-L2387"><code>llmflow</code></a>
-              才真正调用 <code>GenerateContent</code>。Model 不负责会话落盘、文件版本或用户长期记忆。
+              框架用同一个
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/agent.go#L61-L83"><code>Agent</code> interface</a>
+              收束这些差异：Runner 交出 Invocation，Agent 返回一条 Event channel。这样 Runner 只监督 run，
+              不必知道内部是一次模型循环、一张图，还是多个子 Agent 并行执行。
             </p>
 
-            <h3>2.4 服务和组件为什么不能继续与三者并排</h3>
+            <h3>2.3 Model 与 Tool：一个提出下一步，一个真正动手</h3>
             <p>
-              Session、Memory 和 Artifact 都有明确的数据与 service contract：Session 保存当前会话的 Events、State 与 Summaries，
-              <code>session.Service</code> 负责创建、读取和追加；MemoryService 管跨会话事实；ArtifactService 管按 session 和文件名版本化的产物。
-              Tool 与 CodeExecutor 则是 Agent 可以调用的能力接口。它们很重要，但它们回答的是“状态存哪”“动作怎么做”，
-              不是“谁驱动这一轮”。
+              模型不是整位 Agent。它只看这一刻准备好的请求，然后返回文本，或者提出“请调用日志查询工具”这样的 tool call。
+              真正连接日志系统、执行代码和保存文件的是 Tool；LLMAgent 把工具结果放回上下文，再问模型下一步。
+              因而一次排障 run 里可能出现“模型判断 → 工具行动 → 模型再判断”的多次往返。
             </p>
+
             <p>
-              Event 也应放回正确位置：它包着模型 response、调用身份、状态增量和执行元数据，由 Agent 产生、Runner 处理，
-              再由 SessionService 持久化或由协议层翻译。把 Event 叫成与 Runner、Agent、Model 平级的角色，会掩盖这条流向。
-              对应结构见
+              源码边界也很克制：
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/model/model.go#L45-L57"><code>model.Model</code></a>
+              只定义生成与模型信息；真正的 provider 调用发生在
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/llmflow/llmflow.go#L2330-L2387"><code>llmflow</code></a>。
+              会话保存、工具循环和长期资料都不属于 Model。
+            </p>
+
+            <h3>2.4 三类状态服务：本轮档案、长期资料与文件产物</h3>
+
+            <h4>当前排障怎样继续：SessionService</h4>
+            <p>
+              Session 是这次证书排障的工单夹：用户说过什么、Agent 调过什么工具、结果和状态怎样变化，都按顺序留下。
+              每一条过程记录叫作 Event；SessionService 负责创建、读取和追加这些记录。用户明天回来时，Runner 先从这里恢复“昨天做到哪里”，
+              而不是要求模型凭空记住。结构见
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/session.go#L60-L88"><code>Session</code></a>、
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/session.go#L1045-L1111"><code>session.Service</code></a>
               和
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/event/event.go#L95-L166"><code>Event</code></a>。
             </p>
 
-            <h2>三、沿一次请求看主干怎样调用组件</h2>
-            <ol>
-              <li>网页通过 AG-UI 发来问题；A2A 和 OpenAI-compatible 请求虽然 wire contract 不同，也会先被 adapter 翻成 Runner 能接收的输入。</li>
-              <li>Runner 用 app、user、session 标识调用 SessionService；命中就恢复 Session，未命中就创建。</li>
-              <li>Runner 选择 Agent，建立 Invocation，并把 Session、当前消息、MemoryService、ArtifactService 与插件上下文挂进去。</li>
-              <li>Runner 调 <code>Agent.Run</code>。若选中 LLMAgent，它会选择 Model、运行 request processors，组装模型可见历史、工具声明和生成配置。</li>
-              <li>Agent flow 调 <code>Model.GenerateContent</code>。Model 返回文本或 tool call；Model 到这里就完成了自己的职责。</li>
-              <li>若出现 tool call，LLMAgent 的 flow 调 Tool；代码执行交给 CodeExecutor，生成文件时可以通过 workspace/artifact 工具写入 ArtifactService，然后结果回到下一次模型调用。</li>
-              <li>模型片段、tool call、tool result、错误和状态增量被包装成 Event。Runner 一边把 Event 发给调用方，一边通过 SessionService 追加到 Session。</li>
-              <li>run 完成后，summary、auto memory 和 evolution 可以进入各自后台路径；下一轮再由 processor 把 summary、近期事件和必要 memory 组装成新的模型请求。</li>
-            </ol>
-
-            <pre><code>Server adapter
-  -&gt; Runner.Run(user, session, message)
-       -&gt; session.Service.GetSession / CreateSession
-       -&gt; Invocation{Agent, Session, services}
-       -&gt; Agent.Run
-            LLMAgent -&gt; request processors -&gt; model.Model.GenerateContent
-                     -&gt; Tool / CodeExecutor
-                     &lt;- event.Event stream
-       -&gt; session.Service.AppendEvent
-  &lt;- 对外 event channel</code></pre>
+            <h4>换了工单还应知道什么：MemoryService</h4>
             <p>
-              这是 shape-level 路径，不是逐行复制源码。源码中的关键交接点是 Runner 调
+              Session 只回答“这张工单发生过什么”。如果用户新开一张工单，系统仍应知道“生产环境使用 Go”这样的稳定事实，
+              就要交给 MemoryService。它保存跨 Session 的 fact 和 episode，可以在下一轮预加载，也可以按需搜索；
+              但它不代替当前工单的原始记录。公开接口见
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L155-L236"><code>memory.Service</code></a>。
+            </p>
+
+            <h4>报告为什么不塞回聊天文本：ArtifactService</h4>
+            <p>
+              排障脚本、日志切片和最终报告可能很大，也可能反复修改。如果全部塞进 Event 文本，既难版本化，也难让前端稳定引用。
+              ArtifactService 因此按 Session、文件名和 revision 保存文件。Agent 通过工具产生或读取文件，Session 只需要保留这次动作和可见结果。
+              对应的服务接口在
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/artifact/service.go#L14-L78"><code>artifact.Service</code></a>。
+            </p>
+
+            <p>
+              还有一类完成后才运行的服务：Evolution Service。它不为当前排障提供资料，也不保存用户事实；Runner 在 run 完成后把会话快照交给它，
+              让它判断“先检查证书有效期”这类做法是否值得沉淀成 Skill。后文会完整拆这条后台路径。
+            </p>
+
+            <h2>三、跟着一次客服排障走完一轮</h2>
+
+            <h3>3.1 请求先进入 Runner，而不是直接进入模型</h3>
+            <p>
+              网页用 AG-UI 发来“继续查昨天的证书错误，并生成报告”。协议 adapter 先把外部请求翻成 Runner 能识别的用户、会话和消息；
+              A2A 与 OpenAI-compatible 接口也能启动 run，只是它们携带身份和历史的方式不同。协议层负责翻译，Runner 才负责运行。
+            </p>
+
+            <h3>3.2 Runner 打开工作台，并把服务装进 Invocation</h3>
+            <p>
+              Runner 根据 app、user、session 找回昨天的 Session，选择负责排障的 Agent，再建立 Invocation。
+              这张工作单包含当前消息、Session、Agent、运行选项，以及 SessionService、MemoryService、ArtifactService。
+              在启动 Agent 之前，Runner 还会保存当前用户输入；即使后面的模型或工具失败，这次请求也不会像从未发生过。
+              源码交接点见
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L571-L734">会话装载、Invocation 与启动前持久化</a>
+              和
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L756-L793"><code>newRunInvocation</code></a>。
+            </p>
+
+            <h3>3.3 Agent 让 Model 与工具反复接力</h3>
+            <p>
+              Runner 调用 Agent 后，具体执行方式才开始分叉。这里假设选中 LLMAgent：它先把 Session 中需要的历史、可能预加载的 Memory、
+              可用工具和当前消息组装成模型请求。Model 可能先要求查证书信息；工具执行并返回结果后，LLMAgent 再次调用 Model。
+              Model 随后要求运行诊断代码，CodeExecutor 真正执行；如果生成报告，文件写入 ArtifactService。
+            </p>
+
+            <pre><code>用户：继续排查昨天的证书错误，并生成报告
+Runner：恢复工单，选择 Agent，准备会话、长期资料和文件服务
+Agent：整理当前材料，询问 Model 下一步
+Model：请查询证书详情
+Tool：返回证书已过期的证据
+Model：请运行诊断并生成报告
+CodeExecutor / ArtifactService：执行诊断，保存报告文件
+Model：材料足够，生成最终说明</code></pre>
+
+            <p>
+              这段例子说明了三个边界：Runner 管整轮，Agent 管执行循环，Model 只生成某一步的文本或 tool call。
+              实际源码由 Runner 调
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L727-L753"><code>Agent.Run</code></a>，
-              <code>LLMAgent</code> 再进入
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L1499-L1584">LLM flow</a>，
-              Event 回到 Runner 后由
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L1372-L1456"><code>processSingleAgentEvent</code></a>
-              判断持久化与转发。
-            </p>
-            <p>
-              用户第二天回来时，主干没有变：Runner 重新读取同一 Session，再启动 Agent。变化的是 Agent 交给 Model 的请求投影：
-              旧事件可以被 summary 压成短上下文，稳定事实可以从 memory 进入，必要时再用 <code>session_load</code> 找回原始证据。
-              顶部图片讲的正是这条“下一轮模型视图”支线。
+              LLMAgent 再进入
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L1499-L1584">LLM flow</a>。
             </p>
 
-            <h2 id="runtime-map">四、现在再把源码 owner 压成一张表</h2>
+            <h3>3.4 Event 把过程交回 Runner，完成后再启动后台工作</h3>
             <p>
-              仓库 README 把项目定位为 production agent systems 的 Go framework，而不是 memory library。
-              先学会 Runner → Agent → Model 的调用方向，再用下面这张表压缩 package 分工，才不会把功能清单误当成架构。
-              项目范围可对照
+              文本片段、tool call、tool result、错误和状态变化都会包装成 Event。Runner 一边把 Event 流式交给协议层，
+              一边让 SessionService 保存符合条件的完整事件；因此 Event 是运行过程的传递格式，不是又一位执行者。
+              持久化后的事件可能触发 summary 检查；Runner 发出完成事件后，再排 auto memory 与 evolution 任务。
+              对应路径在
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L1372-L1456"><code>processSingleAgentEvent</code></a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L2419-L2519"><code>handleEventPersistence</code></a>
+              和
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L2810-L2856">完成路径</a>。
+            </p>
+
+            <p>
+              现在可以完整复述一次 run：<strong>协议层接住请求 → Runner 打开工作台 → Agent 让 Model 与工具接力 → Event 报告过程 →
+              Runner 保存记录并收尾 → summary、memory、evolution 在各自条件满足时处理后续状态。</strong>
+              用户第二天回来时，Runner 再打开同一 Session，顶部图片讲的正是旧记录与长期资料怎样进入下一轮模型视图。
+            </p>
+
+            <h2 id="runtime-map">四、完整走完以后，再把责任压回源码</h2>
+            <p>
+              到这里再看 package，读者已经知道每个名字在客服任务的哪一刻出现。下面这张表不再按“功能多少”排序，
+              而是把刚才走过的问题压成源码入口。项目的完整范围可对照
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/README.md#L13-L39">README feature map</a>。
             </p>
 
@@ -317,65 +378,65 @@
               <table>
                 <thead>
                   <tr>
-                    <th>Owner</th>
-                    <th>它拥有的责任</th>
-                    <th>边界到哪里为止</th>
+                    <th>运行中的问题</th>
+                    <th>源码 owner</th>
+                    <th>读者可以怎样理解</th>
                     <th>第一眼源码</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr>
+                    <td>谁建立并收尾一整轮工作？</td>
                     <td>Runner / Invocation</td>
-                    <td>run identity、会话装载、Agent 选择、服务注入、事件持久化、取消与完成路径。</td>
-                    <td>驱动 Agent，但不直接实现 Agent 策略或 provider 调用。</td>
+                    <td>Runner 搭工作台并监督生命周期；Invocation 是交给 Agent 的本轮工作单。</td>
                     <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L299-L323"><code>runner</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/invocation.go#L119-L173"><code>Invocation</code></a></td>
                   </tr>
                   <tr>
+                    <td>谁决定任务采用哪种执行方式？</td>
                     <td>Agent family</td>
-                    <td>统一执行接口，以及 LLMAgent、GraphAgent、Chain/Parallel/Cycle、sub-agent 等执行策略。</td>
-                    <td>产生 Event；是否使用 Model 取决于具体 Agent 实现。</td>
+                    <td>LLMAgent、GraphAgent 或组合 Agent 都通过同一接口执行并返回 Event。</td>
                     <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/agent.go#L61-L83"><code>Agent</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L60-L89"><code>LLMAgent</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/graphagent/graph_agent.go#L38-L52"><code>GraphAgent</code></a></td>
                   </tr>
                   <tr>
+                    <td>谁只负责生成下一步？</td>
                     <td>Model adapters</td>
-                    <td>把统一 Request 翻成 provider 请求，再把流式响应归一回来。</td>
-                    <td>不拥有 session、tool loop、artifact 或 memory。</td>
+                    <td>把统一 Request 发给 provider，再把流式 Response 交回 Agent flow。</td>
                     <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/model/model.go#L45-L57"><code>model.Model</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/internal/flow/llmflow/llmflow.go#L2330-L2387">provider call</a></td>
                   </tr>
                   <tr>
+                    <td>本轮经过在哪里保存？</td>
                     <td>SessionService + Session / Event</td>
-                    <td>当前会话的 Events、State、Summaries，以及创建、读取、追加和恢复。</td>
-                    <td>保存运行账本；模型看到的是 processor 生成的投影，不一定是全部原始事件。</td>
+                    <td>Session 是工单夹，Event 是按顺序写入的过程记录，Service 负责读写。</td>
                     <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/session.go#L60-L88"><code>Session</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/session.go#L1045-L1111"><code>Service</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/event/event.go#L95-L166"><code>Event</code></a></td>
                   </tr>
                   <tr>
+                    <td>新工单怎样拿到稳定的旧资料？</td>
                     <td>MemoryService</td>
-                    <td>跨 session 的 fact / episode，支持显式工具、预加载与自动抽取。</td>
-                    <td>不压缩当前 session，也不替代原始事件。</td>
+                    <td>保存跨 Session 的事实和经历，通过预加载或工具按需取回。</td>
                     <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L155-L236"><code>memory.Service</code></a></td>
                   </tr>
                   <tr>
+                    <td>报告和脚本怎样独立保存？</td>
                     <td>ArtifactService</td>
-                    <td>按 session、文件名和 revision 保存、读取、列举与删除产物。</td>
-                    <td>保存文件本体；Event 或 tool result 只承载引用与可见结果。</td>
+                    <td>按 Session、文件名和 revision 保存文件，不把文件本体塞进聊天记录。</td>
                     <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/artifact/service.go#L14-L78"><code>artifact.Service</code></a></td>
                   </tr>
                   <tr>
+                    <td>模型提出动作后，谁真正执行？</td>
                     <td>Tool / Skill / CodeExecutor</td>
-                    <td>工具 schema 与调用、可复用 <code>SKILL.md</code> 工作流、代码和工作区执行。</td>
-                    <td>提供能力，不拥有顶层 run；调用时仍受 Agent flow 与 context cancellation 控制。</td>
+                    <td>把查询、工作流和代码执行变成 Agent 可以调用的受控能力。</td>
                     <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/tool.go#L15-L56"><code>tool</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/skill/repository.go#L12-L76"><code>skill.Repository</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/codeexecutor/codeexecutor.go#L23-L42"><code>CodeExecutor</code></a></td>
                   </tr>
                   <tr>
+                    <td>本轮方法怎样变成以后可复用的 Skill？</td>
                     <td>Evolution Service</td>
-                    <td>在 run 后 review session delta，把可复用做法经过 revision、gate 与 publisher 写回 managed skills。</td>
-                    <td>学习程序性方法，不保存用户事实。</td>
+                    <td>完成后复盘 Session，把程序性经验送入受控的 Skill 发布流程。</td>
                     <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/service.go#L23-L70"><code>evolution.Service</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L121-L127"><code>WithEvolutionService</code></a></td>
                   </tr>
                   <tr>
+                    <td>网页、其他 Agent 和兼容客户端怎样接入？</td>
                     <td>Server adapters</td>
-                    <td>把 AG-UI、A2A 和 OpenAI-compatible 的 identity、history 与 stream contract 翻成 Runner 调用。</td>
-                    <td>协议可以共用 Runner，但 wire semantics 不会因此相同。</td>
+                    <td>把各自的身份、历史与事件格式翻成 Runner 调用，再把 Event 翻回协议。</td>
                     <td><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/agui.go#L25-L55"><code>AG-UI</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/a2a/server.go#L39-L74"><code>A2A</code></a>、<a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/openai/server.go#L59-L117"><code>OpenAI-compatible</code></a></td>
                   </tr>
                 </tbody>
@@ -383,17 +444,17 @@
             </div>
 
             <p>
-              现在可以看出两类常见误读。第一，GraphAgent 不是 Runner 旁边的另一套顶层 runtime，它实现同一个 Agent 接口；
-              第二，Session、Memory、Artifact 不是三个“Agent 能力标签”，而是有独立生命周期和存储语义的服务。
-              后面的 summary 与 memory，正是 SessionService、Runner completion 和下一轮 request processor 合作出来的长上下文回路。
+              表格只是在压缩已经走过的流程。真正要记住的是：Runner 搭工作台并持有服务，Agent 接工作单，Model 只生成下一步，
+              Tool 真正行动，Event 把过程带回 Session。后面的 summary 与 memory，就是这张工作台在“当前工单太长”和“未来工单还需稳定事实”
+              两种压力下长出来的机制。
             </p>
 
-            <h2>五、三层主干怎样扩展成完整框架</h2>
+            <h2>五、这张运行工作台怎样扩展成完整框架</h2>
             <p>
-              接下来不平均介绍 package，而是按主干位置看几条会改变应用写法的路径：
-              GraphAgent 扩展 Agent 的执行策略；Skill 与 CodeExecutor 扩展 Agent 的能力面，ArtifactService 接住文件结果；
-              Evolution 挂在 run 完成后的学习支路；AG-UI、A2A 和 OpenAI-compatible server 则站在 Runner 之前翻译外部协议。
-              这样读，功能再多也不会失去调用方向。
+              基础 run 讲清楚后，其他机制就能按问题自然出现：排障路线需要确定性时，Agent 可以换成 GraphAgent；
+              需要查询、运行代码和复用操作手册时，给 Agent 增加 Tool、CodeExecutor 与 Skill；生成文件时由 ArtifactService 保存；
+              同类任务反复出现时，Evolution 在 run 后学习方法；需要接网页、其他 Agent 或兼容客户端时，再由协议 adapter 包住 Runner。
+              下面只挑这些会改变应用写法的路径深入。
             </p>
 
             <h3>5.1 GraphAgent：流程图先落成状态机，再回到 Agent 接口</h3>
@@ -404,12 +465,9 @@
             </p>
 
             <p>
-              tRPC-Agent-Go 的做法是把这部分控制权从 prompt 里拿出来。<code>StateGraph</code> 用
-              <code>AddNode</code> 包装普通函数节点并创建触发 channel；<code>AddLLMNode</code>、<code>AddToolsNode</code>、
-              <code>AddAgentNode</code> 把模型、工具和子 agent 也变成图节点；<code>AddEdge</code> 建普通边，
-              <code>AddJoinEdge</code> 建等待多个前驱的 barrier，<code>AddConditionalEdges</code> 和
-              <code>AddMultiConditionalEdges</code> 建单路或多路条件分发，最后 <code>Compile</code> 做图结构校验。
-              这部分源码集中在
+              tRPC-Agent-Go 的做法，是把“下一步走到哪里”从 prompt 里拿出来，交给一张由 Go 代码定义的状态图。
+              图里的一个节点可以是普通函数，也可以调用模型、工具或另一个 Agent；节点之间的边负责表示顺序、分支和汇合。
+              图在运行前还会检查结构，避免把走不到的终点、无效的分支留到线上才暴露。对应实现集中在
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L600-L775">节点注册</a>
               和
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/graph/state_graph.go#L820-L1039">边、join、条件路由、compile</a>。
@@ -466,25 +524,25 @@
               可选文档、可选脚本和可执行工作区。模型不需要一开始读完所有材料，也不应该直接拿到任意 shell 权限。
             </p>
 
+            <h4>先读说明，再决定要不要执行</h4>
             <p>
-              第一层是发现和加载。<code>FSRepository</code> 扫描每个包含 <code>SKILL.md</code> 的目录，建立 skill 元数据；
-              <code>skill_load</code> 校验 skill 是否存在，然后把“已加载 skill、可用 docs、选中的 docs”写成 session state delta。
-              它的重点不是把所有说明一次性塞进 prompt，而是让模型按需打开能力说明。源码在
+              还是回到证书排障。Agent 发现自己需要生成一份诊断报告时，第一步不是立刻执行脚本，而是先从 Skill 仓库找到
+              “生成诊断报告”这项能力，读取它的说明；如果说明还引用了格式规范或排障手册，再按需打开那些文档。
+              加载结果会记进当前 Session，因此下一次模型调用知道自己已经读过什么，不必把整座资料库反复塞进 prompt。
+              这条渐进加载路径由
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/skill/repository.go#L112-L165"><code>FSRepository.Refresh</code></a>
               和
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/load.go#L126-L205"><code>skill_load</code></a>。
             </p>
 
+            <h4>真正动手时，才打开受控工作区</h4>
             <p>
-              第二层是工具面组合。<code>LLMAgent</code> 会先收集用户传入的 tools、toolsets、knowledge、时间工具等，
-              再根据 skills 和 executor 判断是否需要 workspace registry，并把 <code>workspace_exec</code> 和 skill tools 接到同一个工具面。
-              skill profile 也会影响暴露范围：knowledge-only 只给加载和文档选择；完整执行路径才会加上 <code>skill_run</code>、
-              <code>skill_exec</code>、<code>skill_stdin</code>、<code>skill_poll</code>、<code>skill_kill</code>。
-              对应源码在
+              “知道怎么做”和“真的执行”是两种权限。只读型 Agent 可以只获得 Skill 说明；需要运行脚本的 Agent，才会获得工作区和进程控制工具。
+              LLMAgent 会根据配置组装这层工具面，而不是让每个 Skill 默认拥有任意 shell。这样，同一份能力既能作为知识被阅读，
+              也能在明确授权后变成一次可观察、可取消、能收集输出的执行。源码入口是
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L780-L830">tool surface 构建</a>、
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/option.go#L974-L990">skill profiles</a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L953-L1031"><code>appendSkillToolsWithRepoAndFlags</code></a>。
+              和 <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L953-L1031">Skill 工具装配</a>。
             </p>
 
             <div class="table-wrap">
@@ -522,17 +580,12 @@
             </div>
 
             <p>
-              这条链路里，<code>CodeExecutor</code> 和 <code>Artifact</code> 的分工也就清楚了。<code>CodeExecutor</code>
-              定义“怎样执行代码块”；workspace tools 负责把工作目录、加载后的 skills 和执行引擎接起来；artifact service
-              负责把文件变成有 app/user/session 归属的持久产物。具体实现可以从
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L468-L544"><code>skill_run</code> 的执行入口</a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L918-L935"><code>stageSkill</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L1180-L1223">命令策略</a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/agent/llmagent/llm_agent.go#L1415-L1463"><code>WithLoadedSkills</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/workspace_exec.go#L159-L170"><code>workspace_exec</code> 的服务依赖</a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/save_artifact.go#L61-L160"><code>workspace_save_artifact</code></a>
-              串起来读。
+              到这里，三个容易混淆的概念就能分开了：CodeExecutor 是“机器怎样运行代码”，workspace 是“这次运行在哪个临时工作现场发生”，
+              ArtifactService 则是“哪些结果要离开现场，作为报告或文件长期保存”。以证书排障为例，脚本在工作区生成报告，执行器负责跑脚本，
+              最后 ArtifactService 才把报告变成带 app、user、session 归属的持久产物。可沿着
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L468-L544">Skill 执行入口</a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L918-L935">工作副本准备</a>
+              和 <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/save_artifact.go#L61-L160">文件持久化</a> 顺读这条链路。
             </p>
 
             <h3>5.3 Evolution Service：Skill 不只会被加载，也会被后台学习出来</h3>
@@ -543,16 +596,13 @@
             </p>
 
             <p>
-              tRPC-Agent-Go 把这件事拆成后台学习管线。<code>runner.WithEvolutionService</code> 把 service 挂到 Runner；
-              runner completion 之后会调用 <code>enqueueEvolutionLearningJob</code>，用 <code>context.WithoutCancel</code>
-              把当前 session 送进 worker。worker 读取 <code>evolution:last_review_at</code> 之后的增量，扫描消息、tool calls、用户纠正和错误恢复信号，
-              再交给 <code>ReviewPolicy</code> 判断是否值得 review。触发条件默认是至少 4 次 tool call、出现用户纠正，或者工具错误后被 assistant 恢复。
-              源码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L3910-L3930"><code>enqueueEvolutionLearningJob</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/worker.go#L297-L391"><code>processJob</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/worker.go#L1094-L1169"><code>scanDelta</code></a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/policy.go#L21-L69"><code>DefaultReviewPolicy</code></a>。
+              tRPC-Agent-Go 把复盘安排在 run 完成之后。Runner 先把当前 Session 交给后台 worker，让用户及时拿到结果；worker 只阅读
+              “上次复盘以后新增的部分”，再寻找值得沉淀的证据，例如多次工具协作、用户纠正，或一次失败后成功恢复。
+              证据不足就跳过，证据充分才让 reviewer 判断能否形成通用方法。这样，Evolution 学的是“这类任务以后怎样做”，
+              而不是复制“这个用户刚才说了什么”。源码可以从
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L3910-L3930">Runner 的完结后入队</a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/worker.go#L297-L391">增量复盘</a>
+              和 <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/policy.go#L21-L69">复盘门槛</a> 开始读。
             </p>
 
             <div class="table-wrap">
@@ -595,17 +645,12 @@
             </div>
 
             <p>
-              发布后的结果仍然回到 Skill 主线：<code>filePublisher</code> 把 skill 写成 managed 目录下的
-              <code>SKILL.md</code>，<code>applyDecision</code> 在发生变更后刷新 repository，下一轮 LLMAgent 就能通过
-              <code>skill_load</code> 或 overview 看到新能力。如果启用了 revision 管线，<code>Revision</code> 还会带着
-              <code>pending</code>、<code>active</code>、<code>rejected</code>、<code>pending_eval</code>、<code>pending_approval</code>
-              等状态，<code>ApprovalService</code> 可以把 pending approval 的 revision 交给外部人审后再 promote。
-              这部分源码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/publisher.go#L21-L58"><code>Publisher</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/worker.go#L394-L429"><code>applyDecision</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/revision.go#L26-L130"><code>Revision</code> lifecycle</a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/approval_service.go#L38-L92"><code>ApprovalService</code></a>。
+              Reviewer 的建议也不会自动变成下一轮能力。系统会先拿它和现有技能库比对，避免重复或互相冲突；需要更严格治理时，
+              候选 Skill 还要经过规格、安全性、效果评估和可选的人审。通过后，它才被发布到受管目录并刷新仓库，下一次 run 才能加载。
+              这条“候选方案 → 检查 → 批准 → 发布”的路径见
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/reconcile.go#L69-L108">技能库对账</a>、
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/worker.go#L758-L854">发布门禁</a>
+              和 <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/approval_service.go#L38-L92">外部审批</a>。
             </p>
 
             <p>
@@ -617,41 +662,30 @@
             <h3>5.4 AG-UI：前端协议不是壳子，它重新定义输入、运行和事件翻译边界</h3>
             <p>
               前端接 agent 时，最容易低估协议层。一个文本流接口只要把 assistant delta 往外推就行；
-              但 AG-UI 还要处理用户消息、tool result 消息、多模态内容、外部工具、运行取消、runtime state、graph interrupt、
-              artifact、reasoning、tool call lifecycle 和最终完成事件。这里的 server adapter 不是示例 glue code，而是运行时边界。
+              但真正的 Agent 界面还要回答三类问题：这次运行开始和结束了吗？工具或图现在走到哪一步？生成的文件、等待确认的动作和取消请求怎样对应到同一次运行？
+              AG-UI 的作用，就是把这些只存在于 runtime 里的状态翻成前端可以稳定消费的协议事件。
             </p>
 
             <p>
-              <code>server/agui.New</code> 先把底层 <code>runner.Runner</code> 包成 service 和 HTTP handler，
-              配上 path、cancel、snapshot 等选项。真正进入运行时之前，adapter 使用 AG-UI SDK 的 <code>RunAgentInput</code>；
-              <code>inputMessagesFromRunAgentInput</code> 要求最后一条输入是 user 或 tool message，并且会把连续的 trailing tool results
-              归成这次 run 的输入结果。源码入口在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/agui.go#L25-L105"><code>server/agui.New</code></a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/service/service.go#L15-L20">service wrapper</a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/adapter/adapter.go#L17-L18"><code>RunAgentInput</code> alias</a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L189-L240">输入消息解析</a>。
+              输入端先把浏览器送来的消息整理成一次 Runner 调用。普通用户消息可以直接成为新输入；如果浏览器是在补交外部工具结果，
+              adapter 会把末尾连续的工具结果归到同一个 run，再交还给 Runner 继续执行。这个整理动作很重要：它保证“继续上次工具调用”
+              不会被误认成一段全新的对话。可先读 <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L189-L240">输入消息解析</a>，
+              再看 <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/agui.go#L25-L105">服务装配</a>。
             </p>
 
             <p>
-              接着 <code>Runner.Run</code> 解析 userID、run options、外部 tools、appName、runtimeState，
-              重写 tool result messages，注册 execution 以支持取消，并创建 translator。真正跑起来时，它会先发
-              <code>RunStarted</code>，把输入里的 tool result 也翻译成前端可见事件；如果图处在 interrupt resume 场景，
-              还会补一段 resume event，然后才调用底层 runner，把内部 agent event 逐个交给 <code>handleAgentEvent</code>。
-              对应源码在
+              运行端先登记这次执行，因而后续取消请求能找到正确的 run；然后调用底层 Runner，持续接收 Agent 发回的 Event。
+              如果是图中断后的恢复，adapter 也会先补齐恢复信号，再让流程往下走。整个入口在
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L340-L430"><code>Runner.Run</code></a>
               和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L433-L513"><code>runner.run</code></a>。
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/runner/runner.go#L433-L513">内部运行循环</a>。
             </p>
 
             <p>
-              translator 是 AG-UI 这层最值得看的对象。它保存一次 run 内的 seen IDs、tool call deltas、graph lifecycle flags、
-              reasoning stream 和 artifact 状态，然后把内部事件翻译成 AG-UI 的 graph、text、reasoning、tool call、tool result、
-              artifact、queued user message、RunFinished 等事件。源码在
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go#L36-L89"><code>Translator</code> state</a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go#L122-L221">事件翻译主线</a>
-              和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go#L232-L257">source metadata finalize</a>。
+              输出端的 translator 像一本“本次运行翻译账”。它记住哪些文本片段、工具调用和文件已经发给前端，
+              再把内部 Event 依次翻成开始、增量、工具进度、产物和结束等前端事件。这样重试或多段流式输出时，UI 不会把同一个调用显示两遍，
+              也能把报告附件挂到正确的 run 上。源码见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go#L36-L89">translator 的运行内状态</a>
+              和 <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/server/agui/translator/translator.go#L122-L221">事件翻译主线</a>。
             </p>
 
             <p>
@@ -820,12 +854,16 @@ Recall path
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/evolution/worker.go#L40-L47">worker scope comment</a>。
             </p>
 
-            <h2>七、Runner 负责把长上下文账本接到运行主线</h2>
+            <h2>七、Runner 让三本账在 run 前后接力</h2>
             <p>
-              tRPC-Agent-Go 的 Runner 负责模型调用前后的运行生命周期，但它不直接调用模型。它先拿到或创建 Session，
-              把当前消息、Agent、SessionService、MemoryService、ArtifactService、插件和运行选项挂到 Invocation 上，再调用
-              <code>Agent.Run</code>。如果这次运行由 LLMAgent 执行，LLM flow 才会准备请求并调用
-              <code>Invocation.Model.GenerateContent</code>。这个边界很重要：长上下文账本由 Runner 接入，模型请求由 Agent 层组装和发出。证据在
+              回到开头的工作台，三本账不是在同一时刻一起塞给模型。run 开始时，Runner 先恢复当前 Session，并把会话与可用服务放进 Invocation；
+              Agent 准备模型请求时，processor 才把 summary、边界之后的 Events 和必要 Memory 投影成这一刻的模型视图。
+              run 进行中，新 Event 继续写回 Session；run 完成后，Runner 再判断是否排 summary、auto memory 与 evolution 后台任务。
+            </p>
+
+            <p>
+              因此 Runner 拥有的是账本与运行之间的交接，而不是模型推理。若执行者是 LLMAgent，LLM flow 最终才会调用
+              <code>Invocation.Model.GenerateContent</code>。证据在
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L510-L754"><code>Run</code></a>
               、
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L756-L793"><code>newRunInvocation</code></a>
@@ -862,13 +900,12 @@ Recall path
 
             <h3>1. 先过触发门槛</h3>
             <p>
-              summary 的门槛可以按事件数、token 数、时间、上下文窗口比例组合。<code>WithTokenThreshold</code>、
-              <code>WithEventThreshold</code>、<code>WithTimeThreshold</code> 是静态阈值；
-              <code>WithContextThreshold</code> 会结合 invocation context、当前模型和上下文窗口动态判断。
-              证据在
+              summary 不应该每来一句话就运行。应用可以按累计事件、token 数或经过时间设置固定门槛，也可以让门槛参考当前模型的上下文窗口：
+              小窗口更早压缩，大窗口则多保留一些原文。前者适合做可预测的成本控制，后者适合在真正接近模型上限时再行动。
+              两类配置分别见
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/options.go#L129-L172">threshold options</a>
               和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/options.go#L267-L302"><code>WithContextThreshold</code></a>。
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/session/summary/options.go#L267-L302">上下文感知门槛</a>。
             </p>
 
             <p>
@@ -935,22 +972,21 @@ Recall path
 
             <h2 id="memory-lifecycle">九、memory：存长期事实，不替代 summary</h2>
             <p>
-              memory 的接口更像一个长期资料库。<code>memory.Service</code> 明确暴露 Add、Update、Delete、Clear、Read、Search、Tools、
-              EnqueueAutoMemoryJob 和 Close。它保存的是 <code>KindFact</code> 或 <code>KindEpisode</code> 的条目，而不是“本轮上下文摘要”。
-              源码在
+              memory 更像跨工单使用的长期资料库：它既允许明确地增删改查，也能提供给 Agent 检索，还能在 run 完成后排队抽取新记忆。
+              条目分成“稳定事实”和“发生过的经历”两类，并按应用与用户隔离；它们不是当前 Session 的压缩副本。
+              服务边界和条目结构见
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L155-L196"><code>Service</code></a>
               和
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L202-L236"><code>Kind</code> / <code>Entry</code></a>。
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L202-L236">memory entry</a>。
             </p>
 
             <h3>1. 工具入口是显式的</h3>
             <p>
-              框架内置的 memory 工具有六个名字：<code>memory_add</code>、<code>memory_update</code>、<code>memory_delete</code>、
-              <code>memory_clear</code>、<code>memory_search</code>、<code>memory_load</code>。工具实现会从 invocation context 拿 memory service、
-              app name 和 user id，再执行对应操作。search/load 返回的是结构化条目，而不是把全部 memory 粘进 prompt。
-              源码在
+              Agent 不会自动看到整个资料库，而是通过一组明确的工具使用它。写入类工具负责新增、修订或清理条目；读取类工具负责搜索相关记忆，
+              或按标识加载某一条。每次调用都会从当前 Invocation 取得应用和用户身份，因此不会把甲用户的证书环境偏好带给乙用户。
+              搜索结果也是结构化条目，不是把所有 memory 粘进 prompt。完整工具名和上下文取值可见
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L22-L30">tool names</a>、
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/tool/tool.go#L249-L364"><code>memory_search</code> / <code>memory_load</code></a>
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/tool/tool.go#L249-L364">搜索与加载</a>
               和
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/tool/tool.go#L472-L517">context lookup</a>。
             </p>
@@ -1032,9 +1068,9 @@ Recall path
             <h2>十一、放回 Agent 框架路线里看</h2>
             <p>
               这一篇和 Eino 的关系很近，但关注点不同。Eino 先回答 Go 里怎样把 component、stream、interrupt、agent loop
-              放进可组合执行图；tRPC-Agent-Go 则先建立 Runner → Agent → Model 的服务端执行主干，再把 GraphAgent 放进 Agent 的执行策略，
-              把 tools、Skills、CodeExecutor 放进能力层，把 Session、Memory、Artifact 放进服务层，并在运行前后接上协议 adapter 与 Evolution Service。
-              本文后半篇重点看的，是这套 runtime 里最容易被误读的 summary / memory / evolution / hidden-history recall。
+              放进可组合执行图；tRPC-Agent-Go 继续追问：这张图或一个普通 LLMAgent 要怎样被服务化运行？它用 Runner 搭起工作台，
+              在 run 前后接住会话、长期资料、文件、协议翻译与后台学习。GraphAgent 只是 Runner 可以选择的一种执行者，
+              不是整套 runtime 的骨架。本文后半篇重点看的，就是这张工作台里最容易混淆的 summary、memory、evolution 与隐藏历史召回。
             </p>
 
             <div class="table-wrap">
@@ -1071,12 +1107,11 @@ Recall path
             </div>
 
             <p>
-              所以这篇的结论要分两层：<strong>整体上，tRPC-Agent-Go 是 Go agent 的服务端 runtime；细节上，它的长上下文 owner
-              不是一个 memory 开关，而是两本账和一个回收通道。</strong>
-              Runner 管理一次运行并注入服务，Agent 决定怎样执行并调用 Model；Graph、Skills、CodeExecutor 扩展 Agent 的执行与行动方式，
-              Session、Memory、Artifact 分别保存会话账本、跨会话事实和版本化文件，协议 adapter 负责对外翻译。
-              Evolution 把可复用流程沉淀回 managed skills；summary 让当前 Session 继续跑，memory 让长期事实留下来，
-              <code>session_load</code> 让被 summary 隐掉的原始历史还能被找回。
+              所以这篇的结论要分两层。<strong>整体上，tRPC-Agent-Go 是一套以 Runner 为运行 owner 的 Go agent 服务端 runtime。</strong>
+              Runner 搭工作台并持有服务；Agent 接下工作单；Model 只生成某一步，Tool 真正行动。
+              Session 保存当前工单经过，Memory 保存跨工单事实，Artifact 保存版本化文件，Evolution 在交付后学习方法。
+              <strong>长上下文也不是一个 memory 开关：</strong>原始 Events 提供证据，summary 压短当前 Session，Memory 留下长期事实，
+              <code>session_load</code> 再把被 summary 隐掉的细节找回来。
             </p>
 
             <h2 id="sources">参考源码与文档</h2>
