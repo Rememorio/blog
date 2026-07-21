@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent 框架源码阅读（十一）：tRPC-Agent-Go Memory 怎样把经历变成可检索知识</title>
+    <meta name="description" content="沿 tRPC-Agent-Go 的 auto memory 生命周期与 LoCoMo-10 benchmark，讲清事实/事件抽取、混合检索、多轮搜索、质量提升、token 成本与召回噪声。" />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="tRPC-Agent-Go Memory：把经历变成可检索知识" />
+    <meta property="og:description" content="从会话增量到 Fact/Episode，再到 Hybrid + RRF 检索；用 1,986 个 LoCoMo 问题检验每一步究竟解决了什么。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/trpc-agent-go-memory-lifecycle.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-framework/zh/trpc-agent-go-memory/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-framework/zh/trpc-agent-go-memory/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-framework/en/trpc-agent-go-memory/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-framework/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.key-point { border-color: rgba(31, 119, 123, 0.34); background: rgba(31, 119, 123, 0.1); }
+      .note.key-point strong { color: var(--rose); }
+      @media (max-width: 760px) {
+        html, body { max-width: 100%; overflow-x: hidden; }
+        .article-shell, .article-main, .toc-panel, .article-hero, .article-body { min-width: 0; max-width: 100%; }
+        .article-card { min-width: 0; width: 100%; max-width: 100%; overflow: hidden; }
+        .article-hero h1 { font-size: 32px; overflow-wrap: anywhere; }
+        .lead, .meta-line span, .table-wrap td, .table-wrap code { overflow-wrap: anywhere; }
+        .hero-image, .hero-image img { width: 100%; min-width: 0; max-width: 100%; }
+        .meta-line { align-items: stretch; }
+        .meta-line span { white-space: normal; }
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Agent 框架系列</a>
+        <a href="../trpc-agent-go/">上一篇：上下文</a>
+        <a href="../trpc-agent-go-evolution/">下一篇：Evolution</a>
+        <a href="#memory-lifecycle">实现</a>
+        <a href="#benchmark">Benchmark</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/trpc-agent-go-memory/" lang="en">English</a></span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Agent 框架源码阅读 · 第十一篇</p>
+            <h1>tRPC-Agent-Go Memory 怎样把经历变成可检索知识</h1>
+            <p class="lead">
+              用户昨天说“生产环境用 Go 1.24”，今天只问“按我的环境给命令”。把昨天整段会话塞回来成本太高，
+              只留 summary 又可能没有这个版本号。Memory 要做的是第三件事：从经历里挑出未来仍有价值的事实与事件，
+              存成可检索条目，再在真正需要时找回来。本篇沿 Rememorio 推进的实现走一遍，并用 LoCoMo-10 的 1,986 个问题检验它。
+            </p>
+            <div class="meta-line">
+              <span>主题：长期 Memory</span><span>写入：delta → extract → reconcile</span><span>存储：Fact / Episode</span><span>读取：Hybrid + RRF</span><span>证据：LoCoMo-10</span>
+            </div>
+            <figure class="hero-image">
+              <img src="../assets/trpc-agent-go-memory-lifecycle.png" alt="tRPC-Agent-Go Memory 手绘生命周期：会话增量经过提取形成 Fact 与 Episode，经 reconcile 写入 memory store，再由 Hybrid + RRF 检索进入未来会话；底部结论是抽取决定写什么，检索决定想起什么。" />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <div class="note key-point"><p><strong>先定边界。</strong>上一篇的 Summary 与 Session Recall 管“当前会话怎样压短、怎样找回原始证据”；这一篇的 Memory 管“哪些知识值得跨会话留下”。它们都能帮助模型想起过去，但读的是不同账本，写入条件也不同。</p></div>
+            <div class="note"><p><strong>证据边界。</strong>实现链接固定到公开快照 <code>0c7774187da9330144df2a038ef18ee89ef2ae1c</code>，实验链接固定到 benchmark 快照 <code>c9aabe56c0eb1cb80e927d2a34ecc72658173cbe</code>。Memory 的初始服务由 Rememorio 在 <a href="https://github.com/trpc-group/trpc-agent-go/commit/b86db0de90d13b6fccd4c98795403029fd95f5f9">#70 对应提交</a>引入；本文数字是特定模型、prompt、存储后端和检索预算下的实验结果，不外推成所有部署的保证。</p></div>
+
+            <h2>一、为什么 Summary 不能顺便充当 Memory</h2>
+            <p>
+              假设一轮证书排障产生了三类信息：“正在读取日志”只是过程；“用户生产环境用 Go 1.24”是稳定事实；
+              “2026-07-20 在上海机房轮换过证书”是带时间的经历。Summary 的目标是让当前工单继续，它会为了压缩舍弃细节；
+              Memory 的目标是让未来工单检索，因此必须先判断什么值得长期保存。
+            </p>
+            <div class="table-wrap"><table><thead><tr><th>内容</th><th>更合适的 owner</th><th>原因</th></tr></thead><tbody>
+              <tr><td>昨天完整的工具输出</td><td>Session events / Session Recall</td><td>它是原始证据，不应先被抽成“用户事实”。</td></tr>
+              <tr><td>“已排除网络问题”</td><td>Session Summary</td><td>它帮助当前任务续跑，但未必对未来任务长期有效。</td></tr>
+              <tr><td>“用户生产环境使用 Go 1.24”</td><td>Memory Fact</td><td>稳定、可复用，未来新 session 仍可能需要。</td></tr>
+              <tr><td>“7 月 20 日轮换过证书”</td><td>Memory Episode</td><td>意义依赖时间、参与者和地点。</td></tr>
+            </tbody></table></div>
+            <p>
+              源码把这个区别做进数据结构：<code>KindFact</code> 表示偏好、身份和背景，<code>KindEpisode</code> 表示发生在某个时间的事件，
+              还可以带 <code>event_time</code>、<code>participants</code> 与 <code>location</code>。条目按 <code>AppName + UserID</code> 隔离。
+              见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/memory.go#L213-L247"><code>Kind</code>、<code>Memory</code> 与 <code>Entry</code></a>。
+            </p>
+
+            <h2 id="memory-lifecycle">二、跟着一条事实走完写入生命周期</h2>
+            <h3>2.1 Runner 收尾后，worker 只看这次新增的对话</h3>
+            <p>
+              Auto memory 不是每收到一句话就写库。run 完成后，服务把 Session 交给 worker；worker 读取上次抽取时间，扫描之后新增的事件，
+              只保留有正文的 user / assistant 消息，跳过 tool message、tool call 和空内容。若 checker 判断这批增量还不值得抽取，就到此为止。
+              入口见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/internal/memory/auto.go#L267-L339"><code>EnqueueJob</code></a>，
+              增量过滤见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/internal/memory/auto.go#L694-L739"><code>scanDeltaSince</code></a>。
+            </p>
+            <pre><code>完整 Session
+  └─ 上次抽取点之后的 delta
+       ├─ 用户：生产环境是 Go 1.24
+       ├─ 助手：已生成证书轮换方案
+       └─ 工具输出：12 KB 日志             // 不直接交给 memory extractor
+
+MemoryJob = {UserKey, delta messages, latest timestamp}</code></pre>
+
+            <h3>2.2 抽取前先查旧记忆，因为“新增”可能其实是“更新”</h3>
+            <p>
+              如果库里已经有“用户使用 Go 1.23”，新对话说“已经升级到 1.24”，直接追加会制造冲突。worker 先用这批用户消息构造查询，
+              找回相关旧条目，再把“旧记忆 + 新对话”一起交给 extractor。这样模型输出的不是一段自由文本，而是 add、update、delete 或 clear 操作。
+              路径在 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/internal/memory/auto.go#L410-L451"><code>createAutoMemory</code></a>；
+              extractor 把主 choice 的 tool calls 解析为操作，见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/extractor/memory.go#L110-L182"><code>Extract</code></a>。
+            </p>
+            <p>
+              模型输出后还有一次 deterministic reconcile：若 add 的内容已经被旧记忆覆盖，就尽量改写成 update，减少“同一事实换个说法存两遍”。
+              这里的设计原则是：<strong>LLM 提议语义操作，运行时负责幂等和写入边界。</strong>
+            </p>
+
+            <h3>2.3 存储结构要为检索服务，不是为了字段好看</h3>
+            <p>
+              Fact / Episode、绝对时间、topic、参与者和地点，真正价值都在查询阶段。例如“我去年先去了哪里，再去了哪里”需要按 event time 排序；
+              “Alice 去过哪座山”需要核对 participants；专有名词又常常需要关键词命中。对应搜索配置支持 kind、时间窗口、排序、去重、
+              hybrid search 与 RRF，见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/memory.go#L277-L320"><code>SearchOptions</code></a>。
+            </p>
+
+            <h2>三、检索不是“取最像的十条”这么简单</h2>
+            <h3>3.1 向量与关键词各自补盲区</h3>
+            <p>
+              向量搜索擅长语义近似，却可能把书名、地名和精确版本号排得不够靠前；关键词搜索擅长精确词，又不理解改写。
+              pgvector 后端先做向量检索，再做全文检索，最后用 Reciprocal Rank Fusion 合并两个排名；kind 结果太少时还会去掉 kind 过滤重试，
+              最后做内容去重。完整顺序见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/pgvector/service.go#L540-L645"><code>SearchMemories</code></a>。
+            </p>
+            <pre><code>vector rank:   [Mt. Fuji trip, hiking preference, Alice profile]
+keyword rank:  [Alice + Mt. Fuji, Mt. Fuji trip]
+RRF merge:     [Mt. Fuji trip, Alice + Mt. Fuji, hiking preference]
+dedupe:        remove near-identical restatements</code></pre>
+
+            <h3>3.2 多跳问题需要多次换查询角度</h3>
+            <p>
+              “Alice 去日本前买了什么，回来后又做了什么？”通常不是一次 top-k 能覆盖。benchmark 里的 optimized agent 会把问题拆成 2–3 个短查询，
+              从实体、时间或子问题角度分别搜索，再汇总答案。工具说明也明确建议多部分问题分别搜索，并要求用 participants 检查人名归属；
+              见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/tool/tool.go#L249-L310"><code>memory_search</code></a>。
+            </p>
+            <p>
+              代价也在这里：多次搜索意味着模型会反复读取已有上下文，token 和时延一起上涨。Memory benchmark 因而不能只报 F1，
+              还必须同时报 Tokens/QA、Calls/QA 和 latency。
+            </p>
+
+            <h2 id="benchmark">四、Benchmark 怎样把“抽得好”和“找得好”拆开</h2>
+            <h3>4.1 为什么选 LoCoMo-10</h3>
+            <p>
+              LoCoMo-10 包含 10 段长期对话和 1,986 个问答。它不是只考“记住一句话”，而是把问题分成 single-hop、multi-hop、temporal、
+              open-domain 与 adversarial 五类，因此能同时暴露事实遗漏、跨条目组合、时间顺序和不应回答的问题。
+              完整实验协议见 <a href="https://github.com/trpc-group/trpc-agent-go-benchmark/blob/c9aabe56c0eb1cb80e927d2a34ecc72658173cbe/memory/results/REPORT.md">Memory benchmark report</a>。
+            </p>
+            <div class="table-wrap"><table><thead><tr><th>类别</th><th>数量</th><th>它在检验什么</th></tr></thead><tbody>
+              <tr><td>single-hop</td><td>282</td><td>一条记忆能否直接回答。</td></tr>
+              <tr><td>multi-hop</td><td>321</td><td>多条事实能否被一起找回并组合。</td></tr>
+              <tr><td>temporal</td><td>96</td><td>相对时间能否转成稳定时间并正确排序。</td></tr>
+              <tr><td>open-domain</td><td>841</td><td>开放问法下能否找到相关背景。</td></tr>
+              <tr><td>adversarial</td><td>446</td><td>证据不足时是否会拒答，而不是编造。</td></tr>
+            </tbody></table></div>
+            <p>
+              主实验固定 GPT-4o-mini 作为回答模型与 judge，embedding 使用 <code>text-embedding-3-small</code>。三条主臂分别是：完整 transcript 的
+              Long Context；基础 auto extraction + pgvector 的 Original；加入结构化抽取、hybrid search 与 multi-pass retrieval 的 Optimized。
+              Session Recall 也跑在同一套数据上，但它检索的是原始历史事件，已放在上一篇上下文篇讨论，不在这里冒充 Memory 优化。
+            </p>
+
+            <h3>4.2 结果：质量追平 Long Context，但成本不是免费的</h3>
+            <div class="table-wrap"><table><thead><tr><th>方案</th><th>F1</th><th>BLEU</th><th>LLM Score</th><th>Tokens/QA</th><th>Calls/QA</th><th>Latency</th></tr></thead><tbody>
+              <tr><td>Long Context</td><td>0.469</td><td>0.426</td><td>0.526</td><td>18,776</td><td>1.0</td><td>2,607 ms</td></tr>
+              <tr><td>Original Memory</td><td>0.399</td><td>0.371</td><td>0.416</td><td>3,056</td><td>2.0</td><td>6,659 ms</td></tr>
+              <tr><td><strong>Optimized Memory</strong></td><td><strong>0.469</strong></td><td><strong>0.431</strong></td><td><strong>0.532</strong></td><td>17,182</td><td>3.0</td><td>8,585 ms</td></tr>
+            </tbody></table></div>
+            <p>
+              从 Original 到 Optimized，F1 从 0.399 升到 0.469，提升 17.5%，并追平 Long Context；但 nominal token 从 3,056 涨到 17,182，
+              时延也更高。报告进一步统计 43.9% prompt tokens 命中 provider cache，按“新输入 token”估算约 9,663/QA；这能解释账单，
+              却不能抹掉三次模型调用带来的端到端时延。
+            </p>
+
+            <h3>4.3 提升来自哪里：multi-hop 与 temporal，而不是所有类别都赢</h3>
+            <div class="table-wrap"><table><thead><tr><th>类别</th><th>Original</th><th>Optimized</th><th>变化</th></tr></thead><tbody>
+              <tr><td>single-hop</td><td>0.316</td><td>0.396</td><td>更完整的原子事实改善直接召回。</td></tr>
+              <tr><td>multi-hop</td><td>0.096</td><td>0.453</td><td>多轮检索带来最大提升。</td></tr>
+              <tr><td>temporal</td><td>0.088</td><td>0.247</td><td>Episode、绝对时间和排序有效。</td></tr>
+              <tr><td>open-domain</td><td>0.358</td><td>0.441</td><td>Hybrid search 扩大召回。</td></tr>
+              <tr><td>adversarial</td><td><strong>0.814</strong></td><td>0.626</td><td>Original 更激进地拒答；不能把下降藏在总分里。</td></tr>
+            </tbody></table></div>
+            <p>
+              这张表比“提升 17.5%”更重要：optimized pipeline 真正修复的是 multi-hop 与 temporal；adversarial 反而下降。
+              因此部署时不能只调 retrieval，还要单独治理“没有足够证据时怎样拒答”。
+            </p>
+
+            <h3>4.4 Top-k 消融：拿得更多，不等于想得更准</h3>
+            <p>
+              在 <code>locomo10_1</code> 的 199 个问题上，SQLiteVec top-k 从 5 增加到 10，F1 从 0.320 升到 0.343；继续升到 20 与 40，
+              F1 反而回落到 0.329 与 0.327，prompt tokens 却从 346,253 涨到 621,790 与 965,423。第二次搜索也把 prompt 提到 659,981，
+              总体 F1 仍是 0.342。检索噪声会占用注意力，这就是 Memory 不能只追 recall 的原因。
+            </p>
+            <div class="note key-point"><p><strong>Benchmark 给出的不是“Memory 已经解决”。</strong>它证明结构化抽取、时间信息、Hybrid + RRF 与多轮检索能显著修复特定问题；同时也证明每多取一条、每多搜一轮都可能增加噪声、token 与时延。最优点是质量与预算共同决定的，不是 top-k 越大越好。</p></div>
+
+            <h2>五、把实验结论翻译成工程选择</h2>
+            <div class="table-wrap"><table><thead><tr><th>你面对的情况</th><th>优先选择</th><th>不要先做什么</th></tr></thead><tbody>
+              <tr><td>同一长会话快装不下</td><td>Summary + Context Compaction；细节用 Session Recall。</td><td>不要把整段会话抽成长期用户事实。</td></tr>
+              <tr><td>稳定偏好、身份、环境配置</td><td>原子 Fact，写前检索并 reconcile。</td><td>不要保存带大量过程噪声的整段 transcript。</td></tr>
+              <tr><td>带时间的人生/任务经历</td><td>Episode + 绝对时间 + 参与者。</td><td>不要只存“上个月”“后来”等相对词。</td></tr>
+              <tr><td>多实体或多跳问题</td><td>拆查询，多路检索，再限制总预算。</td><td>不要一次性把 top-k 提到很大。</td></tr>
+              <tr><td>证据不足的高风险问题</td><td>独立拒答策略与 adversarial 评估。</td><td>不要用总体 F1 掩盖错误肯定回答。</td></tr>
+            </tbody></table></div>
+            <p>
+              所以 Memory 的完整定义不是“有一个向量库”。它是一条有写入治理的知识管线：选择增量、抽取原子事实与事件、参考旧条目做 reconcile、
+              按用户隔离持久化，再用受预算约束的混合检索把少量证据送回模型。下一篇会把 owner 再换一次：Evolution 不记用户事实，
+              而是把任务经验变成可复用 Skill，并用 benchmark 决定候选能不能进入未来运行。
+            </p>
+
+            <h2 id="sources">参考源码与实验</h2>
+            <ul>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/tree/0c7774187da9330144df2a038ef18ee89ef2ae1c">tRPC-Agent-Go 公开源码快照</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/memory.go">Memory 服务、条目与搜索契约</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/internal/memory/auto.go">Auto memory worker</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/extractor/memory.go">Memory extractor</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/pgvector/service.go">pgvector hybrid retrieval</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go-benchmark/blob/c9aabe56c0eb1cb80e927d2a34ecc72658173cbe/memory/results/REPORT.md">LoCoMo-10 Memory benchmark report</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script src="../../table-labels.js"></script>
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        const headings = [...article.querySelectorAll("h2, h3, h4")];
+        const slugCounts = new Map();
+        const slugify = (text) => {
+          const raw = text.trim().toLowerCase().replace(/<[^>]+>/g, "").replace(/[`\"'“”‘’]/g, "").replace(/[^\p{Script=Han}\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "");
+          const base = raw || "section";
+          const count = slugCounts.get(base) || 0;
+          slugCounts.set(base, count + 1);
+          return count ? `${base}-${count + 1}` : base;
+        };
+        const root = document.createElement("ol"); root.className = "toc-list";
+        const stack = [{ level: 2, list: root }];
+        headings.forEach((heading) => {
+          if (!heading.id) heading.id = slugify(heading.textContent || "");
+          const level = Number(heading.tagName.slice(1));
+          while (stack.length && level < stack[stack.length - 1].level) stack.pop();
+          if (level > stack[stack.length - 1].level) { const parent = stack[stack.length - 1].list.lastElementChild; const child = document.createElement("ol"); child.className = "toc-sublist"; if (parent) parent.appendChild(child); stack.push({ level, list: child }); }
+          const item = document.createElement("li"); const link = document.createElement("a"); link.href = `#${heading.id}`; link.textContent = heading.textContent || ""; link.className = `toc-link toc-level-${level}`; item.appendChild(link); stack[stack.length - 1].list.appendChild(item);
+        });
+        toc.appendChild(root);
+      })();
+    </script>
+  </body>
+</html>
