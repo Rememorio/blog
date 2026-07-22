@@ -69,7 +69,8 @@
 
           <section class="article-body">
             <div class="note key-point"><p><strong>三篇的最后一条边界。</strong>Summary 改当前会话给模型看的视图，Memory 保存跨会话事实与事件，Evolution 只维护可复用 Skill。它学习的是“以后遇到这类任务怎样做”，不是“这个用户是谁”。</p></div>
-            <div class="note"><p><strong>证据状态。</strong>在线 Evolution 与第一组 SkillCraft benchmark 已进入公开 main，源码固定到 <code>0c7774187da9330144df2a038ef18ee89ef2ae1c</code>，benchmark 固定到 <code>c9aabe56c0eb1cb80e927d2a34ecc72658173cbe</code>。GEPA 式 optimizer 与对应 benchmark 仍在评审中，本文按待合并实现与当前实验产物解释设计和结果，不把它写成已发布 API；数字也应视为 provisional。</p></div>
+            <div class="note"><p><strong>证据状态。</strong>在线 Evolution 与第一组 SkillCraft benchmark 已进入公开 main，源码固定到 <code>0c7774187da9330144df2a038ef18ee89ef2ae1c</code>，benchmark 固定到 <code>c9aabe56c0eb1cb80e927d2a34ecc72658173cbe</code>。GEPA 式 optimizer 与对应 benchmark 仍在 <a href="https://github.com/trpc-group/trpc-agent-go/pull/2204">框架 PR #2204</a> 和 <a href="https://github.com/trpc-group/trpc-agent-go-benchmark/pull/18">benchmark PR #18</a> 评审中；本文按待合并实现与当前实验产物解释设计和结果，不把它写成已发布 API，数字也应视为 provisional。</p></div>
+            <div class="note"><p><strong>阅读契约。</strong>请跟着一份“多菜谱采集” Skill revision 前进。读完后，你应该能复述：哪一次 run 触发 review，reviewer 看见什么，候选为何可能什么也不写，SpecGate 与 SafetyGate 具体检查哪些字符串和结构，哪个文件决定 active 版本，以及在线 Evolution 与离线 GEPA 分别在何处优化、用什么证据拒绝候选。</p></div>
 
             <h2>一、先把“自进化”翻译成一个可检查的问题</h2>
             <p>
@@ -94,6 +95,11 @@
               <code>NewService</code> 创建 reviewer、publisher、worker 与可选 gate 组件并启动后台 worker；见
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/service.go#L23-L78"><code>NewService</code> 与 <code>EnqueueLearningJob</code></a>。
             </p>
+            <p>
+              默认 Runner 完成钩子通常只交 Session，<code>Outcome</code> 为 nil；benchmark harness 或业务 evaluator 才会显式附上 status、score 与 notes。
+              所以“reviewer 能看 Outcome”是服务能力，不是每个线上 job 天生都有评分。没有 Outcome 时，内置 EffectivenessGate 默认放行，
+              仍由 reviewer、其他 gate 或人工审批判断。
+            </p>
             <pre><code>foreground run
   -> Agent finishes task
   -> evaluator may attach Outcome{status, score, notes}
@@ -110,6 +116,18 @@ background evolution
               worker 还使用按 session hash 路由的队列；队列不可用时才同步 fallback。
             </p>
 
+            <p>
+              但 “run 完成” 只是允许进入后台，不等于一定调用 reviewer。worker 先读取上次 <code>evolution:last_review_at</code>
+              之后的 delta。默认 policy 在三类信号中任一出现时才 review：至少 4 次工具调用、用户在 assistant 回合后纠正做法、
+              或工具报错后 Agent 又恢复继续。若 delta 里已经有 managed Skill 写入，系统还会跳过，避免“学习自己刚写出的学习结果”。
+              没有新消息、policy 未触发、reviewer 返回 <code>skip_reason</code> 都是合法 no-op。
+            </p>
+
+            <p>
+              队列使用 <code>context.WithoutCancel</code> 保住已接受的学习任务，并按 Session 稳定 hash 路由，维持同一 Session 的处理顺序；
+              队列未启动或已满时才做带超时的同步 fallback。前台用户看见的是原任务结果，后续 run 才可能看见新 Skill。
+            </p>
+
             <h3>2.2 Reviewer 看的不是“聊天总结”，而是带结果的任务证据</h3>
             <p>
               worker 从上次 review 点开始扫描 delta，先过 <code>ReviewPolicy</code>，再加载已有 skill 的名称、描述和受限正文片段。
@@ -120,6 +138,44 @@ background evolution
             <p>
               LLM decision 之后还有 library-aware reconciler：例如 reviewer 又创建一个只是名字更具体的同类 Skill，reconciler 会尝试改成 update 或去重。
               这一步解决“模型会提出什么”；下一步 gate 才解决“这个候选能不能上线”。
+            </p>
+
+            <pre><code>ReviewInput（形状简化）
+  recent transcript:
+    user -> tool calls -> tool results -> final answer
+  outcome:
+    status=partial, score=0.82, notes="漏掉最终 artifact"
+  existing skills:
+    name + description + bounded body excerpt
+
+ReviewDecision
+  skip_reason | creates[] | updates[] | deletions[]</code></pre>
+
+            <p>
+              每条 transcript message 默认最多渲染 4,000 字符，超长工具结果保留头尾，防止 reviewer 自己先被上下文撑爆。
+              现有 Skill 也不是只给名字：描述和有界正文片段让模型比较 <code>when_to_use</code> 与 steps，避免仅因“3 道菜”和“5 道菜”
+              建两个 Skill。Decision 必须是结构化 JSON；解析失败、reviewer 超时或返回错误时，本次 review 点不会推进，后续 job 可以重试。
+              policy 主动跳过或成功完成 review 时才推进游标，避免对同一段无价值 delta 反复付费。
+            </p>
+
+            <div class="table-wrap"><table><thead><tr><th>worker 走到哪里</th><th><code>evolution:last_review_at</code></th><th>为什么</th></tr></thead><tbody>
+              <tr><td>delta 没有可 review 的消息</td><td>不推进</td><td>没有新的完整证据需要消费。</td></tr>
+              <tr><td>Policy 返回 false</td><td>推进</td><td>这批 delta 已被确定性策略判为不值得付费，避免下轮重复扫描。</td></tr>
+              <tr><td>发现 managed Skill 写入</td><td>推进</td><td>明确消费掉这批自引用证据，避免循环学习。</td></tr>
+              <tr><td>Reviewer 报错、超时或 JSON 解析失败</td><td>不推进</td><td>后续 job 仍可重试同一批证据。</td></tr>
+              <tr><td>空 decision 或 <code>skip_reason</code></td><td>推进</td><td>Reviewer 已经成功读过，只是决定不改。</td></tr>
+              <tr><td>Revision 被拒、待评估、待审批、发布失败或成功</td><td>推进</td><td><code>applyDecision</code> 已完成本轮治理尝试；候选状态与错误由 revision/audit/log 负责。</td></tr>
+            </tbody></table></div>
+            <p>
+              这个 cursor 存在当前 <code>Session.State</code>，属于“reviewer 消费到哪里”的进度，不是 Skill 发布成功标记。
+              因此发布失败不会自动重跑 reviewer；应从 revision 状态、audit 与 publisher 日志重试治理动作，而不是让模型对同一 transcript
+              再生成一份可能不同的候选。这个区别把<strong>证据消费</strong>和<strong>候选生效</strong>分成了两个恢复边界。
+            </p>
+
+            <p>
+              reconciler 再用确定性规则整理 decision：同一批 create 去重；名字是旧 Skill 严格扩展时把 create 改成 update；
+              “Recipe - 3 Dishes” 这类计数变体若已有 “Recipe - Multi-Dish”，也改写到通用父 Skill；正文词集合高度重合时合并。
+              这层是 best-effort 纠偏，不是发布门禁，所以后面仍需要 SpecGate 重新硬检查。
             </p>
 
             <h3>2.3 Revision 让“生成 Skill”与“生效 Skill”分开</h3>
@@ -137,6 +193,93 @@ background evolution
             <p>
               没有配置 gate 时，旧的 direct-publish 行为仍可保留；只要任一 gate 组件存在，<code>applyDecision</code> 就改走 revision pipeline。
               分支见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L428-L471"><code>applyDecision</code></a>。
+            </p>
+
+            <h3>2.4 四道 Gate 分别怎样作出决定</h3>
+            <p>
+              先看一个故意糟糕的候选。Reviewer 想创建 <code>Recipe Cookbook - 3 Dishes</code>，只写一步，正文里还出现
+              <code>rm -rf /</code>。系统不会把整份 spec 丢给另一个 LLM 问“安全吗”，而是让可审计的确定性规则先给出理由。
+            </p>
+
+            <pre><code>candidate revision
+  action: create
+  name: "Recipe Cookbook - 3 Dishes"
+  description: "Collect recipes"
+  when_to_use: ""
+  steps: ["generate files, then run rm -rf /"]</code></pre>
+
+            <h4>SpecGate：检查它是不是一份可执行、可复用的 Skill</h4>
+            <p>
+              内置 SpecGate 不调用模型。create/update 必须有 spec、名称、description、<code>when_to_use</code>，默认至少 2 个 steps，
+              名称最多 120 字符。创建时，它把名称转小写并把连续非字母数字压成 <code>-</code>，若与现有名称相同就要求改为 update；
+              计数正则还会识别 “3 cities / 5 dishes” 之类的名字，并在已有 multi-city / multi-dish 父 Skill 时拒绝。
+              delete 不需要再验证正文，因为它本来就没有新 spec。上面的候选会同时得到“缺 when_to_use、步骤不足、计数特化”三条理由。
+              具体字段与名称规范化逻辑见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go#L194-L270"><code>defaultSpecGate.Validate</code></a>。
+            </p>
+
+            <h4>SafetyGate：扫描的是整份正文，但规则故意很短</h4>
+            <p>
+              SafetyGate 把 description、<code>when_to_use</code>、steps 与 pitfalls 拼起来，扫描三类高置信模式：
+              常见云密钥/API token/private key；<code>rm -rf /</code>、写磁盘设备、下载后直接 pipe 到 shell、fork bomb；
+              以及 <code>../../</code>、<code>/etc/passwd</code>、<code>.ssh/id_*</code> 等路径穿越或敏感路径。
+              上面的候选因此被明确标成 dangerous shell。规则短不是能力不足的疏忽，而是 false positive 会直接拒绝 revision；
+              这层只挡高置信字符串，不能证明工具执行语义完全安全，也不能替代 CodeExecutor 沙箱与权限控制。
+              扫描入口与规则组合见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go#L272-L302"><code>defaultSafetyGate.Scan</code></a>。
+            </p>
+
+            <h4>EffectivenessGate：默认实现只看 Outcome，不会偷偷重跑 benchmark</h4>
+            <p>
+              内置 <code>OutcomeBasedEffectivenessGate</code> 是廉价启发式：默认分数阈值 0.8，status 为 fail/agent_error 或分数低于阈值时，
+              revision 进入 <code>pending_eval</code>；partial 允许通过，delete 总是通过，没有 Outcome 时也默认通过。
+              它回答“是否应从一次灾难性 run 自动学习”，不回答“这个 Skill 在独立任务上是否更好”。真正的 replay、shadow traffic
+              或 mini-benchmark 需要实现同一个接口，GEPA 的 frozen/runtime 证据也不能冒充这道默认 gate 已经做过的事。
+              默认判定见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go#L107-L174"><code>outcomeBasedEffectivenessGate</code></a>。
+            </p>
+
+            <h4>HumanGate：只决定是否暂缓，不在 worker 里等待人</h4>
+            <p>
+              <code>ShouldHold</code> 必须快速返回；若外部审批耗时，它应返回 hold，让 revision 进入 <code>pending_approval</code>。
+              gate 自身报错也按 hold 处理，也就是 fail closed。之后 <code>ApprovalService.Decide</code> 按 Skill 加锁，重新确认 revision
+              仍在 pending 状态；批准才发布 spec、归档旧 active、更新 active pointer 并写 audit，拒绝则只改成 rejected。
+              人工审批是一次独立状态转换，不是后台 worker 阻塞着等一个网页按钮。
+              状态落盘与最终决定分别见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L903-L922"><code>runHumanGate</code></a>
+              和 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/approval_service.go#L153-L212"><code>ApprovalService.Decide</code></a>。
+            </p>
+
+            <h3>2.5 Gate 顺序、持久化与 Agent 可见性</h3>
+            <p>
+              Spec 与 Safety 都会运行并各自留下 report，便于一次看到结构和安全问题；只有两者都通过才跑 Effectiveness，所有自动门禁通过后
+              才跑 HumanGate。任一 gate 报错都 fail closed。无论通过还是拒绝，revision 都写入 CandidateStore，audit 记录原因；
+              只有通过或显式 shadow mode 才调用 publisher。正常通过时，旧 active revision 被 archive，新 revision 变为 active，
+              <code>active.txt</code> 指针切到新 ID，后续 repository refresh 后的 Agent 才能加载它。
+            </p>
+
+            <pre><code>pending
+  ├─ Spec / Safety fail        -> rejected      -> 只留 revision + audit
+  ├─ Effectiveness holds      -> pending_eval  -> 等外部评估
+  ├─ HumanGate holds          -> pending_approval -> 等 ApprovalService
+  └─ all pass                 -> publish -> active
+                                  old active -> archived</code></pre>
+
+            <p>
+              这条状态机保护的核心不变量是：<strong>生成候选不等于改变未来 Agent。</strong>CandidateStore 保存“曾经提出过什么”，
+              publisher 保存当前 Skill 正文，ActivePointer 保存“哪一版对运行生效”。三者分开，才能审计拒绝、回滚 active，
+              又不把被拒的实验产物伪装成线上能力。
+            </p>
+
+            <div class="table-wrap"><table><thead><tr><th>动作 / 结果</th><th>持久化发生什么</th><th>何时对 Agent 可见</th></tr></thead><tbody>
+              <tr><td>Create / Update 通过</td><td>写 revision，publisher 执行 <code>UpsertSkill</code>，归档旧 active 并切换 pointer。</td><td>repository refresh 后，新正文进入后续 run。</td></tr>
+              <tr><td>Delete 通过</td><td>delete revision 仍保留审计；Spec/Safety 跳过，publisher 执行 <code>DeleteSkill</code>，旧 active 归档并清空 pointer。</td><td>refresh 后该 managed Skill 消失；非 Evolution 管理的 Skill 受保护，不能删除。</td></tr>
+              <tr><td>Rejected / Pending</td><td>只写 revision、gate report 与 audit，publisher 不变。</td><td>不可见；等外部评估或审批作下一次状态转换。</td></tr>
+              <tr><td>Shadow 绕过失败 gate</td><td>保留失败 report/status，递增 bypass metric，但仍调用 publisher 并切 pointer。</td><td>refresh 后可见，专门用于迁移期观测，不能当作正常治理模式。</td></tr>
+            </tbody></table></div>
+            <p>
+              Shadow 尤其容易被误读成“灰度但不生效”。这里恰好相反：<code>WithApprovalGateShadow(true)</code> 的目的，是先观察 gate
+              会拦住什么，同时保持旧 direct-publish 行为，所以失败候选仍可能真实写入 managed library。它留下失败状态与
+              <code>shadow_mode_bypassed</code> 指标，方便比较“如果强制 gate 会发生什么”；生产开始依赖 gate 后应关闭 shadow，
+              否则 report 只是告警，不是隔离。实现顺序见
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L750-L789"><code>processRevision</code></a>
+              与 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L903-L970"><code>publishRevision</code></a>。
             </p>
 
             <h2 id="skillcraft">三、第一组 SkillCraft Benchmark：在线学习有没有用</h2>
@@ -172,7 +315,24 @@ background evolution
             </p>
             <div class="note"><p><strong>Gate 的实验边界也要诚实。</strong>这组 run 里 69/69 候选都被 promoted，没有真实 reject；因为 reviewer 输出先被 reconciler 清理过。它证明了 revision pipeline 没有挡住有效候选，却没有用线上数据证明 gate 的拒绝质量。拒绝路径当时主要由单元测试覆盖，这正是后面需要离线 holdout 的原因。</p></div>
 
-            <h2 id="gepa-optimizer">四、为什么还要 GEPA 式离线优化</h2>
+            <h2>四、在线、离线与是否自动上线是两条轴</h2>
+            <p>
+              “在线 Evolution” 最容易被误解成“数据来自实时流量”，“离线 GEPA” 又被误解成“只能用人工数据”。真正的分界是：
+              <strong>优化步骤是否在实际任务流中随每个 Session 增量发生</strong>。数据来源不是决定条件。
+            </p>
+            <div class="table-wrap"><table><thead><tr><th>问题</th><th>在线 / 持续学习</th><th>离线 / 批量优化</th></tr></thead><tbody>
+              <tr><td>优化何时发生</td><td>真实 run 完成后异步 review，结果影响后续 run。</td><td>请求链路之外，对冻结数据反复搜索和反事实评估。</td></tr>
+              <tr><td>数据可以来自哪里</td><td>通常是实际 Session，也可来自受控运行。</td><td>人工构造、benchmark，或从线上流量冻结出的样本都可以。</td></tr>
+              <tr><td>状态怎样变化</td><td>managed library 随 Session 序列增量演化。</td><td>seed 与候选在固定 Feedback/Validation/Holdout 上批量比较。</td></tr>
+              <tr><td>主要偏差</td><td>顺序效应、单次轨迹噪声、当前任务过拟合。</td><td>数据集不代表生产、搜索预算过拟合、模型迁移失败。</td></tr>
+            </tbody></table></div>
+            <p>
+              “自动上线还是人工审批”是另一条治理轴。概念上，在线 revision 可以要求人工审批，离线候选也可以由部署策略自动发布；
+              两者不由在线/离线身份决定。本文所读的待合并 GEPA 实现更保守：外部评估候选即使通过自动 gate，提交后仍强制
+              <code>pending_approval</code>，理由是 externally evaluated revisions require approval。这里要区分通用概念和当前代码策略。
+            </p>
+
+            <h2 id="gepa-optimizer">五、为什么还要 GEPA 式离线优化</h2>
             <p>
               在线 Evolution 每完成一个 session 就复盘一次，优点是贴近真实运行，缺点是证据不稳定：当前任务既提供教训，又影响候选；
               reviewer 可能学到只对这一题有用的技巧；连续 managed state 还会让前后任务互相影响。要回答“这个 revision 值得发布吗”，
@@ -184,7 +344,49 @@ background evolution
               这里实现的是面向 <code>SkillSpec</code> 的 pure-Go 版本，不声称复现论文全部任务或论文数值。
             </p>
 
-            <h3>4.1 每次只改一个组件，让因果更容易读</h3>
+            <h3>5.1 谁启动 GEPA：外层实验程序，而不是在线 Evolution worker</h3>
+            <p>
+              GEPA optimizer 是一个显式调用的库对象，不是监听真实 Session 的常驻 service。人、CI 或 benchmark harness 先准备 seed Skill、
+              三份冻结数据和一个 <code>Evaluator</code>，再在请求链路之外调用 <code>Optimize(ctx, Request)</code>。Evaluator 负责“拿候选跑这一批 case，
+              每题返回分数、反馈和 trace”；reflector 才根据 feedback 提议修改。engine 只负责预算、候选池、paired seed、实验记录与最终 holdout，
+              不会自己连接线上流量寻找样本。
+            </p>
+            <pre><code>human / CI / benchmark harness
+  ├─ freeze Dataset{Feedback, Validation, Holdout}
+  ├─ provide Evaluator(candidate, cases, seed)
+  ├─ construct GEPA(reflection model, evaluator, budgets)
+  └─ Optimize(seed SkillSpec)
+       ├─ search + validation + holdout
+       ├─ return Result                         // 默认停在实验报告
+       └─ Submit=true + RevisionSubmitter       // 可选
+            └─ pending_approval revision
+                 └─ approval -> publisher -> repository refresh</code></pre>
+            <p>
+              因此“offline”说的是搜索与反事实评估发生在实际任务流之外，不要求数据必须人工编写：Dataset 完全可以由线上 Session 脱敏、筛选后冻结得到。
+              默认 <code>Optimize</code> 只返回结果，不改 Skill；只有调用方设置 <code>Submit=true</code> 并注入 <code>RevisionSubmitter</code>，
+              promotion-eligible 候选才进入同一 revision governance。当前 PR 还会把这种外部评估候选强制放进人工审批，
+              从而把“实验认为更好”和“生产允许生效”继续分开。接口与控制流见
+              <a href="https://github.com/trpc-group/trpc-agent-go/pull/2204">GEPA optimizer PR #2204</a>。
+            </p>
+
+            <h3>5.2 先把 Dataset 合同冻结，才能谈优化</h3>
+            <p>
+              optimizer 的 Request 不是一袋随时变化的 examples。它要求 seed <code>SkillSpec</code>、带 ID 与 version 的 Dataset，
+              以及彼此不重复的 Feedback、Validation、Holdout case ID。Feedback 与 Validation 不能为空；若调用方要 submit，三份 split
+              各至少 10 个 case。Evaluator 必须对每个 case 返回一个 0–1 score，还可以附 output、feedback、trace 与 objectives；
+              搜索只用标量 score 作生存判断，其他 objectives 留在报告里，不会暗中改变排序。
+            </p>
+            <div class="table-wrap"><table><thead><tr><th>Split</th><th>谁能看</th><th>只允许做什么</th></tr></thead><tbody>
+              <tr><td>Feedback</td><td>Evaluator + reflector</td><td>暴露失败轨迹，产生 mutation。</td></tr>
+              <tr><td>Validation</td><td>Evaluator 与候选选择器</td><td>固定 seed 下比较候选，决定 search winner。</td></tr>
+              <tr><td>Holdout</td><td>搜索结束后的 engine</td><td>只确认 winner，不回流到 reflection。</td></tr>
+            </tbody></table></div>
+            <p>
+              默认预算也被写进 engine：最多 10 次迭代、1,000 次 metric call、每次 reflection 看 3 个 feedback case，并支持总时限。
+              validation 先评 seed，holdout 的预算会提前保留，避免搜索把 metric call 用光后只留下一个无法确认的 winner。
+            </p>
+
+            <h3>5.3 每次只改一个组件，让因果更容易读</h3>
             <p>
               一个 Skill 被拆成 description、when_to_use、steps 与 pitfalls。每轮从反馈集抽 minibatch，用同一个 paired seed 分别评估 parent 与 child；
               reflector 只改其中一个组件，并必须让 child 在这批样本的总分严格提高，否则立即拒绝。通过 minibatch 的 child 再跑固定 validation，
@@ -199,22 +401,42 @@ background evolution
   -> evaluate survivor on validation
   -> after search, compare best candidate with seed on untouched holdout</code></pre>
 
-            <h3>4.2 Pareto 不是“平均分最高者永远生孩子”</h3>
+            <p>
+              reflector 收到的是被截断、去除不可信控制字段的 case 记录，以及当前轮唯一允许修改的组件；它必须返回结构化 JSON，
+              runtime 也只把该字段应用到原 spec。输出无效、字段没有变化、候选 hash 已存在时，本轮记录 rejection 后继续。
+              parent 与 child 在同一个 feedback minibatch、同一个 paired seed 上评估，只有 child 总分<strong>严格大于</strong> parent
+              才进入完整 validation；这能减少采样噪声被误判成改进，但不能消除 provider 非确定性。
+            </p>
+
+            <h3>5.4 Pareto 不是“平均分最高者永远生孩子”</h3>
             <p>
               假设候选 A 擅长简单菜谱，B 擅长多步骤菜谱，A 的平均分略高。只按平均分选 parent，B 的经验会很快消失。
               optimizer 记录每个 validation case 的最高分候选，形成 instance-level frontier；只要某候选仍覆盖别人没有覆盖的样本优势，
               就有机会继续被选。最终选择仍看 validation mean，但搜索过程不会过早抹掉互补路径。
             </p>
 
-            <h3>4.3 Holdout 对 reflector 不可见，提交也不等于上线</h3>
+            <p>
+              这也解释一个看似奇怪的行为：child 的 validation 平均分暂时不是最高，仍可能进入 pool。只要它在某些 case 上形成别人没有的
+              frontier，它就为后续 mutation 提供不同 parent。搜索结束时再按固定 validation mean 选最终 best，而不是把探索多样性
+              和部署判定混成一条规则。
+            </p>
+
+            <h3>5.5 Holdout 对 reflector 不可见，提交也不等于上线</h3>
             <p>
               Dataset 明确分 feedback、validation 与 holdout。feedback 带轨迹与文字反馈供反思；validation 选择候选；holdout 只在搜索结束后比较 seed 与 winner，
               不发送给 reflection model。只有 holdout 达到最小提升且关键 case 不退步，候选才是 promotion-eligible。
               即便调用方选择 submit，它也只是通过窄 <code>RevisionSubmitter</code> 进入既有 revision governance，默认不会直接改 live skill。
             </p>
 
-            <h2>五、GEPA Benchmark：发现、确认、上线验证分三关</h2>
-            <h3>5.1 同一 SkillCraft，换成三阶段证据</h3>
+            <p>
+              promotion 还有三个明确 no-op：最终 best 仍是 seed，说明没有 validation 改进；没有 holdout，说明无法独立确认；
+              candidate 的 holdout delta 未达到配置下限，或任何标记为 <code>Critical</code> 的 case 比 seed 退步。满足这些条件只得到
+              <code>PromotionEligible=true</code>，不等于 active。当前 PR 的 submit 会把 dataset ID/version、baseline/candidate score、delta、
+              case 数与 objectives 一起写进 revision evidence，再强制交给人工审批。
+            </p>
+
+            <h2>六、GEPA Benchmark：发现、确认、上线验证分三关</h2>
+            <h3>6.1 同一 SkillCraft，换成三阶段证据</h3>
             <div class="table-wrap"><table><thead><tr><th>阶段</th><th>数据用途</th><th>它可以做出的决定</th></tr></thead><tbody>
               <tr><td>Search</td><td>feedback 反思，validation 选候选。</td><td>可以 abstain；不是每个家族都必须产生新 Skill。</td></tr>
               <tr><td>Frozen confirmation</td><td>固定候选，在独立 seed 与 untouched holdout 上对比。</td><td>可以推翻 validation winner。</td></tr>
@@ -226,7 +448,7 @@ background evolution
               总共 270 个 arm-cases。奇偶 seed 反转整臂顺序，并让三臂共享同一 task seed，减少顺序与采样偏差。
             </p>
 
-            <h3>5.2 Search 的第一项能力是“不改”</h3>
+            <h3>6.2 Search 的第一项能力是“不改”</h3>
             <p>
               Cat Facts 与 Pokémon 保留 seed；Weather 虽产生 mutation，但 validation 仍选 seed；只有 Recipe 与 World Bank 进入 frozen confirmation。
               这很重要：optimizer 完成若干轮迭代，不代表一定有值得发布的候选。
@@ -241,7 +463,7 @@ background evolution
               这个候选会被错误上线。Frozen gate 的作用不是再跑一次漂亮分数，而是主动寻找推翻理由。
             </p>
 
-            <h3>5.3 Runtime 只接受 Recipe，拒绝 World Bank</h3>
+            <h3>6.3 Runtime 只接受 Recipe，拒绝 World Bank</h3>
             <div class="table-wrap"><table><thead><tr><th>家族（optimized vs evolution）</th><th>Pass delta</th><th>Quality delta</th><th>E2E token delta</th><th>决定</th></tr></thead><tbody>
               <tr><td>Recipe（有 overlay）</td><td>0.00pp</td><td>+0.32pp</td><td><strong>-14.75%</strong></td><td><strong>接受</strong></td></tr>
               <tr><td>World Bank（有 overlay）</td><td>0.00pp</td><td>0.00pp</td><td><strong>+3.29%</strong></td><td><strong>拒绝</strong></td></tr>
@@ -252,7 +474,7 @@ background evolution
               这说明 frozen benchmark 是必要条件，不是生产充分条件。
             </p>
 
-            <h3>5.4 为什么不能拿全局 +1.25pp 给候选邀功</h3>
+            <h3>6.4 为什么不能拿全局 +1.25pp 给候选邀功</h3>
             <div class="table-wrap"><table><thead><tr><th>全局（n=90/arm）</th><th>Baseline</th><th>Evolution</th><th>Optimized Evolution</th></tr></thead><tbody>
               <tr><td>Pass rate</td><td>97.78%</td><td>97.78%</td><td><strong>98.89%</strong></td></tr>
               <tr><td>Official quality</td><td>95.98%</td><td>95.96%</td><td><strong>97.21%</strong></td></tr>
@@ -268,7 +490,7 @@ background evolution
               Skill improvement 不是自动跨模型迁移的 prompt 魔法；模型、工具响应形状与执行预算都属于候选的适用边界。
             </p>
 
-            <h2>六、把两条 Evolution 线合起来读</h2>
+            <h2>七、把两条 Evolution 线合起来读</h2>
             <div class="table-wrap"><table><thead><tr><th>问题</th><th>在线 Evolution</th><th>离线 Optimizer</th></tr></thead><tbody>
               <tr><td>候选从哪里来</td><td>真实 run 的 session delta 与 outcome。</td><td>固定数据集上的 paired feedback 与反思。</td></tr>
               <tr><td>擅长什么</td><td>持续收集真实长尾经验，低人工维护。</td><td>隔离变量、保留互补候选、用 holdout 反证。</td></tr>
@@ -290,6 +512,7 @@ background evolution
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go">Spec / Safety / Effectiveness / Human gates</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go-benchmark/blob/c9aabe56c0eb1cb80e927d2a34ecc72658173cbe/skillcraft/results/REPORT.md">已合入 SkillCraft online Evolution report</a></li>
               <li><a href="https://arxiv.org/abs/2507.19457v2">GEPA paper (arXiv:2507.19457v2)</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/pull/2204">待合并 GEPA optimizer PR #2204</a>与 <a href="https://github.com/trpc-group/trpc-agent-go-benchmark/pull/18">对应 benchmark PR #18</a></li>
             </ul>
           </section>
         </article>

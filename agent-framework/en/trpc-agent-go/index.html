@@ -376,6 +376,21 @@ Model: The evidence is sufficient; produce the final explanation</code></pre>
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L2810-L2856">the completion path</a>.
             </p>
 
+            <div class="table-wrap"><table><thead><tr><th>Event shape</th><th>Visible to protocol?</th><th>Appended to Session?</th><th>Can trigger Summary?</th></tr></thead><tbody>
+              <tr><td>Partial text chunk</td><td>Yes, for live display</td><td>Normally no; cancellation recovery is a separate synthesized path</td><td>No</td></tr>
+              <tr><td>Complete user message</td><td>Yes</td><td>Yes, as input evidence</td><td>No; user input alone does not enqueue</td></tr>
+              <tr><td>Complete tool call</td><td>Yes</td><td>Yes, preserving call and ID</td><td>No; wait for result or final text</td></tr>
+              <tr><td>Complete tool result</td><td>Yes</td><td>Yes, preserving its tool-call relation</td><td>Yes, though the checker may no-op</td></tr>
+              <tr><td>Complete assistant text or valid error</td><td>Yes</td><td>Yes; error first receives persistable content</td><td>Yes, unless <code>SkipSummarization</code></td></tr>
+              <tr><td>State delta only</td><td>Depends on protocol translation</td><td>Yes even without a complete response</td><td>No without valid content</td></tr>
+              <tr><td>Runner completion</td><td>Yes, as run terminator</td><td>It is a completion signal, not conversation body</td><td>Enqueues auto Memory and Evolution instead</td></tr>
+            </tbody></table></div>
+            <p>
+              An Event already has identity when it is constructed and injected with invocation metadata; Runner persists that same complete Event.
+              Partial tokens do not each become Session rows. The persistence predicate is small: state delta exists, or the response is complete and valid.
+              Summary applies another filter only after append succeeds, so “streamed,” “durably recorded,” and “starts maintenance” are three distinct conditions.
+            </p>
+
             <p>
               We can now replay the run: <strong>the protocol layer accepts the request → Runner opens the workbench → Agent coordinates Model and tools →
               Events report progress → Runner persists and closes the run → summary, memory, and evolution handle later state when their gates fire.</strong>
@@ -832,6 +847,17 @@ Model: The evidence is sufficient; produce the final explanation</code></pre>
               </table>
             </div>
 
+            <h3>6.1 Where Each Background Path Stores Its Cursor</h3>
+            <div class="table-wrap"><table><thead><tr><th>Path</th><th>Delta cursor owner</th><th>Whole-job failure</th><th>Successful effect</th></tr></thead><tbody>
+              <tr><td>Summary</td><td><code>Session.Summaries[key].Boundary</code></td><td>Text and boundary do not advance</td><td>Later model views; a synchronous path may affect this run</td></tr>
+              <tr><td>Auto Memory</td><td><code>Session.State[memory:last_extract_at]</code></td><td>Search/extractor/job failure does not advance; individual write failures may still advance the batch cursor</td><td>App/User Memory store for future Sessions</td></tr>
+              <tr><td>Evolution</td><td><code>Session.State[evolution:last_review_at]</code></td><td>Policy/reviewer error does not advance; completed review advances even after gate rejection</td><td>Candidate revision; only active-pointer change reaches future Agents</td></tr>
+            </tbody></table></div>
+            <p>
+              All three use Session to remember how far raw Events were scanned, but they are not one transaction. Summary writes model-view state back to Session;
+              Memory writes a user-scoped store; Evolution writes a revision store. Cursor location does not imply identical consistency for their outputs.
+            </p>
+
             <p>
               The tRPC-Agent-Go deep read therefore ends in three chapters. This chapter asks how the <strong>current session becomes shorter yet recoverable</strong>.
               The next explains <a href="../trpc-agent-go-memory/">cross-session Memory</a>. The final chapter follows
@@ -862,6 +888,19 @@ This turn's model view
               reads the Summary boundary and appends only Events after that cutoff. Summary changes what the model sees this turn;
               it does not rewrite the durable Session into one short paragraph.
             </p>
+
+            <p>
+              Three overloaded words need distinct meanings here. <strong>History</strong> is the set of Events that actually happened in the Session.
+              A <strong>Summary</strong> is a durable handoff note with a coverage boundary. <strong>Context</strong> is the temporary input that processors
+              assemble for one model call. Context can disappear after that call; History remains the evidence; Summary remains reusable state.
+              The same Event can therefore still exist in History while no longer appearing in Context because it sits before the Summary boundary.
+            </p>
+
+            <div class="table-wrap"><table><thead><tr><th>Object</th><th>Owner</th><th>May it be lossy?</th><th>How a later turn sees it</th></tr></thead><tbody>
+              <tr><td><code>Session.Events</code></td><td>Session Service</td><td>Compaction must not rewrite or delete it</td><td>Request projection or on-demand Recall</td></tr>
+              <tr><td><code>Session.Summaries[key]</code></td><td>Session Service</td><td>Yes, but only with a coverage boundary</td><td>Injected as system or user context</td></tr>
+              <tr><td><code>model.Request.Messages</code></td><td>The current LLM flow</td><td>May be trimmed, replaced, and rebuilt</td><td>Valid only for this model call</td></tr>
+            </tbody></table></div>
 
             <div class="note key-point">
               <p>
@@ -918,6 +957,67 @@ This turn's model view
               in-request pressure path. That path is Context Compaction.
             </p>
 
+            <h3>8.2 The Boundary Makes The Next Update Delta-Only</h3>
+            <p>
+              Suppose the old Summary covers through <code>event-42</code>, and today appends <code>event-43</code> through <code>event-51</code>.
+              <code>SummarizeSession</code> computes the delta after the old boundary, then presents the old Summary as a synthetic system Event
+              before those nine new records. The summarizer reads “one handoff note plus nine additions,” not all 51 raw Events. Once it returns new text,
+              the runtime advances the boundary to the latest covered Event and writes text, <code>UpdatedAt</code>, and boundary together.
+            </p>
+
+            <pre><code>Before
+  summary = "Network ruled out"
+  boundary = event-42
+
+Summarizer input
+  system: "Network ruled out"        // previous Summary
+  event-43 ... event-51               // new Events only
+
+After
+  summary = "Network ruled out; intermediate certificate missing"
+  boundary = event-51</code></pre>
+
+            <p>
+              Text and coverage must move atomically at the algorithm level. Updating text without the boundary summarizes the same Events again next time.
+              Advancing the boundary before obtaining text hides evidence that never entered the Summary. The implementation therefore calls
+              <code>writeSummary</code> only after the summarizer returns non-empty text. See
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go#L166-L229"><code>SummarizeSession</code></a>
+              and <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go#L270-L345"><code>buildSummaryInput</code></a>.
+            </p>
+
+            <h3>8.3 A Valid Run Often Does Nothing</h3>
+            <p>
+              Rolling Summary does not mean “call a model after every run.” A missing summarizer, an empty post-boundary delta, a trigger below threshold,
+              or empty model output returns <code>updated=false</code> and leaves the old Summary untouched. Runner also does not enqueue after every Event:
+              it persists first, skips user input, bare tool calls, and invalid Events, then normally considers Summary after a tool result or final assistant text.
+              With intra-run synchronous Summary enabled, intermediate tool rounds skip the asynchronous job so two paths do not summarize the same delta.
+            </p>
+            <p>
+              The summarizer configuration owns the trigger; the framework does not silently fix one policy. With <code>WithContextThreshold</code>, the default
+              fires at 50% of the dynamically resolved model window, never below 2,000 tokens, and falls back to an 8,192-token window when resolution fails.
+              Applications may use event-count or custom checkers and another ratio. This 50% line belongs to routine rolling Summary; it is distinct from the
+              70% in-request Compaction emergency threshold below.
+            </p>
+
+            <p>
+              A per-session, per-filter lock serializes concurrent updates. It does not block unrelated sessions; it prevents two workers from both reading
+              boundary <code>event-42</code>, independently summarizing through <code>event-51</code>, then overwriting one another. Filter keys also let a Graph
+              branch own a branch Summary while a full-session Summary advances only when its cascade rules permit. One Session need not collapse every branch
+              into a mixed handoff note.
+            </p>
+
+            <h3>8.4 Background, Cache-Safe, And Emergency Paths Are Different</h3>
+            <div class="table-wrap"><table><thead><tr><th>Path</th><th>When it is used</th><th>Blocks the current response?</th><th>First observer</th></tr></thead><tbody>
+              <tr><td>Post-run asynchronous Summary</td><td>A normal run finishes and its trigger fires</td><td>No</td><td>A later request after persistence</td></tr>
+              <tr><td>Intra-run Summary</td><td>Explicitly enabled for a long tool loop</td><td>Yes, before the next model call</td><td>The next LLM iteration in the same run</td></tr>
+              <tr><td>Pressure-triggered Compaction</td><td>The request approaches the context window</td><td>Yes</td><td>The rebuilt current request</td></tr>
+            </tbody></table></div>
+            <p>
+              Cache-safe forking addresses a separate cost. The Summary request tries to retain the current model request's stable prefix and append only
+              the compaction instruction, giving providers a chance to reuse prompt cache. If no parent exists or the parent cannot fit the Summary model's
+              window, it falls back to a bounded standalone input. This changes how Summary input is delivered, not what the Summary means.
+            </p>
+
             <h2 id="context-compaction">9. Context Compaction Cleans Tool Payloads Before It Summarizes</h2>
             <p>
               The log tool has returned 12 KB. The model already consumed most of it and concluded that an intermediate certificate is missing.
@@ -958,6 +1058,7 @@ This turn's model view
               </table>
             </div>
 
+            <h3>9.1 All Three Passes Rewrite A Request Copy</h3>
             <p>
               The defaults and placeholders live near the top of
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/context_compact.go#L21-L56"><code>context_compact.go</code></a>;
@@ -968,7 +1069,23 @@ This turn's model view
               and repeating a side effect.
             </p>
 
-            <h3>9.1 Only A Still-Oversized Request Forces Synchronous Summary</h3>
+            <p>
+              <code>compactIncrementEvents</code> copies the Event slice before replacing message content; the durable Event in Session Service does not change.
+              Pass 0 only applies an application-declared tool-name policy, and a keep allowlist can protect tools that must remain visible. Pass 1 protects
+              the current request and a configurable recent tail. Pass 2 is the only one allowed to touch an extreme result in the current request, and its
+              default threshold is zero, meaning disabled. These conservative defaults matter because a new tool result may still be unconsumed evidence.
+            </p>
+
+            <pre><code>event-37 in Session (unchanged)
+  tool: certificate_scan
+  content: "... 12 KB raw payload ..."
+
+event-37 in this request after Pass 1
+  tool: certificate_scan
+  content: "Call succeeded and its result was consumed; event_id=event-37;
+            use session_load for exact slices if needed"</code></pre>
+
+            <h3>9.2 Only A Still-Oversized Request Forces Synchronous Summary</h3>
             <p>
               After projection, LLM flow estimates message tokens. By default, it checks for synchronous compaction at 70% of the model context window.
               Missing Session services, unsupported Summary setup, or an unavailable safe-rebuild snapshot all make it skip. When it does fire,
@@ -994,6 +1111,38 @@ New request: new Summary + a few post-boundary Events + current input + tools</c
               invokes Summary when needed, and rebuilds the model view.</strong>
             </p>
 
+            <h3>9.3 A New Summary Requires A New Request Projection</h3>
+            <pre><code>Rebuildable request pipeline
+  raw request snapshot
+       -> content processor: inject Summary and project post-boundary Events
+       -> context compaction: replace or truncate tool payloads
+       -> tail processors that declare replay support
+       -> Model
+
+Synchronous Summary changes Session state; rebuild replays the last three stages.</code></pre>
+            <p>
+              A persisted Summary update does not mutate the old <code>model.Request</code>, which still contains the old Summary and post-boundary Events.
+              LLM flow must return to a snapshot captured before content processing and replay “read boundary, project Events, compact tool results.”
+              To avoid replaying opaque custom processors, this path requires an all-events timeline, Summary injection in the content processor,
+              a safe rebuild plan, and tail processors that explicitly support rebuilding.
+            </p>
+            <p>
+              Failure is biased toward completing the current request. If the token threshold is not crossed, Summary does not advance, a service is missing,
+              or rebuild is unsafe, the original request continues. A Summary error also does not fail the user run. If in-memory Summary state advances but
+              persistence fails, the current call may still use the shorter rebuilt request while the runtime records a warning. Compaction is pressure relief,
+              not a new business transaction.
+            </p>
+
+            <div class="table-wrap"><table><thead><tr><th>Result</th><th>Current call</th><th>Durable Session</th><th>Next request</th></tr></thead><tbody>
+              <tr><td>Summary unchanged or rebuild unsafe</td><td>Continue the original request</td><td>Unchanged</td><td>Starts from the old boundary</td></tr>
+              <tr><td>Summary and persistence succeed</td><td>Use rebuilt short request</td><td>New text and boundary</td><td>Reliably reads the new boundary</td></tr>
+              <tr><td>In-memory state advances, persistence fails</td><td>May rebuild from memory</td><td>May still have old boundary</td><td>Same live Session may see new state; backend reload sees old state</td></tr>
+            </tbody></table></div>
+            <p>
+              The last row does not promise automatic repair. The runtime warns, but does not turn pressure relief into a distributed transaction or guarantee
+              that the next request retries successfully. Deployments need SessionService failure metrics, Summary reports, and later persistence work to detect and converge the split.
+            </p>
+
             <h2>10. Session Recall Returns To The Raw Ledger For Evidence</h2>
             <p>
               “The certificate chain is incomplete” is enough for most turns. If the user asks for yesterday's exact serial number, however,
@@ -1007,6 +1156,7 @@ New request: new Summary + a few post-boundary Events + current input + tools</c
 session_load(event_id="event-37", before=1, after=1)
   -> only the nearby user message, tool call, and tool result</code></pre>
 
+            <h3>10.1 Search Finds An Anchor Before Loading Raw Text</h3>
             <p>
               <code>current_hidden</code> uses the active Summary boundary to search before the cutoff and filters results to Events truly hidden in this Session.
               See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/session/tool/recall/search.go#L198-L235"><code>searchCurrentHidden</code></a>.
@@ -1015,11 +1165,45 @@ session_load(event_id="event-37", before=1, after=1)
             </p>
 
             <p>
+              A search hit acts as an index card: session, Event ID, and a small snippet, not a reinjected transcript. Compound queries receive bounded clause
+              and keyword fallbacks, then results merge by session and Event identity. This helps proper nouns and short exact phrases, but the hit remains
+              candidate evidence. A long tool payload still needs <code>session_load</code>; the search snippet is not a substitute for raw content.
+            </p>
+
+            <h3>10.2 Load Uses An Event Window And Can Page Large Content</h3>
+            <p>
+              <code>session_load</code> normally anchors on <code>event_id</code> and returns a bounded before/after window of user, assistant, and tool messages.
+              If a placeholder only has <code>tool_call_id</code>, it first resolves the corresponding tool-result Event in the in-memory Session, then the
+              persisted Session. When both identifiers were supplied and the Event anchor is stale, it can retry through the tool-call ID.
+              <code>content_offset</code> and <code>content_limit</code> page a still-large content array instead of reinserting all 12 KB.
+            </p>
+
+            <p>
+              The response also says that loaded history is context for the question, not active instructions. That distinction is a security boundary:
+              old user messages and tool payloads may contain expired or adversarial commands. Recall restores evidence; it must not silently elevate historical
+              content into current system policy.
+            </p>
+            <p>
+              No search hits produce an empty result, so the model can continue from Summary and current evidence or state that evidence is insufficient.
+              Search-service errors and missing load anchors return explicit tool errors; Agent may reformulate, retry through a tool-call ID, or stop.
+              Recall never rewrites Session on retrieval failure and never treats “not found” as proof that a fact is false.
+            </p>
+
+            <h3>10.3 Preload And On-Demand Recall Solve Different Questions</h3>
+            <p>
               A separate preload path searches <strong>other sessions</strong> with the current user question before the model's first answer and injects
               a small result set. That helps “the certificate issue from last week.” On-demand <code>current_hidden</code> handles details hidden by Summary
               inside the current long session. They have different scopes and should not be collapsed into one vague recall feature.
               The preload route is <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/content.go#L3338-L3389"><code>getPreloadSessionRecallMessage</code></a>.
             </p>
+
+            <div class="table-wrap"><table><thead><tr><th>Question</th><th>First path</th><th>Reason</th></tr></thead><tbody>
+              <tr><td>“What was the serial number earlier in this long session?”</td><td><code>current_hidden</code> → <code>session_load</code></td><td>The current Summary boundary hides the answer.</td></tr>
+              <tr><td>“How did last week's other ticket end?”</td><td>Cross-session preload search</td><td>The current Session does not own those Events.</td></tr>
+              <tr><td>“Which Go version do I normally use?”</td><td>Durable Memory</td><td>This is a stable cross-session fact, not evidence to rediscover every time.</td></tr>
+            </tbody></table></div>
+
+            <div class="note key-point"><p><strong>The compression loop is complete only now.</strong> Summary creates the cheap main view. Compaction trims the request copy under pressure. Recall follows stable references back to the raw ledger. Compression without Recall loses exact facts; Recall without compression still makes the model carry the whole ledger.</p></div>
 
             <h2 id="context-benchmark">11. Benchmarks Must Measure Savings, Loss, And Recovery Together</h2>
             <p>

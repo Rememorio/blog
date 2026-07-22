@@ -363,6 +363,21 @@ Model：材料足够，生成最终说明</code></pre>
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/runner/runner.go#L2810-L2856">完成路径</a>。
             </p>
 
+            <div class="table-wrap"><table><thead><tr><th>Event 形态</th><th>协议层是否可见</th><th>Session 是否追加</th><th>会不会触发 Summary 检查</th></tr></thead><tbody>
+              <tr><td>流式文本 partial</td><td>是，用于实时显示</td><td>通常不追加；取消恢复是单独的合成持久化路径</td><td>否</td></tr>
+              <tr><td>完整 user message</td><td>是</td><td>是，作为本轮输入证据</td><td>否，用户输入本身不排总结任务</td></tr>
+              <tr><td>完整 tool call</td><td>是</td><td>是，保留调用与 ID</td><td>否，要等结果或最终文本</td></tr>
+              <tr><td>完整 tool result</td><td>是</td><td>是，保留结果与 tool-call 对应关系</td><td>是，但 checker 仍可决定 no-op</td></tr>
+              <tr><td>完整 assistant 文本或有效 error</td><td>是</td><td>是；error 会先补成可持久内容</td><td>是，但可用 <code>SkipSummarization</code> 跳过</td></tr>
+              <tr><td>只有 state delta</td><td>可见性取决于协议翻译</td><td>即使没有完整 response 也会追加</td><td>没有有效正文时不触发</td></tr>
+              <tr><td>Runner completion</td><td>是，标记整轮结束</td><td>它是收尾信号，不充当对话正文</td><td>改为排一次 auto memory 与 evolution</td></tr>
+            </tbody></table></div>
+            <p>
+              Event ID 在 Event 被构造并注入 invocation 身份时已经存在，Runner 持久化的是同一个完整 Event；partial 不会因为每个 token
+              都新增一条 Session 记录。真正的判断式很短：有 state delta，或 response 完整且内容有效，才进入 <code>AppendEvent</code>。
+              Summary 又在 append 成功后做第二层筛选，所以“被流式看见”“进入原始账本”“触发后台维护”是三个不同条件。
+            </p>
+
             <p>
               现在可以完整复述一次 run：<strong>协议层接住请求 → Runner 打开工作台 → Agent 让 Model 与工具接力 → Event 报告过程 →
               Runner 保存记录并收尾 → summary、memory、evolution 在各自条件满足时处理后续状态。</strong>
@@ -812,6 +827,17 @@ Model：材料足够，生成最终说明</code></pre>
               </table>
             </div>
 
+            <h3>6.1 三条后台链路各自把游标写在哪里</h3>
+            <div class="table-wrap"><table><thead><tr><th>链路</th><th>增量游标 owner</th><th>整体失败</th><th>成功后影响什么</th></tr></thead><tbody>
+              <tr><td>Summary</td><td><code>Session.Summaries[key].Boundary</code></td><td>文本与边界都不推进</td><td>后续 model view；同步路径可影响当前 run</td></tr>
+              <tr><td>Auto Memory</td><td><code>Session.State[memory:last_extract_at]</code></td><td>搜索/extractor/job 失败不推进；单条写失败后整批游标仍可能推进</td><td>App/User Memory store，供后续 Session 检索</td></tr>
+              <tr><td>Evolution</td><td><code>Session.State[evolution:last_review_at]</code></td><td>policy/reviewer 报错不推进；完成 review 后即使 gate 拒绝也推进</td><td>Candidate revision；只有 active pointer 改变后未来 Agent 才可见</td></tr>
+            </tbody></table></div>
+            <p>
+              三个游标都借 Session 保存“这段原始事件处理到哪里”，但它们不是同一个事务。Summary 写回 Session 的模型视图状态；
+              Memory 写另一个用户级存储；Evolution 写 revision store。把游标放在 Session 里只是为了增量扫描，不能据此推断三类产物具有相同一致性。
+            </p>
+
             <p>
               因此，tRPC-Agent-Go 的深读拆成三篇：本篇先解决<strong>当前会话怎样变短且可恢复</strong>；
               下一篇讲<a href="../trpc-agent-go-memory/">长期 Memory 怎样跨会话保存事实</a>；最后一篇讲
@@ -842,6 +868,19 @@ Model：材料足够，生成最终说明</code></pre>
               组装请求时先读取 Summary 边界，再只追加边界之后的 Events。换句话说，Summary 改的是模型这一轮看到什么，
               不是把 Session 的原始事件改写成一段短文本。
             </p>
+
+            <p>
+              这里要先把三个容易混用的词拆开。<strong>History</strong> 是 Session 里已经发生过的事件；
+              <strong>Summary</strong> 是一份带覆盖边界的持久交接说明；<strong>Context</strong> 则是 processor
+              为这一次模型调用临时拼出的输入。一次调用结束后，Context 可以丢弃，History 仍是原始事实，Summary 则留给后续调用复用。
+              因而同一个 event 可能还在 History 中，却因为落在 Summary 边界之前而不再出现在 Context 中。
+            </p>
+
+            <div class="table-wrap"><table><thead><tr><th>对象</th><th>谁拥有</th><th>允许有损吗</th><th>下一轮怎样看见</th></tr></thead><tbody>
+              <tr><td><code>Session.Events</code></td><td>Session Service</td><td>不应因压缩而改写或删除</td><td>processor 投影，或 Recall 按需读取</td></tr>
+              <tr><td><code>Session.Summaries[key]</code></td><td>Session Service</td><td>允许概括，但必须带覆盖边界</td><td>作为 system/user 上下文注入</td></tr>
+              <tr><td><code>model.Request.Messages</code></td><td>当前 LLM flow</td><td>允许裁剪、替换和重建</td><td>只对本次模型调用有效</td></tr>
+            </tbody></table></div>
 
             <div class="note key-point">
               <p>
@@ -897,6 +936,66 @@ Model：材料足够，生成最终说明</code></pre>
               这就是 Context Compaction。
             </p>
 
+            <h3>8.2 边界怎样保证“只总结新增部分”</h3>
+            <p>
+              假设旧 Summary 已覆盖到 <code>event-42</code>，今天又写入 <code>event-43</code> 到 <code>event-51</code>。
+              <code>SummarizeSession</code> 先按旧 boundary 计算 delta，再把旧 Summary 伪装成一条 system event 放在 delta 前面。
+              总结模型看到的不是 51 条原始事件，而是“一份旧交接说明 + 9 条新记录”。模型生成新文本后，运行时把边界推进到本批
+              最后一个可覆盖事件，并将文本、<code>UpdatedAt</code> 和 boundary 一起写回。
+            </p>
+
+            <pre><code>更新前
+  summary = "已排除网络问题"
+  boundary = event-42
+
+送给 summarizer
+  system: "已排除网络问题"       // 旧 Summary
+  event-43 ... event-51            // 只有新增事件
+
+更新后
+  summary = "已排除网络问题；证书链缺少中间证书"
+  boundary = event-51</code></pre>
+
+            <p>
+              关键不是时间戳本身，而是“文本和覆盖边界必须一起前进”。若只更新文本、不更新边界，下一次会重复总结同一批事件；
+              若先推进边界、却没有成功得到新文本，则会把未进入摘要的原文藏起来。源码因此只在 summarizer 返回非空文本后调用
+              <code>writeSummary</code>。完整状态转换见
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go#L166-L229"><code>SummarizeSession</code></a>
+              与 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go#L270-L345"><code>buildSummaryInput</code></a>。
+            </p>
+
+            <h3>8.3 什么情况下它明确什么也不做</h3>
+            <p>
+              滚动 Summary 不是“run 结束必调一次模型”。没有 summarizer、旧边界之后没有新事件、trigger 未达到、模型返回空文本时，
+              函数都返回 <code>updated=false</code>，原 Summary 与边界保持不动。Runner 也不会对每个 event 都排任务：它先持久化事件，
+              跳过用户输入、纯 tool call 和无效事件，通常在工具结果或最终 assistant 文本出现后再考虑总结。
+              开启请求内同步总结时，中间工具轮次还会跳过异步排队，避免同一批 delta 被两条路径重复处理。
+            </p>
+            <p>
+              trigger 也由 summarizer 配置，而不是框架暗中固定。应用选择 <code>WithContextThreshold</code> 后，默认在动态解析出的模型窗口
+              达到 50% 时触发，绝对阈值不低于 2,000 token；拿不到模型窗口时用 8,192 作为 fallback。应用也可以换成事件数、
+              自定义 checker 或不同 ratio。这里的 50% 是后台滚动 Summary 的检查线，不要与后面请求内 Compaction 的 70% 救急线混为一谈。
+            </p>
+
+            <p>
+              同一个 session/filter 的并发总结由一把细粒度锁串行化。锁不是为了让所有会话排队，而是防止两个 worker 同时读取
+              <code>event-42</code>，各自总结到 <code>event-51</code>，随后互相覆盖。不同 filter key 仍可拥有各自的 Summary：
+              一个 Graph 分支可以只概括自己的事件，全会话 Summary 则在满足级联条件时单独推进。由此，“一份 Session”不必强迫
+              所有分支共享一段混杂摘要。
+            </p>
+
+            <h3>8.4 异步、省缓存和救急是三条不同路径</h3>
+            <div class="table-wrap"><table><thead><tr><th>路径</th><th>什么时候用</th><th>是否阻塞当前回复</th><th>下一次何时可见</th></tr></thead><tbody>
+              <tr><td>run 后异步 Summary</td><td>正常完成一轮，trigger 达标</td><td>否</td><td>后台写入成功后的后续请求</td></tr>
+              <tr><td>intra-run Summary</td><td>显式开启，工具循环中也需刷新上下文</td><td>是，发生在下一次模型调用前</td><td>同一个 run 的下一轮 LLM</td></tr>
+              <tr><td>压力触发 Compaction</td><td>请求已接近 context window</td><td>是</td><td>当前模型调用重建后的请求</td></tr>
+            </tbody></table></div>
+            <p>
+              cache-safe forking 解决的是另一种成本：总结请求尽量沿用当前 model request 的稳定前缀，只在尾部追加压缩指令，
+              让支持 prompt cache 的 provider 有机会复用前缀。若 parent request 不存在或放不进 summary model 的窗口，才退回有界的独立总结输入。
+              它不改变 Summary 的语义，只改变“怎样把输入送给总结模型”。
+            </p>
+
             <h2 id="context-compaction">九、Context Compaction 先清理工具载荷，再决定是否同步总结</h2>
             <p>
               继续看同一个任务。日志工具刚返回 12 KB 原文，其中绝大多数已经被模型读过并形成“证书链缺少中间证书”的结论。
@@ -937,6 +1036,7 @@ Model：材料足够，生成最终说明</code></pre>
               </table>
             </div>
 
+            <h3>9.1 三轮只改本次请求的副本</h3>
             <p>
               三轮顺序与默认值写在
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/context_compact.go#L21-L56"><code>context_compact.go</code> 的常量与占位符</a>
@@ -947,7 +1047,23 @@ Model：材料足够，生成最终说明</code></pre>
               否则提示只允许重跑只读或幂等工具。这个细节是在保护副作用边界，避免模型把“被压掉”误解成“调用失败”而重复执行。
             </p>
 
-            <h3>9.1 工具结果清理后仍然过线，才同步推进 Summary</h3>
+            <p>
+              <code>compactIncrementEvents</code> 先复制 event slice，再在副本中替换 message content；Session Service 里的原 event 不变。
+              Pass 0 只执行应用明确声明的工具名策略，keep allowlist 又能挡住不应清理的工具；Pass 1 保护当前请求和最近若干完整请求；
+              Pass 2 才允许处理当前请求中的极端大结果，而且默认阈值为 0，也就是不开启。框架把这些默认值设得保守，是因为工具结果
+              可能是模型尚未消费的新证据，过早替换会让下一步推理失去依据。
+            </p>
+
+            <pre><code>Session 中的 event-37（不变）
+  tool: certificate_scan
+  content: "... 12 KB 原始结果 ..."
+
+本次 request 中的 event-37（Pass 1 后）
+  tool: certificate_scan
+  content: "调用已成功且结果已被消费；event_id=event-37；
+            如需原文，使用 session_load 分片读取"</code></pre>
+
+            <h3>9.2 工具结果清理后仍然过线，才同步推进 Summary</h3>
             <p>
               请求投影完成后，LLM flow 会估算消息 token。默认在达到模型上下文窗口的 70% 时触发同步检查；
               条件不满足、没有 Session Service、不能安全重建请求时都直接跳过。真正触发后，它把当前完整请求作为 parent request
@@ -972,6 +1088,37 @@ cache-safe Summary：沿用 parent request 的稳定前缀，只追加压缩指�
               这里最容易混淆的边界是：<strong>Summary 是可持久化的滚动状态；Context Compaction 是在请求压力下组织清理、触发 Summary 并重建模型视图的运行策略。</strong>
             </p>
 
+            <h3>9.3 为什么同步总结后不能直接修改原请求</h3>
+            <pre><code>可重建的请求流水线
+  原始 request snapshot
+       -> content processor：注入 Summary，投影边界后 Events
+       -> context compaction：替换或截断工具载荷
+       -> 声明支持 replay 的 tail processors
+       -> Model
+
+同步 Summary 只改变 Session 状态；重建会从 snapshot 重跑后三段。</code></pre>
+            <p>
+              Summary 成功写入，只说明 Session 的压缩状态前进了；原 <code>model.Request</code> 里仍然装着旧 Summary 和旧 events。
+              LLM flow 必须回到 content processor 之前保存的 request snapshot，重新执行“读 Summary 边界 → 投影边界后 events → 清理工具结果”，
+              才能得到一致的新视图。为了避免重复执行不透明的自定义 processor，框架只在 timeline 是全量视图、content processor
+              开启 Summary，且尾部 processor 明确支持重放时启用这条同步重建路径。
+            </p>
+            <p>
+              失败也按“当前请求仍要尽量完成”处理：token 没过线、Summary 没推进、服务缺失或重建条件不安全时，继续使用原请求；
+              Summary 调用报错也不会把整轮 run 判失败。若内存中的 Summary 已推进而持久化失败，当前轮仍可使用重建后的短请求，
+              同时记录警告，让后续持久化与可观测链路处理。这是一条减压兜底，不是新的业务事务。
+            </p>
+
+            <div class="table-wrap"><table><thead><tr><th>结果</th><th>当前调用</th><th>持久 Session</th><th>下一次请求</th></tr></thead><tbody>
+              <tr><td>Summary 未推进或重建不安全</td><td>继续原请求</td><td>不变</td><td>仍从旧边界开始</td></tr>
+              <tr><td>Summary 与持久化都成功</td><td>使用重建后的短请求</td><td>新文本 + 新边界</td><td>稳定读到新边界</td></tr>
+              <tr><td>内存已推进、持久化失败</td><td>可使用内存状态重建</td><td>仍可能是旧边界</td><td>复用同一 live Session 时可能看到新状态；从后端重载则看到旧状态</td></tr>
+            </tbody></table></div>
+            <p>
+              最后一行没有承诺自动修复：实现记录 warning，但不把本轮压缩变成分布式事务，也不保证下一请求一定重试成功。
+              应用要通过 SessionService 失败指标、Summary report 与后续持久化任务发现并收敛这种分叉。
+            </p>
+
             <h2>十、Session Recall 让压缩后的模型回原始账本取证</h2>
             <p>
               Summary 说“证书链有问题”足以维持大多数对话，但用户若追问“昨天日志里的序列号到底是什么”，摘要可能没有这个细节。
@@ -985,6 +1132,7 @@ cache-safe Summary：沿用 parent request 的稳定前缀，只追加压缩指�
 session_load(event_id="event-37", before=1, after=1)
   -> 只取回该事件附近的用户消息、工具调用与工具结果</code></pre>
 
+            <h3>10.1 Search 先找锚点，不急着搬回整段原文</h3>
             <p>
               <code>current_hidden</code> 不是搜索“所有没显示的内容”，而是根据当前 Summary boundary，把检索时间限制在 cutoff 之前，
               再过滤为当前会话里真正被 Summary 遮住的事件。实现见
@@ -995,11 +1143,43 @@ session_load(event_id="event-37", before=1, after=1)
             </p>
 
             <p>
+              搜索结果承担的是“索引卡”角色：告诉模型哪个 session、哪个 event 可能相关，并给出短片段，而不是把整个 transcript
+              再注入一次。复合问题会先尝试原查询，再按子句与关键词生成有界 fallback，最后按 session/event 去重合并。
+              这能提高专有名词和短句的召回，但结果仍只是候选证据；尤其工具输出很长时，下一步必须 load，不能拿搜索摘要代替原文。
+            </p>
+
+            <h3>10.2 Load 围绕锚点取窗口，也能继续分片</h3>
+            <p>
+              <code>session_load</code> 默认以 <code>event_id</code> 为锚点，读取前后有限数量的 user、assistant 与 tool 消息。
+              如果压缩占位符只有 <code>tool_call_id</code>，工具会先在当前内存 Session 查找对应 tool result event，再回持久 Session 查；
+              event ID 已失效但同时带有 tool-call ID 时，也会用后者重试。对于一个 event 中仍然很大的内容数组，
+              <code>content_offset</code> 与 <code>content_limit</code> 允许继续分页，而不是一次把 12 KB 全塞回来。
+            </p>
+
+            <p>
+              返回值还明确写着：加载到的历史是回答问题的上下文，不是新的活跃指令。这条提示在安全上很重要，因为旧用户消息或旧工具输出
+              可能包含已经过期、甚至恶意的命令。Recall 恢复的是证据，不应悄悄把历史内容提升成当前系统指令。
+            </p>
+            <p>
+              搜索无命中时返回空结果，模型应继续用 Summary 和当前证据作答或说明不足；Service 搜索报错、load 锚点不存在时，工具返回明确错误，
+              由 Agent 决定改查询、换 tool-call ID 重试或停止。Recall 不会因为检索失败而改写 Session，也不会把“没找到”伪装成事实不存在。
+            </p>
+
+            <h3>10.3 Preload 与按需 Recall 解决不同问题</h3>
+            <p>
               框架还有另一条 preload 路径：在模型第一次作答前，用当前用户问题搜索<strong>其他会话</strong>的原始事件，把少量结果预先注入请求。
               它适合“上周那个证书问题”这种跨会话追问；按需的 <code>current_hidden</code> 则适合同一长会话里找回被摘要遮住的细节。
               两条路径的范围不同，不能只用一个“recall”名词带过。preload 逻辑见
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/content.go#L3338-L3389"><code>getPreloadSessionRecallMessage</code></a>。
             </p>
+
+            <div class="table-wrap"><table><thead><tr><th>问题</th><th>先走哪条路</th><th>为什么</th></tr></thead><tbody>
+              <tr><td>“昨天这条长会话里，序列号是多少？”</td><td><code>current_hidden</code> → <code>session_load</code></td><td>答案已被当前 Summary 边界遮住，需要原地取证。</td></tr>
+              <tr><td>“上周另一张工单最后怎样解决？”</td><td>跨会话 preload search</td><td>当前 Session 没有那段 event，需要在首轮回答前带回少量候选。</td></tr>
+              <tr><td>“我通常使用哪个 Go 版本？”</td><td>长期 Memory</td><td>这是跨会话稳定事实，不该每次从原 transcript 重新推断。</td></tr>
+            </tbody></table></div>
+
+            <div class="note key-point"><p><strong>压缩闭环到这里才完整。</strong> Summary 负责形成便宜的主视图，Compaction 在窗口压力下删减请求副本，Recall 用稳定引用回原始账本取证。只有压缩没有 Recall，会丢精确事实；只有 Recall 没有压缩，模型仍要背着整本历史前进。</p></div>
 
             <h2 id="context-benchmark">十一、Benchmark 要同时回答省多少、丢多少、能否找回</h2>
             <p>
