@@ -69,7 +69,8 @@
 
           <section class="article-body">
             <div class="note key-point"><p><strong>The final boundary in this three-part route.</strong> Summary changes the current model-visible session view. Memory persists cross-session facts and episodes. Evolution owns only reusable Skills: how future tasks of this kind should be done.</p></div>
-            <div class="note"><p><strong>Evidence status.</strong> Online Evolution and the first SkillCraft benchmark are merged into public main. Source links are pinned to <code>0c7774187da9330144df2a038ef18ee89ef2ae1c</code> and benchmark links to <code>c9aabe56c0eb1cb80e927d2a34ecc72658173cbe</code>. The GEPA-inspired optimizer and its benchmark remain under review. This chapter explains the pending implementation and current artifacts without presenting them as a released API; those results are provisional.</p></div>
+            <div class="note"><p><strong>Evidence status.</strong> Online Evolution and the first SkillCraft benchmark are merged into public main. Source links are pinned to <code>0c7774187da9330144df2a038ef18ee89ef2ae1c</code> and benchmark links to <code>c9aabe56c0eb1cb80e927d2a34ecc72658173cbe</code>. The GEPA-inspired optimizer and benchmark remain under review in <a href="https://github.com/trpc-group/trpc-agent-go/pull/2204">framework PR #2204</a> and <a href="https://github.com/trpc-group/trpc-agent-go-benchmark/pull/18">benchmark PR #18</a>. This chapter explains the pending implementation and current artifacts without presenting them as a released API; those results are provisional.</p></div>
+            <div class="note"><p><strong>Reading contract.</strong> Follow one multi-recipe Skill revision. By the end, you should be able to replay which run triggers review, what the reviewer sees, why a candidate may produce no write, exactly which strings and fields SpecGate and SafetyGate inspect, which record selects the active version, and where online Evolution and offline GEPA optimize and reject candidates.</p></div>
 
             <h2>1. Translate "Self-Evolution" Into A Checkable Question</h2>
             <p>
@@ -94,6 +95,11 @@
               and Skill scope. <code>NewService</code> constructs the reviewer, publisher, worker, and optional gate components, then starts background workers.
               See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/service.go#L23-L78"><code>NewService</code> and <code>EnqueueLearningJob</code></a>.
             </p>
+            <p>
+              Runner's default completion hook normally supplies Session with a nil <code>Outcome</code>. A benchmark harness or application evaluator must
+              explicitly attach status, score, and notes. “The reviewer can read Outcome” is a service capability, not a score every online job inherently owns.
+              Without Outcome, the built-in EffectivenessGate passes by default and leaves judgment to the reviewer, other gates, or approval.
+            </p>
             <pre><code>foreground run
   -> Agent finishes task
   -> evaluator may attach Outcome{status, score, notes}
@@ -107,6 +113,18 @@ background evolution
   -> refresh managed skill repository</code></pre>
             <p>Background placement protects the main path. A slow reviewer, failed review, or skip decision should not make an already completed user request fail again. Session-hashed queues preserve ordering; synchronous processing is a fallback when the queue cannot accept work.</p>
 
+            <p>
+              “Run complete” only permits background work; it does not force a reviewer call. The worker first reads the delta after
+              <code>evolution:last_review_at</code>. Default policy reviews when any of three signals appears: at least four tool calls, a user correction
+              after an assistant turn, or recovery after a tool error. A delta that already writes a managed Skill is skipped to avoid learning from the
+              learning output it just produced. No new messages, a declined policy, and reviewer <code>skip_reason</code> are all valid no-ops.
+            </p>
+            <p>
+              The queue keeps accepted jobs alive with <code>context.WithoutCancel</code> and routes the same Session through a stable hash so its reviews remain
+              ordered. Only an unstarted or full queue falls back to bounded synchronous work. The foreground user sees the original task result; only a later
+              run can observe an accepted Skill.
+            </p>
+
             <h3>2.2 The Reviewer Reads Task Evidence, Not A Chat Summary</h3>
             <p>
               The worker scans the delta after the last review point, checks <code>ReviewPolicy</code>, and loads names, descriptions, and bounded body excerpts
@@ -115,6 +133,45 @@ background evolution
               the contract is <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/types.go#L116-L155"><code>Outcome</code> and <code>ReviewInput</code></a>.
             </p>
             <p>A library-aware reconciler follows the LLM decision. A proposed count-specific duplicate may become an update or be deduplicated. Reconcile answers what the model meant to change; gates answer whether the candidate may ship.</p>
+
+            <pre><code>ReviewInput (simplified shape)
+  recent transcript:
+    user -> tool calls -> tool results -> final answer
+  outcome:
+    status=partial, score=0.82, notes="final artifact missing"
+  existing skills:
+    name + description + bounded body excerpt
+
+ReviewDecision
+  skip_reason | creates[] | updates[] | deletions[]</code></pre>
+
+            <p>
+              Each transcript message is rendered with a default 4,000-character cap; oversized tool results keep their head and tail so the reviewer does not
+              exhaust its own context. Existing Skills include descriptions and bounded body excerpts, not names alone, allowing comparison of
+              <code>when_to_use</code> and steps before inventing “3 dishes” and “5 dishes” variants. The Decision must parse as structured JSON.
+              Parse failure, timeout, or reviewer error does not advance the review cursor, so a later job may retry. A policy skip or completed review does
+              advance it, avoiding repeated payment for the same unhelpful delta.
+            </p>
+
+            <div class="table-wrap"><table><thead><tr><th>Worker outcome</th><th><code>evolution:last_review_at</code></th><th>Reason</th></tr></thead><tbody>
+              <tr><td>No reviewable message in the delta</td><td>Does not advance</td><td>No new complete evidence was consumed.</td></tr>
+              <tr><td>Policy returns false</td><td>Advances</td><td>A deterministic policy consumed this low-value delta, avoiding another scan.</td></tr>
+              <tr><td>Managed Skill writes are present</td><td>Advances</td><td>Explicitly consumes self-referential evidence and prevents a learning loop.</td></tr>
+              <tr><td>Reviewer error, timeout, or JSON parse failure</td><td>Does not advance</td><td>A later job may retry the same evidence.</td></tr>
+              <tr><td>Nil decision or <code>skip_reason</code></td><td>Advances</td><td>The reviewer successfully read the evidence and chose no change.</td></tr>
+              <tr><td>Revision rejected, pending, publication failed, or succeeded</td><td>Advances</td><td><code>applyDecision</code> completed this governance attempt; revision, audit, and logs own its outcome.</td></tr>
+            </tbody></table></div>
+            <p>
+              This cursor lives in the current <code>Session.State</code>. It records where the reviewer consumed evidence, not whether a Skill was published.
+              A publisher failure therefore does not automatically rerun the reviewer. Recovery should use revision status, audit, and publisher logs to retry
+              governance rather than asking the model to generate a potentially different candidate from the same transcript. Evidence consumption and candidate
+              activation are separate recovery boundaries.
+            </p>
+            <p>
+              Deterministic reconciliation then cleans the decision: duplicates within one create batch collapse; a strict name extension of an existing Skill
+              becomes update; “Recipe - 3 Dishes” becomes an update when “Recipe - Multi-Dish” exists; high body-word overlap also merges candidates.
+              This is best-effort correction rather than a publish gate, so SpecGate repeats the hard invariant checks.
+            </p>
 
             <h3>2.3 A Revision Separates Generated From Active</h3>
             <p>
@@ -131,6 +188,93 @@ background evolution
             <p>
               Direct publish remains available when no gate plumbing is configured. As soon as any gate component exists, <code>applyDecision</code> routes
               through the revision pipeline. See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L428-L471"><code>applyDecision</code></a>.
+            </p>
+
+            <h3>2.4 How The Four Gates Actually Decide</h3>
+            <p>
+              Consider an intentionally bad candidate. The reviewer creates <code>Recipe Cookbook - 3 Dishes</code>, provides one step, omits
+              <code>when_to_use</code>, and includes <code>rm -rf /</code>. The runtime does not send the whole spec to another LLM and ask whether it is safe.
+              Auditable deterministic rules report specific failures first.
+            </p>
+
+            <pre><code>candidate revision
+  action: create
+  name: "Recipe Cookbook - 3 Dishes"
+  description: "Collect recipes"
+  when_to_use: ""
+  steps: ["generate files, then run rm -rf /"]</code></pre>
+
+            <h4>SpecGate asks whether this is an executable, reusable Skill</h4>
+            <p>
+              The built-in SpecGate makes no model call. Create and update need a spec, name, description, <code>when_to_use</code>, at least two steps by default,
+              and a name no longer than 120 characters. For create, names are lowercased and non-alphanumeric runs collapse to <code>-</code>; a canonical match
+              with an existing name must be update. A count pattern catches names such as “3 cities” or “5 dishes” when a multi-city or multi-dish parent exists.
+              Delete bypasses body checks because it has no new spec. The example receives missing-use-condition, too-few-steps, and count-specific-sibling reasons.
+              See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go#L194-L270"><code>defaultSpecGate.Validate</code></a> for the field and canonical-name rules.
+            </p>
+
+            <h4>SafetyGate scans the full body, but deliberately keeps a short rule list</h4>
+            <p>
+              SafetyGate joins description, <code>when_to_use</code>, steps, and pitfalls. It scans for three high-confidence groups: common cloud secrets,
+              API tokens, and private keys; <code>rm -rf /</code>, raw-device writes, download-and-pipe-to-shell, and fork bombs; and traversal or sensitive paths
+              such as <code>../../</code>, <code>/etc/passwd</code>, and <code>.ssh/id_*</code>. The candidate is flagged for dangerous shell content.
+              The list stays short because a false positive rejects a revision. This gate does not prove semantic safety and does not replace CodeExecutor
+              sandboxing or tool permissions.
+              The scan entry and rule composition are in <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go#L272-L302"><code>defaultSafetyGate.Scan</code></a>.
+            </p>
+
+            <h4>Default EffectivenessGate reads Outcome; it does not secretly replay a benchmark</h4>
+            <p>
+              <code>OutcomeBasedEffectivenessGate</code> is a cheap heuristic. Its default score threshold is 0.8. A fail/agent_error status or score below the
+              threshold places the revision in <code>pending_eval</code>; partial may pass, delete always passes, and missing Outcome passes by default.
+              It asks whether automatic learning from a catastrophic run is credible. It does not answer whether the Skill improves independent tasks.
+              Replay, shadow traffic, and mini-benchmarks require another implementation of the interface; GEPA's frozen evidence must not be attributed to this default gate.
+              See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go#L107-L174"><code>outcomeBasedEffectivenessGate</code></a>.
+            </p>
+
+            <h4>HumanGate decides whether to hold; the worker never waits for a person</h4>
+            <p>
+              <code>ShouldHold</code> must return quickly. A slow external approval system should return hold and move the revision to
+              <code>pending_approval</code>. Gate errors also hold, failing closed. Later, <code>ApprovalService.Decide</code> locks the Skill and verifies that the
+              revision is still pending. Approval publishes the spec, archives the old active revision, updates the active pointer, and audits the decision;
+              rejection only records rejected status. Human approval is a separate state transition, not a worker goroutine waiting on a button.
+              Persistence and the final decision are implemented by <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L903-L922"><code>runHumanGate</code></a>
+              and <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/approval_service.go#L153-L212"><code>ApprovalService.Decide</code></a>.
+            </p>
+
+            <h3>2.5 Gate Order, Persistence, And Agent Visibility</h3>
+            <p>
+              Spec and Safety both run and retain reports, so one review reveals structural and safety failures together. Effectiveness runs only after those pass;
+              HumanGate runs only after every automatic gate passes. Every gate error fails closed. Accepted and rejected revisions are both written to CandidateStore
+              with audit reasons; only a pass, or explicit shadow mode, calls the publisher. On a normal pass, the previous active revision becomes archived,
+              the new revision becomes active, and <code>active.txt</code> points to its ID. Agents see it only after the repository refresh.
+            </p>
+
+            <pre><code>pending
+  ├─ Spec / Safety fail        -> rejected         -> revision + audit only
+  ├─ Effectiveness holds      -> pending_eval     -> await evaluation
+  ├─ HumanGate holds          -> pending_approval -> await ApprovalService
+  └─ all pass                 -> publish -> active
+                                  old active -> archived</code></pre>
+
+            <p>
+              The protected invariant is simple: <strong>generating a candidate does not change future Agents.</strong> CandidateStore records what was proposed,
+              the publisher holds current Skill content, and ActivePointer selects the live revision. Keeping them distinct permits rejection audit and rollback
+              without presenting an experiment as a production capability.
+            </p>
+
+            <div class="table-wrap"><table><thead><tr><th>Action / result</th><th>Persistence</th><th>Agent visibility</th></tr></thead><tbody>
+              <tr><td>Create / Update passes</td><td>Write revision, call <code>UpsertSkill</code>, archive the old active revision, and switch the pointer.</td><td>The new body enters later runs after repository refresh.</td></tr>
+              <tr><td>Delete passes</td><td>Keep a delete revision and audit; bypass Spec/Safety, call <code>DeleteSkill</code>, archive old active, and clear the pointer.</td><td>The managed Skill disappears after refresh; non-Evolution-managed Skills are protected.</td></tr>
+              <tr><td>Rejected / Pending</td><td>Write revision, gate reports, and audit only; leave publisher unchanged.</td><td>Invisible until evaluation or approval performs another transition.</td></tr>
+              <tr><td>Shadow bypasses a failed gate</td><td>Retain failed report/status and increment the bypass metric, but still call publisher and switch the pointer.</td><td>Visible after refresh; intended for migration observation, not normal governance.</td></tr>
+            </tbody></table></div>
+            <p>
+              Shadow is easy to misread as “observe without activation.” Here it means the opposite. <code>WithApprovalGateShadow(true)</code> lets teams observe
+              what gates would reject while preserving the old direct-publish behavior, so a failed candidate may still enter the managed library. Failed status
+              and the <code>shadow_mode_bypassed</code> metric answer “what would enforcement have changed?” Once production relies on gates, shadow should be off;
+              otherwise reports are warnings, not isolation. See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L750-L789"><code>processRevision</code></a>
+              and <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L903-L970"><code>publishRevision</code></a>.
             </p>
 
             <h2 id="skillcraft">3. The First SkillCraft Benchmark: Does Online Learning Help?</h2>
@@ -162,7 +306,24 @@ background evolution
             </p>
             <div class="note"><p><strong>State the gate evidence honestly.</strong> All 69 observed candidates in this run were promoted; no production benchmark candidate was rejected because the reconciler cleaned the reviewer output first. The matrix shows that revision plumbing did not block useful candidates, but it does not empirically establish rejection quality. Rejection paths were mainly covered by unit tests, which motivates independent holdout evidence.</p></div>
 
-            <h2 id="gepa-optimizer">4. Why Add A GEPA-Inspired Offline Optimizer?</h2>
+            <h2>4. Online Versus Offline And Automatic Versus Approved Are Different Axes</h2>
+            <p>
+              “Online Evolution” is often misread as “the data came from live traffic,” while offline GEPA is misread as “the data must be synthetic.”
+              The real distinction is <strong>whether optimization happens incrementally inside the operational task flow</strong>. Data origin does not decide it.
+            </p>
+            <div class="table-wrap"><table><thead><tr><th>Question</th><th>Online / continuous learning</th><th>Offline / batch optimization</th></tr></thead><tbody>
+              <tr><td>When optimization happens</td><td>After an operational run; the result may affect later runs.</td><td>Outside the request path through repeated search and counterfactual evaluation.</td></tr>
+              <tr><td>Where data may come from</td><td>Usually real Sessions, but controlled runs also work.</td><td>Hand-built cases, benchmarks, or frozen production traffic.</td></tr>
+              <tr><td>How state changes</td><td>The managed library evolves with Session order.</td><td>Seed and candidates are compared on fixed Feedback/Validation/Holdout splits.</td></tr>
+              <tr><td>Main bias</td><td>Order effects, trajectory noise, one-session overfit.</td><td>Dataset mismatch, search overfit, model-transfer failure.</td></tr>
+            </tbody></table></div>
+            <p>
+              Automatic publication versus human approval is a separate governance axis. Conceptually, online revisions may require approval and offline candidates
+              may be auto-published by policy. The pending GEPA implementation here is deliberately stricter: an externally evaluated submission that passes automatic
+              gates is still forced to <code>pending_approval</code> with “externally evaluated revisions require approval.” Distinguish the general model from this code policy.
+            </p>
+
+            <h2 id="gepa-optimizer">5. Why Add A GEPA-Inspired Offline Optimizer?</h2>
             <p>
               Online Evolution reviews after every session. That is close to production, but evidence is unstable: the same task supplies both lesson and candidate;
               a reviewer may learn a one-case trick; sequential managed state couples later tasks to earlier ones. "Should this revision ship?" requires separating
@@ -174,7 +335,49 @@ background evolution
               candidates with complementary sample-level strengths. The implementation is a pure-Go optimizer for <code>SkillSpec</code>; it does not claim to reproduce every paper task or result.
             </p>
 
-            <h3>4.1 Mutate One Component At A Time</h3>
+            <h3>5.1 Who Starts GEPA: An Experiment Driver, Not The Online Worker</h3>
+            <p>
+              The GEPA optimizer is an explicitly called library object, not a resident service watching real Sessions. A human, CI job, or benchmark harness
+              prepares a seed Skill, three frozen splits, and an <code>Evaluator</code>, then calls <code>Optimize(ctx, Request)</code> outside the request path.
+              The Evaluator runs a candidate on a batch and returns score, feedback, and trace per case. The reflector proposes edits from feedback. The engine
+              owns budget, candidate pool, paired seeds, experiment recording, and final holdout; it does not connect to live traffic to discover examples.
+            </p>
+            <pre><code>human / CI / benchmark harness
+  ├─ freeze Dataset{Feedback, Validation, Holdout}
+  ├─ provide Evaluator(candidate, cases, seed)
+  ├─ construct GEPA(reflection model, evaluator, budgets)
+  └─ Optimize(seed SkillSpec)
+       ├─ search + validation + holdout
+       ├─ return Result                         // experiment report by default
+       └─ Submit=true + RevisionSubmitter       // optional
+            └─ pending_approval revision
+                 └─ approval -> publisher -> repository refresh</code></pre>
+            <p>
+              “Offline” therefore means search and counterfactual evaluation happen outside the operational task flow. It does not require hand-authored data:
+              sanitized production Sessions can be selected and frozen into the Dataset. By default, <code>Optimize</code> returns a Result and changes no Skill.
+              Only <code>Submit=true</code> plus an injected <code>RevisionSubmitter</code> sends a promotion-eligible candidate into the same revision governance.
+              The current PR additionally forces externally evaluated submissions to human approval, preserving the boundary between “the experiment improved”
+              and “production may activate it.” See <a href="https://github.com/trpc-group/trpc-agent-go/pull/2204">GEPA optimizer PR #2204</a>.
+            </p>
+
+            <h3>5.2 Freeze The Dataset Contract Before Optimizing</h3>
+            <p>
+              An optimizer Request is not a bag of changing examples. It requires a seed <code>SkillSpec</code>, a Dataset with ID and version, and unique case IDs
+              across Feedback, Validation, and Holdout. Feedback and Validation cannot be empty; submission requires at least ten cases in each split.
+              Evaluator returns exactly one 0–1 score per case and may attach output, feedback, trace, and objectives. Search survival uses the scalar score;
+              objectives remain report evidence rather than silently changing ranking.
+            </p>
+            <div class="table-wrap"><table><thead><tr><th>Split</th><th>Who may see it</th><th>Only allowed use</th></tr></thead><tbody>
+              <tr><td>Feedback</td><td>Evaluator and reflector</td><td>Expose failure traces and propose a mutation.</td></tr>
+              <tr><td>Validation</td><td>Evaluator and candidate selector</td><td>Compare under a fixed seed and select the search winner.</td></tr>
+              <tr><td>Holdout</td><td>Engine after search</td><td>Confirm the winner; never feed reflection.</td></tr>
+            </tbody></table></div>
+            <p>
+              Engine defaults are bounded: ten iterations, 1,000 metric calls, and three feedback cases per reflection batch, plus an optional wall-clock limit.
+              The seed is evaluated on Validation first, and Holdout calls are reserved before search spends the budget, preventing an unconfirmable winner.
+            </p>
+
+            <h3>5.3 Mutate One Component At A Time</h3>
             <p>
               A Skill contains description, when_to_use, steps, and pitfalls. Each iteration samples a feedback minibatch and evaluates parent and child under the
               same paired seed. Reflection changes one component. The child must strictly improve the minibatch score before it reaches fixed validation and the candidate matrix.
@@ -188,22 +391,41 @@ background evolution
   -> evaluate survivor on validation
   -> after search, compare best candidate with seed on untouched holdout</code></pre>
 
-            <h3>4.2 Pareto Selection Preserves Complementary Candidates</h3>
+            <p>
+              The reflector receives redacted, bounded case records plus the one component it may edit. It must return structured JSON, and the runtime applies
+              only that field to the original spec. Invalid output, no field change, or a duplicate candidate hash records rejection and continues.
+              Parent and child run on the same feedback minibatch with the same paired seed. The child reaches full Validation only when its total score is
+              <strong>strictly greater</strong>, reducing but not eliminating provider sampling noise.
+            </p>
+
+            <h3>5.4 Pareto Selection Preserves Complementary Candidates</h3>
             <p>
               Candidate A may lead simple recipes while B leads multi-step recipes even if A has a slightly better mean. Selecting only by average would erase B.
               The optimizer records leaders for each validation case and keeps candidates that cover otherwise uncovered sample-level strengths. The final winner still
               uses validation mean, but search does not prematurely discard complementary paths.
             </p>
 
-            <h3>4.3 Holdout Is Hidden From Reflection, And Submit Is Not Deploy</h3>
+            <p>
+              A child can therefore enter the pool without the highest Validation mean. If it leads cases that no other candidate covers, it provides a distinct
+              parent for later mutation. Only after search does fixed Validation mean select the final best. Exploration diversity and deployment judgment remain
+              separate rules.
+            </p>
+
+            <h3>5.5 Holdout Is Hidden From Reflection, And Submit Is Not Deploy</h3>
             <p>
               Dataset explicitly separates feedback, validation, and holdout. Feedback supplies traces and comments. Validation selects candidates. Holdout is used only
               after search and is never sent to the reflection model. A winner becomes promotion-eligible only when holdout improves enough and no critical case regresses.
               Optional submission uses a narrow <code>RevisionSubmitter</code> and enters existing governance; it does not mutate the live Skill by default.
             </p>
 
-            <h2>5. The GEPA Benchmark Uses Search, Frozen, And Runtime Evidence</h2>
-            <h3>5.1 One Dataset, Three Increasingly Strict Decisions</h3>
+            <p>
+              Promotion has explicit no-op paths: best remains seed, no Holdout exists, candidate delta misses the configured minimum, or any
+              <code>Critical</code> Holdout case regresses. Passing yields <code>PromotionEligible=true</code>, not active. Current PR submission stores dataset
+              ID/version, baseline and candidate scores, delta, case count, and objectives in revision evidence, then forces human approval.
+            </p>
+
+            <h2>6. The GEPA Benchmark Uses Search, Frozen, And Runtime Evidence</h2>
+            <h3>6.1 One Dataset, Three Increasingly Strict Decisions</h3>
             <div class="table-wrap"><table><thead><tr><th>Stage</th><th>Evidence</th><th>Decision allowed</th></tr></thead><tbody>
               <tr><td>Search</td><td>Reflect on feedback, select on validation.</td><td>May abstain; every family need not produce a new Skill.</td></tr>
               <tr><td>Frozen confirmation</td><td>Fix the candidate and use independent seeds plus untouched holdout.</td><td>May reject a validation winner.</td></tr>
@@ -215,7 +437,7 @@ background evolution
               Odd and even roots reverse whole-arm order while task seeds remain paired across arms.
             </p>
 
-            <h3>5.2 Search Must Be Able To Leave The Seed Unchanged</h3>
+            <h3>6.2 Search Must Be Able To Leave The Seed Unchanged</h3>
             <p>
               Cat Facts and Pokémon keep the seed. Weather creates a mutation but validation still keeps the seed. Only Recipe and World Bank proceed to frozen
               confirmation. Completing search iterations is not evidence that a publishable candidate exists.
@@ -227,7 +449,7 @@ background evolution
             </tbody></table></div>
             <p>The generic Recipe mutation is the most useful bad case. It is cheaper on validation but fails an untouched <code>e3</code> pair. Reporting only the search winner would have shipped the wrong Skill. Frozen confirmation exists to find disconfirming evidence.</p>
 
-            <h3>5.3 Runtime Accepts Recipe And Rejects World Bank</h3>
+            <h3>6.3 Runtime Accepts Recipe And Rejects World Bank</h3>
             <div class="table-wrap"><table><thead><tr><th>Family (optimized vs evolution)</th><th>Pass delta</th><th>Quality delta</th><th>E2E token delta</th><th>Decision</th></tr></thead><tbody>
               <tr><td>Recipe (overlay)</td><td>0.00pp</td><td>+0.32pp</td><td><strong>-14.75%</strong></td><td><strong>Accept</strong></td></tr>
               <tr><td>World Bank (overlay)</td><td>0.00pp</td><td>0.00pp</td><td><strong>+3.29%</strong></td><td><strong>Reject</strong></td></tr>
@@ -237,7 +459,7 @@ background evolution
               World Bank saves tokens on frozen holdout but becomes more expensive in all three roots after returning to sequential managed-skill state. Frozen evidence is necessary, not sufficient for production.
             </p>
 
-            <h3>5.4 Do Not Attribute A Global +1.25pp To The Overlays</h3>
+            <h3>6.4 Do Not Attribute A Global +1.25pp To The Overlays</h3>
             <div class="table-wrap"><table><thead><tr><th>Global (n=90/arm)</th><th>Baseline</th><th>Evolution</th><th>Optimized Evolution</th></tr></thead><tbody>
               <tr><td>Pass rate</td><td>97.78%</td><td>97.78%</td><td><strong>98.89%</strong></td></tr>
               <tr><td>Official quality</td><td>95.98%</td><td>95.96%</td><td><strong>97.21%</strong></td></tr>
@@ -253,7 +475,7 @@ background evolution
               A Skill improvement is not automatically portable across models; model behavior, tool response shape, and execution budget belong to its scope.
             </p>
 
-            <h2>6. Read The Two Evolution Routes Together</h2>
+            <h2>7. Read The Two Evolution Routes Together</h2>
             <div class="table-wrap"><table><thead><tr><th>Question</th><th>Online Evolution</th><th>Offline Optimizer</th></tr></thead><tbody>
               <tr><td>Where candidates come from</td><td>Real session delta and outcome.</td><td>Paired feedback and reflection on a fixed dataset.</td></tr>
               <tr><td>Strength</td><td>Continuously captures production tail experience.</td><td>Isolates variables, keeps complementary candidates, uses holdout to disconfirm.</td></tr>
@@ -275,6 +497,7 @@ background evolution
               <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go">Spec, Safety, Effectiveness, and Human gates</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go-benchmark/blob/c9aabe56c0eb1cb80e927d2a34ecc72658173cbe/skillcraft/results/REPORT.md">Merged SkillCraft online Evolution report</a></li>
               <li><a href="https://arxiv.org/abs/2507.19457v2">GEPA paper (arXiv:2507.19457v2)</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/pull/2204">Pending GEPA optimizer PR #2204</a> and <a href="https://github.com/trpc-group/trpc-agent-go-benchmark/pull/18">benchmark PR #18</a></li>
             </ul>
           </section>
         </article>
