@@ -956,12 +956,38 @@ Model：材料足够，生成最终说明</code></pre>
   summary = "已排除网络问题；证书链缺少中间证书"
   boundary = event-51</code></pre>
 
+            <p>把日志和锁等外围代码裁掉后，真正推进状态的源码只有下面这条主线：</p>
+            <pre><code>// session/internal/summary/summary.go（节选）
+input, ok := buildSummaryInput(ctx, m, base, filterKey, force, prev)
+if !ok {
+    return false, nil
+}
+text, err := m.Summarize(input.ctx, input.session)
+if err != nil {
+    return false, fmt.Errorf("summarize session %s failed: %w", base.ID, err)
+}
+if text == "" {
+    return false, nil
+}
+
+boundary := selectSummaryBoundary(
+    input.session, filterKey, prev.boundary,
+    input.latestBoundary, input.hasDelta,
+)
+writeSummary(base, filterKey, text, boundary.CutoffTime(), boundary)
+return true, nil</code></pre>
+
             <p>
               关键不是时间戳本身，而是“文本和覆盖边界必须一起前进”。若只更新文本、不更新边界，下一次会重复总结同一批事件；
               若先推进边界、却没有成功得到新文本，则会把未进入摘要的原文藏起来。源码因此只在 summarizer 返回非空文本后调用
               <code>writeSummary</code>。完整状态转换见
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go#L166-L229"><code>SummarizeSession</code></a>
               与 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go#L270-L345"><code>buildSummaryInput</code></a>。
+            </p>
+            <p>
+              这段代码把三个边界写得很清楚。<code>buildSummaryInput</code> 返回 false，表示 trigger 或 delta 不满足，本轮没有模型调用；
+              summarizer 报错或返回空文本，也不会触碰旧状态；只有拿到非空文本后，代码才计算新 boundary，并用一次
+              <code>writeSummary</code> 同时交出文本和覆盖位置。这里的“一起”是函数状态转换层面的原子性，不代表 Session 后端天然提供跨服务数据库事务。
             </p>
 
             <h3>8.3 什么情况下它明确什么也不做</h3>
@@ -1054,6 +1080,40 @@ Model：材料足够，生成最终说明</code></pre>
               可能是模型尚未消费的新证据，过早替换会让下一步推理失去依据。
             </p>
 
+            <pre><code>// internal/flow/processor/context_compact.go（节选）
+compacted := make([]event.Event, len(events))
+copy(compacted, events)
+
+if forceCleanActive {
+    passEvents, passStats := applyForceCleanToolResultPass(
+        ctx, compacted, protectedRequestIDs, cfg,
+    )
+    compacted = passEvents
+    stats = mergeContextCompactionStats(stats, passStats)
+}
+if pass1Active {
+    passEvents, passStats := applyHistoricalToolResultPass(
+        ctx, compacted, protectedRequestIDs,
+        cfg.ToolResultMaxTokens, cfg,
+    )
+    compacted = passEvents
+    stats = mergeContextCompactionStats(stats, passStats)
+}
+if pass2Active {
+    passEvents, passStats := applyOversizedToolResultPass(
+        ctx, compacted, currentKey,
+        cfg.OversizedToolResultMaxTokens, cfg,
+    )
+    compacted = passEvents
+    stats = mergeContextCompactionStats(stats, passStats)
+}
+return compacted, stats</code></pre>
+            <p>
+              第一、二行就是“原始账本不被压缩”的实现证据：后续 helper 收到的是 <code>compacted</code>，而不是直接改传入的
+              <code>events</code>。三个 <code>if</code> 又把策略顺序固定下来；某一轮没启用就完全跳过，不会靠 helper 内部猜测。
+              <code>stats</code> 与副本一起逐轮合并，让可观测数据描述真实发生的替换，而不是只报最终 token 数。
+            </p>
+
             <pre><code>Session 中的 event-37（不变）
   tool: certificate_scan
   content: "... 12 KB 原始结果 ..."
@@ -1079,6 +1139,28 @@ cache-safe Summary：沿用 parent request 的稳定前缀，只追加压缩指�
                    v
 新请求：新 Summary + 新边界后的少量事件 + 当前输入 + tools</code></pre>
 
+            <pre><code>// internal/flow/llmflow/llmflow.go（省略诊断事件）
+before := snapshotSummary(invocation.Session, filterKey)
+err := invocation.SessionService.CreateSessionSummary(
+    summaryCtx, invocation.Session, filterKey, false,
+)
+after := snapshotSummary(invocation.Session, filterKey)
+updated := before.advanced(after)
+if !updated {
+    return req
+}
+
+rebuilt := f.rebuildRequestForContextCompaction(
+    ctx, invocation, rebuildPlan,
+)
+if rebuilt == nil {
+    return req
+}
+if err != nil {
+    log.WarnfContext(ctx, "summary advanced in memory; persistence failed: %v", err)
+}
+return rebuilt</code></pre>
+
             <p>
               触发判断、同步 Summary 与重建分别见
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/llmflow/llmflow.go#L1526-L1583"><code>maybeCompactContextBeforeLLM</code></a>、
@@ -1086,6 +1168,11 @@ cache-safe Summary：沿用 parent request 的稳定前缀，只追加压缩指�
               和
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/llmflow/llmflow.go#L1704-L1734"><code>rebuildRequestForContextCompaction</code></a>。
               这里最容易混淆的边界是：<strong>Summary 是可持久化的滚动状态；Context Compaction 是在请求压力下组织清理、触发 Summary 并重建模型视图的运行策略。</strong>
+            </p>
+            <p>
+              这里没有用“Summary 调用返回 nil error”作为重建条件，而是比较前后快照的 <code>advanced</code>。原因是 no-op 也可能没有 error，
+              但边界没前进就没有更短的新投影；反过来，内存状态已经前进而后端持久化报错时，当前请求仍可以重建并减压，只是必须留下 warning。
+              <code>rebuilt == nil</code> 又守住最后一层：如果 processor 不能安全重放，宁可继续旧请求，也不拼一份半新半旧的 Context。
             </p>
 
             <h3>9.3 为什么同步总结后不能直接修改原请求</h3>

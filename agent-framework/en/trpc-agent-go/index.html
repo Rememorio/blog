@@ -977,12 +977,39 @@ After
   summary = "Network ruled out; intermediate certificate missing"
   boundary = event-51</code></pre>
 
+            <p>With locking and logging removed, the source path that advances state is compact:</p>
+            <pre><code>// session/internal/summary/summary.go (excerpt)
+input, ok := buildSummaryInput(ctx, m, base, filterKey, force, prev)
+if !ok {
+    return false, nil
+}
+text, err := m.Summarize(input.ctx, input.session)
+if err != nil {
+    return false, fmt.Errorf("summarize session %s failed: %w", base.ID, err)
+}
+if text == "" {
+    return false, nil
+}
+
+boundary := selectSummaryBoundary(
+    input.session, filterKey, prev.boundary,
+    input.latestBoundary, input.hasDelta,
+)
+writeSummary(base, filterKey, text, boundary.CutoffTime(), boundary)
+return true, nil</code></pre>
+
             <p>
               Text and coverage must move atomically at the algorithm level. Updating text without the boundary summarizes the same Events again next time.
               Advancing the boundary before obtaining text hides evidence that never entered the Summary. The implementation therefore calls
               <code>writeSummary</code> only after the summarizer returns non-empty text. See
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go#L166-L229"><code>SummarizeSession</code></a>
               and <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/session/internal/summary/summary.go#L270-L345"><code>buildSummaryInput</code></a>.
+            </p>
+            <p>
+              The branches expose three distinct boundaries. A false <code>buildSummaryInput</code> result means trigger or delta did not qualify, so no model call
+              occurs. A summarizer error or empty text leaves prior state untouched. Only non-empty text reaches boundary selection and one
+              <code>writeSummary</code> call carrying both text and coverage. “Together” describes this function-level transition; it does not claim that every
+              Session backend provides a cross-service database transaction.
             </p>
 
             <h3>8.3 A Valid Run Often Does Nothing</h3>
@@ -1076,6 +1103,41 @@ After
               default threshold is zero, meaning disabled. These conservative defaults matter because a new tool result may still be unconsumed evidence.
             </p>
 
+            <pre><code>// internal/flow/processor/context_compact.go (excerpt)
+compacted := make([]event.Event, len(events))
+copy(compacted, events)
+
+if forceCleanActive {
+    passEvents, passStats := applyForceCleanToolResultPass(
+        ctx, compacted, protectedRequestIDs, cfg,
+    )
+    compacted = passEvents
+    stats = mergeContextCompactionStats(stats, passStats)
+}
+if pass1Active {
+    passEvents, passStats := applyHistoricalToolResultPass(
+        ctx, compacted, protectedRequestIDs,
+        cfg.ToolResultMaxTokens, cfg,
+    )
+    compacted = passEvents
+    stats = mergeContextCompactionStats(stats, passStats)
+}
+if pass2Active {
+    passEvents, passStats := applyOversizedToolResultPass(
+        ctx, compacted, currentKey,
+        cfg.OversizedToolResultMaxTokens, cfg,
+    )
+    compacted = passEvents
+    stats = mergeContextCompactionStats(stats, passStats)
+}
+return compacted, stats</code></pre>
+            <p>
+              The first two lines are the implementation evidence for “compaction does not rewrite the ledger.” Every helper receives
+              <code>compacted</code>, not the input <code>events</code>. The three <code>if</code> blocks also freeze policy order; a disabled pass disappears
+              entirely rather than asking a helper to guess. Stats are merged beside each transformed copy, so observability reports what was actually replaced,
+              not only the final token count.
+            </p>
+
             <pre><code>event-37 in Session (unchanged)
   tool: certificate_scan
   content: "... 12 KB raw payload ..."
@@ -1102,6 +1164,28 @@ Cache-safe Summary: preserve the parent request's stable prefix; append a compac
                    v
 New request: new Summary + a few post-boundary Events + current input + tools</code></pre>
 
+            <pre><code>// internal/flow/llmflow/llmflow.go (diagnostics omitted)
+before := snapshotSummary(invocation.Session, filterKey)
+err := invocation.SessionService.CreateSessionSummary(
+    summaryCtx, invocation.Session, filterKey, false,
+)
+after := snapshotSummary(invocation.Session, filterKey)
+updated := before.advanced(after)
+if !updated {
+    return req
+}
+
+rebuilt := f.rebuildRequestForContextCompaction(
+    ctx, invocation, rebuildPlan,
+)
+if rebuilt == nil {
+    return req
+}
+if err != nil {
+    log.WarnfContext(ctx, "summary advanced in memory; persistence failed: %v", err)
+}
+return rebuilt</code></pre>
+
             <p>
               The trigger, synchronous Summary, and rebuild are implemented by
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/llmflow/llmflow.go#L1526-L1583"><code>maybeCompactContextBeforeLLM</code></a>,
@@ -1109,6 +1193,12 @@ New request: new Summary + a few post-boundary Events + current input + tools</c
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/llmflow/llmflow.go#L1704-L1734"><code>rebuildRequestForContextCompaction</code></a>.
               The boundary is precise: <strong>Summary is durable rolling state; Context Compaction is the pressure policy that cleans payloads,
               invokes Summary when needed, and rebuilds the model view.</strong>
+            </p>
+            <p>
+              The rebuild condition is not “the Summary call returned no error.” It compares snapshots through <code>advanced</code>. A no-op may have no error,
+              but an unchanged boundary cannot produce a shorter projection. Conversely, in-memory state may advance while persistence reports an error; the current
+              request can still rebuild for pressure relief, with a warning recording the split. Finally, <code>rebuilt == nil</code> protects replay safety:
+              when processors cannot be reconstructed coherently, the runtime keeps the old request instead of producing a half-old, half-new Context.
             </p>
 
             <h3>9.3 A New Summary Requires A New Request Projection</h3>
