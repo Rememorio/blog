@@ -166,22 +166,21 @@
 
             <div class="note route-note">
               <p>
-                <strong>阅读契约：</strong>先记住全文的主结论：<strong>应用代码看到的是阻塞式函数调用，标准库和 runtime 负责把“等待网络”从执行线程上卸下来。</strong>
-                同时，<code>net/http</code> 把连接、请求和出站交换拆成不同生命周期；看清 owner，才能解释取消、超时、泄漏和尾延迟。
+                <strong>阅读契约：</strong>不需要先懂 runtime。读完前半篇，你只要能画出这条接力：服务接到连接 → handler 处理一个请求 → worker 发出站请求 → 网络没数据时 worker 暂停 → 数据到达后继续。
+                后半篇才会把每次交接对应到 <code>net/http</code>、<code>internal/poll</code> 和 runtime 源码。
               </p>
             </div>
 
             <p>
-              证据边界先说明。本文以 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 固定 tag</a>
+              先说明哪些结论可以依赖。本文以 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 固定 tag</a>
               的公开源码为直接证据，API 契约参考 <a href="https://pkg.go.dev/net/http">net/http 文档</a>、
               <a href="https://pkg.go.dev/context">context 文档</a>和
               <a href="https://go.dev/doc/diagnostics">Go diagnostics 文档</a>。
-              主线限定为普通 HTTP/1.x 服务与非阻塞网络描述符；HTTP/2 会在 ALPN 或 alternate RoundTripper 处分流，
-              Windows IOCP、BSD/macOS kqueue 与 Linux epoll 的平台实现也不同。文中用 Linux epoll 展示一种具体落地，
-              不把它冒充所有平台的共同源码。
+              前半篇的请求生命周期适用于一般理解；后半篇的源码主线限定为普通 HTTP/1.x 和非阻塞网络描述符。HTTP/2 会走另一条协议路径，
+              Windows、macOS 与 Linux 的网络等待实现也不同。文中用 Linux epoll 展示一种落地，不把它说成所有平台都一模一样。
             </p>
 
-            <p>这篇要让一位刚打开 Go 源码的读者回答五个问题：</p>
+            <p>带着五个生活化问题往下读：</p>
             <ol>
               <li><code>Server.Serve</code> 创建的是“每请求一个 goroutine”，还是“每连接一个 goroutine”？</li>
               <li><code>Request.Context()</code> 从哪里来，handler 返回后又是谁取消它？</li>
@@ -190,10 +189,14 @@
               <li>遇到慢请求时，应该先看 handler、连接池、netpoll、调度还是 GC？</li>
             </ol>
 
-            <h2>一、先按 owner 拆开这条请求</h2>
+            <h2>一、先用普通话走完一次请求</h2>
             <p>
-              “一次请求”是用户视角，不是源码里的单一对象。进入进程后，它至少跨过四种 owner。
-              每个 owner 持有不同状态，也在不同时间结束。
+              浏览器请求 <code>/fetch</code> 后，服务先从监听端口接到一条连接，再从连接里读出一个 HTTP 请求。handler 解析出两个 URL，
+              启动两个 worker 去抓网页；worker 等网络响应时会暂停，数据到达后再继续；最后 handler 汇总结果并写回 JSON。
+            </p>
+            <p>
+              这里没有一个“请求对象”从头包办到底，而是几位负责人依次接手。源码里常把负责人叫 <em>owner</em>：谁创建状态、谁决定它何时结束、谁负责清理。
+              先记住负责人，再看表里的类型名；类型名只是这段接力在 Go 1.26.0 中的具体实现。
             </p>
 
             <div class="table-wrap">
@@ -242,8 +245,8 @@
             </div>
 
             <p>
-              这张表也是后面排障的索引。连接数涨，不等于 goroutine 一定泄漏；请求 context 结束，不等于 TCP 连接不能复用；
-              goroutine 处于 <code>IO wait</code>，也不等于它正在消耗一个操作系统线程。先找 owner，再谈现象。
+              表里最值得记的不是类型名，而是生命周期不同：一个请求结束后，连接可能留下复用；一个 worker 等网络时，线程可以去跑别的 goroutine；
+              请求 context 取消后，worker 也要自己观察信号并退出。后面所有源码细节都在解释这三件事怎样成立。
             </p>
 
             <figure class="shape-example">

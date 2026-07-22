@@ -45,29 +45,36 @@
           <p class="eyebrow">Go from Request to Production · Chapter IV</p>
           <h1 class="long-title">When Should We Use <code>Channels</code> or Locks?</h1>
           <p class="lead">
-            A <code>fetchd</code> worker returns its result through <code>results &lt;- result</code>. If the service also maintains a shared summary, a <code>sync.Mutex</code> around that state is often the more direct tool.
-            Both synchronize goroutines, but they are not interchangeable concurrency syntax: a channel puts values, waiting, and capacity into a communication protocol; a lock lets goroutines take turns entering one shared state's critical section.
+            A worker finishes a page and hands its result to an aggregator; that resembles passing a package, so a channel is natural.
+            Every worker increments the same success count; that resembles taking turns editing one ledger, so a lock is more direct.
+            We choose by whether data changes owner, then see how each tool makes goroutines wait and continue.
           </p>
           <div class="meta-line"><span>Source: Go 1.26.0</span><span>Path: chansend → sudog → selectgo / Mutex → sema</span><span>Lab: concurrency_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/channel-or-lock-overview.png" alt="Go channel and lock contracts: a channel transfers fetchResult values from worker goroutines to an aggregator with backpressure, while sync.Mutex protects one shared map and its critical section" /></figure>
         </section>
 
         <section class="article-body">
-          <div class="note route-note"><p><strong>Reading contract:</strong> this chapter follows ordinary channel send/receive, blocking select, and contended <code>sync.Mutex</code> paths in Go 1.26.0. It answers where values are copied, how a full buffer creates backpressure, how one select waits on several queues, and how a lock crosses from CAS into a runtime semaphore. You should leave choosing by ownership and synchronization semantics, then validating with block/mutex profiles, traces, and the race detector—without using a microbenchmark as a design contract or treating the 1 ms starvation threshold as an API guarantee.</p></div>
+          <div class="note route-note"><p><strong>Reading contract:</strong> do not begin by asking which tool is faster. If data must be handed to another goroutine, think of a channel first. If several pieces of code must protect one shared state, think of a lock first. The second half explains the source paths for blocking, wake-up, and memory ordering.</p></div>
 
           <p>
-            Direct evidence is pinned to <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0</a>:
+            At the language level, begin with the synchronization guarantees in the <a href="https://go.dev/ref/mem">Go Memory Model</a>. Source details are pinned to <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0</a>:
             <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go">runtime/chan.go</a>,
             <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/select.go">runtime/select.go</a>,
             <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/sync/mutex.go">internal/sync/mutex.go</a>, and
             <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/sema.go">runtime/sema.go</a>.
-            The dependable happens-before edges come from the <a href="https://go.dev/ref/mem">Go Memory Model</a>. Queue shapes, state bits, the 1 ms threshold, and direct handoff are evidence about the current gc runtime.
+            Queue shapes, state bits, the 1 ms threshold, and direct handoff describe the current gc runtime; application code must not treat them as fixed constants.
           </p>
 
-          <h2>1. Choose the Contract Before the Syntax</h2>
+          <h2>1. Start with Two Different Concurrency Problems</h2>
           <p>
-            “Do not communicate by sharing memory” does not mean “never write a lock.” A more useful decision asks who owns the state, who advances the workflow, who should wait under congestion, and how cancellation or closure propagates.
-            A <code>fetchResult</code> naturally moves from worker to aggregator, so a channel fits. If every worker merely increments one counter, protecting that counter is usually more direct.
+            In <code>fetchd</code>, a worker finishes fetching a page and hands one <code>fetchResult</code> to the aggregator. This is a
+            <strong>transfer of work</strong>: the sender gives away a value and the receiver continues processing it, so a channel is natural.
+            A different requirement asks every worker to increment one shared success count. Nothing changes owner; several pieces of
+            code update the same state, so a <code>Mutex</code> around the read-modify-write operation is usually more direct.
+          </p>
+          <p>
+            Ask who owns the data, whether ownership moves, who should wait when the system is busy, and how termination propagates.
+            Those questions define the concurrency protocol; channel and lock syntax merely implement it.
           </p>
 
           <div class="table-wrap"><table>
@@ -81,7 +88,7 @@
           </table></div>
 
           <p>
-            A channel contains a lock internally; a contended Mutex can park a goroutine. The distinction is not “lock-free versus blocking,” but the protocol exposed to the application.
+            The table expands those questions into four common shapes. A channel contains a lock internally; a contended Mutex can park a goroutine. The distinction is not “lock-free versus blocking,” but the protocol exposed to the application.
             Building a command channel solely to protect a map also creates a dedicated goroutine, request/reply messages, and shutdown rules. Rebuilding a work queue behind a Mutex hides waiting, capacity, and ownership in fields and conditions.
           </p>
 
@@ -106,13 +113,13 @@
 }</code></pre>
           <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L34-L60">hchan and waitq</a>.</span>
 
-          <h3><code>makechan</code> allocation depends on element pointers</h3>
+          <h3>2.1 <code>makechan</code> Allocation Depends on Element Pointers</h3>
           <p>
             When elements contain no GC pointers, <code>hchan</code> and its buffer can share one allocation. Pointer-bearing elements use a header plus a separately typed buffer; an unbuffered channel or zero-sized element only needs the header allocation.
             This optimizes layout and scanning without changing send/receive semantics. Once constructed, <code>dataqsiz</code> is immutable during channel operations.
           </p>
 
-          <h2 id="chansend">3. The Four Paths Through <code>chansend</code></h2>
+          <h3 id="chansend">2.2 The Four Paths Through <code>chansend</code></h3>
           <p>
             Compiled <code>c &lt;- x</code> enters <code>chansend1</code>, which calls <code>chansend</code> with <code>block=true</code>. A nil channel parks forever. A non-nil channel, under its lock, checks closure, a waiting receiver, and buffer space before it queues the sender.
           </p>
@@ -138,19 +145,19 @@ if c.qcount &lt; c.dataqsiz {
 }</code></pre>
           <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L176-L310">runtime.chansend</a>.</span>
 
-          <h3>A waiting receiver bypasses the buffer</h3>
+          <h4>A waiting receiver bypasses the buffer</h4>
           <p>
             Even on a buffered channel, a non-empty <code>recvq</code> lets <code>send</code> use <code>sendDirect</code> to copy the element into the receiver's destination, then unlock and <code>goready</code> that G.
             The buffer is queueing space for unmatched values, not a mandatory mailbox slot for every value.
           </p>
 
-          <h3>A send copies the element, not its reachable object graph</h3>
+          <h4>A send copies the element, not its reachable object graph</h4>
           <p>
             The buffered path's <code>typedmemmove(c.elemtype, qp, ep)</code> and the direct path both copy the channel element.
             A value-only <code>fetchResult</code> gets independent fields. If an element contains a slice, map, or pointer, the descriptor or pointer is copied while the underlying object may remain shared—the value-semantics boundary from Chapter II.
           </p>
 
-          <h2>4. How a Full Channel Turns a Sender into a Waiting G</h2>
+          <h3>2.3 How a Full Channel Turns a Sender into a Waiting G</h3>
           <p>
             With no receiver and no buffer slot, <code>chansend</code> acquires a <code>sudog</code>, associates the element address, current G, and channel, enqueues it in <code>sendq</code>, then calls
             <code>gopark(chanparkcommit, &amp;c.lock, waitReasonChanSend, ...)</code>. The park commit releases the channel lock at a safe state transition, allowing the M/P to execute another G.
@@ -173,7 +180,7 @@ gopark(chanparkcommit, unsafe.Pointer(&amp;c.lock),
             Wake-up only changes waiting back to runnable; as Chapter III showed, scheduling still lies between ready and resumed.
           </p>
 
-          <h2>5. <code>chanrecv</code> Is Symmetric, with a Full-Buffer Exchange</h2>
+          <h3>2.4 <code>chanrecv</code> Is Symmetric, with a Full-Buffer Exchange</h3>
           <p>
             Under the lock, receive handles closed+empty and then checks <code>sendq</code>. With a waiting sender, an unbuffered channel copies directly from the sender stack. A full buffered channel takes the old value at <code>recvx</code>, writes the blocked sender's value into that same slot, advances the ring, and wakes the sender.
             The queue remains full, but its oldest element was delivered and the blocked send completed.
@@ -188,13 +195,13 @@ c.sendx = c.recvx
 goready(sg.g, skip+1)</code></pre>
           <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L524-L685">chanrecv</a> and <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L688-L746">recv</a>.</span>
 
-          <h3>Capacity is a concurrency contract, not a casual speed knob</h3>
+          <h4>Capacity is a concurrency contract, not a casual speed knob</h4>
           <p>
             <code>fetchd</code> uses <code>make(chan fetchResult, len(targets))</code>. Every worker can deposit one result even if the handler has not started collecting, preventing an abandoned receive path from stranding workers after request cancellation.
             The tradeoff is up to one batch of queued results when aggregation slows. Capacity zero enforces rendezvous; a small capacity returns pressure early; a larger one absorbs a burst while increasing memory, queue age, and discard cost.
           </p>
 
-          <h2>6. <code>close</code> Broadcasts a State Change; It Does Not Free the Channel</h2>
+          <h3>2.5 <code>close</code> Broadcasts a State Change; It Does Not Free the Channel</h3>
           <p>
             <code>closechan</code> sets <code>closed</code>, dequeues all receivers so they wake with a zero value and <code>ok=false</code>, then dequeues all senders so they wake and panic. The runtime drops the channel lock before calling <code>goready</code>, avoiding another G's state transition while holding that lock.
             Buffered values remain receivable; only closed+empty produces the zero value.
@@ -204,7 +211,7 @@ goready(sg.g, skip+1)</code></pre>
             The engineering contract is usually “the sender/owner closes.” A receiver should not guess whether producers remain. Multiple senders racing to close need a distinct owner, <code>sync.Once</code>, or aggregation protocol; recover is not close coordination.
           </p>
 
-          <h2 id="selectgo">7. <code>selectgo</code> Is a Three-Pass Protocol</h2>
+          <h2 id="selectgo">3. <code>selectgo</code> Is a Three-Pass Protocol</h2>
           <p>
             A multi-case select does not start multiple goroutines or execute every ready case. The runtime generates a randomized <code>pollorder</code>, then a stable <code>lockorder</code> sorted by <code>hchan</code> address so every select locks its channels in a consistent order.
           </p>
@@ -240,7 +247,7 @@ c.recvq.dequeueSudoG(sglist) // or sendq
 releaseSudog(sglist)</code></pre>
           <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/select.go#L122-L307">preparation and pass 1</a>, <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/select.go#L309-L405">passes 2/3</a>.</span>
 
-          <h2 id="mutex">8. The <code>sync.Mutex</code> Fast Path Is One CAS</h2>
+          <h2 id="mutex">4. The <code>sync.Mutex</code> Fast Path Is One CAS</h2>
           <p>
             Go 1.26's public <code>sync.Mutex</code> delegates to <code>internal/sync.Mutex</code>, whose core is <code>state int32</code> plus <code>sema uint32</code>.
             Uncontended <code>Lock</code> uses CAS to change state from zero to <code>mutexLocked</code> and returns, so short low-contention critical sections never enter a runtime wait table.
@@ -269,7 +276,7 @@ func (m *Mutex) Unlock() {
             <code>runtime_SemacquireMutex(&amp;m.sema, queueLifo, ...)</code>. A waiter that has already slept may requeue at the front so running newcomers cannot repeatedly overtake it.
           </p>
 
-          <h2>9. The Runtime Semaphore Supplies Lossless Sleep/Wakeup</h2>
+          <h3>4.1 The Runtime Semaphore Supplies Lossless Sleep/Wakeup</h3>
           <p>
             The comment in <code>runtime/sema.go</code> explicitly says not to think of it as an application semaphore. It is a sleep/wakeup mechanism for primitives such as Mutex, pairing every sleep with one wake even when a racing wake happens first.
             An address hashes into one of 251 <code>semaRoot</code>s; sudogs for one address form a queue, while distinct addresses are organized in a treap.
@@ -284,7 +291,7 @@ root.queue(addr, s, lifo)
 goparkunlock(&amp;root.lock, reason, traceBlockSync, 4+skipframes)</code></pre>
           <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/sema.go#L5-L18">semaphore design goal</a>, <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/sema.go#L146-L201">semacquire1</a>.</span>
 
-          <h3>Normal mode favors throughput; starvation mode bounds pathological tails</h3>
+          <h4>Normal mode favors throughput; starvation mode bounds pathological tails</h4>
           <p>
             Normal mode queues FIFO, but a woken waiter does not own the Mutex and competes with newly arriving Gs already on CPU. After a waiter exceeds the internal
             <code>starvationThresholdNs = 1e6</code>, it requests starvation mode. Unlock uses <code>Semrelease(handoff=true)</code> to transfer a ticket and the P's next execution opportunity to the head waiter, calling <code>goyield</code> when safe.
@@ -294,7 +301,7 @@ goparkunlock(&amp;root.lock, reason, traceBlockSync, 4+skipframes)</code></pre>
             The Mutex leaves starvation mode when the waiter is last or waited less than the threshold, because direct handoff has lower throughput. That 1 ms value is a Go 1.26.0 implementation heuristic that may change by release or platform; it does not promise that <code>Lock</code> waits at most 1 ms.
           </p>
 
-          <h2>10. Both Establish Happens-Before, but Along Different Edges</h2>
+          <h2>5. Both Establish Happens-Before, but Along Different Edges</h2>
           <div class="table-wrap"><table>
             <thead><tr><th>Synchronization</th><th>Memory-model guarantee</th><th>Common misreading</th></tr></thead>
             <tbody>
@@ -310,7 +317,7 @@ goparkunlock(&amp;root.lock, reason, traceBlockSync, 4+skipframes)</code></pre>
             <code>go test -race</code> is dynamic evidence: it finds races reached by that run, while uncovered paths still require design review.
           </p>
 
-          <h2 id="evidence">11. Make Backpressure, Cancellation, and Contention Observable</h2>
+          <h2 id="evidence">6. Make Backpressure, Cancellation, and Contention Observable</h2>
           <p>
             <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/concurrency_lab_test.go">concurrency_lab_test.go</a>
             uses <code>testing/synctest</code> to create an isolated bubble. After a one-slot channel receives its first value, <code>synctest.Wait</code> confirms that every other G is durably blocked, so the test can assert that the second send has not completed. After one receive and another Wait, the send must have resumed—without Sleep or a fragile “10 ms should be enough” guess.
@@ -355,7 +362,7 @@ go test -run '^$' -bench BenchmarkCoordinationContracts -benchmem</code></pre>
             </tbody>
           </table></div>
 
-          <h2>12. Engineering Rules for <code>fetchd</code></h2>
+          <h2>7. Engineering Rules for <code>fetchd</code></h2>
           <ol>
             <li><strong>Use channels to transfer work and ownership.</strong> A <code>fetchResult</code> moves one way from worker to aggregator, and communication is also the completion signal.</li>
             <li><strong>Use Mutex for one short-lived shared state.</strong> Keep a counter, map, or cache invariant in one critical section instead of inventing an actor protocol for an increment.</li>

@@ -45,20 +45,19 @@
           <p class="eyebrow">Go from Request to Production · Chapter VIII</p>
           <h1 class="long-title">Where does the bottleneck hide after connection reuse?</h1>
           <p class="lead">
-            An <code>http.Client</code> response does not mean its connection is reusable. HTTP/1 waits for the underlying body EOF.
-            HTTP/2 splits one connection into streams that still share stream slots, two levels of flow windows, and TCP.
-            Production diagnosis therefore needs more than a connection count: align request phases, runtime pressure, resource
-            owners, and the event timeline.
+            Reuse means creating fewer connections; it does not mean every request can leave immediately. A request may be waiting for
+            a usable connection, waiting for the server, or waiting for an HTTP/2 stream slot. We separate those three waits first,
+            then use response bodies, connection pools, HTTP/2 streams, and diagnostic evidence to find the real bottleneck.
           </p>
           <div class="meta-line"><span>Source: Go 1.26.0</span><span>Route: Transport.getConn → persistConn / bodyEOFSignal → HTTP/2 clientStream</span><span>Lab: transport_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/connection-diagnosis-route.png" alt="A fetchd outbound request enters Transport.getConn and races an idle connection against a dial queue; HTTP/1 persistConn returns to the pool only after underlying EOF, HTTP/2 reuses one TLS connection across streams, and httptrace, metrics, pprof, trace, and race provide combined evidence" /></figure>
         </section>
 
         <section class="article-body">
-          <div class="note route-note"><p><strong>Reading contract:</strong> this chapter pins implementation claims to Go 1.26.0 and covers the standard <code>Transport</code> HTTP/1.1 path plus HTTP/2 over HTTPS. HTTP/3, proxy-specific protocols, and custom RoundTrippers are outside the scope. Internal queues, persistConn fields, and bundled HTTP/2 layout can change; public configuration and Response.Body contracts are application boundaries.</p></div>
+          <div class="note route-note"><p><strong>Reading contract:</strong> do not memorize connection-pool fields. Learn to distinguish three kinds of waiting: waiting for a usable connection, waiting for the server's response, and waiting for an HTTP/2 stream slot. All make a request slow, but each needs different evidence and a different fix.</p></div>
 
           <p>
-            Source evidence comes from the <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>:
+            We begin with the public <code>Transport</code> and <code>Response.Body</code> contracts, then use the <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>:
             <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go">net/http/transport.go</a>,
             <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go">h2_bundle.go</a>, and
             <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/httptrace/trace.go">httptrace/trace.go</a>.
@@ -67,7 +66,18 @@
             <a href="https://pkg.go.dev/net/http/pprof">net/http/pprof</a>, and <a href="https://go.dev/doc/diagnostics">Diagnostics</a>.
           </p>
 
-          <h2>1. A connection pool is not a bucket of sockets</h2>
+          <h2>1. Why Can a Reused Connection Still Leave a Request Waiting?</h2>
+          <p>
+            Suppose <code>fetchd</code> sends twenty requests to the same site at once. Its shared <code>http.Client</code> does reuse
+            connections, but reuse does not give every request an immediate pass. One HTTP/1 connection normally serves exchanges in
+            sequence; new requests queue when the connection limit is reached. HTTP/2 can carry concurrent streams on one connection,
+            but stream slots and flow-control windows still impose limits.
+          </p>
+          <p>
+            When latency rises, ask where the request is stuck: has it not acquired a connection, has it sent the request and begun
+            waiting on the server, or does it have an HTTP/2 connection but no stream slot or window? A pool gives these resources one
+            long-lived owner for reuse and limits; it is not simply a bag of sockets.
+          </p>
           <p>
             A shared <code>Transport</code> coordinates idle connections grouped by connect method, request tickets waiting for an
             idle connection, in-progress dials, and per-host total connection counts. The cache key is more than a hostname: scheme,
@@ -89,7 +99,8 @@ client := &amp;http.Client{Transport: transport} // shared by the process</code>
             boundary.
           </p>
 
-          <h2>2. <code>getConn</code> lets idle and dial race for one ticket</h2>
+          <h2>2. HTTP/1: Acquire, Use, and Return a Connection</h2>
+          <h3>2.1 <code>getConn</code> Lets Idle and Dial Race for One Ticket</h3>
           <p>
             <code>getConn</code> creates a <code>wantConn</code> for the request and calls <code>queueForIdleConn</code>. If no
             connection is immediately delivered, it also calls <code>queueForDial</code>. An idle connection may appear first or
@@ -115,7 +126,7 @@ case &lt;-treq.ctx.Done():
             the request deadline; it transfers connection-creation lifetime from the request owner to the pool owner.
           </p>
 
-          <h2>3. Total limits and retained-idle limits are different</h2>
+          <h3>2.2 Total Limits and Retained-Idle Limits Are Different</h3>
           <div class="table-wrap"><table>
             <thead><tr><th>Setting</th><th>What it counts</th><th>At the limit</th><th>Common misread</th></tr></thead>
             <tbody>
@@ -134,7 +145,7 @@ case &lt;-treq.ctx.Done():
           </p>
           <span class="source-caption">Configuration contract: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L194-L232">Transport fields</a>; queueing: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1594-L1655">queueForDial</a>.</span>
 
-          <h2 id="http1">4. HTTP/1 <code>persistConn</code> has one read loop and one write loop</h2>
+          <h3 id="http1">2.3 HTTP/1 <code>persistConn</code> Has One Read Loop and One Write Loop</h3>
           <p>
             After dialing, the HTTP/1 path creates a <code>persistConn</code>. One <code>writeLoop</code> serializes requests and one
             <code>readLoop</code> reads corresponding responses. Keep-alive lets requests reuse one connection
@@ -156,7 +167,7 @@ case &lt;-treq.ctx.Done():
             lead to <code>tryPutIdleConn</code>.
           </p>
 
-          <h2>5. <code>Close</code> releases resources; it does not promise reuse</h2>
+          <h3>2.4 <code>Close</code> Releases Resources; It Does Not Promise Reuse</h3>
           <figure class="figure"><img src="../assets/http1-connection-reuse.png" alt="Transport.getConn first seeks an idle connection and then queues a dial; MaxConnsPerHost waits when full; HTTP/1 persistConn returns through tryPutIdleConn only when bodyEOFSignal sees underlying io.EOF, while Close before EOF closes the connection and a LimitReader reaching N is not underlying EOF" /></figure>
 
           <pre><code class="language-go">waitForBodyRead := make(chan bool, 2)
@@ -191,7 +202,7 @@ resp.Body = &amp;bodyEOFSignal{
             and compare connection setup cost against extra traffic before choosing a drain policy.
           </p>
 
-          <h2>6. <code>tryPutIdleConn</code> serves waiters before retaining idle</h2>
+          <h3>2.5 <code>tryPutIdleConn</code> Serves Waiters before Retaining Idle</h3>
           <p>
             Returning to the pool is not an append. <code>tryPutIdleConn</code> first rejects disabled keep-alive or a broken
             connection, then marks it reused. If requests wait in <code>idleConnWait</code>, an HTTP/1 connection goes directly to
@@ -206,7 +217,7 @@ resp.Body = &amp;bodyEOFSignal{
           </p>
           <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1057-L1178">tryPutIdleConn</a> and its HTTP/1/HTTP/2 waiter branches.</span>
 
-          <h2 id="http2">7. HTTP/2 turns one connection into many streams</h2>
+          <h2 id="http2">3. HTTP/2 Turns One Connection into Many Streams</h2>
           <p>
             One <code>http2ClientConn</code> owns the TLS connection, a
             <code>streams map[uint32]*http2clientStream</code>, <code>nextStreamID</code>,
@@ -238,7 +249,7 @@ type http2clientStream struct {
 }</code></pre>
           <span class="source-caption">Current layout: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L7603-L7752">http2ClientConn and clientStream</a>.</span>
 
-          <h2>8. The concurrency limit is a stream slot, not just a TCP count</h2>
+          <h3>3.1 The Concurrency Limit Is a Stream Slot, Not Just a TCP Count</h3>
           <p>
             A connection can take a new request only while it has no GOAWAY, is not closing, has stream IDs available, and has not
             exceeded idle rules. Current occupancy includes active streams, reserved slots, and reset streams awaiting
@@ -253,7 +264,7 @@ type http2clientStream struct {
           </p>
           <span class="source-caption">Usability and slots: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L8369-L8410">isUsableLocked / availableLocked</a>; strict contract: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L7430-L7446">StrictMaxConcurrentStreams</a>.</span>
 
-          <h2>9. Two levels of flow control make unread bodies consequential</h2>
+          <h3>3.2 Two Levels of Flow Control Make Unread Bodies Consequential</h3>
           <p>
             Each stream has a window and the connection has another window shared by all streams. Receiving DATA consumes both.
             Only as the application reads response body data does the client accumulate credit and send <code>WINDOW_UPDATE</code>
@@ -268,7 +279,7 @@ type http2clientStream struct {
           </p>
           <span class="source-caption">Connection and stream flow: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L1471-L1591">HTTP/2 flow control</a>; returning credit while reading: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L9845-L9898">transportResponseBody.Read</a>.</span>
 
-          <h2>10. Canceling one stream normally preserves the connection</h2>
+          <h3>3.3 Canceling One Stream Normally Preserves the Connection</h3>
           <p>
             <code>roundTrip</code> waits on response headers, stream abort, request context, and the legacy Request.Cancel channel.
             Context cancellation calls <code>abortStream</code> and the writer sends <code>RST_STREAM</code>. That stream ends while
@@ -284,7 +295,7 @@ type http2clientStream struct {
           </p>
           <span class="source-caption">Per-request stream and cancellation select: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L8602-L8726">http2ClientConn.roundTrip</a>; reset writing: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L10360-L10424">writeStreamReset</a>.</span>
 
-          <h2 id="lab">11. The lab proves reuse, queueing, and multiplexing</h2>
+          <h2 id="lab">4. The Lab Proves Reuse, Queueing, and Multiplexing</h2>
           <p>
             <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/transport_lab_test.go">transport_lab_test.go</a>
             first uses <code>httptrace.GotConn</code> to verify HTTP/1. After the first request reads underlying EOF and closes, the
@@ -316,7 +327,7 @@ go test ./...
 go test -race ./...
 go vet ./...</code></pre>
 
-          <h2 id="diagnosis">12. Joint diagnosis starts by locating the slow layer</h2>
+          <h2 id="diagnosis">5. Joint Diagnosis Starts by Locating the Slow Layer</h2>
           <p>
             When P99 rises, write a falsifiable hypothesis: GetConn queueing, DNS/Connect/TLS, upstream response headers, body
             reading, runtime runnable delay, locks, GC assist, or a data race? Each tool answers one layer. A goroutine dump cannot
@@ -338,7 +349,7 @@ go vet ./...</code></pre>
             </tbody>
           </table></div>
 
-          <h2>13. <code>httptrace</code> splits client request phases</h2>
+          <h3>5.1 <code>httptrace</code> Splits Client Request Phases</h3>
           <p>
             <code>ClientTrace</code> exposes DNSStart/Done, ConnectStart/Done, TLSHandshakeStart/Done, GetConn, GotConn,
             WroteRequest, and GotFirstResponseByte hooks. <code>GotConnInfo</code> adds Reused, WasIdle, and IdleTime.
@@ -362,7 +373,7 @@ req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))</code></p
             aggregates. Upstream execution requires the server's own span or log, aligned through a trace ID.
           </p>
 
-          <h2>14. Metrics show trends; pprof finds owners</h2>
+          <h3>5.2 Metrics Show Trends; pprof Finds Owners</h3>
           <p>
             HTTP pool in-flight, GetConn wait, reuse ratio, and early-close reason are <strong>application metrics</strong>.
             Standard <code>runtime/metrics</code> does not export Transport pool state. Runtime signals such as
@@ -390,7 +401,7 @@ go tool pprof 'http://admin/debug/pprof/profile?seconds=30'</code></pre>
             <code>net/http/pprof</code> on the public service listener. Profiles also cost resources, so bound time and sampling.
           </p>
 
-          <h2>15. Execution trace supplies the timeline; race checks access safety</h2>
+          <h3>5.3 Execution Trace Supplies the Timeline; Race Checks Access Safety</h3>
           <p>
             Execution traces place goroutine runnable states, network blocking/netpoll, syscalls, GC, and mark assists on one
             timeline. Create a <code>trace.NewTask</code> for one fetch batch and a <code>trace.WithRegion</code> around each
@@ -412,7 +423,7 @@ trace.WithRegion(ctx, "outbound-fetch", func() {
             transport reload, metric maps, trace callbacks, and shutdown registries are actually exercised.
           </p>
 
-          <h2>16. Deliverables for a reproducible incident</h2>
+          <h3>5.4 Deliverables for a Reproducible Incident</h3>
           <ol>
             <li><strong>Symptom window:</strong> P50/P99, timeout reasons, request rate, version, and deploy time.</li>
             <li><strong>Request phases:</strong> GetConn wait, reuse, DNS/Connect/TLS, first byte, and body duration.</li>

@@ -45,19 +45,19 @@
           <p class="eyebrow">Go from Request to Production · Chapter VII</p>
           <h1 class="long-title">Why does one request land on the heap?</h1>
           <p class="lead">
-            <code>new</code> does not mean heap, and a returned value does not mean stack. The compiler first proves whether an
-            object can live inside a stack frame. If it cannot, the object escapes. Once it reaches the heap, the request continues
-            through size classes, each P's <code>mcache</code>, concurrent marking, write barriers, and mark assists.
+            A value used only inside one function needs a different lifetime from a value returned, handed to another goroutine, or
+            retained for later. The compiler uses that lifetime to choose stack or heap. “On the heap” is not itself a bug; the useful
+            questions are how often allocation happens, how much remains alive, and whether GC affects request latency.
           </p>
           <div class="meta-line"><span>Source: Go 1.26.0</span><span>Route: escape graph → mallocgc / mcache → pacer / assist</span><span>Lab: memory_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/request-memory-journey.png" alt="A fetchd request's memory journey: escape analysis chooses stack or heap, mallocgc allocates through mcache size classes, slice growth and preallocation produce different allocation volumes, and GC marks, assists, and sweeps around a heap goal" /></figure>
         </section>
 
         <section class="article-body">
-          <div class="note route-note"><p><strong>Reading contract:</strong> this chapter pins implementation claims to Go 1.26.0 and answers four questions: why an object escapes, how a small allocation obtains a slot, how allocations become GC work, and how compiler reports, benchmarks, profiles, metrics, and traces corroborate one another. Escape results, size classes, and allocator layouts are implementation details, not a Go language ABI.</p></div>
+          <div class="note route-note"><p><strong>Reading contract:</strong> do not treat “heap” as a bad word. First separate three questions: why must an object outlive the current function, how many new objects does the program create each second, and how many remain alive when GC runs? The second half enters escape analysis, allocation, and concurrent GC source.</p></div>
 
           <p>
-            The implementation evidence comes from the <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>:
+            The language does not promise that a value lives on a stack or heap. Concrete decisions are pinned to the <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>:
             <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go">escape.go</a>,
             <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go">malloc.go</a>,
             <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go">mgc.go</a>, and
@@ -66,12 +66,17 @@
             <a href="https://pkg.go.dev/runtime/pprof">runtime/pprof</a>, and <a href="https://go.dev/doc/diagnostics">Diagnostics</a> documentation.
           </p>
 
-          <h2>1. Optimize evidence before optimizing “the heap”</h2>
+          <h2>1. An Object on the Heap Is Not Automatically a Problem</h2>
           <p>
-            A heap allocation is not inherently a bug. A response that outlives its handler, data sent through a channel, or a
-            returned slice backing array may legitimately require a longer lifetime than the current frame. The useful production
-            questions are about <strong>allocation rate, the live set, and latency</strong>: objects and bytes per operation, bytes
-            still live at GC, mark assist charged to user goroutines, and whether that work fits the request budget.
+            In <code>fetchd</code>, a local value used only for one calculation and discarded when the function returns can often live on
+            the goroutine's stack. A result that is returned, handed to another goroutine through a channel, or retained in a slice may
+            need to outlive the current call. Putting it on the heap preserves the correct lifetime; it is not a compiler failure.
+          </p>
+          <p>
+            Three different measurements determine whether there is a problem: <strong>allocation rate</strong> is how quickly requests
+            create new objects; the <strong>live set</strong> is how much remains reachable when GC runs; and <strong>latency cost</strong>
+            is how much allocation or GC work lands on a request. Reducing allocation has a clear purpose only when one of those
+            measurements conflicts with the system's goals.
           </p>
 
           <div class="table-wrap"><table>
@@ -85,7 +90,7 @@
             </tbody>
           </table></div>
 
-          <h2 id="escape">2. Stack or heap is a lifetime proof, not a syntax class</h2>
+          <h2 id="escape">2. Ask “How Long Must It Live?” before Stack or Heap</h2>
           <p>
             The Go specification describes values, addresses, and observable behavior; it does not require a syntax form to live
             on the stack or heap. The compiler's escape package states two invariants: <strong>pointers to stack objects cannot be
@@ -115,7 +120,7 @@ func escapingResult() *fetchResult {
             production recommendation. Read the report for the actual build, then verify allocation counts.
           </p>
 
-          <h2>3. The compiler builds a weighted location graph</h2>
+          <h3>2.1 The Compiler Builds a Weighted Location Graph</h3>
           <p>
             Escape analysis maps variables and implicit allocations to locations, then turns assignments into directed edges.
             An edge's weight is dereference count minus address count: <code>p = &amp;q</code> is -1,
@@ -133,7 +138,7 @@ func escapingResult() *fetchResult {
             lacks a sufficient proof for the current frame. It does not mean the object leaks or that GC is currently under pressure.
           </p>
 
-          <h2>4. Read <code>-m=2</code> as a flow report</h2>
+          <h3>2.2 Read <code>-m=2</code> as a Flow Report</h3>
           <p>
             Across the full <code>fetchd</code> build report,
             <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/memory_lab_test.go">memory_lab_test.go</a>
@@ -153,7 +158,7 @@ go test -run '^$' -gcflags='-m=2' ./...</code></pre>
             elimination before declaring either result contradictory.
           </p>
 
-          <h2>5. Slice preallocation avoids backing-array migrations</h2>
+          <h3>2.3 Slice Preallocation Avoids Backing-Array Migrations</h3>
           <p>
             A slice header is a pointer, length, and capacity. Preallocation does not “move the header to the heap”; it lets a
             known upper bound obtain enough backing storage once. Repeated appends past capacity call <code>growslice</code>,
@@ -180,7 +185,7 @@ for i := 0; i &lt; count; i++ {
             Excess preallocation can enlarge the live heap, so use a trustworthy bound rather than “as large as possible.”
           </p>
 
-          <h2 id="allocator">6. <code>mallocgc</code> routes by size and pointer shape</h2>
+          <h2 id="allocator">3. <code>mallocgc</code> Routes by Size and Pointer Shape</h2>
           <p>
             Go 1.26.0 first short-circuits a zero-sized request to shared <code>zerobase</code>. On the regular path, small objects
             are roughly at most 32 KiB. Pointer-free objects below 16 B may enter the tiny allocator, packing multiple values into
@@ -206,7 +211,7 @@ if gcBlackenEnabled != 0 {
             batch size, and reuse boundaries—not runtime spans directly.
           </p>
 
-          <h2>7. The fast path is the current P's <code>mcache</code> and <code>mspan</code></h2>
+          <h3>3.1 The Fast Path Is the Current P's <code>mcache</code> and <code>mspan</code></h3>
           <p>
             <code>nextFreeFast</code> finds a trailing zero in the current span's <code>allocCache</code>, advances
             <code>freeindex</code>, and computes the slot address. It does not visit the global heap for every object.
@@ -231,7 +236,7 @@ if gcBlackenEnabled != 0 {
             nanosecond-scale allocation repeated at high QPS can still turn substantial CPU into marking and sweeping.
           </p>
 
-          <h2 id="gc">8. GC performs concurrent marking between two brief stops</h2>
+          <h2 id="gc">4. GC Performs Concurrent Marking between Two Brief Stops</h2>
           <p>
             The runtime's own overview is explicit. It completes sweep termination under a brief stop, enters <code>_GCmark</code>,
             prepares root jobs, enables the write barrier and mark workers, then resumes mutators for concurrent marking.
@@ -248,7 +253,7 @@ if gcBlackenEnabled != 0 {
           </p>
           <span class="source-caption">Phases and full cycle: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L22-L79">mgc.go overview</a>; <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L733-L879">gcStart</a>.</span>
 
-          <h2>9. The hybrid write barrier keeps white objects visible</h2>
+          <h3>4.1 The Hybrid Write Barrier Keeps White Objects Visible</h3>
           <p>
             Applications still mutate heap pointers during concurrent marking. Go's hybrid write barrier shades the old object in
             a slot before publishing the replacement. While the current goroutine's stack is grey, it also shades the new pointer.
@@ -269,7 +274,7 @@ if gcBlackenEnabled != 0 {
             with compact structures, smaller accidental object graphs, and shorter ownership instead.
           </p>
 
-          <h2>10. If allocation outruns marking, the user goroutine assists</h2>
+          <h3>4.2 If Allocation Outruns Marking, the User Goroutine Assists</h3>
           <p>
             Concurrent marking is not a free background service. While GC is active, <code>mallocgc</code> deducts assist credit in
             proportion to allocation size. When a goroutine's debt becomes negative, <code>gcAssistAlloc</code> first tries to use
@@ -290,7 +295,7 @@ if gcBlackenEnabled != 0 {
             changes when the bill is paid without changing the bill.
           </p>
 
-          <h2>11. <code>GOGC</code> and <code>GOMEMLIMIT</code> constrain different things</h2>
+          <h3>4.3 <code>GOGC</code> and <code>GOMEMLIMIT</code> Constrain Different Things</h3>
           <p>
             <code>GOGC</code> scales the next heap goal from the previous live heap. At the default 100, a useful approximation is
             that new allocation may approach the current live heap before the next cycle must finish. <code>GOMEMLIMIT</code> gives
@@ -315,7 +320,7 @@ if gcBlackenEnabled != 0 {
           </p>
           <span class="source-caption">Pacer goals, 25% background utilization, and memory-limit headroom: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcpacer.go#L22-L92">mgcpacer.go</a>; configuration contracts: <a href="https://pkg.go.dev/runtime/debug#SetGCPercent">SetGCPercent</a> and <a href="https://pkg.go.dev/runtime/debug#SetMemoryLimit">SetMemoryLimit</a>.</span>
 
-          <h2 id="evidence">12. Observe allocation rate separately from live heap</h2>
+          <h2 id="evidence">5. Observe Allocation Rate Separately from Live Heap</h2>
           <p>
             The lab reads <code>/gc/heap/allocs:bytes</code>, <code>/gc/heap/allocs:objects</code>,
             <code>/gc/heap/live:bytes</code>, and <code>/gc/cycles/total:gc-cycles</code> through
@@ -351,7 +356,7 @@ go test ./...
 go test -race ./...
 go vet ./...</code></pre>
 
-          <h2>13. A memory checklist for <code>fetchd</code></h2>
+          <h2>6. A Memory Checklist for <code>fetchd</code></h2>
           <ol>
             <li><strong>Define owner and lifetime first.</strong> Keep request temporaries inside the handler; explicitly transfer truly asynchronous data to a process or session owner.</li>
             <li><strong>Use reports to explain flows and benchmarks to judge value.</strong> <code>-m=2</code> is not a performance ranking.</li>

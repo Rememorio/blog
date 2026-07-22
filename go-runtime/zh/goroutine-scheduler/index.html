@@ -45,18 +45,18 @@
           <p class="eyebrow">Go 从请求到生产现场 · 第三篇</p>
           <h1 class="long-title"><code>goroutine</code> 到底跑在哪里</h1>
           <p class="lead">
-            <code>go h.fetch(...)</code> 看起来像“再开一条线程”，但源码里既没有为它立刻创建专属 OS thread，也没有承诺下一行之前一定启动。
-            <code>go</code> 语句先制造一个 runnable G；只有调度器把它与 M、P 配成一组，它才真正执行。生产里的尾延迟，常常就藏在“已经能跑”到“终于在跑”的间隔里。
+            写下 <code>go h.fetch(...)</code>，只是把一项新工作交给 Go，并不等于新建一条专属线程，也不保证它立刻开始。
+            本篇先把 goroutine 想成待办卡、线程想成工人，讲清“正在等待”和“已经能跑但还没轮到”；再进入 G、M、P 与调度器源码。
           </p>
           <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：newproc → runq → schedule → execute</span><span>实验：scheduler_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/goroutine-scheduler-overview.png" alt="Go goroutine 调度总览：go h.fetch 经 newproc 生成 G 并进入 runq；调度器将 G、OS 线程 M 和执行资源 P 匹配后进入 running" /></figure>
         </section>
 
         <section class="article-body">
-          <div class="note route-note"><p><strong>阅读契约：</strong>本文沿 Go 1.26.0 的普通用户 goroutine 主路径解释“创建、可运行、运行、等待与唤醒”。读完应能区分 goroutine 数、线程数、P 数、waiting 与 runnable，并能用 metric/trace 验证调度假设；不会把内部 10ms 阈值或 256 槽 runq 当成语言保证。</p></div>
+          <div class="note route-note"><p><strong>阅读契约：</strong>不需要先背 G、M、P。先把 goroutine 想成“待办任务”，线程想成“真正干活的人”。读完前半篇，你应能解释为什么启动 1000 个 goroutine 不等于创建 1000 个线程，以及“正在等”和“已经能跑但还没轮到”为什么是两种问题。</p></div>
 
           <p>
-            直接证据固定到 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
+            前半篇先讲可观察的调度过程；后半篇再把它对应到 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
             <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go">runtime/proc.go</a> 与
             <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go">runtime/runtime2.go</a>。
             G/M/P 的概念边界参考官方 <a href="https://go.dev/src/runtime/HACKING">runtime HACKING</a>；生产观测参考
@@ -64,10 +64,14 @@
             本文讨论 gc runtime 的当前实现；别的 Go implementation 可以选择不同映射。
           </p>
 
-          <h2>一、先把三个常被混用的数量拆开</h2>
+          <h2>一、八个 goroutine 不等于八条线程</h2>
           <p>
-            <code>fetchd</code> 最多为八个 URL 启动八个 worker goroutine。这不等于增加八条线程，更不等于八个 worker 同时执行 Go 代码。
-            调度器管理三个不同资源：
+            <code>fetchd</code> 最多为八个 URL 启动八个 worker goroutine。可以把它们想成八张待办卡：有的正在计算，有的正在等网络，有的已经拿到数据、正等 CPU。
+            Go 的调度器负责把“现在可以执行”的卡交给有限数量的线程。于是，八张卡不等于八个工人，更不保证八件事同时发生。
+          </p>
+          <p>
+            源码用 G、M、P 描述这套分工。先用一句话记：<strong>G 是任务，M 是操作系统线程，P 是运行 Go 代码所需的执行资格与本地资源。</strong>
+            调度发生时，runtime 要把一个可运行的 G、一个 M 和一个 P 配到一起。下面的表只是把这个画面说得更精确：
           </p>
 
           <div class="table-wrap"><table>
@@ -80,7 +84,7 @@
           </table></div>
 
           <p>
-            调度器的任务不是把 G 永久绑到 M，而是匹配“待运行的 G + 可执行的 M + 一个 P”。M 可以换 G，G 也可以在不同时间跑到不同 M 上。
+            最重要的关系不是缩写本身，而是它们不会永久绑定。M 可以换 G，G 也可以在不同时间跑到不同 M 上。
             M 阻塞在 syscall 时可交还 P，让另一个 M 继续执行 Go；这正是 goroutine 不等于线程的工程价值。
           </p>
 
@@ -134,7 +138,7 @@ func newproc(fn *funcval) {
 
           <figure class="figure"><img src="../assets/go-statement-newproc.png" alt="go 语句到 runnable G 的源码路径：go h.fetch 经 newproc 和 newproc1 获取 G、准备 stack/goid、切换到 _Grunnable，再由 runqput 放入 runnext、local runq 或溢出到 global runq" /></figure>
 
-          <h3><code>newproc1</code> 优先复用 G，再准备初始执行现场</h3>
+          <h3>3.1 <code>newproc1</code> 优先复用 G，再准备初始执行现场</h3>
           <p>
             <code>newproc1</code> 在 system stack 上执行。它先从当前 P 的 free G 池取一个 <code>gfget</code>；没有才用 <code>malg(stackMin)</code> 创建栈并把 G 加入全局集合。
             随后清空 <code>g.sched</code>，设置初始 SP、返回到 <code>goexit</code> 的 PC、调用入口、parent goid 与创建 PC，最后分配 goid 并把状态从 <code>_Gdead</code> 切到 <code>_Grunnable</code>。
@@ -160,19 +164,19 @@ casgstatus(newg, _Gdead, _Grunnable)</code></pre>
             <code>_Grunnable</code> 只表示它有资格被选中。
           </p>
 
-          <h2>四、local runq、runnext 与 global runq</h2>
+          <h3>3.2 local runq、runnext 与 global runq</h3>
           <p>
             当前 P 持有一个 <code>[256]guintptr</code> 的 local runq 和一个单独的 <code>runnext</code> 槽。数组长度是 Go 1.26.0 实现细节，
             但“局部队列优先保持 locality、全局队列负责溢出与公平”是理解路径的关键。
           </p>
 
-          <h3><code>runnext</code> 不是无限优先级</h3>
+          <h4><code>runnext</code> 不是无限优先级</h4>
           <p>
             <code>newproc</code> 以 <code>next=true</code> 调用 <code>runqput</code>，新 G 会先尝试占据 <code>runnext</code>。取出时它继承当前时间片剩余部分，
             让“创建/唤醒后马上协作”的模式少一次长队等待。如果槽已有 G，旧值会被挤进普通 local runq；没有 sysmon 的平台会避免这个优化，以免 ping-pong 任务饿死别人。
           </p>
 
-          <h3>local queue 满了怎样溢出</h3>
+          <h4>local queue 满了怎样溢出</h4>
           <p>
             <code>runqput</code> 在环形数组有空间时写 tail。满时 <code>runqputslow</code> 从本地拿走一半，再连同新 G 批量放进 global queue。
             它不是“新来的一个直接进全局”，而是重新分布一批工作，给其他 P 获取或窃取的机会。
@@ -186,7 +190,7 @@ casgstatus(newg, _Gdead, _Grunnable)</code></pre>
 runqputslow(pp, gp, h, t) // 一半 local G + 新 G → global runq</code></pre>
           <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L7473-L7559">runqput 与 runqputslow</a>；P 的队列字段见 <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L772-L818">runtime.p</a>。</span>
 
-          <h2 id="find-runnable">五、<code>schedule</code> 与 <code>findRunnable</code> 怎样找到下一份工作</h2>
+          <h3 id="find-runnable">3.3 <code>schedule</code> 与 <code>findRunnable</code> 怎样找到下一份工作</h3>
           <p>
             一轮调度的外壳很短：<code>schedule</code> 调用 <code>findRunnable</code>，得到 G 后处理 locked-M 等特殊情况，最后进入 <code>execute</code>。
             真正复杂的是“从哪里找工作”。
@@ -201,7 +205,7 @@ runqputslow(pp, gp, h, t) // 一半 local G + 新 G → global runq</code></pre>
 
           <figure class="figure"><img src="../assets/find-runnable-route.png" alt="Go findRunnable 主搜索环：先处理 timers、trace 和 GC，以及每 61 tick 的全局公平检查，再查 local runq、普通 global runq、netpoll 与 stealWork；无工作时 idle/park，并在停放前重查来源" /></figure>
 
-          <h3>这不是一条简单 FIFO</h3>
+          <h4>这不是一条简单 FIFO</h4>
           <p>
             <code>findRunnable</code> 顶部先检查 timer，再处理 trace reader 与 GC worker。为了防止两个不断互相唤醒的 local G 长期占满 P，
             每当 <code>schedtick % 61 == 0</code> 且 global queue 非空，会先从全局拿一次。常规业务工作随后依次尝试 local queue 与 global queue。
@@ -212,13 +216,13 @@ runqputslow(pp, gp, h, t) // 一半 local G + 新 G → global runq</code></pre>
             如果仍为空，它准备释放 P 并 park M，但在状态转换前后会重新检查全局/各 P 队列、timer 与 netpoll，避免“工作刚到、所有 worker 却睡了”的丢唤醒。
           </p>
 
-          <h3>work stealing 为什么取一批而不是只拿一个</h3>
+          <h4>work stealing 为什么取一批而不是只拿一个</h4>
           <p>
             <code>runqsteal</code> 通过 <code>runqgrab</code> 尝试从另一个 P 的 local queue 取一半，把其中一个直接返回运行，其余落到自己的 local queue。
             批量平衡减少频繁跨 P 竞争；随机选择受害 P 和 spinning M 限额则避免所有空闲线程同时扫描造成 CPU 浪费。
           </p>
 
-          <h2>六、<code>execute</code> 才把 runnable 变成 running</h2>
+          <h3>3.4 <code>execute</code> 才把 runnable 变成 running</h3>
           <p>
             选到 G 后，<code>execute</code> 把当前 M 的 <code>curg</code> 指向它、把 G 的 <code>m</code> 指回当前 M，
             用 CAS 将状态从 <code>_Grunnable</code> 改为 <code>_Grunning</code>，清理等待与抢占标记，最后 <code>gogo(&amp;gp.sched)</code> 恢复保存现场。
@@ -238,7 +242,8 @@ gogo(&amp;gp.sched)</code></pre>
             <code>runtime.LockOSThread</code>，并承担它对调度灵活性的影响。
           </p>
 
-          <h2>七、阻塞不是停住线程：<code>gopark</code> 与 <code>ready</code></h2>
+          <h2>四、等待、唤醒与抢占</h2>
+          <h3>4.1 阻塞不是停住线程：<code>gopark</code> 与 <code>ready</code></h3>
           <p>
             goroutine 在 channel、mutex、timer 或 netpoll 上不能继续时，runtime 通过 <code>gopark</code> 保存等待原因，并用 <code>mcall(park_m)</code>
             切到 M 的 g0 stack 完成状态转换与调度。稍后资源就绪，<code>goready</code> 在 system stack 调用 <code>ready</code>：
@@ -254,7 +259,7 @@ wakep()</code></pre>
             “I/O 已就绪”不是“handler 已恢复”，中间仍可能存在 runnable latency。
           </p>
 
-          <h2>八、抢占保证机会，不保证硬实时</h2>
+          <h3>4.2 抢占保证机会，不保证硬实时</h3>
           <p>
             长时间不阻塞的 G 不能永远占住 P。Go 1.26 的 sysmon 在 <code>retake</code> 中观察 P 的 <code>schedtick</code>；同一 tick 超过内部
             <code>forcePreemptNS = 10ms</code> 会请求 <code>preemptone</code>。它设置 <code>gp.preempt</code> 与 <code>stackguard0 = stackPreempt</code>，
@@ -266,7 +271,7 @@ wakep()</code></pre>
             抢占提供公平机会，不能把 Go 变成硬实时系统。
           </p>
 
-          <h2 id="evidence">九、用 runnable latency 验证调度假设</h2>
+          <h2 id="evidence">五、用 runnable latency 验证调度假设</h2>
           <figure class="figure"><img src="../assets/runnable-latency-evidence.png" alt="Go runnable latency 证据图：G 从 waiting 经 ready 进入 runnable，再到 running；runnable latency 区间由 /sched/latencies:seconds、go tool trace 与 schedtrace 观察，区别于 I/O waiting" /></figure>
 
           <h3><code>/sched/latencies:seconds</code> 测量什么</h3>
@@ -309,7 +314,7 @@ GODEBUG=schedtrace=1000,scheddetail=1 go test -run TestSchedulerBurst</code></pr
             </tbody>
           </table></div>
 
-          <h2>十、回到 <code>fetchd</code> 的工程边界</h2>
+          <h2>六、回到 <code>fetchd</code> 的工程边界</h2>
           <ol>
             <li><strong>并发不是并行。</strong>八个 fetch worker 可以并发等待网络；CPU 阶段仍受 P 与容器 quota 限制。</li>
             <li><strong>先限制 fan-out，再调调度器。</strong>无界创建 G 会放大内存、队列、连接池和唤醒压力；<code>GOMAXPROCS</code> 不是背压器。</li>

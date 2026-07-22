@@ -45,19 +45,18 @@
           <p class="eyebrow">Go 从请求到生产现场 · 第七篇</p>
           <h1 class="long-title">一个请求为什么在堆上</h1>
           <p class="lead">
-            <code>new</code> 不等于堆，返回值也不等于栈。编译器先证明对象能否活在某个 stack frame；
-            证明不了才让它逃逸。真正进入堆后，一次请求的成本还会穿过 size class、每 P 的 <code>mcache</code>、
-            并发标记、写屏障与 mark assist。
+            一个值只在当前函数里用，和它要被返回、交给别的 goroutine、长期保存，需要的寿命不同。编译器据此决定它适合留在栈上，还是放到堆上。
+            “在堆上”本身不是错误；真正要问的是分配有多频繁、多少对象还活着，以及 GC 是否影响了请求延迟。
           </p>
           <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：escape graph → mallocgc / mcache → pacer / assist</span><span>实验：memory_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/request-memory-journey.png" alt="一个 fetchd 请求的内存旅程：逃逸分析决定栈或堆，mallocgc 从 mcache size class 分配，切片增长与预分配产生不同分配量，GC 依据 heap goal 标记、协助和清扫" /></figure>
         </section>
 
         <section class="article-body">
-          <div class="note route-note"><p><strong>阅读契约：</strong>本文固定到 Go 1.26.0 的编译器与 runtime 实现，回答四件事：对象为什么逃逸、一次小对象分配怎样拿到 slot、分配如何变成 GC 工作、怎样用编译器报告、benchmark、profile、metrics 与 trace 交叉验证。逃逸结果、size class 和分配器布局是实现细节，不是 Go 语言 ABI。</p></div>
+          <div class="note route-note"><p><strong>阅读契约：</strong>不需要把“堆”当成坏词。先学会区分三个问题：对象为什么必须活得比当前函数久；程序每秒制造多少新对象；其中多少对象在 GC 时仍然活着。后半篇再进入逃逸分析、分配器与并发 GC 源码。</p></div>
 
           <p>
-            实现证据来自 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
+            语言并不承诺对象一定放栈或堆；具体判断固定到 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
             <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go">escape.go</a>、
             <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go">malloc.go</a>、
             <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go">mgc.go</a> 与
@@ -66,10 +65,14 @@
             <a href="https://pkg.go.dev/runtime/pprof">runtime/pprof</a> 与 <a href="https://go.dev/doc/diagnostics">Diagnostics 文档</a>。
           </p>
 
-          <h2>一、先优化证据，不先优化“堆”</h2>
+          <h2>一、对象在堆上，不等于内存有问题</h2>
           <p>
-            一次 heap allocation 不是天然 bug。把响应对象留到 handler 返回之后、把数据装入 channel 或 slice backing array，本来就可能需要比当前 frame 更长的生命周期。
-            真正值得追的是请求路径上的<strong>分配速率、存活集合和延迟</strong>：每次操作分配多少对象与字节，GC 时仍有多少 live bytes，mark assist 是否落到用户 goroutine，以及这些工作是否处在延迟预算内。
+            在 <code>fetchd</code> 里，局部变量如果只在当前函数计算一次，函数返回后就不再需要，编译器通常可以把它放在当前 goroutine 的栈上。
+            但一个结果被返回、被 channel 交给别的 goroutine，或被 slice 保存到函数外面，它就可能比当前调用活得更久。此时放到堆上是在保证正确生命周期，不是编译器“失败”。
+          </p>
+          <p>
+            真正值得追的是三件不同的事：<strong>分配速率</strong>——请求不断制造多少新对象；<strong>存活集合</strong>——GC 时还有多少对象不能回收；
+            <strong>延迟代价</strong>——分配和 GC 工作是否落到了用户请求上。只有这三者与性能目标发生冲突时，减少分配才有明确价值。
           </p>
 
           <div class="table-wrap"><table>
@@ -83,7 +86,7 @@
             </tbody>
           </table></div>
 
-          <h2 id="escape">二、栈或堆是生命周期证明，不是语法分类</h2>
+          <h2 id="escape">二、先回答“它要活多久”，再看栈或堆</h2>
           <p>
             Go 规范描述值、地址与可达行为，却不要求实现把某种语法固定放在栈或堆。编译器 escape analysis 的两条核心不变量直接写在源码注释里：
             <strong>指向 stack object 的指针不能被存入 heap；指针不能比它指向的 stack object 活得更久。</strong>
@@ -110,7 +113,7 @@ func escapingResult() *fetchResult {
             结论必须读当前构建的报告，再用 allocation count 验证；不能把某次 <code>-m</code> 输出当语言保证。
           </p>
 
-          <h2>三、编译器建立带权 location graph</h2>
+          <h3>2.1 编译器建立带权 location graph</h3>
           <p>
             escape 包先把变量和隐式分配映射为 location，再把赋值建成有向边。边权是“解引用次数减取地址次数”：
             <code>p = &amp;q</code> 为 -1，<code>p = q</code> 为 0，<code>p = *q</code> 为 +1。
@@ -126,7 +129,7 @@ func escapingResult() *fetchResult {
             “escapes to heap”因此表示编译器没有足够证明把它安全留在当前 frame，不表示这个对象一定泄漏，更不表示 GC 当前就有压力。
           </p>
 
-          <h2>四、读 <code>-m=2</code>：看流向，不数关键词</h2>
+          <h3>2.2 读 <code>-m=2</code>：看流向，不数关键词</h3>
           <p>
             对整个 <code>fetchd</code> 运行构建报告时，
             <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/memory_lab_test.go">memory_lab_test.go</a>
@@ -144,7 +147,7 @@ go test -run '^$' -gcflags='-m=2' ./...</code></pre>
             按函数调用链过滤，再与 benchmark 的 <code>allocs/op</code> 对齐。如果报告说可能逃逸而测量仍为 0 alloc/op，优先相信最终生成代码和稳定测量，同时检查 inline、常量折叠与 benchmark 是否被优化掉。
           </p>
 
-          <h2>五、slice 预分配减少的是 backing array 迁移</h2>
+          <h3>2.3 slice 预分配减少的是 backing array 迁移</h3>
           <p>
             slice header 只有 pointer、len、cap；预分配并没有把 header “改成堆对象”，而是让已知上界的结果集合一次拿到足够 backing array。
             从空 slice 连续 append 时，容量不足会调用 <code>growslice</code>，新建更大数组并复制旧元素。增长策略是当前 runtime 实现，不能把“永远翻倍”写进业务正确性。
@@ -168,7 +171,7 @@ for i := 0; i &lt; count; i++ {
             这些数字是该实验形状的证据，不是跨平台常量。预分配过大同样会扩大 live heap；更好的输入是可信上界，而不是“越大越安全”。
           </p>
 
-          <h2 id="allocator">六、<code>mallocgc</code> 先按大小和指针形状分流</h2>
+          <h2 id="allocator">三、<code>mallocgc</code> 先按大小和指针形状分流</h2>
           <p>
             Go 1.26.0 的 <code>mallocgc</code> 先处理零大小请求：返回共享的 <code>zerobase</code>。常规路径中，小对象不超过约 32 KiB；
             无指针且小于 16 B 的对象可进入 tiny allocator，把多个对象装进一个 16 B block。其他小对象按 size class 和 scan/noscan 分流，
@@ -191,7 +194,7 @@ if gcBlackenEnabled != 0 {
             同一 16 B block 里的任一对象仍可达，整块就不能回收，所以它只适用于 noscan 小对象。应用真正能控制的是对象形状、批量大小与复用边界，不是直接选择 runtime 的 span。
           </p>
 
-          <h2>七、快路径是当前 P 的 <code>mcache</code> 与 <code>mspan</code></h2>
+          <h3>3.1 快路径是当前 P 的 <code>mcache</code> 与 <code>mspan</code></h3>
           <p>
             <code>nextFreeFast</code> 从当前 span 的 <code>allocCache</code> 找 trailing zero，推进 <code>freeindex</code> 并计算 slot 地址。
             这条路径不需要去全局 heap 找空间。cached span 满时，<code>mcache.nextFree</code> 调用 <code>refill</code>；
@@ -214,7 +217,7 @@ if gcBlackenEnabled != 0 {
             最重要的是累计 allocation rate 最终会推进 heap goal。一次只看纳秒很便宜的分配，在高 QPS 下仍可能把大量 CPU 变成标记与清扫。
           </p>
 
-          <h2 id="gc">八、GC 是两段短 STW 之间的并发标记</h2>
+          <h2 id="gc">四、GC 是两段短 STW 之间的并发标记</h2>
           <p>
             runtime 文档把循环写得很清楚：先完成 sweep termination 并短暂停顿，切到 <code>_GCmark</code>、准备 root jobs、启用 write barrier 与 mark workers；
             mutator 恢复后并发标记。达到 mark completion 条件后再次 STW，进入 <code>_GCmarktermination</code> 完成标记与统计，
@@ -229,7 +232,7 @@ if gcBlackenEnabled != 0 {
           </p>
           <span class="source-caption">phase 与完整循环：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L22-L79">mgc.go 概览</a>；<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L733-L879">gcStart</a>。</span>
 
-          <h2>九、混合写屏障防止 mutator 隐藏白对象</h2>
+          <h3>4.1 混合写屏障防止 mutator 隐藏白对象</h3>
           <p>
             concurrent mark 时，应用还在改 heap pointer。Go 的 hybrid write barrier 在发布新指针前 shade 旧 slot 指向的对象；
             当当前 goroutine 的 stack 仍是 grey 时，也 shade 新指针。这样 mutator 不能通过把唯一指针从 heap 移到已扫描或未扫描 stack 的组合中，让白对象从标记器视野消失。
@@ -248,7 +251,7 @@ if gcBlackenEnabled != 0 {
             那会破坏可达性与移动/生命周期规则。应通过紧凑数据结构、减少无意义对象图和缩短 owner 生命周期来改善扫描量。
           </p>
 
-          <h2>十、分配过快时，用户 goroutine 要做 mark assist</h2>
+          <h3>4.2 分配过快时，用户 goroutine 要做 mark assist</h3>
           <p>
             并发标记不是免费后台服务。GC active 时，<code>mallocgc</code> 先按分配大小扣减 assist credit；
             当前 goroutine 的 debt 为负时，<code>gcAssistAlloc</code> 尝试从全局 background credit 偿还，仍不足就直接扫描对象图。
@@ -267,7 +270,7 @@ if gcBlackenEnabled != 0 {
             再讨论调 <code>GOGC</code>；否则只是改变付款时间，没有改变账单。
           </p>
 
-          <h2>十一、<code>GOGC</code> 与 <code>GOMEMLIMIT</code> 控制不同约束</h2>
+          <h3>4.3 <code>GOGC</code> 与 <code>GOMEMLIMIT</code> 控制不同约束</h3>
           <p>
             <code>GOGC</code> 让下一轮 heap goal 随上一轮 live heap 成比例增长；默认 100 可近似理解为允许新分配量接近当前 live heap 后完成下一轮回收。
             <code>GOMEMLIMIT</code> 则给 runtime 一个软内存限制，控制器从 runtime 管理的总映射内存估计 memory-limit heap goal，并预留 headroom。
@@ -290,7 +293,7 @@ if gcBlackenEnabled != 0 {
           </p>
           <span class="source-caption">pacer 目标、25% background utilization 与 memory-limit headroom：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcpacer.go#L22-L92">mgcpacer.go</a>；配置契约：<a href="https://pkg.go.dev/runtime/debug#SetGCPercent">SetGCPercent</a> 与 <a href="https://pkg.go.dev/runtime/debug#SetMemoryLimit">SetMemoryLimit</a>。</span>
 
-          <h2 id="evidence">十二、把 allocation rate 与 live heap 分开观测</h2>
+          <h2 id="evidence">五、把 allocation rate 与 live heap 分开观测</h2>
           <p>
             实验通过 <code>runtime/metrics</code> 读取 <code>/gc/heap/allocs:bytes</code>、
             <code>/gc/heap/allocs:objects</code>、<code>/gc/heap/live:bytes</code> 和 <code>/gc/cycles/total:gc-cycles</code>。
@@ -324,7 +327,7 @@ go test ./...
 go test -race ./...
 go vet ./...</code></pre>
 
-          <h2>十三、回到 <code>fetchd</code> 的内存清单</h2>
+          <h2>六、回到 <code>fetchd</code> 的内存清单</h2>
           <ol>
             <li><strong>先定 owner 与寿命。</strong>请求内临时值尽量不离开 handler；必须异步持有的对象明确交给 process/session owner。</li>
             <li><strong>用报告解释流向，用 benchmark 判断价值。</strong><code>-m=2</code> 不是性能排行榜。</li>

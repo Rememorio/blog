@@ -45,18 +45,19 @@
           <p class="eyebrow">Go from Request to Production · Chapter III</p>
           <h1 class="long-title">Where Does a <code>goroutine</code> Actually Run?</h1>
           <p class="lead">
-            <code>go h.fetch(...)</code> looks like “start another thread,” yet the source neither creates a dedicated OS thread immediately nor promises that the function begins before the next statement.
-            A <code>go</code> statement first creates a runnable G. It executes only after the scheduler matches that G with an M and a P. Tail latency often hides in the gap between “able to run” and “actually running.”
+            Writing <code>go h.fetch(...)</code> gives Go another task. It does not create a dedicated thread or promise that the task
+            starts immediately. We first treat goroutines as task cards and threads as workers, then distinguish “waiting” from “ready
+            but not yet chosen” before entering G, M, P, and scheduler source.
           </p>
           <div class="meta-line"><span>Source: Go 1.26.0</span><span>Path: newproc → runq → schedule → execute</span><span>Lab: scheduler_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/goroutine-scheduler-overview.png" alt="Go goroutine scheduling overview: go h.fetch passes through newproc to create a G in a run queue; the scheduler matches the G with an OS thread M and execution resources P before it becomes running" /></figure>
         </section>
 
         <section class="article-body">
-          <div class="note route-note"><p><strong>Reading contract:</strong> this chapter follows the ordinary user-goroutine path in Go 1.26.0 through creation, runnable, running, waiting, and wake-up. You should leave able to distinguish goroutine, thread, and P counts, waiting from runnable, and verify scheduling hypotheses with metrics and traces—without turning the internal 10 ms threshold or 256-slot run queue into language guarantees.</p></div>
+          <div class="note route-note"><p><strong>Reading contract:</strong> you do not need to memorize G, M, and P. Begin by treating a goroutine as a task card and a thread as a worker who can execute one card. The first half explains why 1,000 goroutines do not mean 1,000 threads, and why “waiting” differs from “ready but not yet scheduled.”</p></div>
 
           <p>
-            Direct evidence is pinned to <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0</a>, primarily
+            The first half describes the observable scheduling story; the second maps it to <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0</a>, primarily
             <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go">runtime/proc.go</a> and
             <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go">runtime/runtime2.go</a>.
             Conceptual boundaries come from the official <a href="https://go.dev/src/runtime/HACKING">runtime HACKING guide</a>;
@@ -64,10 +65,16 @@
             This is the current gc runtime, not a required mapping for every Go implementation.
           </p>
 
-          <h2>1. Separate Three Counts That Are Often Collapsed</h2>
+          <h2>1. Eight Goroutines Are Not Eight Threads</h2>
           <p>
-            <code>fetchd</code> starts at most eight worker goroutines for eight URLs. That does not add eight threads, nor guarantee eight workers execute Go code simultaneously.
-            The scheduler manages three distinct resources:
+            <code>fetchd</code> starts at most eight worker goroutines for eight URLs. Think of them as eight task cards: one may be
+            computing, another waiting for the network, and another ready for CPU time. The scheduler hands cards that can run to a
+            limited number of threads. Eight cards are not eight workers, and they do not guarantee eight simultaneous operations.
+          </p>
+          <p>
+            Runtime source names the three roles G, M, and P. One sentence is enough to begin: <strong>G is the task, M is the operating-system
+            thread, and P supplies the permission and local resources needed to execute Go code.</strong> Running code requires the runtime
+            to bring one runnable G, one M, and one P together. The table makes that picture more precise:
           </p>
 
           <div class="table-wrap"><table>
@@ -80,8 +87,9 @@
           </table></div>
 
           <p>
-            The scheduler does not permanently bind a G to an M. It matches a runnable G, an M on which to execute, and a P granting the resources to execute Go.
-            An M can run different Gs; a G can resume on a different M. If an M blocks in a syscall, it can release its P so another M continues Go work.
+            The important relationship is that these roles are not permanently bound. An M can run different Gs, and a G can resume
+            on another M. If an M blocks in a syscall, it can release its P so another M continues Go work. That is the practical value
+            behind “a goroutine is not a thread.”
           </p>
 
           <h3><code>GOMAXPROCS</code> limits parallel Go execution</h3>
@@ -134,7 +142,7 @@ func newproc(fn *funcval) {
 
           <figure class="figure"><img src="../assets/go-statement-newproc.png" alt="Source path from a go statement to a runnable G: go h.fetch enters newproc and newproc1, which obtains a G, prepares its stack and goid, changes status to _Grunnable, and lets runqput use runnext, the local run queue, or global overflow" /></figure>
 
-          <h3><code>newproc1</code> reuses a G before allocating one</h3>
+          <h3>3.1 <code>newproc1</code> Reuses a G before Allocating One</h3>
           <p>
             <code>newproc1</code> runs on the system stack. It first asks the current P's free-G pool through <code>gfget</code>; only if that fails does it call <code>malg(stackMin)</code>
             and publish a new G. It clears <code>g.sched</code>, sets the initial SP, a PC returning through <code>goexit</code>, the function entry, parent goid, and creation PC.
@@ -161,19 +169,19 @@ casgstatus(newg, _Gdead, _Grunnable)</code></pre>
             <code>_Grunnable</code> means eligible, not started.
           </p>
 
-          <h2>4. Local Run Queue, <code>runnext</code>, and Global Run Queue</h2>
+          <h3>3.2 Local Run Queue, <code>runnext</code>, and Global Run Queue</h3>
           <p>
             A P currently contains a <code>[256]guintptr</code> local queue and a separate <code>runnext</code> slot. The size is a Go 1.26.0 implementation detail;
             the useful model is that local queues preserve locality while the global queue supports overflow and fairness.
           </p>
 
-          <h3><code>runnext</code> is not unlimited priority</h3>
+          <h4><code>runnext</code> is not unlimited priority</h4>
           <p>
             <code>newproc</code> calls <code>runqput</code> with <code>next=true</code>, so the new G first tries to occupy <code>runnext</code>. When selected, it inherits the remainder of the current time slice,
             reducing latency for communicating Gs. If the slot already has a G, the old one moves to the normal local queue. Platforms without sysmon avoid the optimization so ping-pong work cannot starve everything else.
           </p>
 
-          <h3>What happens when the local queue is full</h3>
+          <h4>What happens when the local queue is full</h4>
           <p>
             With room, <code>runqput</code> writes at the ring tail. When full, <code>runqputslow</code> takes half the local work and places that batch plus the new G on the global queue.
             It redistributes a batch rather than merely putting the newest G elsewhere, making work available to other Ps.
@@ -187,7 +195,7 @@ casgstatus(newg, _Gdead, _Grunnable)</code></pre>
 runqputslow(pp, gp, h, t) // half the local Gs + new G → global</code></pre>
           <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L7473-L7559">runqput and runqputslow</a>; queue fields in <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L772-L818">runtime.p</a>.</span>
 
-          <h2 id="find-runnable">5. How <code>schedule</code> and <code>findRunnable</code> Locate Work</h2>
+          <h3 id="find-runnable">3.3 How <code>schedule</code> and <code>findRunnable</code> Locate Work</h3>
           <p>
             One scheduler round has a small shell: <code>schedule</code> asks <code>findRunnable</code> for a G, handles special cases such as locked Ms, and enters <code>execute</code>.
             The complicated part is discovering work.
@@ -202,7 +210,7 @@ runqputslow(pp, gp, h, t) // half the local Gs + new G → global</code></pre>
 
           <figure class="figure"><img src="../assets/find-runnable-route.png" alt="The main Go findRunnable search loop checks timers, trace, and GC plus a global fairness check every 61 ticks, then the local queue, ordinary global queue, netpoll, and stealWork; before idle and park it rechecks work sources" /></figure>
 
-          <h3>This is not one FIFO</h3>
+          <h4>This is not one FIFO</h4>
           <p>
             <code>findRunnable</code> checks timers near the top, then trace-reader and GC work. To stop a small set of local Gs from occupying a P indefinitely,
             it samples the global queue whenever <code>schedtick % 61 == 0</code>. Ordinary business work then checks the local queue followed by the global queue.
@@ -213,13 +221,13 @@ runqputslow(pp, gp, h, t) // half the local Gs + new G → global</code></pre>
             If nothing appears, it prepares to release its P and park the M, but rechecks queues, timers, and netpoll around that transition so newly submitted work cannot be left with every worker asleep.
           </p>
 
-          <h3>Why work stealing takes a batch</h3>
+          <h4>Why work stealing takes a batch</h4>
           <p>
             <code>runqsteal</code> asks <code>runqgrab</code> for roughly half of another P's local queue. One stolen G returns immediately and the remainder populates the thief's local queue.
             Batch balancing reduces repeated cross-P contention; randomized victim order and a cap on spinning Ms avoid turning idle search into excessive CPU use.
           </p>
 
-          <h2>6. <code>execute</code> Turns Runnable into Running</h2>
+          <h3>3.4 <code>execute</code> Turns Runnable into Running</h3>
           <p>
             Once a G is selected, <code>execute</code> points the M's <code>curg</code> at it, points the G's <code>m</code> back to the M, CASes
             <code>_Grunnable</code> to <code>_Grunning</code>, clears waiting and preemption markers, and finally restores the saved context through <code>gogo(&amp;gp.sched)</code>.
@@ -239,7 +247,8 @@ gogo(&amp;gp.sched)</code></pre>
             GUI, or cgo constraints, accepting the loss of scheduler flexibility.
           </p>
 
-          <h2>7. Blocking Need Not Block the Thread: <code>gopark</code> and <code>ready</code></h2>
+          <h2>4. Waiting, Wake-Up, and Preemption</h2>
+          <h3>4.1 Blocking Need Not Block the Thread: <code>gopark</code> and <code>ready</code></h3>
           <p>
             When a goroutine cannot continue on a channel, mutex, timer, or netpoll, runtime code uses <code>gopark</code> to record a wait reason and
             <code>mcall(park_m)</code> to switch to the M's g0 stack for the state transition. When the resource is ready, <code>goready</code> calls <code>ready</code> on the system stack:
@@ -255,7 +264,7 @@ wakep()</code></pre>
             “I/O is ready” therefore does not mean “the handler resumed”; runnable latency can still intervene.
           </p>
 
-          <h2>8. Preemption Offers a Chance, Not a Real-Time Deadline</h2>
+          <h3>4.2 Preemption Offers a Chance, Not a Real-Time Deadline</h3>
           <p>
             A G that does not block must not own a P forever. In Go 1.26, sysmon's <code>retake</code> watches each P's <code>schedtick</code>. If one tick persists beyond the internal
             <code>forcePreemptNS = 10ms</code>, it requests <code>preemptone</code>. That sets <code>gp.preempt</code> and <code>stackguard0 = stackPreempt</code>;
@@ -267,7 +276,7 @@ wakep()</code></pre>
             platform support, cgo/syscalls, and OS scheduling affect the actual handoff. Preemption improves fairness; it does not make Go hard real time.
           </p>
 
-          <h2 id="evidence">9. Verify Scheduling with Runnable Latency</h2>
+          <h2 id="evidence">5. Verify Scheduling with Runnable Latency</h2>
           <figure class="figure"><img src="../assets/runnable-latency-evidence.png" alt="Go runnable-latency evidence: a G changes from waiting through ready to runnable, then eventually running; /sched/latencies:seconds, go tool trace, and schedtrace observe the runnable interval rather than I/O wait" /></figure>
 
           <h3>What <code>/sched/latencies:seconds</code> measures</h3>
@@ -310,7 +319,7 @@ GODEBUG=schedtrace=1000,scheddetail=1 go test -run TestSchedulerBurst</code></pr
             </tbody>
           </table></div>
 
-          <h2>10. Return to the <code>fetchd</code> Boundaries</h2>
+          <h2>6. Return to the <code>fetchd</code> Boundaries</h2>
           <ol>
             <li><strong>Concurrency is not parallelism.</strong> Fetch workers can wait on networking concurrently; CPU work remains bounded by P count and container quota.</li>
             <li><strong>Bound fan-out before tuning the scheduler.</strong> Unbounded G creation amplifies memory, queues, pools, and wake-ups; <code>GOMAXPROCS</code> is not backpressure.</li>

@@ -71,20 +71,30 @@
 
           <section class="article-body">
             <div class="note route-note">
-              <p><strong>阅读契约：</strong>本文只证明 Go 1.26.0 的语言与实现边界。读完应能从任意赋值、参数、返回值或 channel 发送出发，先画出“复制了哪个值”，再判断值内引用是否形成别名；不会用“slice 是引用传递”替代分析。</p>
+              <p><strong>阅读契约：</strong>不需要先知道 slice 的内部结构。读完后，看到赋值、传参、返回值或 channel 发送，你应该会先问两句：这一步复制了什么？复制品里面还有没有指向同一份底层数据的东西？</p>
             </div>
 
             <p>
-              直接证据分三层：语义以 <a href="https://go.dev/ref/spec#Representation_of_values">Go 语言规范的 Representation of values</a>、
+              本文先用可运行代码建立直觉，再用三层证据确认它：语言语义以 <a href="https://go.dev/ref/spec#Representation_of_values">Go 语言规范的 Representation of values</a>、
               <a href="https://go.dev/ref/spec#Slice_types">Slice types</a> 和 <a href="https://go.dev/ref/spec#For_statements">for 语句</a>为准；
               实现固定到 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>；可观察行为由仓库中的
               <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/value_semantics_test.go">值语义测试</a>覆盖。
               runtime 布局是解释当前实现的证据，不是让业务用 <code>unsafe</code> 依赖内部字段的承诺。
             </p>
 
-            <h2>一、先修正一句容易误导的真话</h2>
+            <h2>一、先看一个“复制了却还会互相影响”的例子</h2>
+            <pre><code class="language-go">a := []int{10, 20}
+b := a
+b[0] = 99
+
+fmt.Println(a) // [99 20]
+fmt.Println(b) // [99 20]</code></pre>
             <p>
-              Go 的赋值、函数传参、返回值和 channel 发送都在传递<strong>值</strong>。但“值”不等于“整棵对象图”。
+              <code>b := a</code> 确实发生了复制，但复制的是一张很小的“说明卡”：数据从哪里开始、当前有多长、最多能用多大。
+              两张说明卡起初都指向同一排元素，所以通过任意一张卡改第一个元素，另一边也能看到。<strong>复制说明卡，不等于复制说明卡指向的整间仓库。</strong>
+            </p>
+            <p>
+              这就是“Go 只有值传递”真正有用的读法：赋值、函数传参、返回值和 channel 发送都在传递<strong>值</strong>，但“值”不一定包含整棵对象图。
               规范明确区分了两类表示：布尔、数值、数组、结构体这样的值包含其数据的完整副本；指针、函数、slice、map、channel 的非 nil 值含有对底层数据的引用。
               interface 则取决于它装入的动态值。
             </p>
@@ -104,7 +114,7 @@
             </div>
 
             <p>
-              “结构体被完整复制”也不是深拷贝承诺。若 <code>struct</code> 含 <code>[]byte</code> 字段，结构体值和 slice 头都被复制，
+              表格只是把刚才的两问压缩起来。“结构体被完整复制”也不是深拷贝承诺。若 <code>struct</code> 含 <code>[]byte</code> 字段，结构体值和 slice 头都被复制，
               两个 slice 头仍可能指向同一个数组。分析应逐层展开，而不是按最外层类型贴“值/引用”标签。
             </p>
 
@@ -189,7 +199,8 @@ original[:3][2] == "gamma"           // 但 append 仍写入共享数组</code><
               若 API 要拥有输入，应明确 clone：<code>owned := append([]T(nil), input...)</code> 或 <code>slices.Clone(input)</code>；若只借用，应约定调用期间谁能改、能否保留。
             </p>
 
-            <h2 id="channel">四、channel 发送复制元素，不承诺深拷贝</h2>
+            <h2>四、继续追踪三种常见的共享边界</h2>
+            <h3 id="channel">4.1 channel 发送复制元素，不承诺深拷贝</h3>
             <p>
               <code>results &lt;- result</code> 发送的是一个 <code>fetchResult</code> 值。对有空位的 buffered channel，
               <code>chansend</code> 找到环形缓冲的目标槽位后，用 <code>typedmemmove</code> 把元素复制进去：
@@ -213,14 +224,14 @@ original[:3][2] == "gamma"           // 但 append 仍写入共享数组</code><
               “通过 channel 传递所有权”是设计协议，不是 runtime 自动深拷贝。
             </p>
 
-            <h2>五、map 与 interface：复制值后还要看动态状态</h2>
-            <h3>map 赋值共享同一张表</h3>
+            <h3>4.2 map 与 interface：复制值后还要看动态状态</h3>
+            <h4>map 赋值共享同一张表</h4>
             <p>
               规范说 map 值是对实现特定数据结构的引用。<code>second := first</code> 复制 map 值，两者仍指向同一张映射；
               用其中一个更新键，另一个会观察到。复制 map 变量既不快照，也不提供并发安全。跨 goroutine 共享普通 map 时仍需 mutex、单 owner 或不可变发布协议。
             </p>
 
-            <h3>interface 的 nil 必须同时看类型与数据</h3>
+            <h4>interface 的 nil 必须同时看类型与数据</h4>
             <p>
               Go 1.26 runtime 把非空 interface 表示为 <code>tab + data</code>，空 interface 表示为 <code>_type + data</code>。
               这解释了 typed nil：把 <code>(*fetchResult)(nil)</code> 装进 <code>any</code> 后，data 可以是 nil，但动态类型仍是 <code>*fetchResult</code>，所以 interface 整体不等于 nil。
@@ -244,7 +255,7 @@ value == nil                  // false：动态类型存在
 typed, ok := value.(*fetchResult)
 ok &amp;&amp; typed == nil            // true</code></pre>
 
-            <h2>六、Go 1.22+ 的 range 变量：旧陷阱已变，别名问题没消失</h2>
+            <h3>4.3 Go 1.22+ 的 range 变量：旧陷阱已变，别名问题没消失</h3>
             <p>
               <code>fetchd</code> 在 <code>for _, target := range targets</code> 中启动 goroutine。自 Go 1.22 起，range clause 用 <code>:=</code>
               声明的迭代变量每轮各有一个新变量；模块声明 <code>go 1.26.0</code>，所以闭包捕获的是不同的 <code>target</code>，无需再写历史上的 <code>target := target</code> 补丁。
@@ -257,7 +268,7 @@ ok &amp;&amp; typed == nil            // true</code></pre>
               range 一个 <code>[][]byte</code> 时，每轮 slice 变量各自独立，仍可能指向重叠数组。语言修复的是变量捕获语义，不是所有权协议。
             </p>
 
-            <h2 id="experiments">七、把“复制”变成可运行实验</h2>
+            <h2 id="experiments">五、把“复制”变成可运行实验</h2>
             <p>仓库测试把容易混在一起的现象拆成六个独立断言：</p>
             <div class="table-wrap">
               <table>
@@ -283,7 +294,7 @@ go vet ./...</code></pre>
               race detector 才会报告数据竞争。测试的价值是把“复制字节”和“共享状态”分开观察。
             </p>
 
-            <h2>八、从值语义推导 API 设计规则</h2>
+            <h2>六、从值语义推导 API 设计规则</h2>
             <ol>
               <li><strong>参数先写借用还是拥有。</strong>只读借用就不要保留；需要跨调用保存就 clone，并把成本写进 API。</li>
               <li><strong>返回 slice/map 要说明可变性。</strong>直接暴露内部集合会把调用方变成别名 owner；必要时返回副本或只读操作。</li>

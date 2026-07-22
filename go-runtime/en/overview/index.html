@@ -168,25 +168,25 @@
 
             <div class="note route-note">
               <p>
-                <strong>Reading contract:</strong> the central claim comes first: <strong>application code sees blocking function calls; the standard library and runtime
-                remove network waiting from the execution thread.</strong> At the same time, <code>net/http</code> gives connections,
-                requests, and outbound exchanges different lifetimes. Understanding those owners is the shortest route to cancellation,
-                timeout, leak, and tail-latency bugs.
+                <strong>Reading contract:</strong> you do not need runtime knowledge. After the first half, you should be able to draw this relay:
+                the server accepts a connection → a handler processes one request → workers make outbound requests → a worker pauses
+                while the network is empty → it continues when data arrives. The second half maps those handoffs to <code>net/http</code>,
+                <code>internal/poll</code>, and runtime source.
               </p>
             </div>
 
             <p>
-              The evidence boundary is explicit. Direct source claims are pinned to the public
+              First, the evidence boundary. Direct source claims are pinned to the public
               <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>. API contracts come from the
               <a href="https://pkg.go.dev/net/http">net/http documentation</a>,
               <a href="https://pkg.go.dev/context">context documentation</a>, and
               <a href="https://go.dev/doc/diagnostics">Go diagnostics documentation</a>.
-              The main route is ordinary HTTP/1.x over pollable network descriptors. HTTP/2 branches at ALPN or an alternate
-              RoundTripper. Windows uses IOCP, BSD and macOS use kqueue, and Linux uses epoll; the epoll section is one concrete
-              platform implementation, not a universal source path.
+              The request-lifecycle model in the first half is broadly useful. The detailed source path in the second half covers
+              ordinary HTTP/1.x over pollable network descriptors. HTTP/2 takes another protocol path, and network waiting differs
+              across Windows, macOS, and Linux. We use Linux epoll as one concrete implementation, not as a universal path.
             </p>
 
-            <p>By the end, a reader opening Go source for the first time should be able to answer five questions:</p>
+            <p>Keep five everyday questions in mind:</p>
             <ol>
               <li>Does <code>Server.Serve</code> create one goroutine per request or one per connection?</li>
               <li>Where does <code>Request.Context()</code> come from, and who cancels it after the handler returns?</li>
@@ -195,10 +195,16 @@
               <li>For a slow request, should we first inspect the handler, connection pool, netpoll, scheduler, or GC?</li>
             </ol>
 
-            <h2>1. Split the request by owner first</h2>
+            <h2>1. Walk One Request in Plain Language</h2>
             <p>
-              “One request” is a user-facing story, not one object in the source. Inside the process it crosses at least five owners.
-              Each owns different state and ends at a different moment.
+              A browser calls <code>/fetch</code>. The server first accepts a connection, then reads one HTTP request from it. The handler
+              finds two URLs and starts two workers. A worker pauses while waiting for a network response and continues when data
+              arrives. Finally, the handler gathers both results and writes JSON.
+            </p>
+            <p>
+              No single request object performs that whole story. Several owners take turns. Here, <em>owner</em> simply means the code
+              that creates some state, decides when its lifetime ends, and cleans it up. Learn the owners first; the type names in the
+              table are only Go 1.26.0's concrete implementation of this relay.
             </p>
 
             <div class="table-wrap">
@@ -247,9 +253,9 @@
             </div>
 
             <p>
-              This table is also a debugging index. More connections do not automatically prove a goroutine leak. Ending a request
-              context does not imply that the TCP connection cannot be reused. A goroutine in <code>IO wait</code> is not necessarily
-              consuming an OS thread. Find the owner before interpreting the symptom.
+              The most important fact in the table is not a type name but a different lifetime. A request may end while its connection
+              stays reusable. A worker may wait for the network while its thread runs another goroutine. A canceled request still needs
+              workers to observe the signal and return. The rest of the source tour explains how those three facts work.
             </p>
 
             <figure class="shape-example">
