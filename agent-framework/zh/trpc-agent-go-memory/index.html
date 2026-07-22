@@ -117,6 +117,31 @@ MemoryJob = {UserKey, delta messages, latest timestamp}</code></pre>
               组合成 AND / OR。返回 false 是正常 no-op：不调用 extractor、不写 Memory，也不推进 cursor；这个接口本身没有 error 通道。
               定义见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/extractor/checker.go#L20-L85"><code>Checker</code> 与内置条件</a>。
             </p>
+            <pre><code>// memory/extractor/checker.go 与 memory.go（节选）
+type Checker func(ctx *ExtractionContext) bool
+
+func CheckMessageThreshold(n int) Checker {
+    return func(ctx *ExtractionContext) bool {
+        return len(ctx.Messages) > n
+    }
+}
+
+func (e *memoryExtractor) ShouldExtract(ctx *ExtractionContext) bool {
+    if len(e.checkers) == 0 {
+        return true
+    }
+    for _, check := range e.checkers {
+        if !check(ctx) {
+            return false
+        }
+    }
+    return true
+}</code></pre>
+            <p>
+              代码里的 <code>len(ctx.Messages) &gt; n</code> 是严格大于，不是达到 n 就触发；<code>checkers</code> 为空则直接 true，保持默认行为。
+              多个 checker 在 <code>ShouldExtract</code> 里天然是 AND；需要 OR 时，调用方先用 <code>ChecksAny</code> 组合成一个 checker。
+              因为返回值只有 bool，false 只能表示“这次不抽取”，不能携带一个需要重试的错误。
+            </p>
 
             <h3>2.2 后台队列为什么按用户分流，队列满了又怎样</h3>
             <p>
@@ -173,11 +198,30 @@ extractor 提议
               <tr><td>确实是新知识</td><td>都未达到</td><td>保留原 add。</td></tr>
             </tbody></table></div>
 
+            <pre><code>// memory/internal/memory/auto.go（节选）
+func reconcileDecisionTier(score, jaccard float64) int {
+    switch {
+    case score >= reconcileSkipScore ||
+        jaccard >= reconcileJaccardHigh:
+        return reconcileTierSkip
+    case score >= reconcileUpdateScore ||
+        jaccard >= reconcileJaccardMid:
+        return reconcileTierUpdate
+    default:
+        return reconcileTierNone
+    }
+}</code></pre>
+
             <p>
               先比较层级，再比较 score 和 Jaccard，确保“明确重复”不会被另一条分数略高但只是相关的记忆抢走。
               reconcile 自身检索失败时保留 extractor 的原操作，而不是把不确定性当成重复并丢数据；若 add 被改成 update，
               但部署禁用了 update，则退回原 add。这里的设计原则才是：<strong>LLM 提议语义操作，确定性代码负责幂等与能力边界。</strong>
               阈值与决策见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/internal/memory/auto.go#L30-L121">reconcile tiers</a>。
+            </p>
+            <p>
+              这段 switch 解释了表格里的“满足任一条件”：搜索分数与 Jaccard 不是相加后再过一条神秘总分线，而是两个独立证据源。
+              高阈值分支写在前面，所以同一候选同时满足 skip 与 update 时一定进入 skip；两个信号都不够才保留原 add。
+              模型生成的是候选操作，最终 tier 完全由这段普通 Go 控制流决定。
             </p>
 
             <h3>2.5 写入成功点决定下一轮会不会重复抽取</h3>
@@ -222,11 +266,40 @@ extractor 提议
          └─ 大集合：用当前用户消息构造 query
                        └─ hybrid search + deduplicate，最多 N 条
                             └─ 注入本轮模型请求</code></pre>
+            <pre><code>// internal/flow/processor/content.go（节选）
+probeEntries, err := reader.ReadMemories(ctx, userKey, budget+1)
+if err != nil || len(probeEntries) == 0 {
+    return nil
+}
+if len(probeEntries) &lt;= budget {
+    return newPreloadMemoryMessage(probeEntries, p.PreloadMemoryPlaybook)
+}
+
+query := buildPreloadSearchQuery(inv.Message)
+if query == "" {
+    return p.loadPreloadMemoryMessage(ctx, inv, reader, userKey, budget)
+}
+searchOpts := memory.SearchOptions{
+    Query: query, MaxResults: budget,
+    Deduplicate: true, HybridSearch: true,
+}
+memories, err := reader.SearchMemories(
+    ctx, userKey, query, memory.WithSearchOptions(searchOpts),
+)
+if err != nil || len(memories) == 0 {
+    return p.loadPreloadMemoryMessage(ctx, inv, reader, userKey, budget)
+}
+return newPreloadMemoryMessage(memories, p.PreloadMemoryPlaybook)</code></pre>
             <p>
               小集合不必花一次相关性搜索；超过预算后，processor 才用当前 user message 做 query。搜索报错或返回空集时，会降级读取最近 N 条；
               probe 或 fallback read 也失败时，本轮不注入 Memory，但请求仍继续。预载内容默认作为 system message 放进 prompt，也可以切到
               user/history 附近的注入模式。整条分支见
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/content.go#L3192-L3294"><code>getPreloadMemoryMessage</code></a>。
+            </p>
+            <p>
+              <code>budget+1</code> 是一个很小但关键的实现技巧：processor 不需要先做昂贵的 count，只多读一条就能判断“是否超过预算”。
+              超过后才构造 query；query 为空、搜索失败或零命中都回到有界的 recent read。只有最前面的 probe 失败时直接返回 nil，
+              因为此时连存储是否可读都无法确认，继续发模型请求比把 Memory 故障升级成整轮失败更稳妥。
             </p>
             <p>
               第二条是<strong>Agent 主动调用工具</strong>。应用把 <code>memory_search</code> / <code>memory_load</code> 暴露给 Agent 后，模型可在同一次 run

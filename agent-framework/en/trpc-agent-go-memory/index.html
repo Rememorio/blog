@@ -114,6 +114,31 @@ MemoryJob = {UserKey, delta messages, latest timestamp}</code></pre>
               while <code>ChecksAll</code> and <code>ChecksAny</code> compose AND and OR policies. False is a normal no-op: no extractor call, no Memory write,
               and no cursor advance. The interface has no error channel. See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/extractor/checker.go#L20-L85"><code>Checker</code> and its built-ins</a>.
             </p>
+            <pre><code>// memory/extractor/checker.go and memory.go (excerpt)
+type Checker func(ctx *ExtractionContext) bool
+
+func CheckMessageThreshold(n int) Checker {
+    return func(ctx *ExtractionContext) bool {
+        return len(ctx.Messages) > n
+    }
+}
+
+func (e *memoryExtractor) ShouldExtract(ctx *ExtractionContext) bool {
+    if len(e.checkers) == 0 {
+        return true
+    }
+    for _, check := range e.checkers {
+        if !check(ctx) {
+            return false
+        }
+    }
+    return true
+}</code></pre>
+            <p>
+              <code>len(ctx.Messages) &gt; n</code> is strictly greater, not greater than or equal. An empty checker list returns true and preserves default behavior.
+              Multiple checkers naturally form AND inside <code>ShouldExtract</code>; callers that want OR first compose one checker through
+              <code>ChecksAny</code>. Because the return type is only bool, false can mean only “skip this extraction,” never a retryable error.
+            </p>
 
             <h3>2.2 Why The Queue Is Sharded By User, And What Happens When It Fills</h3>
             <p>
@@ -171,11 +196,30 @@ extractor proposal
               <tr><td>Genuinely new</td><td>Neither threshold is reached</td><td>Keep the original add.</td></tr>
             </tbody></table></div>
 
+            <pre><code>// memory/internal/memory/auto.go (excerpt)
+func reconcileDecisionTier(score, jaccard float64) int {
+    switch {
+    case score >= reconcileSkipScore ||
+        jaccard >= reconcileJaccardHigh:
+        return reconcileTierSkip
+    case score >= reconcileUpdateScore ||
+        jaccard >= reconcileJaccardMid:
+        return reconcileTierUpdate
+    default:
+        return reconcileTierNone
+    }
+}</code></pre>
+
             <p>
               Candidate tier is compared before score and Jaccard, so a clear duplicate is not displaced by a merely related entry with a slightly higher score.
               A reconcile-search failure preserves the extractor's original operation rather than dropping uncertain data. If add becomes update but the deployment
               disables update, the worker falls back to the original add. <strong>The LLM proposes semantic operations; deterministic code owns idempotence
               and capability boundaries.</strong> See the <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/internal/memory/auto.go#L30-L121">reconcile tiers</a>.
+            </p>
+            <p>
+              The switch makes “either condition” literal. Search score and Jaccard are not added into an undocumented composite score; they are independent
+              evidence sources. The high tier appears first, so a candidate satisfying both skip and update always becomes skip. Only two weak signals preserve
+              the original add. The model proposes an operation, while ordinary Go control flow owns the final tier.
             </p>
 
             <h3>2.5 The Write Completion Point Controls Retry</h3>
@@ -220,11 +264,40 @@ extractor proposal
          └─ large set: build a query from the current user message
                        └─ hybrid search + deduplicate, at most N entries
                             └─ inject into this model request</code></pre>
+            <pre><code>// internal/flow/processor/content.go (excerpt)
+probeEntries, err := reader.ReadMemories(ctx, userKey, budget+1)
+if err != nil || len(probeEntries) == 0 {
+    return nil
+}
+if len(probeEntries) &lt;= budget {
+    return newPreloadMemoryMessage(probeEntries, p.PreloadMemoryPlaybook)
+}
+
+query := buildPreloadSearchQuery(inv.Message)
+if query == "" {
+    return p.loadPreloadMemoryMessage(ctx, inv, reader, userKey, budget)
+}
+searchOpts := memory.SearchOptions{
+    Query: query, MaxResults: budget,
+    Deduplicate: true, HybridSearch: true,
+}
+memories, err := reader.SearchMemories(
+    ctx, userKey, query, memory.WithSearchOptions(searchOpts),
+)
+if err != nil || len(memories) == 0 {
+    return p.loadPreloadMemoryMessage(ctx, inv, reader, userKey, budget)
+}
+return newPreloadMemoryMessage(memories, p.PreloadMemoryPlaybook)</code></pre>
             <p>
               A small set does not need a relevance search. Above the budget, the processor derives a query from the current user message. A search error or
               empty result falls back to reading the most recent N entries. If the probe or fallback read also fails, this request gets no Memory injection but
               still proceeds. Preloaded content is a system message by default, with an option to place it near user/history context. Follow the complete branch in
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/content.go#L3192-L3294"><code>getPreloadMemoryMessage</code></a>.
+            </p>
+            <p>
+              <code>budget+1</code> is a small but important implementation trick: the processor avoids an expensive count by reading only one entry beyond the
+              budget. Only then does it build a query. An empty query, search failure, or zero hits falls back to a bounded recent read. A failed initial probe
+              returns nil because storage readability itself is unknown; continuing the model request is safer than promoting a Memory outage into a failed run.
             </p>
             <p>
               The second path is an <strong>Agent-initiated tool call</strong>. When the application exposes <code>memory_search</code> and
