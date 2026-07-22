@@ -167,6 +167,33 @@ ReviewDecision
               governance rather than asking the model to generate a potentially different candidate from the same transcript. Evidence consumption and candidate
               activation are separate recovery boundaries.
             </p>
+            <pre><code>// evolution/worker.go (excerpt)
+shouldReview, err := w.reviewPolicy.ShouldReview(ctx, policyInput)
+if err != nil {
+    return // policy failure: keep the cursor
+}
+if !shouldReview {
+    writeLastReviewAt(sess, latestTs)
+    return
+}
+
+decision, err := w.reviewer.Review(ctx, reviewInput)
+if err != nil {
+    return // reviewer failure: retain the delta for retry
+}
+if decision == nil || decision.SkipReason != "" {
+    writeLastReviewAt(sess, latestTs)
+    return
+}
+
+w.applyDecision(ctx, decision, outcome, scope, scoped, repo)
+writeLastReviewAt(sess, latestTs)</code></pre>
+            <p>
+              Read this excerpt by tracking the three <code>writeLastReviewAt</code> calls. Policy and Reviewer errors return before the write, preserving the
+              same delta for retry. Deterministic and model-declared skips consumed the evidence, so they write before returning. <code>applyDecision</code> has no
+              error result; whether the revision becomes active, pending, rejected, or fails publication, the worker advances the review point. Governance recovery
+              belongs to revision and audit state, not another Reviewer replay.
+            </p>
             <p>
               Deterministic reconciliation then cleans the decision: duplicates within one create batch collapse; a strict name extension of an existing Skill
               becomes update; “Recipe - 3 Dishes” becomes an update when “Recipe - Multi-Dish” exists; high body-word overlap also merges candidates.
@@ -212,6 +239,42 @@ ReviewDecision
               Delete bypasses body checks because it has no new spec. The example receives missing-use-condition, too-few-steps, and count-specific-sibling reasons.
               See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go#L194-L270"><code>defaultSpecGate.Validate</code></a> for the field and canonical-name rules.
             </p>
+            <pre><code>// evolution/gates.go (excerpt)
+if c.Action == RevisionActionDelete {
+    return &amp;SpecReport{Passed: true}, nil
+}
+if c.Spec == nil {
+    return &amp;SpecReport{Passed: false,
+        Reasons: []string{"missing spec body"}}, nil
+}
+if strings.TrimSpace(c.Spec.Description) == "" {
+    reasons = append(reasons, "missing description")
+}
+if strings.TrimSpace(c.Spec.WhenToUse) == "" {
+    reasons = append(reasons, "missing when_to_use")
+}
+if len(c.Spec.Steps) &lt; minSteps {
+    reasons = append(reasons, "not enough steps")
+}
+if c.Action == RevisionActionCreate {
+    cand := canonicalSkillName(c.Spec.Name)
+    for _, ex := range existing {
+        if canonicalSkillName(ex.Name) == cand {
+            reasons = append(reasons, "duplicate; use update")
+            break
+        }
+    }
+    if matchesQuantifiedSibling(c.Spec.Name, existing) != "" {
+        reasons = append(reasons, "count-specific sibling")
+    }
+}
+return &amp;SpecReport{Passed: len(reasons) == 0, Reasons: reasons}, nil</code></pre>
+            <p>
+              Delete passes at the first branch because this gate validates new body shape, not whether deletion is allowed. A missing spec fails immediately;
+              no later field can be inspected. Other failures accumulate in <code>reasons</code>, so one report can expose missing description, use condition,
+              and steps together. Duplicate and quantified-sibling checks belong only to create because update is expected to retain the same Skill identity.
+              The final <code>len(reasons) == 0</code> also proves there is no hidden model score: no deterministic reason means pass.
+            </p>
 
             <h4>SafetyGate scans the full body, but deliberately keeps a short rule list</h4>
             <p>
@@ -221,6 +284,26 @@ ReviewDecision
               The list stays short because a false positive rejects a revision. This gate does not prove semantic safety and does not replace CodeExecutor
               sandboxing or tool permissions.
               The scan entry and rule composition are in <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go#L272-L302"><code>defaultSafetyGate.Scan</code></a>.
+            </p>
+            <pre><code>// evolution/gates.go (excerpt)
+body := strings.Join(append([]string{
+    c.Spec.Description, c.Spec.WhenToUse,
+}, append(c.Spec.Steps, c.Spec.Pitfalls...)...), "\n")
+
+if pattern, ok := containsSecret(body); ok {
+    reasons = append(reasons, "suspected secret: "+pattern)
+}
+if pattern, ok := containsDangerousShell(body); ok {
+    reasons = append(reasons, "dangerous shell: "+pattern)
+}
+if pattern, ok := containsPathTraversal(body); ok {
+    reasons = append(reasons, "path traversal: "+pattern)
+}
+return &amp;SafetyReport{Passed: len(reasons) == 0, Reasons: reasons}, nil</code></pre>
+            <p>
+              SafetyGate first joins the four reader-visible fields, then runs three independent regex groups. It reads no transcript, tool permissions, or
+              CodeExecutor state. It can therefore answer “does this Skill body contain these high-confidence strings?” but not “will apparently safe prose
+              eventually induce a dangerous tool call?” All three checks run instead of returning on first match so one report retains every reason.
             </p>
 
             <h4>Default EffectivenessGate reads Outcome; it does not secretly replay a benchmark</h4>
@@ -275,6 +358,34 @@ ReviewDecision
               and the <code>shadow_mode_bypassed</code> metric answer “what would enforcement have changed?” Once production relies on gates, shadow should be off;
               otherwise reports are warnings, not isolation. See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L750-L789"><code>processRevision</code></a>
               and <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L903-L970"><code>publishRevision</code></a>.
+            </p>
+            <pre><code>// evolution/worker.go (excerpt)
+gatePassed := w.runGates(ctx, rev, existing, outcome)
+if !gatePassed &amp;&amp; rev.Status == RevisionPending {
+    rev.Status = RevisionRejected
+}
+
+// Rejected candidates are still persisted for audit.
+if store != nil {
+    _ = store.WriteRevision(ctx, rev)
+}
+
+shouldPublish := gatePassed || w.approvalGateShadow
+if !shouldPublish {
+    w.auditReject(ctx, rev, store)
+    return false
+}
+if !gatePassed &amp;&amp; w.approvalGateShadow {
+    w.bumpGateMetric(func(m *approvalGateCounters) {
+        m.ShadowModeBypassed++
+    })
+}
+return w.publishRevision(ctx, rev, actionLabel, gatePassed, scope, scoped, store)</code></pre>
+            <p>
+              <code>WriteRevision</code> appears before the publish decision, so rejected does not mean “nothing was retained”; candidate body, reports, and an
+              audit target still exist. <code>shouldPublish</code> owns the live side effect. Normally it equals <code>gatePassed</code>; with shadow enabled, the OR
+              sends even a failed candidate to <code>publishRevision</code>. The code never flips <code>gatePassed</code> to true, preserving failed status and the
+              bypass metric. That is observe-without-enforcement, not canary isolation.
             </p>
 
             <h2 id="skillcraft">3. The First SkillCraft Benchmark: Does Online Learning Help?</h2>
@@ -352,12 +463,36 @@ ReviewDecision
        └─ Submit=true + RevisionSubmitter       // optional
             └─ pending_approval revision
                  └─ approval -> publisher -> repository refresh</code></pre>
+            <pre><code>// evolution/optimization/optimization.go and gepa.go (PR #2204 excerpt)
+type Request struct {
+    Seed             *evolution.SkillSpec
+    Dataset          Dataset
+    Scope            skill.SkillScope
+    ParentRevisionID string
+    Submit           bool
+}
+
+type Optimizer interface {
+    Optimize(context.Context, Request) (*Result, error)
+}
+
+func (o *gepaOptimizer) Optimize(
+    ctx context.Context, req Request,
+) (*Result, error) {
+    return o.engine.optimize(ctx, req, o.search)
+}</code></pre>
             <p>
               “Offline” therefore means search and counterfactual evaluation happen outside the operational task flow. It does not require hand-authored data:
               sanitized production Sessions can be selected and frozen into the Dataset. By default, <code>Optimize</code> returns a Result and changes no Skill.
               Only <code>Submit=true</code> plus an injected <code>RevisionSubmitter</code> sends a promotion-eligible candidate into the same revision governance.
               The current PR additionally forces externally evaluated submissions to human approval, preserving the boundary between “the experiment improved”
               and “production may activate it.” See <a href="https://github.com/trpc-group/trpc-agent-go/pull/2204">GEPA optimizer PR #2204</a>.
+            </p>
+            <p>
+              The public shape contains no Session, Event channel, or background queue: only an explicit seed, frozen Dataset, scope, parent revision, and submit
+              switch. <code>Optimize</code> hands one bounded experiment to the engine. The type therefore confirms that GEPA is not a hidden branch of the online
+              worker. With <code>Submit=false</code>, Result stays with the caller. True only permits the engine to invoke a separate
+              <code>RevisionSubmitter</code> after promotion checks; the optimizer still does not write the live Skill itself.
             </p>
 
             <h3>5.2 Freeze The Dataset Contract Before Optimizing</h3>

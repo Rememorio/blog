@@ -172,6 +172,33 @@ ReviewDecision
               再生成一份可能不同的候选。这个区别把<strong>证据消费</strong>和<strong>候选生效</strong>分成了两个恢复边界。
             </p>
 
+            <pre><code>// evolution/worker.go（节选）
+shouldReview, err := w.reviewPolicy.ShouldReview(ctx, policyInput)
+if err != nil {
+    return // policy 失败：不推进 cursor
+}
+if !shouldReview {
+    writeLastReviewAt(sess, latestTs)
+    return
+}
+
+decision, err := w.reviewer.Review(ctx, reviewInput)
+if err != nil {
+    return // reviewer 失败：保留 delta 供重试
+}
+if decision == nil || decision.SkipReason != "" {
+    writeLastReviewAt(sess, latestTs)
+    return
+}
+
+w.applyDecision(ctx, decision, outcome, scope, scoped, repo)
+writeLastReviewAt(sess, latestTs)</code></pre>
+            <p>
+              读这段代码时，只要盯住三处 <code>writeLastReviewAt</code>。Policy 和 Reviewer 报错都在写 cursor 之前 return，所以同一 delta
+              还能重试；确定性 skip 与模型明确 skip 已经消费过证据，因此先写再 return；<code>applyDecision</code> 没有返回 error，
+              不论 revision 最后 active、pending、rejected 还是发布失败，worker 都会推进 review 点。治理恢复必须走 revision/audit，不能靠重放 reviewer。
+            </p>
+
             <p>
               reconciler 再用确定性规则整理 decision：同一批 create 去重；名字是旧 Skill 严格扩展时把 create 改成 update；
               “Recipe - 3 Dishes” 这类计数变体若已有 “Recipe - Multi-Dish”，也改写到通用父 Skill；正文词集合高度重合时合并。
@@ -216,6 +243,42 @@ ReviewDecision
               delete 不需要再验证正文，因为它本来就没有新 spec。上面的候选会同时得到“缺 when_to_use、步骤不足、计数特化”三条理由。
               具体字段与名称规范化逻辑见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go#L194-L270"><code>defaultSpecGate.Validate</code></a>。
             </p>
+            <pre><code>// evolution/gates.go（节选）
+if c.Action == RevisionActionDelete {
+    return &amp;SpecReport{Passed: true}, nil
+}
+if c.Spec == nil {
+    return &amp;SpecReport{Passed: false,
+        Reasons: []string{"missing spec body"}}, nil
+}
+if strings.TrimSpace(c.Spec.Description) == "" {
+    reasons = append(reasons, "missing description")
+}
+if strings.TrimSpace(c.Spec.WhenToUse) == "" {
+    reasons = append(reasons, "missing when_to_use")
+}
+if len(c.Spec.Steps) &lt; minSteps {
+    reasons = append(reasons, "not enough steps")
+}
+if c.Action == RevisionActionCreate {
+    cand := canonicalSkillName(c.Spec.Name)
+    for _, ex := range existing {
+        if canonicalSkillName(ex.Name) == cand {
+            reasons = append(reasons, "duplicate; use update")
+            break
+        }
+    }
+    if matchesQuantifiedSibling(c.Spec.Name, existing) != "" {
+        reasons = append(reasons, "count-specific sibling")
+    }
+}
+return &amp;SpecReport{Passed: len(reasons) == 0, Reasons: reasons}, nil</code></pre>
+            <p>
+              delete 在最前面直接通过，说明 gate 检查的是“新正文是否合格”，不是阻止删除动作；缺 spec 则立即失败，因为后面的字段都无从读取。
+              其余问题只追加到 <code>reasons</code>，所以一次检查能同时报告缺 description、缺使用时机和步骤不足。
+              duplicate 与 quantified sibling 只在 create 分支出现，update 共享原 Skill 身份本来就是预期行为。最后的 <code>len(reasons) == 0</code>
+              也证明这里没有隐藏模型分数：规则没有理由才通过。
+            </p>
 
             <h4>SafetyGate：扫描的是整份正文，但规则故意很短</h4>
             <p>
@@ -225,6 +288,26 @@ ReviewDecision
               上面的候选因此被明确标成 dangerous shell。规则短不是能力不足的疏忽，而是 false positive 会直接拒绝 revision；
               这层只挡高置信字符串，不能证明工具执行语义完全安全，也不能替代 CodeExecutor 沙箱与权限控制。
               扫描入口与规则组合见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/gates.go#L272-L302"><code>defaultSafetyGate.Scan</code></a>。
+            </p>
+            <pre><code>// evolution/gates.go（节选）
+body := strings.Join(append([]string{
+    c.Spec.Description, c.Spec.WhenToUse,
+}, append(c.Spec.Steps, c.Spec.Pitfalls...)...), "\n")
+
+if pattern, ok := containsSecret(body); ok {
+    reasons = append(reasons, "suspected secret: "+pattern)
+}
+if pattern, ok := containsDangerousShell(body); ok {
+    reasons = append(reasons, "dangerous shell: "+pattern)
+}
+if pattern, ok := containsPathTraversal(body); ok {
+    reasons = append(reasons, "path traversal: "+pattern)
+}
+return &amp;SafetyReport{Passed: len(reasons) == 0, Reasons: reasons}, nil</code></pre>
+            <p>
+              SafetyGate 先把四类读者可见字段拼成一段 body，再独立执行三组正则；它没有读取 transcript、工具权限或 CodeExecutor 状态。
+              因此它能准确回答“Skill 正文是否出现这些高置信字符串”，却回答不了“某条看似安全的自然语言最终会不会诱导危险调用”。
+              三组检查都执行而不是首次命中就 return，也是为了让一次 gate report 收集完整理由。
             </p>
 
             <h4>EffectivenessGate：默认实现只看 Outcome，不会偷偷重跑 benchmark</h4>
@@ -280,6 +363,33 @@ ReviewDecision
               否则 report 只是告警，不是隔离。实现顺序见
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L750-L789"><code>processRevision</code></a>
               与 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/evolution/worker.go#L903-L970"><code>publishRevision</code></a>。
+            </p>
+            <pre><code>// evolution/worker.go（节选）
+gatePassed := w.runGates(ctx, rev, existing, outcome)
+if !gatePassed &amp;&amp; rev.Status == RevisionPending {
+    rev.Status = RevisionRejected
+}
+
+// 被拒候选也先持久化，保留完整审计。
+if store != nil {
+    _ = store.WriteRevision(ctx, rev)
+}
+
+shouldPublish := gatePassed || w.approvalGateShadow
+if !shouldPublish {
+    w.auditReject(ctx, rev, store)
+    return false
+}
+if !gatePassed &amp;&amp; w.approvalGateShadow {
+    w.bumpGateMetric(func(m *approvalGateCounters) {
+        m.ShadowModeBypassed++
+    })
+}
+return w.publishRevision(ctx, rev, actionLabel, gatePassed, scope, scoped, store)</code></pre>
+            <p>
+              <code>WriteRevision</code> 位于 publish 判断之前，所以 rejected 不是“什么都没留下”；它仍有候选正文、report 与审计入口。
+              真正控制线上副作用的是 <code>shouldPublish</code>。正常模式下它等于 <code>gatePassed</code>；shadow 打开后 OR 条件会把失败候选也送进
+              <code>publishRevision</code>。同时代码没有把 <code>gatePassed</code> 改成 true，所以失败状态和 bypass 指标仍保留，这正是“观测但不拦截”的实现，而不是灰度隔离。
             </p>
 
             <h2 id="skillcraft">三、第一组 SkillCraft Benchmark：在线学习有没有用</h2>
@@ -361,12 +471,36 @@ ReviewDecision
        └─ Submit=true + RevisionSubmitter       // 可选
             └─ pending_approval revision
                  └─ approval -> publisher -> repository refresh</code></pre>
+            <pre><code>// evolution/optimization/optimization.go 与 gepa.go（PR #2204 节选）
+type Request struct {
+    Seed             *evolution.SkillSpec
+    Dataset          Dataset
+    Scope            skill.SkillScope
+    ParentRevisionID string
+    Submit           bool
+}
+
+type Optimizer interface {
+    Optimize(context.Context, Request) (*Result, error)
+}
+
+func (o *gepaOptimizer) Optimize(
+    ctx context.Context, req Request,
+) (*Result, error) {
+    return o.engine.optimize(ctx, req, o.search)
+}</code></pre>
             <p>
               因此“offline”说的是搜索与反事实评估发生在实际任务流之外，不要求数据必须人工编写：Dataset 完全可以由线上 Session 脱敏、筛选后冻结得到。
               默认 <code>Optimize</code> 只返回结果，不改 Skill；只有调用方设置 <code>Submit=true</code> 并注入 <code>RevisionSubmitter</code>，
               promotion-eligible 候选才进入同一 revision governance。当前 PR 还会把这种外部评估候选强制放进人工审批，
               从而把“实验认为更好”和“生产允许生效”继续分开。接口与控制流见
               <a href="https://github.com/trpc-group/trpc-agent-go/pull/2204">GEPA optimizer PR #2204</a>。
+            </p>
+            <p>
+              这个公开接口里没有 Session、Event channel 或后台 queue，只有调用方明确传入的 seed、冻结 Dataset 与提交开关；
+              <code>Optimize</code> 也只是把一次有界实验交给 engine。由此可以从类型层面确认 GEPA 不是在线 worker 的隐藏分支。
+              <code>Submit=false</code> 时 Result 停在调用方手里；即使为 true，也只是允许 engine 在满足 promotion 条件后调用另一个
+              <code>RevisionSubmitter</code>，而不是让 optimizer 自己写 live Skill。
             </p>
 
             <h3>5.2 先把 Dataset 合同冻结，才能谈优化</h3>
