@@ -71,6 +71,7 @@
           <section class="article-body">
             <div class="note key-point"><p><strong>Set the boundary first.</strong> The previous chapter uses Summary and Session Recall to shorten a current session and recover raw evidence. Memory asks which knowledge should survive into another session. Both help a model recall the past, but they read different ledgers and write under different rules.</p></div>
             <div class="note"><p><strong>Evidence boundary.</strong> Implementation links are pinned to public snapshot <code>0c7774187da9330144df2a038ef18ee89ef2ae1c</code>; experiments are pinned to benchmark snapshot <code>c9aabe56c0eb1cb80e927d2a34ecc72658173cbe</code>. Rememorio introduced the initial service in the <a href="https://github.com/trpc-group/trpc-agent-go/commit/b86db0de90d13b6fccd4c98795403029fd95f5f9">commit corresponding to #70</a>. Results describe one model, prompt, storage backend, and retrieval budget; they are not a universal deployment guarantee.</p></div>
+            <div class="note"><p><strong>Reading contract.</strong> Keep one fact in view: “the user upgraded production from Go 1.23 to 1.24.” By the end, you should be able to explain which delta Runner hands off, why the extractor proposes update rather than add, how deterministic reconcile prevents duplicate writes, where the final entry lives, and how a new Session retrieves it within a bounded budget.</p></div>
 
             <h2>1. Why Summary Cannot Double As Memory</h2>
             <p>
@@ -106,7 +107,28 @@
 
 MemoryJob = {UserKey, delta messages, latest timestamp}</code></pre>
 
-            <h3>2.2 Search Existing Memories Before Writing</h3>
+            <p>
+              This checker is not another model asked whether something deserves memory. It is a pure Go function,
+              <code>func(*ExtractionContext) bool</code>, that receives the user key, filtered delta messages, and optional last-extraction time.
+              No configured checker means proceed. Built-ins include “message count is strictly greater than n” and “more than this interval has elapsed,”
+              while <code>ChecksAll</code> and <code>ChecksAny</code> compose AND and OR policies. False is a normal no-op: no extractor call, no Memory write,
+              and no cursor advance. The interface has no error channel. See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/extractor/checker.go#L20-L85"><code>Checker</code> and its built-ins</a>.
+            </p>
+
+            <h3>2.2 Why The Queue Is Sharded By User, And What Happens When It Fills</h3>
+            <p>
+              Extraction adds another model call and storage writes. Running it inline would make an already successful response wait for, or fail with,
+              a maintenance task. The worker therefore uses <code>context.WithoutCancel</code>: closing the HTTP request does not cancel an accepted job.
+              Each job gets its own timeout. Defaults are one worker, queue capacity ten, and thirty seconds. A stable hash of
+              <code>AppName + UserID</code> routes one user's updates to the same queue, preserving their order while allowing other users to use other workers.
+            </p>
+            <p>
+              An unstarted or full queue does not silently drop the delta. If the caller is still live, processing falls back to the synchronous path;
+              only an already-cancelled caller skips that fallback. A missing extractor, nil Session, invalid user key, no new user/assistant text,
+              or a checker that declines extraction is a normal no-op. Auto Memory is conditional maintenance, not a mandatory database row per run.
+            </p>
+
+            <h3>2.3 Search Existing Memories Before Writing</h3>
             <p>
               If the store already says "Go 1.23" and the new conversation says "we upgraded to 1.24," a blind append creates a conflict. The worker
               builds a query from the new user messages, retrieves related entries, and gives both old memories and new conversation to the extractor.
@@ -114,19 +136,105 @@ MemoryJob = {UserKey, delta messages, latest timestamp}</code></pre>
               and <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/extractor/memory.go#L110-L182"><code>Extract</code></a>.
             </p>
             <p>
-              A deterministic reconcile pass follows model output. When an add is already covered by an existing entry, it can become an update instead
-              of another paraphrased duplicate. <strong>The LLM proposes semantic operations; the runtime owns idempotence and the write boundary.</strong>
+              Existing-memory lookup has its own fallback. When relevance search fails, the worker reads a small recent set as deduplication context.
+              Only when both search and fallback read fail does the job stop without advancing its extraction timestamp. It does not blindly emit adds while
+              knowing nothing about prior state.
+            </p>
+            <p>
+              The extractor prompt exposes four operations as tools. <code>add</code> stores genuinely new knowledge. <code>update</code> revises an existing entry.
+              <code>delete</code> handles one explicitly forgotten or obsolete item. <code>clear</code> is reserved for an explicit “forget everything.”
+              Operations can also classify Fact or Episode and attach topics, absolute time, participants, and location. The model chooses the semantic intent;
+              it does not receive a storage transaction or mutate the service merely by emitting a tool call.
             </p>
 
-            <h3>2.3 Storage Shape Exists To Support Retrieval</h3>
+            <pre><code>existing memory-17
+  Fact: "The user's production environment runs Go 1.23"
+  topics: [go, production]
+
+new delta
+  user: "We upgraded production to Go 1.24"
+
+extractor proposal
+  update(memory_id="memory-17",
+         memory="The user's production environment runs Go 1.24")</code></pre>
+
+            <h3>2.4 Reconcile Stops Paraphrased Duplicates Before The Store</h3>
+            <p>
+              The model may still propose add for the upgrade. For each add, the worker retrieves at most three candidates and compares two independent signals:
+              the backend's relevance score and token-level Jaccard overlap. The signals use logical OR. Vector stores are good at semantic paraphrase;
+              keyword stores often produce lower BM25-like scores; Jaccard catches common entity names and exact versions.
+            </p>
+
+            <div class="table-wrap"><table><thead><tr><th>Tier</th><th>Either condition</th><th>Runtime action</th></tr></thead><tbody>
+              <tr><td>Effectively identical</td><td>score ≥ 0.90 or Jaccard ≥ 0.70</td><td>Drop add if no topic is new; otherwise rewrite as a topic-only update.</td></tr>
+              <tr><td>A newer form of the same fact</td><td>score ≥ 0.60 or Jaccard ≥ 0.40</td><td>Rewrite add as update of the strongest entry and merge topics.</td></tr>
+              <tr><td>Genuinely new</td><td>Neither threshold is reached</td><td>Keep the original add.</td></tr>
+            </tbody></table></div>
+
+            <p>
+              Candidate tier is compared before score and Jaccard, so a clear duplicate is not displaced by a merely related entry with a slightly higher score.
+              A reconcile-search failure preserves the extractor's original operation rather than dropping uncertain data. If add becomes update but the deployment
+              disables update, the worker falls back to the original add. <strong>The LLM proposes semantic operations; deterministic code owns idempotence
+              and capability boundaries.</strong> See the <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/internal/memory/auto.go#L30-L121">reconcile tiers</a>.
+            </p>
+
+            <h3>2.5 The Write Completion Point Controls Retry</h3>
+            <p>
+              Only after reconcile does the worker execute add, update, delete, or clear. If an update targets a missing ID and add is enabled, it may fall back
+              to add. One failed operation is logged while later operations continue. There is an important boundary: <code>last_extract_at</code> advances only
+              after extraction and reconcile complete, but individual storage-write failures are logged rather than returned for the whole batch. That avoids
+              replaying one delta forever, and it also means production monitoring must inspect operation-level failures, not only job completion.
+            </p>
+            <p>
+              A failure while loading old memories, invoking the extractor, or timing out the whole job does not advance the timestamp, so a later job may retry
+              the delta. Successful entries are isolated by <code>AppName + UserID</code>; any new Session with that identity can retrieve them. The completed
+              foreground run never changes retroactively. Memory first becomes visible to <strong>later model calls</strong>.
+            </p>
+            <p>
+              Session, not the Memory store, owns this incremental cursor. The framework writes the timestamp of the last included Event to
+              <code>Session.State["memory:last_extract_at"]</code>. It is not in one storage transaction with add, update, or delete, so it means
+              “the worker processed through this point,” not “every Memory operation in the batch committed.” Production observability needs both operation-level
+              errors and this cursor. See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/internal/memory/auto.go#L673-L691"><code>readLastExtractAt</code> and <code>writeLastExtractAt</code></a>.
+            </p>
+
+            <h3>2.6 Storage Shape Exists To Support Retrieval</h3>
             <p>
               Fact versus Episode, absolute time, topics, participants, and location matter at query time. "What happened first?" needs event-time ordering;
               "which mountain did Alice visit?" must validate participants; proper nouns often need lexical matching. Search options therefore include kind,
               time ranges, ordering, deduplication, hybrid search, and RRF. See <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/memory.go#L277-L320"><code>SearchOptions</code></a>.
             </p>
 
-            <h2>3. Retrieval Is More Than "Take The Ten Nearest"</h2>
-            <h3>3.1 Vectors And Keywords Cover Different Misses</h3>
+            <h2>3. Read Memory Into A New Session, Then Make Retrieval Precise</h2>
+            <h3>3.1 Separate Framework Preload From Agent-Initiated Search</h3>
+            <p>
+              A stored Memory is not automatically visible to the model. tRPC-Agent-Go offers two read paths. The first is <strong>framework preload</strong>.
+              After the application explicitly configures <code>WithPreloadMemory(N)</code>, <code>ContentRequestProcessor</code> takes a
+              <code>MemoryReader</code> from Invocation and reads prior entries under the current Session's <code>AppName + UserID</code>. The default is zero,
+              which disables preload. <code>-1</code> loads all entries, while positive N is the per-request entry budget.
+            </p>
+            <pre><code>first turn of a new Session
+  user: “Plan the upgrade for my current production setup”
+    └─ ContentRequestProcessor
+         ├─ probe N+1 entries to classify the set as small or large
+         ├─ small set: load all returned entries
+         └─ large set: build a query from the current user message
+                       └─ hybrid search + deduplicate, at most N entries
+                            └─ inject into this model request</code></pre>
+            <p>
+              A small set does not need a relevance search. Above the budget, the processor derives a query from the current user message. A search error or
+              empty result falls back to reading the most recent N entries. If the probe or fallback read also fails, this request gets no Memory injection but
+              still proceeds. Preloaded content is a system message by default, with an option to place it near user/history context. Follow the complete branch in
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/content.go#L3192-L3294"><code>getPreloadMemoryMessage</code></a>.
+            </p>
+            <p>
+              The second path is an <strong>Agent-initiated tool call</strong>. When the application exposes <code>memory_search</code> and
+              <code>memory_load</code>, the model can decide what to retrieve and whether to split a question into several searches during the same run.
+              An empty query returns an empty result; a backend failure returns a tool error, so the Agent can rewrite the query, answer with reduced confidence,
+              or explain the failure. These paths are complementary: preload places common facts before the first model call, while tools handle long-tail,
+              multi-hop, and time-filtered retrieval on demand.
+            </p>
+
+            <h3>3.2 Vectors And Keywords Cover Different Misses</h3>
             <p>
               Vector search handles paraphrase but may under-rank book titles, place names, and exact versions. Keyword search handles exact strings but not
               semantic rewrites. The pgvector backend runs vector and full-text search, merges ranks through Reciprocal Rank Fusion, retries without a kind
@@ -137,7 +245,26 @@ keyword rank:  [Alice + Mt. Fuji, Mt. Fuji trip]
 RRF merge:     [Mt. Fuji trip, Alice + Mt. Fuji, hiking preference]
 dedupe:        remove near-identical restatements</code></pre>
 
-            <h3>3.2 Multi-Hop Questions Need Multiple Query Angles</h3>
+            <p>
+              RRF avoids comparing an incompatible cosine score such as 0.82 with a keyword score such as 7.4. It uses ranks instead. With default
+              <code>k=60</code>, a result ranked first in one list and third in another receives <code>1/(60+1) + 1/(60+3)</code>; a result present in only
+              one list receives one term. Items supported by both semantic and exact matching move upward without requiring a shared score scale.
+            </p>
+
+            <h3>3.3 Kind Fallback And Deduplication Correct Extraction Uncertainty</h3>
+            <p>
+              For “when did the upgrade happen?” an Agent may prefer Episode, while the extractor may have stored the statement as Fact. If a kind-filtered
+              query returns fewer than three entries, <code>KindFallback</code> runs an unfiltered search and merges it while preserving requested-kind priority.
+              Content deduplication then uses 0.80 word-set Jaccard and keeps the higher-scored representative, preventing two near-identical versions from
+              consuming prompt budget. The Memory tool enables hybrid and deduplication by default, and enables kind fallback only when a kind was requested.
+            </p>
+            <p>
+              These are service capabilities, not identical backend implementations. Vector backends such as pgvector, SQLiteVec, and MySQLVec can merge vector
+              and keyword rankings with RRF. Keyword-only stores use BM25-like relevance. “Hybrid” in this article refers to a backend path that supports it;
+              it does not imply that every store secretly generates embeddings.
+            </p>
+
+            <h3>3.4 Multi-Hop Questions Need Multiple Query Angles</h3>
             <p>
               "What did Alice buy before Japan, and what did she do after returning?" often exceeds one top-k. The optimized benchmark agent uses two or
               three short searches from entity, time, and sub-question angles, then combines evidence. Tool guidance explicitly recommends separate searches
@@ -164,7 +291,20 @@ dedupe:        remove near-identical restatements</code></pre>
               Session Recall also ran on the same data, but it searches raw session events and belongs to the context chapter rather than being relabeled as a Memory gain.
             </p>
 
-            <h3>4.2 Quality Reaches Long Context, But Cost Is Real</h3>
+            <h3>4.2 What Each Experimental Arm Actually Changes</h3>
+            <div class="table-wrap"><table><thead><tr><th>Arm</th><th>Write path</th><th>Read path</th><th>Question answered</th></tr></thead><tbody>
+              <tr><td>Long Context</td><td>No Memory extraction</td><td>Full transcript in prompt</td><td>Quality and token reference without retrieval.</td></tr>
+              <tr><td>Original Memory</td><td>Baseline auto extraction</td><td>One pgvector retrieval</td><td>What the original Memory pipeline provides.</td></tr>
+              <tr><td>Optimized Memory</td><td>Fact/Episode, absolute time, finer atomic facts</td><td>Hybrid + RRF, top-30, two to three query passes</td><td>End-to-end value and cost after improving write and read paths.</td></tr>
+              <tr><td>Session Recall</td><td>Raw Events, no knowledge extraction</td><td>Search and load transcript evidence</td><td>Whether structure beats direct evidence recovery; covered in the context chapter.</td></tr>
+            </tbody></table></div>
+            <p>
+              This design compares complete systems, but it cannot attribute the gain to one switch. Optimized changes schema, retrieval mode, top-k, and call count.
+              The main table answers whether the pipeline is worthwhile; top-k and search-pass ablations answer local parameter questions. Some framework comparisons
+              in the report also require benchmark adapters or manual configuration and should not be read as rankings of untouched defaults.
+            </p>
+
+            <h3>4.3 Quality Reaches Long Context, But Cost Is Real</h3>
             <div class="table-wrap"><table><thead><tr><th>Arm</th><th>F1</th><th>BLEU</th><th>LLM Score</th><th>Tokens/QA</th><th>Calls/QA</th><th>Latency</th></tr></thead><tbody>
               <tr><td>Long Context</td><td>0.469</td><td>0.426</td><td>0.526</td><td>18,776</td><td>1.0</td><td>2,607 ms</td></tr>
               <tr><td>Original Memory</td><td>0.399</td><td>0.371</td><td>0.416</td><td>3,056</td><td>2.0</td><td>6,659 ms</td></tr>
@@ -176,7 +316,7 @@ dedupe:        remove near-identical restatements</code></pre>
               billing but does not erase the end-to-end latency of three model calls.
             </p>
 
-            <h3>4.3 The Gain Is Concentrated In Multi-Hop And Temporal Questions</h3>
+            <h3>4.4 The Gain Is Concentrated In Multi-Hop And Temporal Questions</h3>
             <div class="table-wrap"><table><thead><tr><th>Category</th><th>Original</th><th>Optimized</th><th>Reading</th></tr></thead><tbody>
               <tr><td>single-hop</td><td>0.316</td><td>0.396</td><td>More atomic facts improve direct recall.</td></tr>
               <tr><td>multi-hop</td><td>0.096</td><td>0.453</td><td>Multiple searches produce the largest gain.</td></tr>
@@ -186,13 +326,19 @@ dedupe:        remove near-identical restatements</code></pre>
             </tbody></table></div>
             <p>The category view matters more than the 17.5% headline. The optimized pipeline repairs multi-hop and temporal recall, while adversarial behavior regresses. Deployment needs a separate policy for refusing unsupported answers.</p>
 
-            <h3>4.4 Top-k Ablation: More Evidence Can Mean More Noise</h3>
+            <h3>4.5 Top-k Ablation: More Evidence Can Mean More Noise</h3>
             <p>
               On 199 questions from <code>locomo10_1</code>, SQLiteVec F1 rises from 0.320 at top-k 5 to 0.343 at top-k 10. It falls to 0.329 and 0.327 at
               top-k 20 and 40 while prompt tokens grow from 346,253 to 621,790 and 965,423. A second search raises prompt tokens to 659,981 but leaves overall
               F1 at 0.342. Retrieved noise consumes attention; Memory cannot optimize recall alone.
             </p>
             <div class="note key-point"><p><strong>The benchmark does not say "Memory is solved."</strong> It shows that structured extraction, time metadata, Hybrid + RRF, and multi-pass search repair specific failure modes. It also shows that every extra result and every extra search may increase noise, tokens, and latency. The optimum is a joint quality and budget decision.</p></div>
+
+            <p>
+              Two limits should not be hidden in footnotes. LoCoMo-10 contains only ten long conversations, and GPT-4o-mini participates in both answering and judging;
+              the numbers compare these arms, not every model. Memory quality also multiplies three stages: write the right item, retrieve it, then use it correctly.
+              When F1 falls, retain extractor operations, retrieval ranks, and final-answer traces so the failure can be assigned to schema, backend, or answer policy.
+            </p>
 
             <h2>5. Translate The Evidence Into Engineering Choices</h2>
             <div class="table-wrap"><table><thead><tr><th>Situation</th><th>Prefer</th><th>Do not start with</th></tr></thead><tbody>

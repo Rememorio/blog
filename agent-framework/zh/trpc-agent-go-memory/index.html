@@ -74,6 +74,7 @@
           <section class="article-body">
             <div class="note key-point"><p><strong>先定边界。</strong>上一篇的 Summary 与 Session Recall 管“当前会话怎样压短、怎样找回原始证据”；这一篇的 Memory 管“哪些知识值得跨会话留下”。它们都能帮助模型想起过去，但读的是不同账本，写入条件也不同。</p></div>
             <div class="note"><p><strong>证据边界。</strong>实现链接固定到公开快照 <code>0c7774187da9330144df2a038ef18ee89ef2ae1c</code>，实验链接固定到 benchmark 快照 <code>c9aabe56c0eb1cb80e927d2a34ecc72658173cbe</code>。Memory 的初始服务由 Rememorio 在 <a href="https://github.com/trpc-group/trpc-agent-go/commit/b86db0de90d13b6fccd4c98795403029fd95f5f9">#70 对应提交</a>引入；本文数字是特定模型、prompt、存储后端和检索预算下的实验结果，不外推成所有部署的保证。</p></div>
+            <div class="note"><p><strong>阅读契约。</strong>请一直跟踪“用户已经从 Go 1.23 升级到 1.24”这条信息。读完后，你应该能说清：Runner 何时交出哪些新消息，extractor 为什么提议 update 而不是 add，确定性 reconcile 怎样兜住重复写入，最终条目存在哪里，以及新 session 如何在有限预算内把它找回来。</p></div>
 
             <h2>一、为什么 Summary 不能顺便充当 Memory</h2>
             <p>
@@ -109,7 +110,28 @@
 
 MemoryJob = {UserKey, delta messages, latest timestamp}</code></pre>
 
-            <h3>2.2 抽取前先查旧记忆，因为“新增”可能其实是“更新”</h3>
+            <p>
+              这里的 checker 不是另一个“判断要不要记忆”的模型，而是一个纯 Go 函数 <code>func(*ExtractionContext) bool</code>。
+              它能看到用户键、过滤后的增量消息和上次抽取时间；没有配置 checker 时默认通过。内置条件包括
+              “消息数严格大于 n”与“距离上次抽取超过一段时间”，还可以用 <code>ChecksAll</code> / <code>ChecksAny</code>
+              组合成 AND / OR。返回 false 是正常 no-op：不调用 extractor、不写 Memory，也不推进 cursor；这个接口本身没有 error 通道。
+              定义见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/extractor/checker.go#L20-L85"><code>Checker</code> 与内置条件</a>。
+            </p>
+
+            <h3>2.2 后台队列为什么按用户分流，队列满了又怎样</h3>
+            <p>
+              Memory extraction 需要额外的模型调用和存储写入，若放在前台，用户已经拿到的答案会被“记忆整理失败”再次拖慢或判错。
+              worker 因此使用 <code>context.WithoutCancel</code>：HTTP 请求结束不会顺带取消已排队的整理任务；每个 job 再套独立超时，
+              默认是一名 worker、容量 10、最长 30 秒。相同 <code>AppName + UserID</code> 经过稳定 hash 进入同一队列，避免同一个用户的
+              两批更新乱序，不同用户则可以落到不同 worker。
+            </p>
+            <p>
+              队列未启动或已满时，运行时不会静默丢掉这批 delta：只要原调用尚未取消，就退回同步处理；原调用已经取消才跳过。
+              extractor 不存在、Session 为空、用户键缺失、没有新 user/assistant 正文、checker 判定不值得抽取时，则是正常 no-op。
+              这些分支说明 Auto Memory 是“符合条件才整理”的后台维护任务，不是每轮必写一条数据库记录。
+            </p>
+
+            <h3>2.3 抽取前先查旧记忆，因为“新增”可能其实是“更新”</h3>
             <p>
               如果库里已经有“用户使用 Go 1.23”，新对话说“已经升级到 1.24”，直接追加会制造冲突。worker 先用这批用户消息构造查询，
               找回相关旧条目，再把“旧记忆 + 新对话”一起交给 extractor。这样模型输出的不是一段自由文本，而是 add、update、delete 或 clear 操作。
@@ -117,19 +139,102 @@ MemoryJob = {UserKey, delta messages, latest timestamp}</code></pre>
               extractor 把主 choice 的 tool calls 解析为操作，见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/extractor/memory.go#L110-L182"><code>Extract</code></a>。
             </p>
             <p>
-              模型输出后还有一次 deterministic reconcile：若 add 的内容已经被旧记忆覆盖，就尽量改写成 update，减少“同一事实换个说法存两遍”。
-              这里的设计原则是：<strong>LLM 提议语义操作，运行时负责幂等和写入边界。</strong>
+              查旧条目本身也有降级：相关性搜索报错时，worker 读取少量最近 Memory 作为 dedup 上下文；只有搜索与 fallback read 都失败，
+              整个 job 才停止且不推进抽取时间点。它不会在完全不知道旧状态时悄悄裸写一批 add。
+            </p>
+            <p>
+              extractor 的 prompt 把四种操作做成工具：<code>add</code> 保存真正的新知识，<code>update</code> 修改已有条目，
+              <code>delete</code> 处理明确过时或用户要求遗忘的单条信息，<code>clear</code> 只用于“忘掉全部”这类显式请求。
+              它还能给条目标注 Fact / Episode、topics、绝对时间、参与者与地点。模型选择的是“这句话在语义上意味着什么操作”，
+              但它没有直接拿到存储事务，也不能仅凭生成一个 tool call 就改库。
             </p>
 
-            <h3>2.3 存储结构要为检索服务，不是为了字段好看</h3>
+            <pre><code>旧条目 memory-17
+  Fact: "用户的生产环境使用 Go 1.23"
+  topics: [go, production]
+
+新 delta
+  user: "我们已经把生产环境升到 Go 1.24 了"
+
+extractor 提议
+  update(memory_id="memory-17",
+         memory="用户的生产环境使用 Go 1.24")</code></pre>
+
+            <h3>2.4 Reconcile 怎样把“换一种说法”挡在写库之前</h3>
+            <p>
+              模型有时仍会把升级事实提议成 add。worker 会对每个 add 额外检索最多 3 条候选，并用两个独立信号比较：后端返回的相关分数，
+              以及候选文本与旧条目的 token Jaccard 重合度。两个信号用“或”连接，是因为向量后端擅长语义改写，关键词后端的 BM25
+              分数通常更低，而 Jaccard 能抓住版本号、实体名等共同词。
+            </p>
+
+            <div class="table-wrap"><table><thead><tr><th>判定层级</th><th>满足任一条件</th><th>运行时动作</th></tr></thead><tbody>
+              <tr><td>近乎同一条</td><td>score ≥ 0.90 或 Jaccard ≥ 0.70</td><td>没有新 topic 就丢弃 add；只有 topic 新增则改成 update。</td></tr>
+              <tr><td>同一事实的新版本</td><td>score ≥ 0.60 或 Jaccard ≥ 0.40</td><td>把 add 改写成对最佳旧条目的 update，并合并 topics。</td></tr>
+              <tr><td>确实是新知识</td><td>都未达到</td><td>保留原 add。</td></tr>
+            </tbody></table></div>
+
+            <p>
+              先比较层级，再比较 score 和 Jaccard，确保“明确重复”不会被另一条分数略高但只是相关的记忆抢走。
+              reconcile 自身检索失败时保留 extractor 的原操作，而不是把不确定性当成重复并丢数据；若 add 被改成 update，
+              但部署禁用了 update，则退回原 add。这里的设计原则才是：<strong>LLM 提议语义操作，确定性代码负责幂等与能力边界。</strong>
+              阈值与决策见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/internal/memory/auto.go#L30-L121">reconcile tiers</a>。
+            </p>
+
+            <h3>2.5 写入成功点决定下一轮会不会重复抽取</h3>
+            <p>
+              reconcile 后，worker 才逐条执行 add、update、delete 或 clear。update 指向的 ID 已不存在时，如果 add 能力开启，运行时可以降级为 add；
+              单条操作失败会记录日志并继续后面的操作，不让一条坏数据阻断整批。需要注意一个边界：extract 与 reconcile 整体成功后，
+              <code>last_extract_at</code> 才推进；但单条存储写失败只记日志，不会让整批返回错误，因此时间点仍可能前进。
+              这避免无限重放同一 delta，却意味着部署必须监控操作级失败，而不能只看 job 是否完成。
+            </p>
+            <p>
+              如果查旧记忆、调用 extractor 或整个 job 超时，时间点不会推进，后续任务仍可重试这批 delta。成功写入的条目按
+              <code>AppName + UserID</code> 隔离，下一次新 Session 只要使用同一用户键，就能检索到；当前前台回复不会因为后台写入而回头改变。
+              这补齐了可见性边界：Memory 影响的是<strong>后续模型调用</strong>，不是已经结束的 run。
+            </p>
+            <p>
+              这个增量 cursor 的所有者是 Session，而不是 Memory store：框架把最后一个已纳入抽取的 Event 时间写进
+              <code>Session.State["memory:last_extract_at"]</code>。它与 add/update/delete 并不处在同一个存储事务里；因此它只能表示
+              “worker 已经处理到哪里”，不能证明这一批每条 Memory 都写入成功。真正的运维信号必须同时包含操作级错误日志与该 cursor，
+              读写实现见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/internal/memory/auto.go#L673-L691"><code>readLastExtractAt</code> / <code>writeLastExtractAt</code></a>。
+            </p>
+
+            <h3>2.6 存储结构要为检索服务，不是为了字段好看</h3>
             <p>
               Fact / Episode、绝对时间、topic、参与者和地点，真正价值都在查询阶段。例如“我去年先去了哪里，再去了哪里”需要按 event time 排序；
               “Alice 去过哪座山”需要核对 participants；专有名词又常常需要关键词命中。对应搜索配置支持 kind、时间窗口、排序、去重、
               hybrid search 与 RRF，见 <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/memory/memory.go#L277-L320"><code>SearchOptions</code></a>。
             </p>
 
-            <h2>三、检索不是“取最像的十条”这么简单</h2>
-            <h3>3.1 向量与关键词各自补盲区</h3>
+            <h2>三、从新 Session 读回记忆，再谈怎样搜得准</h2>
+            <h3>3.1 先区分框架预载与 Agent 主动搜索</h3>
+            <p>
+              Memory 已经写入，不代表模型会自动看见它。tRPC-Agent-Go 提供两条读路径。第一条是<strong>框架预载</strong>：应用显式配置
+              <code>WithPreloadMemory(N)</code> 后，<code>ContentRequestProcessor</code> 在组装模型请求时，从 Invocation 取得
+              <code>MemoryReader</code>，再用当前 Session 的 <code>AppName + UserID</code> 读取同一用户的旧记忆。默认值是 0，也就是关闭；
+              <code>-1</code> 表示全部加载，正数 N 表示本轮允许预载的条数预算。
+            </p>
+            <pre><code>新 Session 的第一轮
+  user: “按我现在的生产环境给升级建议”
+    └─ ContentRequestProcessor
+         ├─ probe 读取 N+1 条，判断记忆集合是否很小
+         ├─ 小集合：直接装入全部结果
+         └─ 大集合：用当前用户消息构造 query
+                       └─ hybrid search + deduplicate，最多 N 条
+                            └─ 注入本轮模型请求</code></pre>
+            <p>
+              小集合不必花一次相关性搜索；超过预算后，processor 才用当前 user message 做 query。搜索报错或返回空集时，会降级读取最近 N 条；
+              probe 或 fallback read 也失败时，本轮不注入 Memory，但请求仍继续。预载内容默认作为 system message 放进 prompt，也可以切到
+              user/history 附近的注入模式。整条分支见
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/0c7774187da9330144df2a038ef18ee89ef2ae1c/internal/flow/processor/content.go#L3192-L3294"><code>getPreloadMemoryMessage</code></a>。
+            </p>
+            <p>
+              第二条是<strong>Agent 主动调用工具</strong>。应用把 <code>memory_search</code> / <code>memory_load</code> 暴露给 Agent 后，模型可在同一次 run
+              中根据问题决定搜什么、是否拆成多次查询。空 query 会返回空结果，后端错误则作为 tool error 回到 Agent，由它决定改写查询、降级回答或说明失败。
+              所以二者不是重复开关：预载保证常用事实在第一次模型调用前就可见，工具搜索把长尾、多跳、时间过滤交给 Agent 按需完成。
+            </p>
+
+            <h3>3.2 向量与关键词各自补盲区</h3>
             <p>
               向量搜索擅长语义近似，却可能把书名、地名和精确版本号排得不够靠前；关键词搜索擅长精确词，又不理解改写。
               pgvector 后端先做向量检索，再做全文检索，最后用 Reciprocal Rank Fusion 合并两个排名；kind 结果太少时还会去掉 kind 过滤重试，
@@ -140,7 +245,25 @@ keyword rank:  [Alice + Mt. Fuji, Mt. Fuji trip]
 RRF merge:     [Mt. Fuji trip, Alice + Mt. Fuji, hiking preference]
 dedupe:        remove near-identical restatements</code></pre>
 
-            <h3>3.2 多跳问题需要多次换查询角度</h3>
+            <p>
+              RRF 不直接比较“余弦 0.82”和“关键词 7.4”这两个不可比的原始分数，而只比较名次。默认 <code>k=60</code>，
+              某条结果在一个列表排第 1、另一个排第 3，它会得到 <code>1/(60+1) + 1/(60+3)</code>；只在一个列表出现的结果只有一项。
+              因此同时被语义和精确词命中的条目自然前移，又不会要求两个后端共享同一分数标尺。
+            </p>
+
+            <h3>3.3 Kind fallback 与去重是在修正抽取的不确定性</h3>
+            <p>
+              用户问“什么时候升级到 1.24”时，Agent 可以偏好 Episode；但 extractor 也可能把这句话存成 Fact。若带 kind 的结果少于 3 条，
+              <code>KindFallback</code> 会再做一次不带 kind 的搜索并合并，优先保留原 kind 命中。随后内容去重以 0.80 的词集合 Jaccard
+              为阈值，留下分数更高的代表条目，避免两个近义版本同时占用 prompt。Memory 工具默认开启 hybrid 与 deduplicate，
+              只有调用者明确给 kind 时才开启 kind fallback。
+            </p>
+            <p>
+              这些能力是 service contract，但具体执行取决于后端。pgvector、SQLiteVec、MySQLVec 等向量后端可以把向量与关键词排名做 RRF；
+              纯关键词后端使用 BM25 风格相关度。文章说“Hybrid”时，指支持该能力的后端路径，不意味着所有存储都会暗中生成 embedding。
+            </p>
+
+            <h3>3.4 多跳问题需要多次换查询角度</h3>
             <p>
               “Alice 去日本前买了什么，回来后又做了什么？”通常不是一次 top-k 能覆盖。benchmark 里的 optimized agent 会把问题拆成 2–3 个短查询，
               从实体、时间或子问题角度分别搜索，再汇总答案。工具说明也明确建议多部分问题分别搜索，并要求用 participants 检查人名归属；
@@ -171,7 +294,20 @@ dedupe:        remove near-identical restatements</code></pre>
               Session Recall 也跑在同一套数据上，但它检索的是原始历史事件，已放在上一篇上下文篇讨论，不在这里冒充 Memory 优化。
             </p>
 
-            <h3>4.2 结果：质量追平 Long Context，但成本不是免费的</h3>
+            <h3>4.2 四条实验臂分别改变了什么</h3>
+            <div class="table-wrap"><table><thead><tr><th>实验臂</th><th>写入</th><th>读取</th><th>它回答的问题</th></tr></thead><tbody>
+              <tr><td>Long Context</td><td>不抽 Memory</td><td>把完整对话放进 prompt</td><td>不做检索时的质量与 token 上界。</td></tr>
+              <tr><td>Original Memory</td><td>基础 auto extraction</td><td>pgvector 单次检索</td><td>原始框架 Memory 能做到什么。</td></tr>
+              <tr><td>Optimized Memory</td><td>Fact/Episode、绝对时间与更细原子事实</td><td>Hybrid + RRF、top-30、2–3 次换查询</td><td>同时改善抽取和检索后的完整收益与成本。</td></tr>
+              <tr><td>Session Recall</td><td>保留原始 events，不抽知识</td><td>搜索并加载原会话</td><td>结构化 Memory 是否真的优于直接取证；详见上下文篇。</td></tr>
+            </tbody></table></div>
+            <p>
+              这个设计能比较完整系统，却不能把提升精确归因给某一个开关：Optimized 同时改了写入 schema、检索方式、top-k 和调用轮数。
+              因此主表回答“这条 pipeline 值不值得”，top-k 与检索轮数消融才回答局部参数。报告中的部分框架对比还依赖 benchmark adapter
+              或手动配置，不应解读成每个框架开箱即用默认值的排名。
+            </p>
+
+            <h3>4.3 结果：质量追平 Long Context，但成本不是免费的</h3>
             <div class="table-wrap"><table><thead><tr><th>方案</th><th>F1</th><th>BLEU</th><th>LLM Score</th><th>Tokens/QA</th><th>Calls/QA</th><th>Latency</th></tr></thead><tbody>
               <tr><td>Long Context</td><td>0.469</td><td>0.426</td><td>0.526</td><td>18,776</td><td>1.0</td><td>2,607 ms</td></tr>
               <tr><td>Original Memory</td><td>0.399</td><td>0.371</td><td>0.416</td><td>3,056</td><td>2.0</td><td>6,659 ms</td></tr>
@@ -183,7 +319,7 @@ dedupe:        remove near-identical restatements</code></pre>
               却不能抹掉三次模型调用带来的端到端时延。
             </p>
 
-            <h3>4.3 提升来自哪里：multi-hop 与 temporal，而不是所有类别都赢</h3>
+            <h3>4.4 提升来自哪里：multi-hop 与 temporal，而不是所有类别都赢</h3>
             <div class="table-wrap"><table><thead><tr><th>类别</th><th>Original</th><th>Optimized</th><th>变化</th></tr></thead><tbody>
               <tr><td>single-hop</td><td>0.316</td><td>0.396</td><td>更完整的原子事实改善直接召回。</td></tr>
               <tr><td>multi-hop</td><td>0.096</td><td>0.453</td><td>多轮检索带来最大提升。</td></tr>
@@ -196,13 +332,19 @@ dedupe:        remove near-identical restatements</code></pre>
               因此部署时不能只调 retrieval，还要单独治理“没有足够证据时怎样拒答”。
             </p>
 
-            <h3>4.4 Top-k 消融：拿得更多，不等于想得更准</h3>
+            <h3>4.5 Top-k 消融：拿得更多，不等于想得更准</h3>
             <p>
               在 <code>locomo10_1</code> 的 199 个问题上，SQLiteVec top-k 从 5 增加到 10，F1 从 0.320 升到 0.343；继续升到 20 与 40，
               F1 反而回落到 0.329 与 0.327，prompt tokens 却从 346,253 涨到 621,790 与 965,423。第二次搜索也把 prompt 提到 659,981，
               总体 F1 仍是 0.342。检索噪声会占用注意力，这就是 Memory 不能只追 recall 的原因。
             </p>
             <div class="note key-point"><p><strong>Benchmark 给出的不是“Memory 已经解决”。</strong>它证明结构化抽取、时间信息、Hybrid + RRF 与多轮检索能显著修复特定问题；同时也证明每多取一条、每多搜一轮都可能增加噪声、token 与时延。最优点是质量与预算共同决定的，不是 top-k 越大越好。</p></div>
+
+            <p>
+              实验还有两个不能藏在脚注里的边界。第一，LoCoMo-10 只有 10 段长对话，同一套 GPT-4o-mini 同时参与回答与 judge，
+              结果适合比较本实验中的方案，不足以推出模型无关结论。第二，Memory 质量由“是否写对、是否找回、模型是否正确使用”三段相乘；
+              F1 下降时，必须保留 extractor 操作、检索排名和最终回答三层 trace，才能知道应该修 schema、后端还是回答策略。
+            </p>
 
             <h2>五、把实验结论翻译成工程选择</h2>
             <div class="table-wrap"><table><thead><tr><th>你面对的情况</th><th>优先选择</th><th>不要先做什么</th></tr></thead><tbody>
