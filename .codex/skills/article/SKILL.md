@@ -127,6 +127,27 @@ only when a new example clarifies a new boundary; do not restart with unrelated
 examples in every section. Titles should name the reader-facing question or
 tradeoff first, then mention the mechanism when it is needed for precision.
 
+When a mechanism starts from multiple data sources, do not introduce the
+sources as a taxonomy and jump straight to split names or class names. Define
+one normalized record first, then carry that same record through the whole
+data lifecycle:
+
+```text
+raw source
+-> normalized task or record
+-> case-specific success criteria
+-> shared scoring and runtime conditions
+-> split or visibility boundary
+-> the stage that consumes it
+```
+
+Keep origin, shape, scoring, and use separate. A source answers where material
+came from; a normalized record answers what the program stores; a rubric or
+metric answers what counts as good; a split answers who may see the record and
+when. If the current entry point chooses one source branch rather than merging
+all sources, state that before a conceptual overview implies a combined
+pipeline.
+
 Use source names only after the reader has a concrete hook for the concept.
 When a mechanism depends on overloaded terms such as `history`, `prompt`,
 `context`, `baseline`, `projection`, or `replacement`, define the local usage
@@ -146,6 +167,19 @@ complete enough for a new reader to replay:
 - whether it may do nothing;
 - where successful output is stored;
 - when later turns can observe the result.
+
+For evaluation, optimization, and self-evolution lifecycles, define data split
+names by visibility and time rather than assuming machine-learning vocabulary
+is self-explanatory. State what is actually being trained or searched.
+`train` may drive prompt or Skill revisions without changing model weights;
+`validation` may influence candidate selection during search; `holdout` remains
+sealed until a candidate is chosen and stops being holdout if its result drives
+another revision. Pair runtime fairness with data independence: the baseline
+and candidate need the same model, tools, budget, and scorer, while paraphrases
+or records from one session or problem family must not leak across splits.
+Random row shuffling alone does not establish that independence. Say whether
+the implementation provides grouping, semantic deduplication, versioning, and a
+reproducible seed instead of silently assuming them.
 
 If a section still feels abstract, add a compact step table before diving into
 source names. The table should explain the product-level event first, then link
@@ -171,6 +205,24 @@ protocols, and recovery/observability/evolution. Do not force absent layers or
 turn this map into a feature brochure. Select the mechanisms that materially
 change ownership, execution, persistence, or the user-visible contract, then
 make the requested subsystem deeper than the rest.
+
+For optimization frameworks, establish four boundaries before introducing API
+types: fixed input/output contract, fixed execution structure, explicitly
+optimizable parameters, and the examples plus metric that judge candidates.
+Then verify how the target text enters the optimizer's parameter set and how
+the winning value is written back. Do not imply that a framework can rewrite
+arbitrary program state because it can optimize one registered instruction.
+Teach reflective optimization as a closed evidence loop:
+
+```text
+execute
+-> diagnose from per-case trace and feedback
+-> revise a named parameter
+-> rerun comparable tasks
+-> retain only measured improvement
+```
+
+Reflection without the rerun is an explanation, not an improvement.
 
 Treat dense identifier runs as a comprehension failure, not as proof of source
 depth. A paragraph that introduces roughly five or more fields, functions,
@@ -210,6 +262,13 @@ For long source articles, prefer ending with a transferable decision table or
 rule set. It should map content state to runtime handling and the invariant
 protected, so readers can apply the article beyond the named products.
 
+For evaluation or self-evolution articles, end with a delivery gate rather than
+a higher-score claim. A credible candidate should improve on unseen work,
+preserve critical old capabilities, stay within cost and latency budgets, keep
+data and configuration replayable, support rollback, and remain subject to
+human acceptance. Separate "candidate generated" from "candidate measured" and
+"version delivered" throughout the article.
+
 For a new source-reading series, the first public chapter should normally build
 the technical route before drilling into a single mechanism. Follow one
 representative request, turn, job, or runtime cycle across the major owners:
@@ -245,6 +304,10 @@ and what sequence would make the section natural. Also test whether a fresh
 reader can replay the mechanism without private context: what entered, who
 owned it, which gate fired, which record changed, where it was stored, how it is
 retrieved later, why the simpler design would fail, and where the claim stops.
+For evaluation sections, also ask whether the reader can state what one case
+contains, where its task and scoring rule came from, which fields enter the
+program, which data may influence search, when sealed data is opened, and what
+artifact is ultimately delivered.
 Prioritize gaps that block this replay over sentence-level polish. If the user
 explicitly authorizes a subagent or outside reader, use it only for this bounded
 feedback. The subagent should not edit files; it should return prioritized
@@ -512,6 +575,9 @@ When explaining source code:
 - Name files and functions only after verifying them in the repository or in
   official documentation.
 - Do not overfit a diagram to implementation details that are not visible.
+- Label capability or source maps as conceptual when the current entry point
+  uses mutually exclusive branches. Arrows, filters, and merge points must not
+  imply sequencing or integration that the verified call path does not perform.
 - If a mechanism exists only through surrounding contracts, say so in prose and
   keep the figure abstract.
 - Prefer "model-visible view" and "runtime projection" language when UI,
@@ -531,6 +597,21 @@ Classify every source-level claim before making it sound certain:
 Write only `official docs` and `verified source` claims as direct facts. Mark
 `surrounding contract inference` as an inference in prose, and keep diagrams
 abstract. Do not publish `not visible` claims as implementation facts.
+
+For prototype, roadmap, or framework-integration audits, classify capability
+status before describing the architecture:
+
+- `in the main path`: inputs cross the real entry point and call site, and the
+  claimed return value, side effect, or persisted output is actually reached;
+- `code exists but is disconnected`: a class, helper, configuration flag, or
+  test is present but does not govern the analyzed run;
+- `target route not demonstrated`: the README, paper, or intended design names
+  a loop that the verified call chain does not complete.
+
+Do not promote file presence, a constructor call, or a broad fallback into an
+end-to-end implementation claim. Follow the target value into the optimizer,
+through validation and failure handling, and into the claimed output or
+delivered artifact.
 
 When a mechanism is behind a feature gate, conditional import, build flag, or
 dead-code-elimination boundary, verify whether the target module files are
@@ -938,6 +1019,14 @@ that covers the edit:
 - If source-shaped snippets, JSON fragments, or API shapes were added, check
   balanced tags or fences and make sure shape-level examples cannot be mistaken
   for exact private internals.
+- If the article describes evaluation or optimization, verify the published
+  lifecycle against the pinned source: normalized case shape, fields visible to
+  the program versus scorer, actual source-selection branch, train/validation/
+  holdout consumption, baseline-versus-candidate runtime equality, and whether
+  grouping, deduplication, seed control, non-regression, cost, replay, rollback,
+  and human delivery gates are implemented or only recommended. Recheck that
+  conceptual figures and captions do not upgrade optional or disconnected
+  paths into the current main flow.
 - For every touched page containing code blocks, verify that each `pre code`
   has an explicit semantic language class and that the shared highlight
   stylesheet, runtime, and initializer load exactly once from valid paths. In a
