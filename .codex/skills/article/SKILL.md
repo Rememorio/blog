@@ -127,26 +127,25 @@ only when a new example clarifies a new boundary; do not restart with unrelated
 examples in every section. Titles should name the reader-facing question or
 tradeoff first, then mention the mechanism when it is needed for precision.
 
-When a mechanism starts from multiple data sources, do not introduce the
-sources as a taxonomy and jump straight to split names or class names. Define
-one normalized record first, then carry that same record through the whole
-data lifecycle:
+When a mechanism starts from multiple inputs, source formats, or entry paths,
+do not introduce them as a taxonomy and jump straight to class names. Define
+one representative unit first, such as a request, record, job, message, or
+artifact, then carry it through the whole lifecycle:
 
 ```text
-raw source
--> normalized task or record
--> case-specific success criteria
--> shared scoring and runtime conditions
--> split or visibility boundary
--> the stage that consumes it
+raw input
+-> normalized form
+-> governing contract or decision rule
+-> owner and visibility boundary
+-> stage that consumes or transforms it
+-> observable output
 ```
 
-Keep origin, shape, scoring, and use separate. A source answers where material
-came from; a normalized record answers what the program stores; a rubric or
-metric answers what counts as good; a split answers who may see the record and
-when. If the current entry point chooses one source branch rather than merging
-all sources, state that before a conceptual overview implies a combined
-pipeline.
+Keep origin, shape, policy, ownership, and use separate. They answer different
+questions: where the unit came from, what the program stores, which rule
+governs it, who may observe it, and what later stage changes because of it. If
+the current entry point chooses one branch rather than merging several, state
+that before a conceptual overview implies a combined pipeline.
 
 Use source names only after the reader has a concrete hook for the concept.
 When a mechanism depends on overloaded terms such as `history`, `prompt`,
@@ -168,18 +167,14 @@ complete enough for a new reader to replay:
 - where successful output is stored;
 - when later turns can observe the result.
 
-For evaluation, optimization, and self-evolution lifecycles, define data split
-names by visibility and time rather than assuming machine-learning vocabulary
-is self-explanatory. State what is actually being trained or searched.
-`train` may drive prompt or Skill revisions without changing model weights;
-`validation` may influence candidate selection during search; `holdout` remains
-sealed until a candidate is chosen and stops being holdout if its result drives
-another revision. Pair runtime fairness with data independence: the baseline
-and candidate need the same model, tools, budget, and scorer, while paraphrases
-or records from one session or problem family must not leak across splits.
-Random row shuffling alone does not establish that independence. Say whether
-the implementation provides grouping, semantic deduplication, versioning, and a
-reproducible seed instead of silently assuming them.
+Define stage names by owner, visibility, and time instead of assuming the
+domain vocabulary is self-explanatory. This applies to labels such as
+`train / validation / holdout`, `draft / staged / committed`, or
+`active / stale / archived`. State what each stage may read, change, or decide
+and what event advances the unit. When the mechanism claims a fair comparison
+or independent check, explain both comparable conditions and isolation between
+stages. Do not let a convenient operation such as random shuffling, timestamp
+age, or a status flag stand in for the stronger property the prose claims.
 
 If a section still feels abstract, add a compact step table before diving into
 source names. The table should explain the product-level event first, then link
@@ -206,23 +201,25 @@ turn this map into a feature brochure. Select the mechanisms that materially
 change ownership, execution, persistence, or the user-visible contract, then
 make the requested subsystem deeper than the rest.
 
-For optimization frameworks, establish four boundaries before introducing API
-types: fixed input/output contract, fixed execution structure, explicitly
-optimizable parameters, and the examples plus metric that judge candidates.
-Then verify how the target text enters the optimizer's parameter set and how
-the winning value is written back. Do not imply that a framework can rewrite
-arbitrary program state because it can optimize one registered instruction.
-Teach reflective optimization as a closed evidence loop:
+For framework and integration source readings, establish four boundaries before
+introducing API types: fixed input/output contract, fixed control flow,
+discoverable or configurable state, and the evaluator or guardrails that judge
+the result. Then verify how the target value enters the configurable surface
+and how a selected value is written back. Do not imply that a framework can
+rewrite arbitrary program state because one field or component is configurable.
+When a system claims improvement, recovery, adaptation, or learning, teach it
+as a closed evidence loop:
 
 ```text
 execute
--> diagnose from per-case trace and feedback
--> revise a named parameter
--> rerun comparable tasks
--> retain only measured improvement
+-> observe a concrete result or trace
+-> explain the failure or pressure
+-> change a named owner or component
+-> rerun under comparable conditions
+-> retain only verified improvement
 ```
 
-Reflection without the rerun is an explanation, not an improvement.
+An explanation without the rerun is a hypothesis, not a demonstrated change.
 
 Treat dense identifier runs as a comprehension failure, not as proof of source
 depth. A paragraph that introduces roughly five or more fields, functions,
@@ -262,12 +259,12 @@ For long source articles, prefer ending with a transferable decision table or
 rule set. It should map content state to runtime handling and the invariant
 protected, so readers can apply the article beyond the named products.
 
-For evaluation or self-evolution articles, end with a delivery gate rather than
-a higher-score claim. A credible candidate should improve on unseen work,
-preserve critical old capabilities, stay within cost and latency budgets, keep
-data and configuration replayable, support rollback, and remain subject to
-human acceptance. Separate "candidate generated" from "candidate measured" and
-"version delivered" throughout the article.
+When a system claims an output is better or ready for use, end with an
+acceptance gate rather than the system's preferred success signal alone.
+Check the intended outcome, critical regressions, cost and latency, replay or
+recovery, rollback, and the human or automated authority that may adopt the
+change. Keep "output produced," "output validated," and "output adopted" as
+separate states throughout the article.
 
 For a new source-reading series, the first public chapter should normally build
 the technical route before drilling into a single mechanism. Follow one
@@ -304,10 +301,10 @@ and what sequence would make the section natural. Also test whether a fresh
 reader can replay the mechanism without private context: what entered, who
 owned it, which gate fired, which record changed, where it was stored, how it is
 retrieved later, why the simpler design would fail, and where the claim stops.
-For evaluation sections, also ask whether the reader can state what one case
-contains, where its task and scoring rule came from, which fields enter the
-program, which data may influence search, when sealed data is opened, and what
-artifact is ultimately delivered.
+For multi-stage sections, also ask whether the reader can state what one
+representative unit contains, where it came from, which owners can see or
+change it, what advances it between stages, and which observable output is
+different at the end.
 Prioritize gaps that block this replay over sentence-level polish. If the user
 explicitly authorizes a subagent or outside reader, use it only for this bounded
 feedback. The subagent should not edit files; it should return prioritized
@@ -609,9 +606,9 @@ status before describing the architecture:
   a loop that the verified call chain does not complete.
 
 Do not promote file presence, a constructor call, or a broad fallback into an
-end-to-end implementation claim. Follow the target value into the optimizer,
-through validation and failure handling, and into the claimed output or
-delivered artifact.
+end-to-end implementation claim. Follow the target value through its actual
+owners, validation and failure handling, and into the claimed output or
+observable side effect.
 
 When a mechanism is behind a feature gate, conditional import, build flag, or
 dead-code-elimination boundary, verify whether the target module files are
@@ -1019,14 +1016,14 @@ that covers the edit:
 - If source-shaped snippets, JSON fragments, or API shapes were added, check
   balanced tags or fences and make sure shape-level examples cannot be mistaken
   for exact private internals.
-- If the article describes evaluation or optimization, verify the published
-  lifecycle against the pinned source: normalized case shape, fields visible to
-  the program versus scorer, actual source-selection branch, train/validation/
-  holdout consumption, baseline-versus-candidate runtime equality, and whether
-  grouping, deduplication, seed control, non-regression, cost, replay, rollback,
-  and human delivery gates are implemented or only recommended. Recheck that
-  conceptual figures and captions do not upgrade optional or disconnected
-  paths into the current main flow.
+- If the article describes a multi-stage pipeline or framework integration,
+  verify the representative unit's shape, field visibility, actual branch or
+  merge path, stage transitions, governing conditions, failure handling, and
+  final side effect against the pinned source. Mark guarantees such as
+  independence, ordering, replay, recovery, rollback, or adoption as
+  implemented, inferred, or recommended. Recheck that conceptual figures and
+  captions do not upgrade optional or disconnected paths into the current main
+  flow.
 - For every touched page containing code blocks, verify that each `pre code`
   has an explicit semantic language class and that the shared highlight
   stylesheet, runtime, and initializer load exactly once from valid paths. In a
