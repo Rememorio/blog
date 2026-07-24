@@ -349,6 +349,24 @@ Model: The evidence is sufficient; return the final answer</code></pre>
               request copy, not painted onto the wall. The table now compresses those roles into source names.
             </p>
 
+            <p>
+              The source does not concatenate one large string and then guess where each sentence came from. It collects
+              three lists and joins them in a fixed order. With layer contents omitted, the return shape of
+              <code>build_system_prompt_parts</code> is small:
+            </p>
+
+            <pre><code class="language-python">return {
+    "stable": "\n\n".join(stable_parts),
+    "context": "\n\n".join(context_parts),
+    "volatile": "\n\n".join(volatile_parts),
+}</code></pre>
+
+            <p>
+              Notice that <code>turn-only</code> in the table does not appear in this return value. That is intentional:
+              it never enters the system prompt. Hermes attaches it to a copy of the user message immediately before one
+              model call. The data shape itself separates session instructions from temporary turn material.
+            </p>
+
             <div class="table-wrap">
               <table>
                 <thead>
@@ -384,6 +402,12 @@ Model: The evidence is sufficient; return the final answer</code></pre>
             </div>
 
             <p>
+              The complete implementation also shows tool guidance and the skills index entering the stable list, while
+              context and volatile material are collected separately and joined only at the end. See
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/system_prompt.py#L85-L133">identity and tool guidance</a>,
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/system_prompt.py#L185-L213">skills-index construction</a>,
+              and
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/system_prompt.py#L320-L401">context and volatile assembly</a>.
               The takeaway is simple: important information does not automatically belong in the system prompt. Stable
               rules can sit near the front; current-turn recall needs a current-turn lifetime.
             </p>
@@ -481,6 +505,24 @@ Model: The evidence is sufficient; return the final answer</code></pre>
             </p>
 
             <p>
+              Remove middleware, timing, and display concerns, and the ownership boundary becomes visible:
+            </p>
+
+            <pre><code class="language-python">if function_name == "session_search":
+    db = agent._get_session_db_for_recall()
+    result = session_search(..., db=db)
+elif function_name == "memory":
+    result = memory_tool(..., store=agent._memory_store)
+elif function_name == "delegate_task":
+    result = agent._dispatch_delegate_task(function_args)</code></pre>
+
+            <p>
+              The model supplies only <code>function_name</code> and arguments. The current session database, authoritative
+              memory store, and parent task's delegation dispatcher are bound at execution time. A syntactically valid
+              model request therefore cannot choose another history ledger or another user's durable state.
+            </p>
+
+            <p>
               The model may request a tool, but the state boundary, audit trail, permission shape, and recovery semantics
               belong to the runtime. Without that split, a temporary observation could become long-term memory, a search
               could guess at past history instead of reading evidence, and delegated work could contaminate the parent
@@ -503,6 +545,13 @@ Model: The evidence is sufficient; return the final answer</code></pre>
                 The answer is delivered first. A restricted background branch decides later whether anything deserves to be written down.
               </figcaption>
             </figure>
+
+            <p>
+              Do not try to read the whole figure at once. Section 6.1 follows Answer, Finalizer, and Nudge to ask when
+              review is allowed to start. Section 6.2 follows Review fork and Write stores to ask what the side path can
+              see and change. Section 6.3 follows Curator to ask who maintains the skill library after many turns. The
+              source excerpts below zoom into those three locations in that order.
+            </p>
 
             <p>
               Use the coding-session example again. The agent finds a fixed project command, learns your commit
@@ -560,71 +609,147 @@ Model: The evidence is sufficient; return the final answer</code></pre>
 
             <h3>6.1 Finalizer schedules review only after the answer</h3>
             <p>
-              The trigger point is explicit. The finalizer assembles the result, runs post hooks, syncs external memory,
-              and only then checks whether memory or skill review should run. The code shows that review is spawned only
-              when there is a final response, the turn was not interrupted, and a memory or skill nudge gate fired; see
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_finalizer.py#L375-L401">the review trigger</a>.
+              Expand the final steps of finalization. Hermes already has the final answer, runs post hooks, synchronizes
+              external memory, and only then checks the background-learning gate. With error handling removed, the order
+              is visible directly in the source:
             </p>
 
+            <pre><code class="language-python">agent._sync_external_memory_for_turn(...)
+
+if final_response and not interrupted and (
+    _should_review_memory or _should_review_skills
+):
+    agent._spawn_background_review(
+        messages_snapshot=list(messages),
+        review_memory=_should_review_memory,
+        review_skills=_should_review_skills,
+    )</code></pre>
+
             <p>
-              The nudge is not the model deciding to learn. It is a runtime throttle. Memory nudge is counted by user
-              turns, visible in
+              There is no "the model feels that it should reflect" condition. The gate contains three runtime facts: a
+              final response exists, the turn was not interrupted, and at least one nudge is due. Memory nudge is counted
+              by user turns, visible in
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_context.py#L184-L217"><code>turn_context.py</code></a>.
               Skill nudge is counted by tool-call iterations, visible in
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/conversation_loop.py#L516-L521"><code>conversation_loop.py</code></a>.
               If the foreground agent already uses <code>memory</code> or <code>skill_manage</code>, the corresponding
               counter resets in
               <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/tool_executor.py#L263-L273">tool execution bookkeeping</a>.
+              The complete gate is in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/turn_finalizer.py#L375-L401"><code>turn_finalizer.py</code></a>.
+              Review is therefore not a per-turn tax. It is best-effort work after a safe ending: failure cannot revoke
+              the delivered answer, and success is still allowed to write nothing.
             </p>
 
             <h3>6.2 Review fork reuses runtime, but narrows tools</h3>
             <p>
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L1-L17"><code>background_review.py</code></a>
-              describes the job: replay a conversation snapshot in a forked agent and ask whether any memory or skill
-              should be saved or updated. Writes go straight to the memory and skill stores; the main conversation and
-              prompt cache are not touched.
+              The finalizer does not pass a sentence that says "summarize a lesson." It passes a copy of completed
+              messages. In the running test-repair example, the relevant tail of that snapshot looks like this:
+            </p>
+
+            <pre><code class="language-text">user: Fix this failing test
+assistant -> terminal: Run pytest directly
+tool -> assistant: Failed; generated files are stale
+assistant -> terminal: Run the generator, then pytest
+tool -> assistant: Tests passed
+assistant: Fixed and verified</code></pre>
+
+            <p>
+              Because both the failed path and the adopted path remain visible, review can extract "run the generator
+              first" without turning "run pytest directly" into recommended procedure. The
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L1-L17">module contract</a>
+              also says that writes go directly to memory or skill stores; the main conversation and prompt cache remain
+              untouched.
             </p>
 
             <p>
-              The fork inherits the parent's provider, model, credentials, toolset configuration, and cached system
-              prompt, so it judges the turn under the same runtime conditions. But it runs with <code>skip_memory=True</code>
-              so external memory providers do not ingest the review harness as if it were user conversation. It also sets
-              a runtime whitelist to memory and skill tools; non-whitelisted tools are denied. The construction and
-              whitelist live in
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L327-L416"><code>_run_review_in_thread</code></a>
-              and
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L470-L495">the whitelisted run call</a>.
+              A complete snapshot does not imply complete permission. Hermes reuses the parent's provider, model,
+              credentials, and cached system prompt, but disables external memory-provider ingestion and compression.
+              It then installs a whitelist at tool-dispatch time. The reduced construction and call shape is:
+            </p>
+
+            <pre><code class="language-python">review_agent = AIAgent(..., skip_memory=True)
+review_agent._cached_system_prompt = agent._cached_system_prompt
+review_agent.compression_enabled = False
+
+review_whitelist = {
+    tool["function"]["name"]
+    for tool in get_tool_definitions(
+        enabled_toolsets=["memory", "skills"]
+    )
+}
+set_thread_tool_whitelist(review_whitelist)
+try:
+    review_agent.run_conversation(
+        user_message=prompt + "...Only memory/skill tools...",
+        conversation_history=messages_snapshot,
+    )
+finally:
+    clear_thread_tool_whitelist()</code></pre>
+
+            <p>
+              <code>skip_memory=True</code> prevents an external provider from ingesting the review harness as user
+              conversation. Disabling compression prevents a fork from racing the parent over the same session lineage.
+              The whitelist permits only Memory and Skills operations, so review cannot continue terminal work, edit
+              code, or delegate another task. The complete construction is in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L327-L495"><code>_run_review_in_thread</code></a>.
             </p>
 
             <p>
-              After review finishes, Hermes scans the fork's tool results. Only successful memory or skill actions are
-              surfaced as a compact self-improvement summary; see
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L516-L537">the action summary code</a>.
+              A successful write still affects future work, not the turn that produced it. Memory reaches a later model
+              view when a new snapshot is built; a skill reaches later turns through the skills index. Hermes finally
+              scans review tool results and surfaces only successful actions as a short self-improvement summary; see
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/background_review.py#L516-L537">the action-summary code</a>.
+              If no experience qualifies, silence is the correct output.
             </p>
 
             <h3>6.3 Curator is long-term maintenance, not per-turn reflection</h3>
             <p>
               Background review answers "did this turn reveal something worth saving?" Curator answers a different
               question: "is the skill library still healthy after many turns?" Some skills are active, some are stale,
-              some overlap, and some need patching or archiving.
+              some overlap, and some need patching or archiving. A curator pass therefore has two phases: deterministic
+              lifecycle maintenance first, semantic consolidation second.
             </p>
 
             <p>
-              The curator module says it periodically reviews agent-created skills, applies lifecycle transitions, and
-              may fork an AIAgent to pin, archive, consolidate, or patch skills. Its invariants are listed in
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L1-L20"><code>curator.py</code></a>.
-              It is not a per-turn cleanup pass. <code>should_run_now</code> checks enabled, paused, and interval gates;
-              first observation seeds <code>last_run_at</code> rather than mutating immediately. See
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L198-L248"><code>should_run_now</code></a>
+              The order is explicit in <code>run_curator_review</code>:
+            </p>
+
+            <pre><code class="language-python"># Phase 1: deterministic lifecycle maintenance
+counts = apply_automatic_transitions(now=start)
+state["last_run_at"] = start.isoformat()
+save_state(state)
+
+# Phase 2: semantic review only when candidates exist
+candidate_list = _render_candidate_list()
+if "No agent-created skills" not in candidate_list:
+    llm_meta = _run_llm_review(prompt)</code></pre>
+
+            <p>
+              Phase one needs no model. Pinned skills remain untouched; long-unused active skills become stale and later
+              archived; renewed activity can reactivate a stale skill. Phase two gives the candidate list to a restricted
+              agent that may decide to pin, archive, consolidate, or patch. See
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L255-L310"><code>apply_automatic_transitions</code></a>
               and
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L255-L310"><code>apply_automatic_transitions</code></a>.
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L1407-L1530"><code>run_curator_review</code></a>.
+              Pure rules avoid asking a model to reinvent inactivity thresholds; model judgment remains available for
+              relationships that timestamps cannot explain.
+            </p>
+
+            <p>
+              Curator is not a per-turn cleanup pass. <code>should_run_now</code> checks enabled, paused, and interval
+              gates. First observation records <code>last_run_at</code> and waits a full interval before the first real
+              pass. A manual dry-run skips automatic transitions and tells the model to report without mutating the
+              library. Those boundaries are visible in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L198-L248"><code>should_run_now</code></a>
+              and the <code>run_curator_review</code> path above.
             </p>
 
             <p>
               The foreground turn, background review, and curator all improve the agent, but they run on different
               clocks. The foreground solves the current task. Review extracts a preference or procedure after one turn.
-              Curator maintains the skill library after many turns. Their context and write permissions are deliberately
-              different.
+              Curator maintains the skill library after many turns. Their trigger, input snapshot, decision method, and
+              write permissions are deliberately different.
             </p>
 
             <div class="note">
