@@ -251,9 +251,14 @@ feedback. The subagent should not edit files; it should return prioritized
 reading obstacles and concrete rewrite suggestions. Keep the final rewrite
 owned by the main pass, so the article remains one coherent voice.
 
-Protocol-shaped examples are mandatory when prose alone leaves too much
-ambiguity. For API/runtime articles, include small before/after request or
-record examples at mechanism boundaries:
+## Examples, Code, And Source Shapes
+
+Treat examples as steps in the explanation, not as evidence deposited after a
+claim. Establish the reader's question and the relevant boundary in prose,
+show the smallest representation that resolves the ambiguity, then explain
+what changed and why it matters. Protocol-shaped examples are mandatory when
+prose alone leaves too much ambiguity. For API/runtime articles, include small
+before/after request or record examples at mechanism boundaries.
 
 When one framework supports multiple API protocols, do not infer identical
 behavior from a shared runner or model abstraction. Compare the protocols at
@@ -271,7 +276,7 @@ owns compatibility.
 - show only fields needed for the concept;
 - avoid invented exact values for hidden provider internals;
 - explain what changed immediately after the code block.
-- when a JSON or API shape is still abstract, precede it with a short
+- When a JSON or API shape is still abstract, precede it with a short
   plain-language decision trace of `3` to `5` steps that explains what the
   runtime is deciding and what it deliberately leaves undecided.
 - For branchy mechanisms such as forks, skip-cache modes, fallback paths, or
@@ -285,6 +290,31 @@ owns compatibility.
   `static profile + dynamic search results`. Link the full source, show only
   fields that carry the mechanism, and explain immediately what changed. Do not
   paste long source blocks as evidence by volume.
+
+Classify every published code block by what the reader should interpret, not
+by which highlighter happens to make it colorful:
+
+- Give every public `pre code` block an explicit `language-*` class.
+- Use the real language for source code, commands, and syntactically meaningful
+  payloads. A simplified example may still use that language when it remains
+  valid and is clearly labeled as shape-level.
+- Use `language-text` for decision traces, sequence sketches, event timelines,
+  tree layouts, illustrative pseudocode, and mixed prose. These blocks need
+  code-block spacing and alignment, but syntax colors would invent semantics.
+- Never rely on language auto-detection. Short fragments, JSON, shell commands,
+  and prose diagrams are easy to misclassify, so detection can make the same
+  article look authoritative while teaching the wrong structure.
+
+The public blog has one shared highlighting layer. Reuse
+`/assets/code-highlight.css`,
+`/assets/vendor/highlightjs/highlight.min.js`, and
+`/assets/code-highlight.js` with the correct page-relative paths, each exactly
+once. Do not add a CDN dependency, a page-specific token theme, manually
+authored `hljs-*` spans, or a second highlighting runtime. Article CSS owns the
+code block's background, spacing, typography, border, and overflow; the shared
+highlight stylesheet owns token colors. When a shared CSS or JavaScript asset
+changes, update its cache-version query consistently on every page that loads
+it.
 
 Keep source and publication targets synchronized during every revision. When a
 standalone Markdown source and generated public HTML both exist, render the
@@ -809,7 +839,7 @@ Images must be useful for readers who see them and readers who rely on text:
   `../assets/name.png` or the equivalent correct relative path. Validate the
   rendered HTML rather than assuming a path by inspection.
 
-## Tables And Responsive Reading
+## Tables, Code, And Responsive Reading
 
 Use tables for compact comparison only when the rows are easy to scan. For
 wide comparison tables in standalone HTML articles:
@@ -820,6 +850,11 @@ wide comparison tables in standalone HTML articles:
   header via `data-label`.
 - Generate `data-label` from the table headers in page script rather than
   duplicating labels by hand in prose.
+- Keep a long code block's horizontal scrolling inside its own wrapper and
+  verify that it does not widen the document. In tight table cells, do not use
+  a global no-wrap rule for every inline `code` element. Scope that behavior to
+  the table or identifier column that needs atomic tokens, and test its longest
+  value at mobile width.
 - Do not treat `overflow-x: hidden` as responsive validation. At representative
   desktop and mobile widths, confirm the intended media queries activate,
   compare document `scrollWidth` with `clientWidth`, inspect element bounding
@@ -903,6 +938,16 @@ that covers the edit:
 - If source-shaped snippets, JSON fragments, or API shapes were added, check
   balanced tags or fences and make sure shape-level examples cannot be mistaken
   for exact private internals.
+- For every touched page containing code blocks, verify that each `pre code`
+  has an explicit semantic language class and that the shared highlight
+  stylesheet, runtime, and initializer load exactly once from valid paths. In a
+  browser, inspect one source block and one `language-text` block when both are
+  present: the source block should receive `hljs` token markup, while the text
+  block should receive `nohighlight` and no token spans. Recheck page-level
+  overflow and local code scrolling after the runtime has executed.
+- When shared highlighting JavaScript changes, run a syntax check. When shared
+  highlighting CSS or JavaScript changes, verify that every consuming page
+  uses the same new cache version.
 - Run repository content/build checks when the touched files participate in a
   renderer or build step.
 
