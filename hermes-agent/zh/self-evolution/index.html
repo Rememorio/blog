@@ -221,9 +221,27 @@
             </div>
 
             <p>
-              Hermes 仓库把单道题表示成 <code>EvalExample</code>，字段包括 <code>task_input</code>、<code>expected_behavior</code>、难度、类别和来源；
-              再由 <code>EvalDataset</code> 分成 train、validation 和 holdout。对应数据形状在
-              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/dataset_builder.py#L20-L86"><code>dataset_builder.py</code></a>。
+              Hermes 源码不只给这两个字段起了名字，还把“题目可以进程序，评分说明不能泄漏进去”写进转换过程。删去持久化细节后，
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/dataset_builder.py#L20-L86"><code>dataset_builder.py</code></a>
+              的关键形状如下：
+            </p>
+
+            <pre><code class="language-python">@dataclass
+class EvalExample:
+    task_input: str
+    expected_behavior: str
+    difficulty: str = "medium"
+    category: str = "general"
+    source: str = "synthetic"
+
+dspy.Example(
+    task_input=ex.task_input,
+    expected_behavior=ex.expected_behavior,
+).with_inputs("task_input")</code></pre>
+
+            <p>
+              最后一行很关键：<code>expected_behavior</code> 仍留在样本上供 metric 读取，但只有 <code>task_input</code> 被声明为程序输入。
+              这才是“题目与尺子分开”的源码含义。<code>EvalDataset</code> 随后把同一种样本分成 train、validation 和 holdout，而不是为三份数据发明三种口径。
             </p>
 
             <p>
@@ -404,6 +422,31 @@ compile -> 返回新程序</code></pre>
               <a href="https://arxiv.org/pdf/2507.19457v2">GEPA v2 第 3 节</a>。
             </p>
 
+            <p>
+              在独立 GEPA 实现里，这个失败现场不是一段随意拼接的日志，而是 adapter 必须返回的逐题批次。引擎只要求输出、分数和轨迹一一对齐；
+              轨迹内部是什么，由接入方解释。这个边界让 GEPA 可以优化 Agent、RAG 或别的文字组件，而不必理解它们各自的运行时。
+            </p>
+
+            <pre><code class="language-python">Candidate = dict[str, str]
+
+@dataclass
+class EvaluationBatch:
+    outputs: list[RolloutOutput]
+    scores: list[float]
+    trajectories: list[Trajectory] | None = None
+
+def evaluate(
+    batch,
+    candidate: Candidate,
+    capture_traces: bool = False,
+) -> EvaluationBatch: ...</code></pre>
+
+            <p>
+              <a href="https://github.com/gepa-ai/gepa/blob/92dadfffbe98c8ecf508179a1cab09c1bb85cd32/src/gepa/core/adapter.py#L15-L35"><code>EvaluationBatch</code></a>
+              的 <code>scores[i]</code> 回答第 i 道题有多好，<code>trajectories[i]</code> 保存这道题为何得到这个结果。
+              反思阶段再由 <code>make_reflective_dataset</code> 把轨迹压成可操作反馈。没有这条对应关系，“反思”就会退化成只看总分猜原因。
+            </p>
+
             <h3>5.2 为什么不永远选择总分第一</h3>
             <p>
               一个候选可能擅长安全审查，另一个擅长 API 兼容性，第三个在格式要求上最稳定。只保留平均分最高的版本，会过早丢掉这些局部强项。
@@ -451,7 +494,26 @@ compile -> 返回新程序</code></pre>
               运行模块并捕获 trace，最后把 GEPA 选出的文字装回新程序。对应实现见
               <a href="https://github.com/stanfordnlp/dspy/blob/6f1e17e1f75656e570c818fdf0676de8516cffea/dspy/teleprompt/gepa/gepa.py#L553-L609"><code>dspy.GEPA.compile</code></a>
               和
-              <a href="https://github.com/gepa-ai/gepa/blob/92dadfffbe98c8ecf508179a1cab09c1bb85cd32/README.md#L135-L168">GEPA adapter 契约</a>。
+              <a href="https://github.com/gepa-ai/gepa/blob/92dadfffbe98c8ecf508179a1cab09c1bb85cd32/src/gepa/core/adapter.py#L59-L193">GEPA adapter 契约</a>。
+            </p>
+
+            <p>
+              DSPy 的翻译可以缩成下面四行。第一行决定搜索空间：只有 predictor 的 <code>signature.instructions</code> 被放进初始候选。
+              adapter 负责把候选跑成轨迹与分数，GEPA 负责搜索，最后再由 adapter 把胜出文字装回程序。
+            </p>
+
+            <pre><code class="language-python">seed_candidate = {
+    name: pred.signature.instructions
+    for name, pred in student.named_predictors()
+}
+result = optimize(seed_candidate=seed_candidate, adapter=adapter, ...)
+new_program = adapter.build_program(result.best_candidate)</code></pre>
+
+            <p>
+              这段
+              <a href="https://github.com/stanfordnlp/dspy/blob/6f1e17e1f75656e570c818fdf0676de8516cffea/dspy/teleprompt/gepa/gepa.py#L574-L609"><code>dspy.GEPA.compile</code></a>
+              也给了我们一把很具体的审计尺：想证明某段文字会进化，就必须能指出它在哪一步进入 <code>seed_candidate</code>，又在哪一步从
+              <code>best_candidate</code> 被写回。
             </p>
 
             <div class="note">
@@ -473,6 +535,27 @@ compile -> 返回新程序</code></pre>
               为了让同一份 Skill 可以反复做同一道题，仓库用 <code>SkillModule</code> 把它包成 DSPy 模块：每次 forward 把 Skill 正文和任务输入交给
               <code>ChainOfThought</code>，再返回模型输出。换句话说，它把“某个 Skill 做某道题”变成一项可以重复运行、评分和比较的函数。实现见
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/skill_module.py#L84-L115"><code>SkillModule</code></a>。
+            </p>
+
+            <pre><code class="language-python">class TaskWithSkill(dspy.Signature):
+    skill_instructions: str = dspy.InputField()
+    task_input: str = dspy.InputField()
+    output: str = dspy.OutputField()
+
+def __init__(self, skill_text):
+    self.skill_text = skill_text
+    self.predictor = dspy.ChainOfThought(self.TaskWithSkill)
+
+def forward(self, task_input):
+    return self.predictor(
+        skill_instructions=self.skill_text,
+        task_input=task_input,
+    )</code></pre>
+
+            <p>
+              这段包装已经完成“可重复执行”，却也暴露出下一节要检查的边界：<code>self.predictor</code> 是 DSPy 能发现的 predictor，
+              <code>self.skill_text</code> 则是普通 Python 属性；forward 又把它放进 <code>InputField</code>。能参与一次运行，不自动等于会进入刚才的
+              <code>seed_candidate</code>。
             </p>
 
             <div class="table-wrap">
@@ -517,6 +600,19 @@ compile -> 返回新程序</code></pre>
               因此仅凭这条调用链，不能确认 GEPA 会改写 Skill 本身，而不是只优化 predictor 内部提示。
             </p>
 
+            <pre><code class="language-python">baseline_module = SkillModule(skill["body"])
+optimized_module = optimizer.compile(baseline_module, ...)
+
+# 主流程从普通属性取“进化后的正文”
+evolved_body = optimized_module.skill_text</code></pre>
+
+            <p>
+              这里缺的不是一次赋值，而是双向映射：优化前要把 Skill 正文注册成 predictor instruction，优化后再从胜出 instruction 还原成
+              <code>SKILL.md</code> 正文。当前
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/evolve_skill.py#L143-L184">主流程</a>
+              只展示了包装与读取，没有展示这两次翻译。
+            </p>
+
             <h3>7.2 最低依赖版本下，GEPA 的构造参数也对不上</h3>
             <p>
               仓库声明的依赖是 <code>dspy&gt;=3.0.0</code>，没有锁定上限；主流程却调用
@@ -527,6 +623,27 @@ compile -> 返回新程序</code></pre>
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/evolve_skill.py#L133-L176">实际调用</a>
               和
               <a href="https://github.com/stanfordnlp/dspy/blob/3.0.0/dspy/teleprompt/gepa/gepa.py#L223-L282">DSPy 3.0.0 构造接口</a>即可确认。
+            </p>
+
+            <pre><code class="language-python"># Hermes 调用
+dspy.GEPA(
+    metric=skill_fitness_metric,
+    max_steps=iterations,
+)
+
+# DSPy 3.0.0 构造器的关键参数
+def __init__(
+    metric,
+    *,
+    auto=None,
+    max_full_evals=None,
+    max_metric_calls=None,
+    reflection_lm=None,
+): ...</code></pre>
+
+            <p>
+              这不是参数改个名字就结束：三个预算参数必须恰好选择一个，<code>reflection_lm</code> 也不能为空。也就是说，当前调用既没有提供合法预算，
+              也没有告诉 GEPA 由哪个模型阅读失败现场并提出新 instruction。
             </p>
 
             <p>
@@ -546,6 +663,20 @@ compile -> 返回新程序</code></pre>
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/constraints.py#L137-L166"><code>_check_skill_structure</code></a>。
             </p>
 
+            <pre><code class="language-python"># 调用方传入 body
+validator.validate_all(skill["body"], "skill")
+validator.validate_all(evolved_body, "skill", ...)
+
+# 校验方却按完整文件检查
+has_frontmatter = text.strip().startswith("---")
+has_name = "name:" in text[:500] if has_frontmatter else False
+has_description = "description:" in text[:500] if has_frontmatter else False</code></pre>
+
+            <p>
+              因而基线和候选即使正文完全合法，也会在同一处失败。修复方向只有两个：要么传入重组后的完整 Skill 文件，要么让“正文约束”和“frontmatter
+              约束”接收各自的数据，而不是让一个函数猜调用方传来的究竟是哪一层。
+            </p>
+
             <h3>7.4 丰富的 LLM Judge 存在，但优化器实际拿到的是关键词重合度</h3>
             <p>
               <code>fitness.py</code> 定义了 correctness、procedure following、conciseness 和文字反馈组成的 <code>LLMJudge</code>；这正接近 GEPA 需要的可解释反馈。
@@ -556,8 +687,15 @@ compile -> 返回新程序</code></pre>
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/fitness.py#L107-L136"><code>skill_fitness_metric</code></a>。
             </p>
 
+            <pre><code class="language-python">expected_words = set(expected.lower().split())
+output_words = set(agent_output.lower().split())
+
+overlap = len(expected_words &amp; output_words) / len(expected_words)
+score = 0.3 + (0.7 * overlap)
+return min(1.0, max(0.0, score))</code></pre>
+
             <p>
-              关键词代理指标速度快，却会奖励“重复 rubric 里的词”，不一定奖励正确完成任务；同时，丰富的失败原因没有通过这条 metric 返回给优化器。
+              这几行才是搜索实际看见的目标。关键词代理指标速度快，却会奖励“重复 rubric 里的词”，不一定奖励正确完成任务；同时，丰富的失败原因没有通过这条 metric 返回给优化器。
               这不是调权重能解决的小问题，而是当前搜索目标与论文方法之间的接口差异。
             </p>
 
@@ -670,6 +808,7 @@ compile -> 返回新程序</code></pre>
               <li><a href="https://arxiv.org/abs/2507.19457v2">GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning</a></li>
               <li><a href="https://arxiv.org/pdf/2507.19457v2">GEPA v2 论文 PDF</a></li>
               <li><a href="https://github.com/gepa-ai/gepa/tree/92dadfffbe98c8ecf508179a1cab09c1bb85cd32">GEPA 官方实现固定快照</a></li>
+              <li><a href="https://github.com/gepa-ai/gepa/blob/92dadfffbe98c8ecf508179a1cab09c1bb85cd32/src/gepa/core/adapter.py#L15-L193">GEPA adapter、EvaluationBatch 与反思数据契约</a></li>
             </ul>
           </section>
         </article>

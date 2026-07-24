@@ -248,10 +248,31 @@ and explain which path leaks it</code></pre>
             </div>
 
             <p>
-              The Hermes repository represents one task as an <code>EvalExample</code> with <code>task_input</code>,
-              <code>expected_behavior</code>, difficulty, category, and source. <code>EvalDataset</code> divides examples
-              into train, validation, and holdout. The data shape is visible in
-              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/dataset_builder.py#L20-L86"><code>dataset_builder.py</code></a>.
+              The Hermes source does more than name those fields. Its conversion step encodes the rule that the task may
+              enter the program while the scoring note must not leak into it. With persistence details removed, the
+              important shape in
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/dataset_builder.py#L20-L86"><code>dataset_builder.py</code></a>
+              is:
+            </p>
+
+            <pre><code class="language-python">@dataclass
+class EvalExample:
+    task_input: str
+    expected_behavior: str
+    difficulty: str = "medium"
+    category: str = "general"
+    source: str = "synthetic"
+
+dspy.Example(
+    task_input=ex.task_input,
+    expected_behavior=ex.expected_behavior,
+).with_inputs("task_input")</code></pre>
+
+            <p>
+              The final line matters. <code>expected_behavior</code> remains on the example for the metric, but only
+              <code>task_input</code> is declared as program input. That is the source-level meaning of separating task from
+              ruler. <code>EvalDataset</code> then divides the same example shape into train, validation, and holdout rather
+              than inventing three grading contracts.
             </p>
 
             <p>
@@ -463,6 +484,35 @@ compile -> revised program</code></pre>
               <a href="https://arxiv.org/pdf/2507.19457v2">Section 3 of GEPA v2</a>.
             </p>
 
+            <p>
+              In the standalone GEPA implementation, this failure scene is not an arbitrary log blob. The adapter must
+              return a per-example batch whose outputs, scores, and trajectories align. GEPA leaves trajectory contents
+              opaque and asks the integration to interpret them. That boundary lets the engine optimize agents, RAG
+              pipelines, or other text components without understanding each runtime.
+            </p>
+
+            <pre><code class="language-python">Candidate = dict[str, str]
+
+@dataclass
+class EvaluationBatch:
+    outputs: list[RolloutOutput]
+    scores: list[float]
+    trajectories: list[Trajectory] | None = None
+
+def evaluate(
+    batch,
+    candidate: Candidate,
+    capture_traces: bool = False,
+) -> EvaluationBatch: ...</code></pre>
+
+            <p>
+              In
+              <a href="https://github.com/gepa-ai/gepa/blob/92dadfffbe98c8ecf508179a1cab09c1bb85cd32/src/gepa/core/adapter.py#L15-L35"><code>EvaluationBatch</code></a>,
+              <code>scores[i]</code> says how well task i went and <code>trajectories[i]</code> preserves why. The reflection
+              step later uses <code>make_reflective_dataset</code> to compress that trace into actionable feedback. Without
+              this alignment, reflection would collapse into guessing from an aggregate score.
+            </p>
+
             <h3>5.2 Why not mutate the overall winner forever?</h3>
             <p>
               One candidate may excel at security review, another at API compatibility, and another at output format.
@@ -519,7 +569,27 @@ compile -> revised program</code></pre>
               module with trace capture, and installs selected text into a new program. See
               <a href="https://github.com/stanfordnlp/dspy/blob/6f1e17e1f75656e570c818fdf0676de8516cffea/dspy/teleprompt/gepa/gepa.py#L553-L609"><code>dspy.GEPA.compile</code></a>
               and the standalone
-              <a href="https://github.com/gepa-ai/gepa/blob/92dadfffbe98c8ecf508179a1cab09c1bb85cd32/README.md#L135-L168">GEPA adapter contract</a>.
+              <a href="https://github.com/gepa-ai/gepa/blob/92dadfffbe98c8ecf508179a1cab09c1bb85cd32/src/gepa/core/adapter.py#L59-L193">GEPA adapter contract</a>.
+            </p>
+
+            <p>
+              DSPy's translation reduces to the four lines below. The first line defines the search space: only predictor
+              <code>signature.instructions</code> become seed components. The adapter turns candidates into traces and
+              scores, GEPA performs the search, and the adapter installs the winning text back into a program.
+            </p>
+
+            <pre><code class="language-python">seed_candidate = {
+    name: pred.signature.instructions
+    for name, pred in student.named_predictors()
+}
+result = optimize(seed_candidate=seed_candidate, adapter=adapter, ...)
+new_program = adapter.build_program(result.best_candidate)</code></pre>
+
+            <p>
+              This excerpt from
+              <a href="https://github.com/stanfordnlp/dspy/blob/6f1e17e1f75656e570c818fdf0676de8516cffea/dspy/teleprompt/gepa/gepa.py#L574-L609"><code>dspy.GEPA.compile</code></a>
+              gives us a concrete audit rule: to prove that text evolves, identify where it enters
+              <code>seed_candidate</code> and where the corresponding <code>best_candidate</code> text is written back.
             </p>
 
             <div class="note">
@@ -545,6 +615,28 @@ compile -> revised program</code></pre>
               output. In plain terms, it turns "this skill performs this task" into a function that can be rerun, scored,
               and compared. See
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/skill_module.py#L84-L115"><code>SkillModule</code></a>.
+            </p>
+
+            <pre><code class="language-python">class TaskWithSkill(dspy.Signature):
+    skill_instructions: str = dspy.InputField()
+    task_input: str = dspy.InputField()
+    output: str = dspy.OutputField()
+
+def __init__(self, skill_text):
+    self.skill_text = skill_text
+    self.predictor = dspy.ChainOfThought(self.TaskWithSkill)
+
+def forward(self, task_input):
+    return self.predictor(
+        skill_instructions=self.skill_text,
+        task_input=task_input,
+    )</code></pre>
+
+            <p>
+              This wrapper already makes execution repeatable, but it also exposes the boundary the next section audits:
+              <code>self.predictor</code> is a predictor DSPy can discover, while <code>self.skill_text</code> is an ordinary
+              Python attribute that forward supplies through an <code>InputField</code>. Participating in one execution does
+              not automatically place text in the <code>seed_candidate</code>.
             </p>
 
             <div class="table-wrap">
@@ -594,6 +686,20 @@ compile -> revised program</code></pre>
               cannot establish that GEPA rewrites the skill itself rather than predictor prompt state.
             </p>
 
+            <pre><code class="language-python">baseline_module = SkillModule(skill["body"])
+optimized_module = optimizer.compile(baseline_module, ...)
+
+# The orchestration reads the "evolved body" from a plain attribute.
+evolved_body = optimized_module.skill_text</code></pre>
+
+            <p>
+              What is missing is a two-way mapping, not one assignment. Before optimization, the skill body must become
+              predictor instructions; afterward, the winning instructions must become a <code>SKILL.md</code> body again.
+              The current
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/evolve_skill.py#L143-L184">orchestration</a>
+              shows wrapping and extraction but not either translation.
+            </p>
+
             <h3>7.2 The GEPA constructor does not match even the minimum dependency</h3>
             <p>
               The repository declares <code>dspy&gt;=3.0.0</code> without an upper bound, while the orchestration calls
@@ -604,6 +710,28 @@ compile -> revised program</code></pre>
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/pyproject.toml#L17-L23">Hermes dependency</a>,
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/evolve_skill.py#L133-L176">call site</a>, and
               <a href="https://github.com/stanfordnlp/dspy/blob/3.0.0/dspy/teleprompt/gepa/gepa.py#L223-L282">DSPy 3.0.0 constructor</a>.
+            </p>
+
+            <pre><code class="language-python"># Hermes call site
+dspy.GEPA(
+    metric=skill_fitness_metric,
+    max_steps=iterations,
+)
+
+# Relevant DSPy 3.0.0 constructor parameters
+def __init__(
+    metric,
+    *,
+    auto=None,
+    max_full_evals=None,
+    max_metric_calls=None,
+    reflection_lm=None,
+): ...</code></pre>
+
+            <p>
+              This is more than a renamed parameter. Exactly one budget option must be selected and
+              <code>reflection_lm</code> cannot be empty. The current call therefore supplies neither a valid budget nor the
+              model that should read failures and propose new instructions.
             </p>
 
             <p>
@@ -625,6 +753,21 @@ compile -> revised program</code></pre>
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/constraints.py#L137-L166"><code>_check_skill_structure</code></a>.
             </p>
 
+            <pre><code class="language-python"># The caller supplies only the body.
+validator.validate_all(skill["body"], "skill")
+validator.validate_all(evolved_body, "skill", ...)
+
+# The validator checks for a complete file.
+has_frontmatter = text.strip().startswith("---")
+has_name = "name:" in text[:500] if has_frontmatter else False
+has_description = "description:" in text[:500] if has_frontmatter else False</code></pre>
+
+            <p>
+              Baseline and candidate therefore fail at the same check even when both bodies are valid. A repair must either
+              validate the reassembled full skill or give body constraints and frontmatter constraints their own inputs,
+              instead of asking one function to guess which layer it received.
+            </p>
+
             <h3>7.4 A rich LLM judge exists, but optimization receives keyword overlap</h3>
             <p>
               <code>fitness.py</code> defines an <code>LLMJudge</code> with correctness, procedure following,
@@ -636,8 +779,15 @@ compile -> revised program</code></pre>
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/fitness.py#L107-L136"><code>skill_fitness_metric</code></a>.
             </p>
 
+            <pre><code class="language-python">expected_words = set(expected.lower().split())
+output_words = set(agent_output.lower().split())
+
+overlap = len(expected_words &amp; output_words) / len(expected_words)
+score = 0.3 + (0.7 * overlap)
+return min(1.0, max(0.0, score))</code></pre>
+
             <p>
-              The proxy is fast, but it rewards repeating rubric vocabulary rather than necessarily completing the task.
+              These lines are the objective the search actually sees. The proxy is fast, but it rewards repeating rubric vocabulary rather than necessarily completing the task.
               It also does not return the rich failure explanation through this metric path. That is an interface gap
               between the current search objective and the paper's reflective method, not a small matter of adjusting weights.
             </p>
@@ -765,6 +915,7 @@ Human review decides delivery.</code></pre>
               <li><a href="https://arxiv.org/abs/2507.19457v2">GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning</a></li>
               <li><a href="https://arxiv.org/pdf/2507.19457v2">GEPA v2 paper PDF</a></li>
               <li><a href="https://github.com/gepa-ai/gepa/tree/92dadfffbe98c8ecf508179a1cab09c1bb85cd32">Fixed official GEPA implementation snapshot</a></li>
+              <li><a href="https://github.com/gepa-ai/gepa/blob/92dadfffbe98c8ecf508179a1cab09c1bb85cd32/src/gepa/core/adapter.py#L15-L193">GEPA adapter, EvaluationBatch, and reflection-data contracts</a></li>
             </ul>
           </section>
         </article>
