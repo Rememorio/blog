@@ -64,7 +64,7 @@
             <div class="meta-line">
               <span>Series 2 / 2</span>
               <span>Source snapshot: 0a929e3</span>
-              <span>Framework: DSPy 3.0+</span>
+              <span>Declared dependency: DSPy &ge; 3.0.0</span>
               <span>Paper: GEPA v2</span>
             </div>
             <nav class="series-strip" aria-label="Hermes Agent series">
@@ -282,51 +282,178 @@ dspy.Example(
               Inspect the ruler before starting optimization.
             </p>
 
-            <h2>3. Where evaluation tasks come from: build the ruler first</h2>
+            <h2>3. Build the ruler as a dataset: where evaluation tasks come from</h2>
+            <p>
+              The previous chapter used one hand-written resource-leak task to explain a fair comparison. One task is not
+              enough to start optimization. A revision may memorize that example or work for only one kind of code. We need
+              a task set that covers different difficulties and failure modes, with "what good must do" written down before
+              search begins.
+            </p>
+
+            <p>
+              Do not split the data yet. In the current Hermes prototype, the smallest persisted row is an
+              <code>EvalExample</code>. It keeps the <strong>task given to the agent</strong> beside the
+              <strong>requirement shown to the scorer</strong>, but only the task enters the program being evaluated:
+            </p>
+
+            <pre><code class="language-text">one EvalExample
+├─ task_input: the user's actual task
+├─ expected_behavior: case-specific requirements for a good result
+├─ difficulty / category: coverage labels
+└─ source: synthetic, real session, or human-authored
+
+one evaluation run separately fixes
+└─ model, tools, budget, and the shared metric</code></pre>
+
+            <p>
+              The "ruler" is therefore not one field. <code>expected_behavior</code> says what this case must check, the
+              shared <code>metric</code> compares output with that requirement, and fixed runtime conditions give the
+              baseline and candidate the same equipment. An unrealistic task, a wrong rubric, or changing runtime
+              conditions can produce a higher score without producing a better skill.
+            </p>
+
             <figure class="figure">
               <img
                 src="assets/eval-dataset-sources.png"
-                alt="Synthetic tasks, a golden set, and real sessions become normalized examples, pass a relevance filter, and split into train, validation, and sealed holdout sets"
+                alt="Synthetic tasks, a golden set, and real sessions can become normalized evaluation examples before splitting into train, validation, and sealed holdout sets"
               />
-              <figcaption>Sources may be mixed, but the holdout must remain independent or the final score only echoes the search process.</figcaption>
+              <figcaption>This is a conceptual source map. The current CLI chooses one source path per run, and only the real-session path performs relevance filtering.</figcaption>
             </figure>
 
-            <h3>3.1 Synthetic tasks bootstrap coverage; they do not become truth automatically</h3>
+            <h3>3.1 Three sources are three task authors; all must produce the same row</h3>
             <p>
-              With no history, <code>SyntheticDatasetBuilder</code> gives the full artifact to a model and asks it to
-              generate tasks, expected behavior, difficulty, and category, then randomly splits the result. This can
-              start evaluation for a new skill quickly. The path is in
+              The first author is a model. With no history, <code>SyntheticDatasetBuilder</code> gives the full old skill
+              to a stronger model and asks for <code>task_input</code>, <code>expected_behavior</code>, difficulty, and
+              category. For the review skill, it might create "review file-reading code with an early
+              <code>return</code>" and pair it with "identify the unclosed handle and the path that triggers the leak."
+              This quickly produces bootstrap cases. The path is in
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/dataset_builder.py#L89-L169"><code>SyntheticDatasetBuilder.generate</code></a>.
             </p>
 
             <p>
-              Its blind spot follows from its input. The task generator reads the old skill, so it can easily restate
-              concerns the old skill already contains while missing failures the old skill never recognized. Synthetic
-              examples are useful bootstrapping data, not sufficient proof. Important skills still need human golden
-              cases or tasks with executable checks.
+              But the model writes from the old skill's field of view. If that skill already emphasizes SQL injection,
+              the generator can produce more SQL-injection tasks. If it never notices resource release, the generator may
+              share that blind spot. Synthetic data answers "how can we start without data?" It cannot alone answer
+              "did behavior improve on real work?"
             </p>
 
-            <h3>3.2 Real sessions supply a task distribution, not automatic answers</h3>
             <p>
-              External importers read local Claude Code, Copilot, and Hermes sessions. A cheap keyword filter narrows the
-              messages, then a model scores relevance and creates fresh expected behavior. The two-stage filter is in
-              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/external_importers.py#L422-L520"><code>RelevanceFilter</code></a>;
-              source aggregation and splitting are in
+              The second author is a human. A <strong>golden set</strong> is not a mysterious canonical answer. It is a
+              collection of <code>task_input + expected_behavior</code> pairs written or reviewed by people. It costs the
+              most, but can deliberately add high-risk cases missing from the old skill and can attach executable checks.
+              <code>GoldenDatasetLoader</code> reads three pre-split JSONL files, or randomly divides a single
+              <code>golden.jsonl</code>.
+            </p>
+
+            <p>
+              The third author is real usage. Claude Code, Copilot, and Hermes histories contribute the kinds of questions
+              users actually ask, instead of staying inside the old skill's wording. A conversation is not yet an
+              evaluation case, however. It may be irrelevant to the target skill, and the old assistant response may be
+              the very failure we want to repair. The session path must filter messages and create a fresh rubric for each
+              retained user task.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Source</th><th>Where the task comes from</th><th>Where the ruler comes from</th><th>Main risk</th></tr></thead>
+                <tbody>
+                  <tr><td>Synthetic</td><td>A model reads the old skill and generates it</td><td>The same generation writes a rubric</td><td>Copies the old skill's attention and blind spots</td></tr>
+                  <tr><td>Golden</td><td>A person writes or selects a high-value task</td><td>A person reviews requirements or executable checks</td><td>Expensive; coverage depends on the designer</td></tr>
+                  <tr><td>Real session</td><td>Selected from actual user messages</td><td>A relevance model writes a fresh rubric</td><td>Privacy, noise, and judge bias</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>3.2 Why real sessions pass through two gates</h3>
+            <p>
+              Session histories can be large, so sending every message to a model is slow and expensive.
+              <code>RelevanceFilter</code> first uses keywords and the skill name as a cheap pre-filter. A second gate gives
+              a model the skill summary, user message, and historical assistant response, then asks whether the case is
+              relevant. Only accepted messages receive new <code>expected_behavior</code>, difficulty, and category
+              fields. The two stages are implemented in
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/external_importers.py#L422-L520"><code>RelevanceFilter</code></a>.
+            </p>
+
+            <p>
+              The historical answer is context for judging the case, not its golden answer. If the old agent missed a
+              handle leak, the filter can derive "inspect resource release on early-return paths," but it must not bless
+              the failed review as correct output. Accepted Claude Code, Copilot, and Hermes cases are then aggregated and
+              split by
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/external_importers.py#L608-L693"><code>build_dataset_from_external</code></a>.
             </p>
 
+            <h3>3.3 The three splits do not train model weights</h3>
             <p>
-              In other words, real sessions mostly contribute realistic task inputs. They do not turn the historical
-              assistant response into a golden answer. That boundary is useful: the old response may be the exact failure
-              the skill should repair, so provenance alone cannot certify it.
+              Suppose generation leaves 20 valid cases. The default ratios produce 10 train, 5 validation, and 5 holdout
+              cases. <strong>Train</strong> does not update model weights here. It lets a text optimizer repeatedly run
+              tasks, observe failures, and propose skill candidates. <strong>Validation</strong> scores participate in
+              candidate comparison during search, so validation is not a sealed exam. Only <strong>holdout</strong> stays
+              outside revision until a candidate has been selected.
             </p>
 
-            <h3>3.3 Holdout answers one question: did you learn the rule or the tasks?</h3>
+            <pre><code class="language-text">10 train cases
+-> run the current skill and collect failures
+-> propose multiple skill candidates
+
+5 validation cases
+-> compare candidates during search
+-> scores may decide what survives and what changes next
+
+choose a candidate and stop search
+
+5 holdout cases
+-> baseline and candidate see these tasks for the first time
+-> report the difference; do not revise from the result</code></pre>
+
             <p>
-              Training examples drive proposals. Validation examples compare candidates during search. Holdout examples
-              are used once after a candidate has been chosen. If the system keeps revising the skill in response to
-              holdout scores, the holdout has become another validation set. A credible run preserves data versions,
-              split seeds, and baseline results so the final comparison cannot be repeatedly rehearsed.
+              If the holdout score sends the author back to revise the skill, those five cases have joined the search.
+              Calling them "unseen" on the next run does not restore independence. Equal models, tools, and budgets give
+              baseline and candidate the same equipment. A sealed holdout ensures neither saw the final questions.
+              A fair comparison needs both.
+            </p>
+
+            <p>
+              Randomly separating rows does not guarantee independence. Two paraphrases from one session, or the same bug
+              described in different words, can land in train and holdout. The current builders call
+              <code>random.shuffle</code> and slice by position; they do not deduplicate by meaning or group by session or
+              problem family. A rigorous run must add semantic deduplication or grouped splitting and preserve the data
+              version and random seed.
+            </p>
+
+            <h3>3.4 Which path the current command actually runs</h3>
+            <p>
+              Compressing the source into one path keeps origin, purpose, and opening time separate:
+            </p>
+
+            <pre><code class="language-python">if eval_source == "golden":
+    dataset = GoldenDatasetLoader.load(dataset_path)
+elif eval_source == "sessiondb":
+    dataset = build_dataset_from_external(...)
+elif eval_source == "synthetic":
+    dataset = SyntheticDatasetBuilder(config).generate(...)
+
+trainset = dataset.to_dspy_examples("train")
+valset = dataset.to_dspy_examples("val")
+optimized = optimizer.compile(baseline, trainset=trainset, valset=valset)
+
+# Read only after search ends.
+holdout = dataset.to_dspy_examples("holdout")</code></pre>
+
+            <p>
+              One CLI run chooses <code>golden</code>, <code>sessiondb</code>, or <code>synthetic</code>; it does not
+              automatically merge all three. The <code>sessiondb</code> branch is the one that aggregates three session
+              sources. The common <code>EvalExample</code> format makes future mixing or manual assembly possible, but that
+              is capacity in the data model, not an action already performed by this entry point. See the
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/evolve_skill.py#L79-L116">dataset branches</a>
+              and the
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/evolve_skill.py#L145-L228">optimization and holdout comparison</a>.
+            </p>
+
+            <p>
+              The prerequisites for optimization are now concrete: every case has a task and rubric, each run fixes its
+              runtime conditions, train and validation may influence search, and holdout must not leak. The next chapter
+              asks a different question: once the data can judge quality, how does DSPy turn the skill into a parameter an
+              optimizer can actually replace?
             </p>
 
             <h2>4. Before GEPA, identify what DSPy makes optimizable</h2>
@@ -342,6 +469,23 @@ dspy.Example(
               algorithm. It is an LM programming framework: declare inputs, outputs, and task instructions; compose one
               or more calls into a module; then pass the program, examples, and metric to an optimizer. Prompt writing
               becomes compilation of a parameterized program.
+            </p>
+
+            <p>
+              Before reading class names, divide the contract into four boxes. The first two define how the program works,
+              the third is what an optimizer may search, and the last only judges results:
+            </p>
+
+            <pre><code class="language-text">fixed input and output fields: Signature
+fixed execution structure: Module
+searchable content: explicitly registered instructions / demonstrations
+candidate judgment: Example + metric</code></pre>
+
+            <p>
+              DSPy does not rewrite arbitrary Python control flow, and it does not automatically treat every string as an
+              optimizable parameter. Only exposed instructions, demonstrations, and similar parameters enter search.
+              Input fields, Module control flow, and the metric remain developer-owned. The source that follows can be
+              read by asking which box each line belongs to.
             </p>
 
             <figure class="figure">
@@ -466,6 +610,25 @@ compile -> revised program</code></pre>
               Each iteration selects a parent candidate, runs it on a minibatch, collects traces, scores, and textual
               feedback, then asks a reflection model to diagnose failures and propose a new prompt. Evaluated candidates
               return to the pool and the loop continues.
+            </p>
+
+            <p>
+              Keep the resource-leak task in view. One reflective step is not free-form self-critique; it is a chain that
+              can be executed again:
+            </p>
+
+            <pre><code class="language-text">candidate P1 reviews the code
+-> it misses the early-return path and scores poorly
+-> feedback says: resource acquisition was found, but exit paths were not enumerated
+-> the reflector turns that failure into a more explicit review step
+-> candidate P2 is produced
+-> P1 and P2 rerun the same small task batch
+-> only measured improvements return to the candidate pool</code></pre>
+
+            <p>
+              Read the next figure as "execute, diagnose, revise, retest." Textual feedback proposes a direction; another
+              execution proves whether the revision helped. Without that final step, reflection is only a plausible
+              explanation.
             </p>
 
             <figure class="figure">
@@ -661,6 +824,22 @@ def forward(self, task_input):
             </p>
 
             <h2>7. How far the current source goes: a prototype, not a closed loop</h2>
+            <p>
+              When returning to the Hermes repository, separate "a file exists," "it enters the main path," and "the
+              target loop is demonstrated." The fixed snapshot first divides into three states:
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Status</th><th>What the current source supports</th></tr></thead>
+                <tbody>
+                  <tr><td>In the main path</td><td>Read a skill, choose one data source, build DSPy examples, attempt optimization, compare holdout scores, and save output</td></tr>
+                  <tr><td>Code exists but is not wired into the target path</td><td>The richer LLM judge, test runner, and PR configuration do not gate this candidate search and delivery</td></tr>
+                  <tr><td>Target route not demonstrated</td><td>GEPA actually rewrites the skill body, every candidate passes hard gates, and an accepted result becomes a reviewable PR</td></tr>
+                </tbody>
+              </table>
+            </div>
+
             <figure class="figure">
               <img
                 src="assets/implementation-boundary.png"
@@ -863,10 +1042,18 @@ return min(1.0, max(0.0, score))</code></pre>
               <li><strong>Return the right objective.</strong> Prefer executable checks; use rubric judges for open tasks and pass actionable textual feedback into GEPA.</li>
               <li><strong>Gate every candidate first.</strong> Validate full frontmatter, size growth, tests, and caching boundaries before a candidate enters the pool.</li>
               <li><strong>Keep failures in the right layer.</strong> Do not let a different optimizer hide a failed GEPA integration; fallback should be an explicit run mode.</li>
-              <li><strong>Open holdout once.</strong> Report per-example outcomes and repeated runs or uncertainty, not only a percentage from one example.</li>
+              <li><strong>Open holdout once.</strong> Report per-example outcomes, regressions on critical old tasks, and repeated runs or uncertainty, not only a percentage from one example.</li>
+              <li><strong>Account for the cost of improvement.</strong> A higher score cannot depend on unacceptable model cost, tokens, tool calls, or latency; report those budgets beside the baseline.</li>
               <li><strong>Deliver a diff, not an overwrite.</strong> Package candidate, baseline, metrics, failures, and a PR for human approval.</li>
               <li><strong>Wait for a future runtime boundary.</strong> A passed skill should refresh safely, not mutate the stable prompt prefix halfway through a conversation.</li>
             </ol>
+
+            <pre><code class="language-text">stable improvement on unseen tasks
++ no regression on critical old capabilities
++ cost and latency remain within budget
++ data, configuration, and candidate can be replayed
++ the old version can be restored
+= eligible for a human delivery decision</code></pre>
 
             <p>
               Then the series closes. Runtime use discovers experience worth preserving. Offline evaluation treats a

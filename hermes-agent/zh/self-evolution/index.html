@@ -63,7 +63,7 @@
             <div class="meta-line">
               <span>系列 2 / 2</span>
               <span>源码快照：0a929e3</span>
-              <span>框架：DSPy 3.0+</span>
+              <span>依赖声明：DSPy &ge; 3.0.0</span>
               <span>论文：GEPA v2</span>
             </div>
             <nav class="series-strip" aria-label="Hermes Agent 系列">
@@ -250,45 +250,155 @@ dspy.Example(
               如果评分说明本身写错，优化器就会忠实地把 Skill 推向错误方向。开始优化之前，必须先检查尺子。
             </p>
 
-            <h2>三、评测题从哪里来：先解决尺子，再启动优化</h2>
+            <h2>三、先把尺子做成数据集：评测题究竟从哪里来</h2>
+            <p>
+              上一章为了讲清公平比较，只手写了一道资源泄漏题。真正启动优化时，一道题远远不够：新版可能恰好记住这个例子，
+              也可能只在某一类代码上有效。我们需要一组覆盖不同难度和失败方式的题，并且每道题都要提前写清“怎样才算做好”。
+            </p>
+
+            <p>
+              先不要急着分训练集和留出集。对当前 Hermes 原型来说，数据集里最小的一行叫作 <code>EvalExample</code>，
+              它把<strong>给 Agent 做的题</strong>和<strong>交给评分器看的要求</strong>放在一起，却只把前者送进被评测的程序：
+            </p>
+
+            <pre><code class="language-text">一条 EvalExample
+├─ task_input：用户真正提出的任务
+├─ expected_behavior：好结果必须满足的逐题要求
+├─ difficulty / category：难度与覆盖面标签
+└─ source：这道题来自合成、真实会话还是人工编写
+
+一次评测运行另外固定
+└─ 模型、工具、预算与共同 metric</code></pre>
+
+            <p>
+              所以这里说的“尺子”不是某一个字段。<code>expected_behavior</code> 规定这道题要检查什么，共同的
+              <code>metric</code> 负责把输出与要求比较，固定的模型、工具和预算保证旧版与候选使用同样的装备。
+              如果题目本身不真实，rubric 写错，或者运行条件前后变化，优化器即使把分数推高，也不能证明 Skill 真的变好。
+            </p>
+
             <figure class="figure">
               <img
                 src="assets/eval-dataset-sources.png"
-                alt="合成任务、人工金标和真实会话经过统一样本与相关性筛选后，分入训练集、验证集和最后才打开的留出集"
+                alt="合成任务、人工金标和真实会话可以整理成统一评测样本，再分入训练集、验证集和最后才打开的留出集"
               />
-              <figcaption>数据源可以混合，但留出集必须保持独立；否则最后的分数只是训练过程的回声。</figcaption>
+              <figcaption>这张图先画概念上的来源地图；当前 CLI 每次选择一条来源路径，真实会话路径才会执行相关性筛选。</figcaption>
             </figure>
 
-            <h3>3.1 合成任务负责启动，不负责自动成为真理</h3>
+            <h3>3.1 三种来源只是三种出题人，最后都要交出同一种样本</h3>
             <p>
-              没有历史数据时，仓库里的 <code>SyntheticDatasetBuilder</code> 会把完整 artifact 交给模型，要求生成任务、期望行为、难度和类别，再随机切成三份。
-              这条路径能快速启动一个新 Skill，源码在
+              第一种出题人是模型。没有历史数据时，<code>SyntheticDatasetBuilder</code> 会读取完整旧 Skill，让一个较强模型同时生成
+              <code>task_input</code>、<code>expected_behavior</code>、难度和类别。对代码审查 Skill，它可能生成“审查一段存在提前
+              <code>return</code> 的文件读取代码”，再配上“必须指出未关闭句柄及触发路径”的 rubric。这条路径能很快凑出启动样本，源码在
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/dataset_builder.py#L89-L169"><code>SyntheticDatasetBuilder.generate</code></a>。
             </p>
 
             <p>
-              它的盲点也很直接：出题模型读的是旧 Skill，容易把旧 Skill 已经写出的关注点再次包装成题目，却漏掉旧 Skill 根本没意识到的问题。
-              因此合成集适合做启动样本，不该独自承担最终证明。关键 Skill 仍需要人工金标或可自动核验的任务补足盲区。
+              但模型是照着旧 Skill 出题的。旧 Skill 已经强调 SQL 注入，它就容易再出几道 SQL 注入题；旧 Skill 从未意识到资源释放，
+              出题模型也可能一起忽略。因此合成题适合回答“没有数据时怎样开始”，不适合独自回答“真实世界里是否变好”。
             </p>
 
-            <h3>3.2 真实会话提供分布，但不能把历史回答直接当答案</h3>
             <p>
-              外部导入器会读取 Claude Code、Copilot 和 Hermes 的本地会话，先做便宜的关键词预筛，再由模型判断消息是否与目标 Skill 相关，并生成新的 expected behavior。
-              两阶段过滤在
-              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/external_importers.py#L422-L520"><code>RelevanceFilter</code></a>，
-              三种来源汇总与切分在
+              第二种出题人是人。<strong>人工金标</strong>不是一份神秘标准答案，而是人直接编写或审定的
+              <code>task_input + expected_behavior</code>。它成本最高，却能有意加入旧 Skill 没覆盖的高风险题，也能把可执行检查写成明确门槛。
+              <code>GoldenDatasetLoader</code> 可以读取已经分好的三个 JSONL 文件；如果只有一个 <code>golden.jsonl</code>，当前实现会随机切分。
+            </p>
+
+            <p>
+              第三种出题人是真实使用。Claude Code、Copilot 和 Hermes 的历史会话能提供“用户实际上会怎样提问”，
+              让数据不只围着旧 Skill 的措辞打转。但一段历史会话还不是评测样本：其中可能与目标 Skill 无关，旧回答也可能正是我们想修复的失败。
+              所以这条路径必须先筛选，再为保留下来的用户任务重新生成 rubric。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>来源</th><th>题目怎样得到</th><th>尺子怎样得到</th><th>主要风险</th></tr></thead>
+                <tbody>
+                  <tr><td>合成任务</td><td>模型阅读旧 Skill 后生成</td><td>同一个生成过程写 rubric</td><td>复制旧 Skill 的视野和盲区</td></tr>
+                  <tr><td>人工金标</td><td>人编写或挑选高价值任务</td><td>人审定要求或可执行检查</td><td>成本高，覆盖取决于设计者经验</td></tr>
+                  <tr><td>真实会话</td><td>从实际用户消息中筛选</td><td>相关性模型重新生成 rubric</td><td>隐私、噪声与裁判偏差</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>3.2 真实会话为什么要过两道门</h3>
+            <p>
+              真实会话数量可能很多，逐条交给模型判断既慢又贵。<code>RelevanceFilter</code> 因此先用关键词和 Skill 名做一次便宜预筛，
+              把明显无关的消息放下；第二道门再让模型同时阅读 Skill 摘要、用户消息和当时的 assistant 回答，判断它是否相关。
+              只有通过第二道门的消息，才会生成新的 <code>expected_behavior</code>、难度和类别。两阶段实现见
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/external_importers.py#L422-L520"><code>RelevanceFilter</code></a>。
+            </p>
+
+            <p>
+              历史回答在这里是判断上下文，不是金标答案。假设旧 Agent 审查代码时漏掉了句柄泄漏，筛选模型可以据此写出“应检查提前返回路径上的资源释放”，
+              但不能把那份漏检回答原样当成正确输出。通过筛选的 Claude Code、Copilot 与 Hermes 样本随后汇总并切分，入口在
               <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/core/external_importers.py#L608-L693"><code>build_dataset_from_external</code></a>。
             </p>
 
+            <h3>3.3 切成三份不是为了训练模型权重</h3>
             <p>
-              这意味着“真实会话”主要贡献真实任务分布，而不是把当时 assistant 的回答直接封成金标。历史回答会帮助相关性判断，但最终进入 <code>EvalExample</code> 的仍是任务与新生成的 rubric。
-              这个边界是对的：旧回答可能正是我们想修复的失败，不能因为它来自真实会话就自动变成标准答案。
+              假设生成器最终留下 20 道有效题，默认比例会得到 10 道 train、5 道 validation 和 5 道 holdout。
+              这里的 <strong>train</strong> 不是拿来更新模型权重，而是让文本优化器反复执行、观察失败并提出 Skill 候选；
+              <strong>validation</strong> 的分数会在搜索期间参与候选比较，因此也不是保密考试；只有 <strong>holdout</strong>
+              在候选选定之前完全不参与修改。
             </p>
 
-            <h3>3.3 留出集只回答一个问题：你学会的是规则，还是题目</h3>
+            <pre><code class="language-text">10 道 train
+-> 执行当前 Skill，收集失败与反馈
+-> 生成多份 Skill 候选
+
+5 道 validation
+-> 搜索期间比较候选
+-> 分数可以影响保留谁、下一轮改谁
+
+先选定候选，停止搜索
+
+5 道 holdout
+-> 旧版与候选第一次面对这些题
+-> 只报告差异，不再根据结果继续改候选</code></pre>
+
             <p>
-              训练集用于产生候选，验证集用于搜索期间比较候选，留出集只在候选确定之后做一次独立检查。
-              如果不断根据留出分数继续改 Skill，留出集就已经变成另一份验证集。可信的交付应该保留数据版本、切分种子和基线结果，让同一个候选不能反复偷看最终答案。
+              如果看完 holdout 分数又回去修改 Skill，这五道题就已经加入了搜索，下一次再叫它“未见数据”只是换了名字。
+              同模型、同工具和同预算，保证旧版与候选使用相同装备；隔离 holdout，保证它们都没有提前见过最终考题。公平比较需要这两层约束同时成立。
+            </p>
+
+            <p>
+              随机切开文件也不自动等于独立。来自同一次会话的两个改写，或者同一个漏洞换一种说法，若分别落进 train 与 holdout，
+              候选仍可能提前见过答案模式。当前构建器只做 <code>random.shuffle</code> 后按位置切分，没有按会话或问题家族去重；
+              严谨运行还要先做语义去重或分组切分，并保存数据版本与随机种子。
+            </p>
+
+            <h3>3.4 当前命令实际走哪条路</h3>
+            <p>
+              把源码压成一条调用链后，来源、用途和打开时机就不会混在一起：
+            </p>
+
+            <pre><code class="language-python">if eval_source == "golden":
+    dataset = GoldenDatasetLoader.load(dataset_path)
+elif eval_source == "sessiondb":
+    dataset = build_dataset_from_external(...)
+elif eval_source == "synthetic":
+    dataset = SyntheticDatasetBuilder(config).generate(...)
+
+trainset = dataset.to_dspy_examples("train")
+valset = dataset.to_dspy_examples("val")
+optimized = optimizer.compile(baseline, trainset=trainset, valset=valset)
+
+# 搜索结束后才读取
+holdout = dataset.to_dspy_examples("holdout")</code></pre>
+
+            <p>
+              当前 CLI 的一次运行会在 <code>golden</code>、<code>sessiondb</code> 和 <code>synthetic</code> 中选择一条路径，
+              并不会自动把三类样本混成一个数据集；<code>sessiondb</code> 路径内部才会汇总三种会话来源。统一的
+              <code>EvalExample</code> 让未来混合或人工重组成为可能，但那是数据模型提供的空间，不是这段入口已经完成的动作。
+              真实调用见
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/evolve_skill.py#L79-L116">数据集分支</a>
+              与
+              <a href="https://github.com/NousResearch/hermes-agent-self-evolution/blob/0a929e3aa20e15cf04dc7c28492a7d41a5139125/evolution/skills/evolve_skill.py#L145-L228">优化和留出比较</a>。
+            </p>
+
+            <p>
+              到这里，优化开始前应准备好的东西已经具体了：每道题有任务与 rubric，整轮有固定运行条件，train 与 validation
+              可以参与搜索，holdout 不能泄漏。下一章才轮到另一个问题：这些数据已经能判断好坏，DSPy 怎样把 Skill 变成优化器真正可以替换的参数？
             </p>
 
             <h2>四、在理解 GEPA 之前，先看 DSPy 让什么变得可优化</h2>
@@ -300,6 +410,20 @@ dspy.Example(
             <p>
               <a href="https://arxiv.org/abs/2310.03714">DSPy</a>解决的正是这个中间问题。它不是某一种搜索算法，而是一套语言模型编程框架：
               先声明输入、输出和任务说明，再把一次或多次模型调用组成模块，最后用统一的样本与指标调用优化器。这样，“写提示词”就变成了“编译一个有参数的程序”。
+            </p>
+
+            <p>
+              在看类名之前，先把边界分成四格。前两格定义程序怎样工作，第三格才是优化器可以搜索的内容，最后一格只负责判断结果：
+            </p>
+
+            <pre><code class="language-text">固定输入输出字段：Signature
+固定执行结构：Module
+可被搜索的内容：显式注册的 instructions / demonstrations
+判断候选好坏：Example + metric</code></pre>
+
+            <p>
+              DSPy 不会任意改写 Python 控制流，也不会自动把任何字符串都当成可优化参数。只有被程序暴露出来的 instruction、示例等参数会进入搜索；
+              输入字段、Module 的调用结构和 metric 仍由开发者固定。后面所有源码都可以用“这一行属于哪一格”来读。
             </p>
 
             <figure class="figure">
@@ -405,6 +529,23 @@ compile -> 返回新程序</code></pre>
             <p>
               现在才轮到 GEPA。论文把目标写得很清楚：模型权重保持不变，搜索的是自然语言提示词。每轮从候选池里选一个父代，拿一小批样本执行，收集轨迹、分数和文字反馈，
               再让反思模型解释失败原因并提出新的提示词。新候选经过评测后回到池里，循环继续。
+            </p>
+
+            <p>
+              继续用资源泄漏题，一轮反思不是“让模型自由复盘”，而是下面这条可以重新执行的链：
+            </p>
+
+            <pre><code class="language-text">候选 P1 审查代码
+-> 漏掉提前 return 路径，得分低
+-> 反馈指出：找到资源获取点，却没有枚举所有退出路径
+-> 反思器把这条失败改写成更明确的审查步骤
+-> 得到候选 P2
+-> P1 与 P2 在同一小批题上重新执行
+-> 只有实际改善的候选才回到候选池</code></pre>
+
+            <p>
+              因此下面的图应按“执行、诊断、修改、复测”阅读。文字反馈负责提出改动方向，重新执行负责证明这次改动是否真的有效；
+              少了最后一步，反思只是一段听起来合理的自我解释。
             </p>
 
             <figure class="figure">
@@ -579,6 +720,21 @@ def forward(self, task_input):
             </p>
 
             <h2>七、当前源码走到哪里：原型已经成形，闭环还没有</h2>
+            <p>
+              回到 Hermes 仓库时，要把“文件存在”“进入主流程”和“目标闭环已证明”分开。固定快照里的状态可以先压成三层：
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>状态</th><th>当前可以确认的内容</th></tr></thead>
+                <tbody>
+                  <tr><td>已经进入主流程</td><td>读取 Skill、选择一种数据来源、构造 DSPy 样本、尝试优化、做留出比较并保存输出</td></tr>
+                  <tr><td>已有代码但没有接入目标路径</td><td>丰富的 LLM Judge、测试函数和 PR 配置存在，却没有成为本次候选搜索与交付的实际门</td></tr>
+                  <tr><td>目标路线尚未证明</td><td>GEPA 真正改写 Skill 正文、每个候选经过硬门控、通过后自动形成可审阅 PR</td></tr>
+                </tbody>
+              </table>
+            </div>
+
             <figure class="figure">
               <img
                 src="assets/implementation-boundary.png"
@@ -763,10 +919,18 @@ return min(1.0, max(0.0, score))</code></pre>
               <li><strong>让 metric 返回正确目标。</strong>优先使用可执行检查；开放任务再用 rubric judge，并把可操作的文字反馈交给 GEPA。</li>
               <li><strong>每个候选先过硬约束。</strong>完整 frontmatter、长度增长、测试和缓存边界都应在候选进入池前检查。</li>
               <li><strong>把异常留在正确层。</strong>GEPA 失败就保留失败，不用另一个优化器掩盖；回退必须是显式运行模式。</li>
-              <li><strong>最后只打开一次留出集。</strong>同时报告逐题结果、置信区间或重复运行，避免一个样本的百分比制造确定感。</li>
+              <li><strong>最后只打开一次留出集。</strong>同时报告逐题结果、关键旧任务是否退化、置信区间或重复运行，避免一个样本的百分比制造确定感。</li>
+              <li><strong>检查改进的代价。</strong>更高分不能靠不可接受的模型成本、token、工具调用或时延换来；这些预算也要和基线并排报告。</li>
               <li><strong>交付是 diff，不是覆盖。</strong>输出候选、基线、指标、失败案例和 PR，让人决定是否进入 Hermes Agent。</li>
               <li><strong>回到运行时仍要等下一轮。</strong>通过评测的 Skill 在安全边界刷新，不能在当前会话中途改变稳定提示前缀。</li>
             </ol>
+
+            <pre><code class="language-text">未见题上稳定提升
++ 关键旧能力没有退化
++ 成本与时延仍在预算内
++ 数据、配置和候选可以重放
++ 旧版本可以回滚
+= 有资格交给人决定是否交付</code></pre>
 
             <p>
               做完这些，第一篇与第二篇才真正闭合：运行时从真实任务里发现值得沉淀的经验，离线流程把某个 Skill 当成有版本的 artifact 做实验，
