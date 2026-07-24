@@ -20,7 +20,7 @@
     <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/hermes-agent/zh/" />
     <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/hermes-agent/en/" />
     <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/hermes-agent/" />
-    <link rel="stylesheet" href="../styles.css?v=hermes-series-3" />
+    <link rel="stylesheet" href="../styles.css?v=hermes-series-4" />
   <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
   <link rel="stylesheet" href="../../assets/code-highlight.css?v=1" />
   </head>
@@ -720,44 +720,265 @@ finally:
 
             <h3>6.3 Curator is long-term maintenance, not per-turn reflection</h3>
             <p>
-              Background review answers "did this turn reveal something worth saving?" Curator answers a different
-              question: "is the skill library still healthy after many turns?" Some skills are active, some are stale,
-              some overlap, and some need patching or archiving. A curator pass therefore has two phases: deterministic
-              lifecycle maintenance first, semantic consolidation second.
+              Background review asks whether one completed turn revealed something worth saving. Months later, the
+              problem changes shape. A library may contain "generate code before testing," "refresh generated files
+              before testing," and "rerun tests after a schema change" as three separate skills. Every one may come from
+              a real success, but keeping all three forever may make retrieval worse. Another rarely used skill may
+              still be important and should not disappear merely because its task has not appeared recently. Curator
+              handles maintenance pressure that becomes visible only across many turns.
             </p>
 
+            <h4>6.3.1 It wakes on periodic entry-point checks, not after every turn</h4>
             <p>
-              The order is explicit in <code>run_curator_review</code>:
+              Curator does not sit on the finalizer-to-background-review path above. The CLI checks at new-session
+              startup, while a long-running Gateway asks from its housekeeping loop once an hour. Whether a pass
+              actually starts is then decided by <code>maybe_run_curator</code> and <code>should_run_now</code>:
             </p>
 
-            <pre><code class="language-python"># Phase 1: deterministic lifecycle maintenance
-counts = apply_automatic_transitions(now=start)
-state["last_run_at"] = start.isoformat()
-save_state(state)
-
-# Phase 2: semantic review only when candidates exist
-candidate_list = _render_candidate_list()
-if "No agent-created skills" not in candidate_list:
-    llm_meta = _run_llm_review(prompt)</code></pre>
+            <pre><code class="language-text">CLI session starts / Gateway polls hourly
+  -> is curator.enabled true?
+  -> is the curator paused?
+  -> has interval_hours elapsed since last_run_at?
+  -> has the caller reported at least min_idle_hours of idle time?
+  -> yes: start one Curator run
+  -> no: stop this check without reading or changing skills</code></pre>
 
             <p>
-              Phase one needs no model. Pinned skills remain untouched; long-unused active skills become stale and later
-              archived; renewed activity can reactivate a stale skill. Phase two gives the candidate list to a restricted
-              agent that may decide to pin, archive, consolidate, or patch. See
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L255-L310"><code>apply_automatic_transitions</code></a>
+              The defaults are a seven-day interval and a two-hour idle gate. On the first observation of an install
+              with no Curator history, Hermes only seeds <code>last_run_at</code> and waits a full interval. It does not
+              reorganize the library immediately after an update. A manual <code>hermes curator run</code> bypasses
+              this periodic gate. See the
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/cli.py#L13249-L13264">CLI startup hook</a>,
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/gateway/run.py#L20184-L20198">Gateway poll</a>,
               and
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L1407-L1530"><code>run_curator_review</code></a>.
-              Pure rules avoid asking a model to reinvent inactivity thresholds; model judgment remains available for
-              relationships that timestamps cannot explain.
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/agent/curator.py#L219-L269"><code>should_run_now</code></a>.
+            </p>
+
+            <h4>6.3.2 Phase one applies time thresholds without a model</h4>
+            <p>
+              Hermes keeps operational telemetry out of <code>SKILL.md</code>. A sidecar at
+              <code>~/.hermes/skills/.usage.json</code> records how often a skill was actually loaded or referenced,
+              viewed with <code>skill_view</code>, and patched, plus the latest time for each event.
+              <code>last_activity_at</code> is the newest of <code>last_used_at</code>,
+              <code>last_viewed_at</code>, and <code>last_patched_at</code>:
+            </p>
+
+            <pre><code class="language-json">{
+  "generated-code-testing": {
+    "use_count": 12,
+    "view_count": 4,
+    "patch_count": 2,
+    "last_used_at": "2026-04-10T09:00:00Z",
+    "last_viewed_at": "2026-04-12T08:00:00Z",
+    "last_patched_at": "2026-03-28T18:00:00Z",
+    "state": "active",
+    "pinned": false
+  }
+}</code></pre>
+
+            <p>
+              This record's latest activity is April 12. Counter updates and timestamp derivation live in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/tools/skill_usage.py#L611-L643"><code>bump_view</code>, <code>bump_use</code>, and <code>bump_patch</code></a>
+              and
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/tools/skill_usage.py#L146-L176">activity derivation</a>.
+              The lifecycle is not four mutually exclusive states. It has three states plus one orthogonal protection
+              flag:
+            </p>
+
+            <div class="table-wrap">
+              <table class="curator-state-table">
+                <thead>
+                  <tr>
+                    <th>State or flag</th>
+                    <th>Discoverable by later work?</th>
+                    <th>How it enters</th>
+                    <th>How it leaves</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>active</code></td>
+                    <td>Yes</td>
+                    <td>Creation, restoration, or renewed activity after stale</td>
+                    <td>Becomes stale after 30 inactive days by default</td>
+                  </tr>
+                  <tr>
+                    <td><code>stale</code></td>
+                    <td>Yes. Its directory remains in the normal skill tree</td>
+                    <td>Crosses <code>stale_after_days</code></td>
+                    <td>Returns active after activity and the next pass, or ages into archive</td>
+                  </tr>
+                  <tr>
+                    <td><code>archived</code></td>
+                    <td>No. Its directory moves under <code>skills/.archive/</code></td>
+                    <td>Crosses 90 inactive days by default, or is manually archived</td>
+                    <td><code>hermes curator restore &lt;name&gt;</code> restores it as active</td>
+                  </tr>
+                  <tr>
+                    <td><code>pinned</code></td>
+                    <td>Yes; pin does not replace active or stale, and is not a fourth state</td>
+                    <td>The user explicitly pins it</td>
+                    <td>The user unpins it; automatic transitions skip it while set</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Phase one walks these records and applies one configured threshold policy. Reduced to its decision shape,
+              the source reads like this:
+            </p>
+
+            <pre><code class="language-python">anchor = newest(last_used_at, last_viewed_at, last_patched_at)
+anchor = anchor or created_at
+
+if skill.pinned or skill.referenced_by_cron:
+    continue
+if now - anchor >= archive_after:
+    archive(skill)                 # move to .archive; recoverable
+elif now - anchor >= stale_after and skill.state == "active":
+    skill.state = "stale"
+elif now - anchor &lt; stale_after and skill.state == "stale":
+    skill.state = "active"</code></pre>
+
+            <p>
+              Follow <code>generated-code-testing</code> through time. It is used on day 10. A Curator pass on day 41
+              sees 31 inactive days and changes active to stale, but the skill remains discoverable. Work views or uses
+              it again on day 45, updating the timestamp; the next Curator pass restores active. If nothing touches it
+              after day 45, it becomes stale again on day 76 and is only archived after day 135. The complete transition
+              and new-skill grace logic is in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/agent/curator.py#L291-L369"><code>apply_automatic_transitions</code></a>.
             </p>
 
             <p>
-              Curator is not a per-turn cleanup pass. <code>should_run_now</code> checks enabled, paused, and interval
-              gates. First observation records <code>last_run_at</code> and waits a full interval before the first real
-              pass. A manual dry-run skips automatic transitions and tells the model to report without mutating the
-              library. Those boundaries are visible in
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L198-L248"><code>should_run_now</code></a>
-              and the <code>run_curator_review</code> path above.
+              The candidate set is not every skill on disk. Skills autonomously created and marked by background review
+              qualify. With <code>prune_builtins: true</code>, bundled built-ins also receive time-based maintenance,
+              but their first observation only seeds a clock. Hub-installed, external-directory, and protected built-in
+              skills remain outside the set. Skills referenced by cron jobs and pinned skills skip automatic
+              transitions. See
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/tools/skill_usage.py#L330-L382">candidate enumeration</a>.
+            </p>
+
+            <h4>6.3.3 This is neither LRU nor LFU</h4>
+            <p>
+              "Recently used," "frequency," and "archive" sound like cache eviction, but Curator has no rule saying a
+              full library must evict one entry. It does not rank every skill and sacrifice the last one. Phase one is
+              better understood as an independent lifecycle clock for each skill:
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Question</th>
+                    <th>LRU / LFU cache</th>
+                    <th>Hermes Curator phase one</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>When removal happens</td>
+                    <td>Usually under capacity or memory pressure</td>
+                    <td>When a periodic pass finds one skill beyond its time threshold</td>
+                  </tr>
+                  <tr>
+                    <td>Primary signal</td>
+                    <td>Global recency order or global frequency</td>
+                    <td>That skill's latest use, view, or patch timestamp</td>
+                  </tr>
+                  <tr>
+                    <td>Global ranking required?</td>
+                    <td>Yes, to choose a victim</td>
+                    <td>No; many skills may remain active, become stale, or archive together</td>
+                  </tr>
+                  <tr>
+                    <td>Is removal destructive?</td>
+                    <td>A cache entry is usually dropped and rebuilt from its source</td>
+                    <td>The directory moves to <code>.archive</code> and can be restored or rolled back</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Status and the semantic candidate list expose <code>use_count</code>, <code>view_count</code>, and
+              <code>patch_count</code>, but automatic stale/archive decisions do not sort by frequency.
+              <code>use_count == 0</code> only adds a grace rule: a newly created skill whose trigger has not appeared
+              must survive at least the stale window. Zero frequency is absence of evidence, not an immediate LFU
+              eviction signal.
+            </p>
+
+            <h4>6.3.4 Phase two is optional semantic consolidation</h4>
+            <p>
+              Timestamps can say how long a skill has been quiet; they cannot say whether three testing skills belong in
+              one reusable procedure. Phase two therefore renders each candidate's state, pin and cron flags, counters,
+              and latest activity for a restricted auxiliary agent to inspect. In the current source,
+              <code>consolidate</code> defaults to <code>false</code>. A normal automatic pass only runs phase one.
+              The model pass costs tokens only after setting <code>curator.consolidate: true</code> or manually running
+              <code>hermes curator run --consolidate</code>.
+            </p>
+
+            <pre><code class="language-python">counts = apply_automatic_transitions(now=start)  # phase one always runs
+
+if not consolidate:
+    write_report("llm: skipped (consolidation off)")
+    return
+
+candidate_list = _render_candidate_list()
+if candidate_list:
+    llm_meta = _run_llm_review(candidate_list)   # phase two is optional</code></pre>
+
+            <p>
+              Return to the three testing skills. The auxiliary agent must inspect complete skill packages rather than
+              merge on name similarity. If they implement one class of workflow, it may choose or create a
+              <code>generated-code-testing</code> umbrella, preserve unique details in its body,
+              <code>references/</code>, <code>templates/</code>, or <code>scripts/</code>, and then archive the absorbed
+              source directories. It can patch a drifting skill, consolidate overlapping skills, keep an already broad
+              umbrella, or archive genuinely obsolete content. The model does not reinvent inactivity thresholds.
+            </p>
+
+            <pre><code class="language-text">before
+  test-after-codegen
+  refresh-generated-files
+  pytest-schema-change
+
+semantic decision
+  all three serve generated-code validation
+  each still contains a distinct tool, failure signal, or command
+
+after
+  generated-code-testing/
+    SKILL.md
+    references/schema-change.md
+    scripts/verify-generated-files.sh
+  old directories -> skills/.archive/ (absorbed_into recorded; recoverable)</code></pre>
+
+            <p>
+              A pin is a user-owned safety fence, not an excellence grade the model may award; phase two must skip pinned
+              skills. Bundled built-ins may only be archived when pruning is enabled, not rewritten into umbrellas.
+              Hub and external skills remain out of bounds. The consolidation gate and ordering are in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/agent/curator.py#L1480-L1623"><code>run_curator_review</code></a>,
+              and the rendered fields are in
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/agent/curator.py#L1458-L1477"><code>_render_candidate_list</code></a>.
+            </p>
+
+            <h4>6.3.5 What later work observes</h4>
+            <p>
+              Before a real mutating pass, Curator makes a best-effort snapshot of <code>~/.hermes/skills/</code>. It then writes state,
+              transitions, consolidation destinations, tool calls, and recovery data under
+              <code>~/.hermes/logs/curator/&lt;timestamp&gt;/</code>. Active and stale directories remain in the normal
+              skill tree, so later discovery can still see both. Archived directories live under <code>.archive</code>
+              and leave the normal discovery path. A new umbrella becomes available when later work rebuilds or queries
+              the skill catalog; none of these writes reaches backward into the turn that was already delivered.
+            </p>
+
+            <p>
+              <code>hermes curator run --dry-run</code> is the safety preview. It skips automatic state mutations,
+              instructs the model to report without write tools, and does not advance the scheduled
+              <code>last_run_at</code>. After a real pass, one archived skill can be restored or the pre-run snapshot can
+              roll back the whole maintenance pass. The two phases now have separate questions: phase one asks where a
+              skill sits in its lifecycle; phase two asks how the knowledge that remains worth keeping should be
+              organized.
             </p>
 
             <p>

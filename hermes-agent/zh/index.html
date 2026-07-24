@@ -20,7 +20,7 @@
     <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/hermes-agent/zh/" />
     <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/hermes-agent/en/" />
     <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/hermes-agent/" />
-    <link rel="stylesheet" href="../styles.css?v=hermes-series-3" />
+    <link rel="stylesheet" href="../styles.css?v=hermes-series-4" />
   <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
   <link rel="stylesheet" href="../../assets/code-highlight.css?v=1" />
   </head>
@@ -671,40 +671,247 @@ finally:
 
             <h3>6.3 Curator：不是每轮反思，而是长期整理</h3>
             <p>
-              Background review 解决的是“这一轮之后是否有东西要沉淀”。但如果 agent 长期运行，skills 会越来越多：有的被频繁使用，
-              有的过期了，有的其实可以合并。这时需要的不是再看某一轮对话，而是整理整个技能库。Hermes 的 curator 把一次维护再拆成两段：
-              先用确定性规则处理生命周期，再让模型判断语义上是否需要合并或修补。
+              Background review 解决的是“这一轮之后是否有东西值得保存”。但运行几个月后，问题会换一种形态：技能库里可能同时出现
+              “修改 schema 后先生成代码再测试”“生成文件变化后重跑测试”“测试前刷新 generated files”三条 Skill。它们都可能来自真实成功经验，
+              却未必应该永远作为三份独立说明存在；与此同时，还有一些 Skill 只是暂时少用，不能因为最近没有碰到对应任务就立刻删除。
+              Curator 处理的正是这类<strong>跨很多轮才显现</strong>的维护问题。
             </p>
 
+            <h4>6.3.1 它什么时候醒来：不是每轮结束，而是入口定期检查</h4>
             <p>
-              这个两阶段顺序在 <code>run_curator_review</code> 里非常清楚：
+              Curator 不挂在前面那条 finalizer → background review 链上。CLI 会在新会话启动时检查一次，长期运行的 Gateway 则在 housekeeping
+              循环里每小时询问一次；真正是否运行，再由 <code>maybe_run_curator</code> 和 <code>should_run_now</code> 共同决定。把这条触发链先展开，
+              后面的“两阶段”就不会误读成每个 turn 都执行两遍：
             </p>
 
-            <pre><code class="language-python"># Phase 1: deterministic lifecycle maintenance
-counts = apply_automatic_transitions(now=start)
-state["last_run_at"] = start.isoformat()
-save_state(state)
-
-# Phase 2: semantic review only when candidates exist
-candidate_list = _render_candidate_list()
-if "No agent-created skills" not in candidate_list:
-    llm_meta = _run_llm_review(prompt)</code></pre>
+            <pre><code class="language-text">CLI 新会话启动 / Gateway 每小时轮询
+  -> curator.enabled 是否开启？
+  -> 是否被 paused？
+  -> 距离 last_run_at 是否已过 interval_hours？
+  -> 调用方报告的空闲时间是否达到 min_idle_hours？
+  -> 是：启动一次 Curator run
+  -> 否：本次检查结束，不读取也不改写 Skill</code></pre>
 
             <p>
-              第一阶段不需要模型：pinned skill 保持不动；长期未使用的 active skill 变成 stale，再久则 archived；stale skill 如果重新被使用，还可以回到 active。
-              第二阶段才把候选清单交给受限 agent，判断 pin、archive、consolidate 或 patch。源码分别见
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L255-L310"><code>apply_automatic_transitions</code></a>
+              默认间隔是 7 天，默认空闲门槛是 2 小时。首次看到一个从未运行过 Curator 的安装时，Hermes 只把
+              <code>last_run_at</code> 记为当前时间，再等待完整的一个间隔，并不会刚升级就立即整理技能库。手动执行
+              <code>hermes curator run</code> 才会绕过这条定期检查。触发入口见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/cli.py#L13249-L13264">CLI 启动钩子</a>、
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/gateway/run.py#L20184-L20198">Gateway 轮询</a>
               和
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L1407-L1530"><code>run_curator_review</code></a>。
-              把机械清理交给纯规则，可以避免模型每次都重新发明“多久算过期”；把合并和修补留给语义判断，又避免只凭时间戳处理内容关系。
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/agent/curator.py#L219-L269"><code>should_run_now</code></a>。
+            </p>
+
+            <h4>6.3.2 第一阶段：按时间阈值维护生命周期，不调用模型</h4>
+            <p>
+              Hermes 不把使用统计写进 <code>SKILL.md</code>，而是放在 <code>~/.hermes/skills/.usage.json</code> 这个旁路记录里。
+              对每条 Skill，它分别记录“真正加载或引用了多少次”“用 <code>skill_view</code> 看过多少次”“被 patch 过多少次”，以及三种行为最近发生的时间。
+              <code>last_activity_at</code> 不是第四个独立计时器，而是 <code>last_used_at</code>、<code>last_viewed_at</code>、
+              <code>last_patched_at</code> 中最新的一个：
+            </p>
+
+            <pre><code class="language-json">{
+  "generated-code-testing": {
+    "use_count": 12,
+    "view_count": 4,
+    "patch_count": 2,
+    "last_used_at": "2026-04-10T09:00:00Z",
+    "last_viewed_at": "2026-04-12T08:00:00Z",
+    "last_patched_at": "2026-03-28T18:00:00Z",
+    "state": "active",
+    "pinned": false
+  }
+}</code></pre>
+
+            <p>
+              因此这条记录的最后活动时间是 4 月 12 日。计数更新和时间合并分别在
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/tools/skill_usage.py#L611-L643"><code>bump_view</code>、<code>bump_use</code>、<code>bump_patch</code></a>
+              与
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/tools/skill_usage.py#L146-L176">活动时间计算</a>。
+              Curator 的生命周期不是四个互斥状态，而是<strong>三个状态加一个保护开关</strong>：
+            </p>
+
+            <div class="table-wrap">
+              <table class="curator-state-table">
+                <thead>
+                  <tr>
+                    <th>状态或标记</th>
+                    <th>仍会被后续任务发现吗</th>
+                    <th>怎样进入</th>
+                    <th>怎样离开</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>active</code></td>
+                    <td>会</td>
+                    <td>新建、恢复，或 stale 后重新出现近期活动</td>
+                    <td>默认连续 30 天无活动后变成 stale</td>
+                  </tr>
+                  <tr>
+                    <td><code>stale</code></td>
+                    <td>会。目录仍在正常 Skill 路径中</td>
+                    <td>超过 <code>stale_after_days</code></td>
+                    <td>再次活动后在下一次 Curator run 回到 active；继续闲置则归档</td>
+                  </tr>
+                  <tr>
+                    <td><code>archived</code></td>
+                    <td>不会。目录被移到 <code>skills/.archive/</code></td>
+                    <td>默认连续 90 天无活动，或人工归档</td>
+                    <td><code>hermes curator restore &lt;name&gt;</code> 恢复为 active</td>
+                  </tr>
+                  <tr>
+                    <td><code>pinned</code></td>
+                    <td>会；pin 不改变 active / stale，它不是第四种状态</td>
+                    <td>用户显式 pin</td>
+                    <td>用户显式 unpin；开启时自动迁移直接跳过它</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              第一阶段逐条读取这份记录，用同一套可配置阈值做迁移。下面是贴近源码、删去异常处理后的判断顺序：
+            </p>
+
+            <pre><code class="language-python">anchor = newest(last_used_at, last_viewed_at, last_patched_at)
+anchor = anchor or created_at
+
+if skill.pinned or skill.referenced_by_cron:
+    continue
+if now - anchor >= archive_after:
+    archive(skill)                 # 移到 .archive，可恢复
+elif now - anchor >= stale_after and skill.state == "active":
+    skill.state = "stale"
+elif now - anchor &lt; stale_after and skill.state == "stale":
+    skill.state = "active"</code></pre>
+
+            <p>
+              继续用 <code>generated-code-testing</code>：第 10 天被使用，最后活动时间更新为第 10 天；第 41 天运行 Curator 时，
+              因为已经 31 天没有活动，它从 active 变成 stale，但仍可被发现；第 45 天任务再次查看或使用它，时间戳更新，
+              下一次 Curator run 会把它恢复为 active；如果从第 45 天起一直没有活动，第 76 天会再次 stale，第 136 天超过 90 天后才 archived。
+              源码中的完整迁移与“新 Skill 不立即归档”的宽限逻辑见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/agent/curator.py#L291-L369"><code>apply_automatic_transitions</code></a>。
             </p>
 
             <p>
-              Curator 也不是“每轮都整理一次技能”。<code>should_run_now</code> 会检查 enabled、paused 和 interval gate；首次观察只记录
-              <code>last_run_at</code>，等待完整周期后才真正运行。手动 dry-run 则跳过自动迁移，并要求模型只生成报告、不修改技能库。
-              这些门槛见
-              <a href="https://github.com/NousResearch/hermes-agent/blob/3edd09a46f721c19e47ab39aad08ce8d3e61ee20/agent/curator.py#L198-L248"><code>should_run_now</code></a>
-              和上面的 <code>run_curator_review</code>。
+              候选也不是“磁盘里所有 Skill”。Agent 在后台 review 中自主创建并标记的 Skill 会进入；配置
+              <code>prune_builtins: true</code> 时，bundled built-ins 也会进入时间维护，但第一次看到只建立基线，不会立刻归档。
+              Hub 安装、外部目录和受保护的内置 Skill 不进入候选；被 cron job 引用的 Skill 与 pinned Skill 一样跳过自动迁移。
+              候选范围见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/tools/skill_usage.py#L330-L382">候选枚举</a>。
+            </p>
+
+            <h4>6.3.3 所以它不是 LRU，也不是 LFU</h4>
+            <p>
+              “最近使用”“使用次数”“归档”这些词很像缓存淘汰，但 Curator 没有“容量满了必须赶走一个条目”的前提，也不会把全部 Skill 排名后淘汰最后一名。
+              更准确地说，第一阶段是<strong>每条 Skill 独立计时的生命周期规则</strong>，接近带恢复通道的时间阈值管理：
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>问题</th>
+                    <th>LRU / LFU 缓存</th>
+                    <th>Hermes Curator 第一阶段</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>什么时候淘汰</td>
+                    <td>通常在容量或内存压力出现时</td>
+                    <td>定期检查到单条 Skill 超过时间阈值时</td>
+                  </tr>
+                  <tr>
+                    <td>主要决策信号</td>
+                    <td>LRU 看全局最近次序，LFU 看全局频率</td>
+                    <td>看该 Skill 最近一次 use / view / patch 的时间</td>
+                  </tr>
+                  <tr>
+                    <td>是否需要全局排名</td>
+                    <td>需要从候选中选牺牲者</td>
+                    <td>不需要；多条 Skill 可以同时不变、stale 或 archived</td>
+                  </tr>
+                  <tr>
+                    <td>移除是否不可逆</td>
+                    <td>缓存条目通常直接丢弃并可从源重建</td>
+                    <td>只移动到 <code>.archive</code>，可以 restore 或整体 rollback</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              <code>use_count</code>、<code>view_count</code> 和 <code>patch_count</code> 会出现在 status 与候选清单里，便于人和第二阶段理解活跃程度；
+              但自动 stale / archive 并不按频率排序。<code>use_count == 0</code> 只触发一个保护：刚创建、还没等到合适任务的 Skill，
+              至少先活过 stale 窗口，不能因为“零次使用”立即归档。这就是它与 LFU 最容易混淆、也最需要分开的地方。
+            </p>
+
+            <h4>6.3.4 第二阶段：可选的语义合并，不是默认必跑</h4>
+            <p>
+              时间戳能判断“多久没碰”，却不能判断三条测试 Skill 是否应该合成一条。因此 Curator 才保留第二阶段：把
+              <code>state</code>、<code>pinned</code>、cron 引用、use / view / patch 计数和最后活动时间渲染成候选清单，
+              再让一个受限的辅助 agent 阅读内容关系。但当前源码里 <code>consolidate</code> 默认是 <code>false</code>：
+              普通自动运行只做第一阶段；只有配置 <code>curator.consolidate: true</code>，或手动运行
+              <code>hermes curator run --consolidate</code>，才会付出模型调用成本。
+            </p>
+
+            <pre><code class="language-python">counts = apply_automatic_transitions(now=start)  # Phase 1 总会执行
+
+if not consolidate:
+    write_report("llm: skipped (consolidation off)")
+    return
+
+candidate_list = _render_candidate_list()
+if candidate_list:
+    llm_meta = _run_llm_review(candidate_list)   # Phase 2 可选</code></pre>
+
+            <p>
+              仍以三条测试 Skill 为例。辅助 agent 不是看到名字相似就删除，而是先读取完整 Skill package，判断它们是否属于同一类可复用流程。
+              如果确实重叠，它可以选择或创建一条 <code>generated-code-testing</code> umbrella Skill，把各自独有的步骤写进正文、
+              <code>references/</code>、<code>templates/</code> 或 <code>scripts/</code>，再把已吸收内容的旧目录归档；如果只是某条说明漂移，
+              就 patch 那条 Skill；如果内容已经无效且没有合并去向，才做可恢复的 prune。换句话说，第二阶段的结果是
+              <strong>keep、patch、consolidate 或 archive</strong>，不是让模型重新计算过期天数。
+            </p>
+
+            <pre><code class="language-text">合并前
+  test-after-codegen
+  refresh-generated-files
+  pytest-schema-change
+
+语义判断
+  三者共享“生成代码变化后的验证流程”
+  但各自保留不同工具、失败信号和命令
+
+合并后
+  generated-code-testing/
+    SKILL.md
+    references/schema-change.md
+    scripts/verify-generated-files.sh
+  三个旧目录 -> skills/.archive/（记录 absorbed_into，可恢复）</code></pre>
+
+            <p>
+              <code>pinned</code> 不是模型可随意授予的“优秀等级”，而是用户设置的保护栏；第二阶段必须跳过 pinned Skill。
+              bundled built-ins 在允许清理时最多被归档，不参与内容合并；Hub 与外部目录仍然完全越界。模型阶段的开关和执行顺序见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/agent/curator.py#L1480-L1623"><code>run_curator_review</code></a>，
+              候选字段见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/513dba42e6a066fd55edd7833bf807afee8da637/agent/curator.py#L1458-L1477"><code>_render_candidate_list</code></a>。
+            </p>
+
+            <h4>6.3.5 整理完成后，谁会看见什么</h4>
+            <p>
+              真正修改前，Curator 会 best-effort 地先尝试为 <code>~/.hermes/skills/</code> 做快照；运行后再把状态、迁移、合并去向、工具调用和恢复信息写入
+              <code>~/.hermes/logs/curator/&lt;timestamp&gt;/</code>。active 与 stale 的目录仍在正常 Skill 树里，所以后续重新扫描技能目录时都能看见；
+              archived 目录位于 <code>.archive</code>，会退出正常发现路径。合并产生的 umbrella Skill 也从后续技能发现开始可用，
+              但不会穿越时间去改写已经交付的当前回合。
+            </p>
+
+            <p>
+              不放心时可以先运行 <code>hermes curator run --dry-run</code>：它跳过自动状态写入，并要求模型只报告、不调用任何修改工具；
+              dry-run 也不会推进正式运行的 <code>last_run_at</code>。如果正式整理结果不对，既可以 restore 单条 archived Skill，
+              也可以用 pre-run snapshot 回滚整次维护。于是“两阶段”的边界就很清楚了：第一阶段只回答“这条 Skill 在生命周期的哪一段”，
+              第二阶段只回答“这些仍值得保留的知识应该怎样组织”。
             </p>
 
             <p>
