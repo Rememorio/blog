@@ -173,16 +173,30 @@
               <a href="https://github.com/microsoft/agent-framework/blob/a9e5f6d7985a555d042ff807995da7ca908f86d2/README.md#L12-L35">MAF README overview</a>。
             </p>
 
-            <h2>三、同一份报告怎样从对话原型走到生产</h2>
+            <h2>三、同一份报告，用两套实现各跑一次</h2>
+            <p>
+              这里比较的是<strong>同一个逻辑任务的两次独立实现</strong>，不是一个运行先进入 AutoGen、做到一半再迁移到 MAF。
+              AutoGen 原型用于看清角色消息和团队规则；MAF 生产版重新实现同一业务目标，把审批、checkpoint 和发布回执放进显式 Workflow。
+            </p>
+            <h3>3.1 AutoGen 原型运行</h3>
             <ol>
-              <li>用户提交“调研三家竞品并给出建议”，消息运行时先把任务交给研究员。</li>
+              <li>用户提交“调研三家竞品并给出建议”，这里选择一个明确的 AgentChat Team pattern，并调用 <code>team.run(...)</code>。</li>
               <li>研究员完成检索后发出结果，团队对话规则把结果转交给写作者。</li>
-              <li>写作者生成草稿，负责人收到审核请求；到这里，AutoGen 已经能把协作关系跑通。</li>
-              <li>进入生产后，请求先由 MAF 的 Hosting 接收，不同渠道共用同一套 Agent 和工作流。</li>
-              <li>工作流把“检索、写作、审核、发布”记成明确步骤，并在人工审核前保存 checkpoint。</li>
-              <li>负责人晚些时候补充意见，工作流从 checkpoint 继续，而不是重新调研和写作。</li>
-              <li>即使服务中途重启，session 与 checkpoint 仍能告诉系统：这是哪个用户的任务，现在应该从哪里恢复。</li>
+              <li>写作者生成草稿，负责人收到审核消息；团队达到终止条件，本次原型运行结束。</li>
+              <li>如果应用需要稍后恢复，由应用在合适时机调用 <code>save_state</code>、持久化结果，并在新进程中先 <code>load_state</code>。</li>
             </ol>
+            <h3>3.2 MAF 生产运行</h3>
+            <ol>
+              <li>新的请求由 MAF Hosting 接收；本例的 host target 明确是 <code>Workflow</code>，不是在 Agent 与 Workflow 之间临时二选一。</li>
+              <li>Workflow 把“检索、写作、审核、发布”记成步骤，在人工审核前产生 request-info 并保存 checkpoint。</li>
+              <li>负责人晚些时候补充意见，调用方用 responses 或 checkpoint id 恢复同一 Workflow。</li>
+              <li>发布 executor 在批准后执行外部发布，保存回执；只有回执成功，报告才从 approved 进入 published。</li>
+            </ol>
+            <p>
+              服务重启后的恢复还有前提：Hosting 必须配置持久化 checkpoint storage（例如相应的
+              <code>state_dir</code>/<code>checkpoint_location</code>）和稳定 isolation key。默认只在内存里的状态会随进程退出丢失，
+              不能因为 API 里出现 checkpoint 字段就宣称天然跨进程恢复。
+            </p>
 
             <div class="note key-point">
               <p>
@@ -218,11 +232,11 @@
     -&gt; embedded runtime publishes messages
     -&gt; team save_state / load_state
 
-MAF production route
+MAF production route (a separate implementation)
   channel request
     -&gt; AgentFrameworkHost
     -&gt; ChannelContext.run_stream(...)
-    -&gt; Agent.run(session=...) or Workflow.run(checkpoint_id/responses=...)
+    -&gt; Workflow.run(message=...) or Workflow.run(checkpoint_id/responses=...)
     -&gt; status / request_info / checkpoint events
     -&gt; channel response and durable recovery point</code></pre>
             <p>
@@ -378,6 +392,13 @@ MAF production route
               证据在
               <a href="https://github.com/microsoft/autogen/blob/027ecf0a379bcc1d09956d46d12d44a3ad9cee14/README.md#L104-L154">AutoGen AgentTool 示例</a>。
             </p>
+            <h3>7.1 AutoGen 的恢复 owner 仍在应用</h3>
+            <p>
+              <code>pause/resume</code> 改变当前 Team 的运行状态，<code>save_state/load_state</code> 则提供状态导出和导入能力；
+              但“何时保存、保存到哪里、进程重启后先装载哪份状态”仍由应用决定。这个边界与后面的 MAF Hosting 不同：
+              Hosting 可以为 Workflow 配置 checkpoint owner，但只有配置了持久存储和隔离键时，重启恢复才成立。
+              两边都出现 state API，不代表 durability owner 相同。
+            </p>
 
             <h2>八、MAF 的 Agent 是 client、tool、session 的组合面</h2>
             <p>
@@ -509,6 +530,12 @@ MAF production route
               和
               <a href="https://github.com/microsoft/agent-framework/blob/a9e5f6d7985a555d042ff807995da7ca908f86d2/python/packages/orchestrations/agent_framework_orchestrations/_orchestration_request_info.py#L168-L235"><code>AgentApprovalExecutor</code></a>。
             </p>
+            <p>
+              对报告任务来说，这里只完成了“草稿是否获准”的判断，还没有发布。一个单独的 publisher executor
+              应消费 approved draft：补充意见会把草稿退回写作者，拒绝会终止发布，批准才允许调用外部发布接口。
+              外部系统返回 <code>publication_id</code> 后，Workflow 才把状态写成 published。草稿被<strong>产出</strong>、
+              负责人<strong>验证</strong>、发布系统<strong>采用</strong>，不能被一个 approve 动作压成同一状态。
+            </p>
 
             <p>
               group chat 同样没有回到 AutoGen 的 topic runtime，而是用 orchestrator 和 workflow graph 表达。
@@ -540,6 +567,11 @@ MAF production route
               <a href="https://github.com/microsoft/agent-framework/blob/a9e5f6d7985a555d042ff807995da7ca908f86d2/python/packages/hosting/agent_framework_hosting/_host.py#L544-L634"><code>AgentFrameworkHost.__init__</code></a>
               和
               <a href="https://github.com/microsoft/agent-framework/blob/a9e5f6d7985a555d042ff807995da7ca908f86d2/python/packages/hosting/agent_framework_hosting/_host.py#L667-L691">checkpoint ownership</a>。
+            </p>
+            <p>
+              这里的“可以配置”是关键限定。Hosting dispatch 会按 target 类型选择 Agent 或 Workflow；本文的生产报告选择 Workflow。
+              若 <code>state_dir=None</code> 且没有外部 checkpoint storage，host 管理的相关状态仍停留在内存，进程退出后不能恢复。
+              所以 production-ready 的结论必须带着存储、isolation key、重启测试和外部发布幂等性一起验收。
             </p>
 
             <p>
