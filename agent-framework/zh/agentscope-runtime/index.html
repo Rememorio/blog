@@ -139,6 +139,11 @@
               这个路径是否允许读取？要不要先问用户？工具是在当前进程里跑，还是交给浏览器或远端 worker？
               如果等待确认时页面刷新，回来以后还能不能继续？
             </p>
+            <p>
+              这里先把问题限定准确：源码能直接证明的是<strong>同一个 Agent runtime 怎样暂停并接收确认结果</strong>。
+              浏览器重连、进程重启和 provider continuation 是另外三种恢复层级；只有外层服务把 pending tool state
+              与 reply 身份持久化并重新关联时，“刷新后继续”才成立。后文不会用一个 <code>RedisStorage</code> 类名替代这条端到端证据。
+            </p>
 
             <p>
               一个“输入文字、返回最终文字”的接口回答不了这些问题。应用必须看见中间状态，确认结果必须能回到原来的回复，
@@ -303,6 +308,28 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               这样看，<code>reply_stream</code> 的价值就不只是“可以流式显示”。它让一次 reply 有自己的局部状态：
               工具调用可以暂停，确认结果可以回灌，外部执行可以稍后返回，最终写进 <code>Msg</code> 账本后再进入下一轮模型输入。
             </p>
+            <h3>4.1 同一个 <code>call_7</code> 的三条结局</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>决定</th>
+                    <th>记录怎样变化</th>
+                    <th>下一轮看到什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td>allow</td><td>state 进入 executing，本地或外部 owner 执行工具</td><td><code>ToolResultBlock(call_7, output)</code></td></tr>
+                  <tr><td>ask → confirm</td><td>保存 asking 与确认事件，恢复时仍匹配 <code>reply_42 / call_7</code></td><td>确认后才执行，并写回同一个 call id</td></tr>
+                  <tr><td>deny 或参数无效</td><td>不执行，把拒绝或校验错误写成 tool result</td><td>模型可以解释或修正，不能假装读到了文件</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>
+              成功分支也要走到底：工具只返回 <code>config.toml</code> 中的 <code>database.address</code>，runtime
+              把结果匹配给 <code>call_7</code>，模型据此生成最终回答，并避免回显同文件里的其他密钥。
+              <code>ReplyEndEvent</code> 只说明 reply 生命周期结束；答案是否只暴露允许字段，仍需要业务校验器或调用方验收。
+            </p>
 
             <h2>五、内部账本不是聊天字符串，而是 Msg 与 content blocks</h2>
             <p>
@@ -371,6 +398,18 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
             </p>
 
             <h2>六、工具调用是一段可治理的 lifecycle</h2>
+            <p>
+              在看函数前，先按 owner 把一次调用拆开。注册来源负责提供能力，Toolkit 规范化 schema，PermissionEngine
+              只作 policy 决定，真正执行可以在本地或外部系统，结果最后由 Agent loop 消费。权限 owner 与执行 owner 不是同一个概念。
+            </p>
+            <pre><code class="language-text">tool function / MCP / skill
+  -&gt; Toolkit registry + normalized schema
+  -&gt; model emits ToolCallBlock(call_7)
+  -&gt; argument validation
+  -&gt; PermissionEngine: allow / ask / deny
+  -&gt; local _acting OR RequireExternalExecutionEvent
+  -&gt; ToolResultBlock(call_7)
+  -&gt; Msg ledger -&gt; next model-visible input</code></pre>
             <p>
               模型返回工具调用后，AgentScope 不会直接 <code>call_tool</code>。<code>_execute_tool_call</code> 先检查工具是否可用，
               再用 schema 解析和校验 JSON 输入；失败时会把错误作为 tool result 写回上下文，让 agent 能在下一轮看到。
@@ -614,6 +653,18 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               这解释了为什么第一篇把 AgentScope 放在“事件化 agent runtime、权限、workspace、服务化 session”这一格。
               它不是最轻的 API 封装，也不是先让你画 workflow graph；它更像一个把单 agent turn 做完整、再往 service 和 team 扩展的框架。
             </p>
+            <h3>9.1 “恢复”要按层级说</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>中断层级</th><th>需要保存什么</th><th>本文能下的结论</th></tr></thead>
+                <tbody>
+                  <tr><td>同一 Agent 实例等待确认</td><td>pending call、reply id、工具状态</td><td><code>reply_stream</code> 的恢复路径直接可见</td></tr>
+                  <tr><td>浏览器重连</td><td>事件游标或 snapshot、reply 关联</td><td>需要 service adapter 明确实现，不能从 typed event 自动推出</td></tr>
+                  <tr><td>进程重启</td><td>可重建 Agent 的完整 pending state</td><td><code>RedisStorage</code> 的存在本身不足以证明</td></tr>
+                  <tr><td>Responses provider continuation</td><td><code>previous_response_id</code> 等 provider identity</td><td>只延续 provider response，不替代本地权限与工具状态</td></tr>
+                </tbody>
+              </table>
+            </div>
 
             <h2>十、读完 AgentScope 先记住这些 invariant</h2>
             <div class="table-wrap">
@@ -650,6 +701,11 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
                     <td>服务化不是后补 demo。</td>
                     <td>example service 同时接 storage、message bus、workspace、MCP 和 subagent templates。</td>
                     <td>AgentScope 的设计目标明显包含多人产品和长期 session。</td>
+                  </tr>
+                  <tr>
+                    <td>运行结束不等于答案正确。</td>
+                    <td><code>ReplyEndEvent</code> 封闭 reply lifecycle。</td>
+                    <td>字段脱敏、业务规则与最终采用仍由校验器或调用方负责。</td>
                   </tr>
                 </tbody>
               </table>
