@@ -150,6 +150,75 @@
               又把哪些步骤留给应用自己实现。
             </p>
 
+            <h3>3.1 先给这次运行一个不会丢的身份</h3>
+            <p>
+              为了不让六类责任变成六组名词，后文都跟踪同一条记录：报销运行 <code>E-1042</code>。
+              它不是整段聊天记录，而是应用用来回答“现在做到哪里、下一步能不能做、失败后从哪里接”的任务账本。
+              模型、工具、审批页和 ERP 看到的字段并不相同，但它们都通过这个身份回到同一件事。
+            </p>
+            <pre><code class="language-json">{
+  "expense_run_id": "E-1042",
+  "applicant": "alice",
+  "invoice_ref": "INV-77",
+  "amount": null,
+  "policy_result": null,
+  "pending_action": null,
+  "approval": "not_required_yet",
+  "idempotency_key": "expense:E-1042:commit",
+  "erp_receipt": null,
+  "status": "submitted"
+}</code></pre>
+            <p>
+              第一次读发票后，工具层只把 <code>amount</code> 改成 <code>12800</code>；制度检查再把
+              <code>policy_result</code> 改成“需主管审批”。权限关口不会直接写 ERP，而是先保存
+              <code>pending_action=write_expense</code> 和恢复键，把状态推进到
+              <code>waiting_approval</code>。主管批准会创建一次新的运行，但新运行仍引用
+              <code>E-1042</code> 和原幂等键；只有 ERP 返回 <code>ERP-778</code> 后，状态才变成
+              <code>completed</code>。
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>阶段</th>
+                    <th>改变记录的 owner</th>
+                    <th>新增的事实</th>
+                    <th>中断后从哪里接</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>submitted</code></td>
+                    <td>产品入口</td>
+                    <td>用户、发票引用、任务身份</td>
+                    <td>按 <code>E-1042</code> 重新装载会话</td>
+                  </tr>
+                  <tr>
+                    <td><code>evaluated</code></td>
+                    <td>工具层与流程层</td>
+                    <td>金额和制度结论</td>
+                    <td>从已保存结果继续，不必让模型猜测</td>
+                  </tr>
+                  <tr>
+                    <td><code>waiting_approval</code></td>
+                    <td>权限关口</td>
+                    <td>待执行动作、审批摘要、恢复键</td>
+                    <td>批准事件重新关联原任务和待执行动作</td>
+                  </tr>
+                  <tr>
+                    <td><code>completed</code></td>
+                    <td>应用与 ERP</td>
+                    <td>幂等写入回执 <code>ERP-778</code></td>
+                    <td>回执证明已经写过，重试不得重复入账</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p>
+              这也解释了三个容易混淆的“看见”：账本可以保存完整工具结果，模型下一轮只看到投影后的必要部分，
+              审批页则只看到金额、理由和待执行动作。<strong>保存了，不等于模型看到了；模型看到了，也不等于有权执行。</strong>
+            </p>
+
             <div class="note key-point">
               <p>
                 <strong>阅读契约。</strong>
@@ -244,13 +313,14 @@
             <p>
               可以把后面几篇都压成同一条形状级 trace。它不是某个框架的真实结构体，而是读源码时要追的状态变化：
             </p>
-            <pre><code class="language-text">用户请求：“查订单并申请退款”
-  -&gt; model loop：生成 turn / reply / run id，准备模型可见输入
-  -&gt; tool runtime：把 check_order 转成 schema 校验过的 tool call
+            <pre><code class="language-text">报销运行 E-1042：“读取 INV-77 并提交报销”
+  -&gt; model loop：生成本轮 run id，投影当前问题与必要历史
+  -&gt; tool runtime：把 read_invoice 转成 schema 校验过的 tool call
   -&gt; permission gate：判断这次调用是只读、需确认，还是直接拒绝
-  -&gt; state ledger：写入 tool_call_id、tool result、usage、event
-  -&gt; workflow graph：如果退款条件不满足，路由到人工审批或补充信息
-  -&gt; service plane：把进度事件推给前端，把 session 保存到可恢复存储</code></pre>
+  -&gt; state ledger：写入金额、tool_call_id、result 和 pending_action
+  -&gt; workflow graph：资料齐全但金额超门槛，路由到主管审批
+  -&gt; service plane：只向前端投影审批摘要，并保存 resume key
+  -&gt; application：批准后用 expense:E-1042:commit 写 ERP，保存 ERP-778</code></pre>
             <p>
               后面读每个框架时，我会反复问这条 trace 的同一个问题：哪个对象接住了输入，哪个 gate 改变了路径，
               哪条记录让下一轮还能继续。如果一篇文章只能说出“这里有 Agent / Tool / Memory 类”，但说不清这条 trace 怎么走，
@@ -391,6 +461,11 @@
               但真正难的不是起三个名字，而是决定：票据识别的结果谁保存，制度检查失败后谁重试，
               审批沟通能不能直接写系统，用户中途关闭页面后下一次从哪里继续。没有这些边界，多 agent 只是多个 prompt。
             </p>
+            <p>
+              在 <code>E-1042</code> 里，更稳妥的做法是让三个子任务都只把结果写回父记录：
+              票据识别补金额，制度检查补政策结论，审批沟通补批准或拒绝。它们都不能直接触发 ERP 写入；
+              只有拥有幂等键和完整前置条件的父流程可以提交。这样“多 agent”改变的是分析分工，而不是副作用的最终 owner。
+            </p>
 
             <p>
               AutoGen 的价值正在这里：它让社区很早就把多 agent 对话、team、handoff 和工具化 agent 当成一等抽象来实验。
@@ -501,6 +576,18 @@
                 </tbody>
               </table>
             </div>
+
+            <h3>8.1 选中框架之后，还要通过采用门</h3>
+            <p>
+              以报销产品为例，框架在 README 里出现 Session、Workflow 或 Approval，只能说明“有候选能力”，
+              不能说明已经接住生产责任。团队还应固定四个验收场景：Alice 与 Bob 的记录不会串线；审批等待期间重启服务仍能回到
+              <code>E-1042</code>；重复提交同一幂等键只产生一个 ERP 回执；审计记录能还原谁在何时批准了什么。
+            </p>
+            <p>
+              某项能力缺失时只有两个诚实选择：由应用明确拥有并测试它，或者淘汰这个候选框架。
+              因此这里要一直分开三件事：<strong>框架产出了运行结果，验收用例验证了恢复与副作用边界，
+              产品负责人最后才采用这套实现。</strong>类名、demo 和一次成功运行都不能跳过中间两步。
+            </p>
 
             <p>
               <a href="../pi-agent-harness/">下一篇先进入 Pi</a>。我们不会从 package 列表开始，而是跟一次“改代码并跑测试”的任务：
