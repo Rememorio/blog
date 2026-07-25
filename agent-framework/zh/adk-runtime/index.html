@@ -156,9 +156,16 @@
             </p>
 
             <h2>三、一笔退款怎样走完</h2>
+            <p>
+              ADK 的 Runner 会在 <strong>root <code>LlmAgent</code></strong> 与 <strong>root
+              <code>BaseNode</code></strong> 之间选择入口，并不会先跑一个 chat Agent、再自动进入 Workflow。
+              为了让本例的确定性步骤可恢复，这里明确选择 <strong>root Workflow</strong>：Workflow 的第一个节点是负责理解用户语言的
+              <code>LlmAgent(single_turn)</code>，后面才是查订单、查政策、审批和写入节点。另一个合法设计是以 chat Agent
+              为 root，再由应用显式把一个 Workflow 暴露成可调用能力；两种设计不能在图里画成未经说明的顺序管线。
+            </p>
             <ol>
-              <li>Runner 找到用户会话，把“鞋码不合适，想退款”交给入口 Agent。</li>
-              <li>Agent 理解意图并追问订单号；拿到信息后，Workflow 启动查订单与查政策两个步骤。</li>
+              <li>Runner 找到用户会话，把“鞋码不合适，想退款”交给 root Workflow。</li>
+              <li>Workflow 的入口 Agent 节点理解意图并输出结构化订单号；资料不足时先补问，资料齐全后启动查订单与查政策。</li>
               <li>两个步骤各自产生 Event；Workflow 等待它们都完成，而不是让模型自己记进度。</li>
               <li>低风险且符合政策时走自动退款；高风险时进入人工审批分支并暂停。</li>
               <li>如果核对政策由专门 Agent 完成，Task API 要求它用结构化结果明确结束任务。</li>
@@ -209,8 +216,8 @@
             <p>
               把退款助手压成一条形状级记录，ADK 的分工会更清楚。下面不是源码里的完整 schema，而是读源码时要追的 owner 交接：
             </p>
-            <pre><code class="language-text">Runner.run_async(user_id, session_id, message="鞋码不合适，想退款")
-  -&gt; Agent(chat): 理解诉求，追问缺失信息，或调用订单工具
+            <pre><code class="language-text">Runner.run_async(root=refund_workflow, message="鞋码不合适，想退款")
+  -&gt; intake_agent(single_turn): 输出 {order_id, reason} 或 RequestInput
   -&gt; Workflow state:
        order = pending(check_order)
        policy = pending(check_policy)
@@ -402,6 +409,49 @@ Runner event queue -&gt; plugin callbacks -&gt; session service -&gt; caller str
               <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_node_runner.py#L319-L420">事件 enrichment</a>。
             </p>
 
+            <h3>6.1 同一笔退款的状态到底归谁</h3>
+            <p>
+              “Workflow 有 state”不等于所有状态都归 Workflow。把退款 <code>RF-204</code> 放回各层，会看到四份用途不同的记录：
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>记录</th>
+                    <th>owner</th>
+                    <th>保存什么</th>
+                    <th>不能证明什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>child context</td>
+                    <td><code>NodeRunner</code></td>
+                    <td>节点输入、输出、route、interrupt id</td>
+                    <td>不是外部退款已经发生</td>
+                  </tr>
+                  <tr>
+                    <td>invocation queue</td>
+                    <td><code>Runner</code></td>
+                    <td>本次运行中待消费的 Event</td>
+                    <td>内存队列本身不是重启后的 durable record</td>
+                  </tr>
+                  <tr>
+                    <td>session events</td>
+                    <td>session service</td>
+                    <td>非 partial Event、节点归因和恢复材料</td>
+                    <td>不等于模型下一轮看见完整事件历史</td>
+                  </tr>
+                  <tr>
+                    <td>退款事实与回执</td>
+                    <td>外部退款系统</td>
+                    <td>幂等键、退款状态、业务回执</td>
+                    <td>不能只靠 Workflow completed 推断</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
             <h2>七、Runner 把 Agent 与 Workflow 接到 session event 上</h2>
             <p>
               到这里还差一个问题：Agent 和 Workflow 产生的事件，怎样变成一次可恢复的运行？这就是 <code>Runner</code> 的位置。
@@ -473,6 +523,12 @@ Runner event queue -&gt; plugin callbacks -&gt; session service -&gt; caller str
               <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/utils/_rehydration_utils.py#L231-L346">rehydration scan</a>，
               prior output 与 interrupt id 的回灌则在
               <a href="https://github.com/google/adk-python/blob/62b97007378c4da749a1615d0881aba443a32325/src/google/adk/workflow/_node_runner.py#L192-L260"><code>NodeRunner</code> child context</a>。
+            </p>
+            <p>
+              但恢复 Workflow 不等于回滚外部系统。<code>issue_refund</code> 应携带稳定幂等键
+              <code>refund:RF-204</code>；退款系统返回业务回执后，节点才能把“已采用”写回事务记录。
+              如果网络在外部写入成功、Event 持久化之前断开，恢复时必须先按幂等键查询或重试，不能把“session 里没有完成 Event”
+              当成“退款一定没发生”。节点产生输出、规则校验通过、退款系统接受写入，是三个不同状态。
             </p>
 
             <h2>八、Task API 是 Agent 和 Workflow 之间的桥</h2>
