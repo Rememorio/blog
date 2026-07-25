@@ -160,14 +160,20 @@
             </p>
 
             <h2>三、让一笔退款风险检查完整跑一遍</h2>
+            <p>
+              Eino 有两条合法入口，不能把它们读成依次经过的四层管线。<strong>Compose 应用路径</strong>由
+              <code>NewGraph → Compile → Runnable</code> 启动；<strong>ADK agent 路径</strong>由
+              <code>Runner.Query → flowAgent → ChatModelAgent</code> 启动，ChatModelAgent 内部再使用 ReAct graph。
+              下面的退款任务选择第一条 Compose 路径，因为订单、风控与审批步骤需要显式业务形状；ADK 放到后文作为另一种入口对照。
+            </p>
             <ol>
               <li>用户输入订单号，消息先进入执行图的起点。</li>
               <li>“读取订单”组件返回订单数据，类型边界保证下一节点拿到的是约定结构，而不是随意拼出的文本。</li>
               <li>模型节点判断还需要风险信息，于是进入工具节点调用风控服务。</li>
               <li>若资料齐全，图走向“生成建议”；Runnable 把模型的流式片段持续交给界面。</li>
               <li>若缺少退款原因，Runner 在补问节点中断，并把当前位置和已有数据保存为 checkpoint。</li>
-              <li>用户补充原因后，Runner 从 checkpoint 恢复，只继续未完成的节点，不重复查询和副作用操作。</li>
-              <li>Agent 层据此继续模型与工具循环，直到图到达终点并返回最终建议。</li>
+              <li>用户补充原因后，Runner 恢复 channel、state 与 pending input，再由 task calculation 决定下一批节点。</li>
+              <li>图到达终点并返回建议；业务校验和外部退款系统再决定是否采用它。</li>
             </ol>
 
             <p>
@@ -206,33 +212,41 @@
             <p>
               先把“查订单退款风险”这类请求走一遍，Eino 的层次会更容易读：
             </p>
-            <pre><code class="language-text">input
+            <pre><code class="language-text">Compose application path used by this refund example
+  RefundRequest
+    -&gt; compose.NewGraph
+    -&gt; OrderSnapshot
+    -&gt; RiskContext
+    -&gt; DecisionDraft
+    -&gt; Graph.Compile() -&gt; Runnable
+    -&gt; runner: channels + tasks + checkpoint
+
+ADK agent path, shown later as an alternative entry
   []*schema.Message{user("查订单退款风险")}
+    -&gt; adk.Runner.Query
+    -&gt; flowAgent
+    -&gt; ChatModelAgent
+    -&gt; internal ReAct graph
 
-component boundary
-  ChatModel.Generate / Stream
-  Tool.Info -&gt; JSON schema
-  Tool.InvokableRun(ctx, input) -&gt; tool result
-
-compose boundary
+Shared compose primitive inside either path
   graph := compose.NewGraph[[]*schema.Message, *schema.Message]()
   Graph.AddEdge(START, "planner")
   Graph.AddEdge("planner", "tools")
-  Graph.Compile() -&gt; Runnable
-
-execution boundary
-  runner.run -&gt; channels + tasks + checkpoint
-  interrupt -&gt; checkpoint + resume input
-
-ADK layer
-  ChatModelAgent.Run -&gt; AsyncIterator
-  AgentTool -&gt; bridge checkpoint</code></pre>
+  Graph.Compile() -&gt; Runnable</code></pre>
             <p>
               这条链说明，Eino 的重点不是把“模型调用”包装得更顺手，而是把每个节点的输入输出、流式数据、
               中断点和恢复状态都放进同一套 Go graph runtime。后面读组件、Graph、runner 和 ADK 时，都可以沿着这条链定位 owner。
             </p>
 
             <h2>四、组件层先把模型、工具和消息形状封住</h2>
+            <p>
+              先不要让通用消息类型遮住业务数据。Compose 版退款图的代表对象依次是：
+              <code>RefundRequest{order_id, reason}</code> 来自用户，
+              <code>OrderSnapshot{status, amount}</code> 来自订单系统，
+              <code>RiskContext{score, policy}</code> 来自风控，
+              <code>DecisionDraft{action, rationale}</code> 才交给生成节点。
+              Graph 的泛型边界约束这些转换；后面的 <code>[]*schema.Message</code> 是 ADK 模型循环的账本形状，不是订单结构体。
+            </p>
             <p>
               Eino 的组件接口很 Go：先把类型边界收紧，再谈 agent 行为。<code>BaseModel[M]</code> 用 sealed type constraint
               限定消息类型只能是 <code>*schema.Message</code> 或 <code>*schema.AgenticMessage</code>，并暴露 <code>Generate</code>
@@ -436,6 +450,10 @@ ADK layer
                 调用方之后只提供 resume data，不需要自己重建 graph 内部状态。反过来，单独一个 interrupt token 也不等于完整恢复状态。
               </p>
             </div>
+            <p>
+              这份 checkpoint 也不包住外部风控或退款写入的事务。恢复后的 task calculation 可能再次选择某个节点；
+              读操作要接受重复查询，写操作则必须使用幂等键、去重或补偿。Eino 能恢复图状态，不等于它自动承诺每个业务副作用 exactly-once。
+            </p>
 
             <h2>七、callback 是 aspect，不是随便插日志</h2>
             <p>
@@ -564,6 +582,13 @@ ADK layer
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/agent_tool.go#L133-L214">agent tool setup and resume</a>
               和
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/agent_tool.go#L216-L279">agent tool event loop</a>。
+            </p>
+            <h3>10.1 图结束只是产出，不是业务采用</h3>
+            <p>
+              对退款任务，到达 <code>END</code> 或 iterator 结束，只说明得到一个 <code>DecisionDraft</code>。
+              应用还要验证订单数据是否仍新鲜、必要规则是否齐全、是否存在未解决 interrupt，以及高风险动作是否获得批准。
+              最后由退款系统按幂等键接受写入并返回回执，才算 adopted。把 produced、validated、adopted
+              分开，才能避免“graph 跑完了，所以钱一定退了”的错误结论。
             </p>
 
             <h2>十一、和前几篇放在一起看</h2>

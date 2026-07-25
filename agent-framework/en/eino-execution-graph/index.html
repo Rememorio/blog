@@ -164,14 +164,21 @@
             </p>
 
             <h2>3. Follow One Refund-Risk Check From Start To Finish</h2>
+            <p>
+              Eino has two valid entry routes, not one four-layer sequence. The <strong>Compose application route</strong> starts
+              with <code>NewGraph → Compile → Runnable</code>. The <strong>ADK agent route</strong> starts with
+              <code>Runner.Query → flowAgent → ChatModelAgent</code>, and ChatModelAgent uses a ReAct graph internally. This refund
+              example chooses Compose because order, risk, and approval steps need explicit business shapes. ADK appears later as an
+              alternative entry.
+            </p>
             <ol>
               <li>The user submits an order identifier, and the message enters the graph at its start node.</li>
               <li>The read-order component returns order data; the type boundary ensures the next node receives the promised structure rather than improvised text.</li>
               <li>The model node decides that risk data is required and routes execution to a tool node that calls the risk service.</li>
               <li>With enough data, the graph proceeds to recommendation generation, and Runnable streams model chunks to the interface.</li>
               <li>If the refund reason is missing, Runner interrupts at the question node and stores the position and accumulated data as a checkpoint.</li>
-              <li>After the user replies, Runner resumes from the checkpoint and executes only unfinished nodes without repeating side effects.</li>
-              <li>The agent layer continues the model-tool loop until the graph reaches its end and returns the final recommendation.</li>
+              <li>After the user replies, Runner restores channels, state, and pending input, then task calculation chooses the next nodes.</li>
+              <li>The graph reaches END and returns a recommendation; business validation and the refund system decide whether to adopt it.</li>
             </ol>
 
             <p>
@@ -208,32 +215,39 @@
             <p>
               A "check refund risk for this order" request makes the runtime shape easier to follow:
             </p>
-            <pre><code class="language-text">input
-  []*schema.Message{user("check refund risk for this order")}
+            <pre><code class="language-text">Compose application path used by this refund example
+  RefundRequest
+    -&gt; compose.NewGraph
+    -&gt; OrderSnapshot
+    -&gt; RiskContext
+    -&gt; DecisionDraft
+    -&gt; Graph.Compile() -&gt; Runnable
+    -&gt; runner: channels + tasks + checkpoint
 
-component boundary
-  ChatModel.Generate / Stream
-  Tool.Info -&gt; JSON schema
-  Tool.InvokableRun(ctx, input) -&gt; tool result
+ADK agent path, shown later as an alternative entry
+  []*schema.Message{user("check refund risk")}
+    -&gt; adk.Runner.Query
+    -&gt; flowAgent
+    -&gt; ChatModelAgent
+    -&gt; internal ReAct graph
 
-compose boundary
+Shared compose primitive inside either path
   graph := compose.NewGraph[[]*schema.Message, *schema.Message]()
   Graph.AddEdge(START, "planner")
   Graph.AddEdge("planner", "tools")
-  Graph.Compile() -&gt; Runnable
-
-execution boundary
-  runner.run -&gt; channels + tasks + checkpoint
-  interrupt -&gt; checkpoint + resume input
-
-ADK layer
-  ChatModelAgent.Run -&gt; AsyncIterator
-  AgentTool -&gt; bridge checkpoint</code></pre>
+  Graph.Compile() -&gt; Runnable</code></pre>
             <p>
               The point is not a nicer model-call wrapper. Eino puts node input / output, streaming data, interrupt points, and resume state into one Go graph runtime. The component, Graph, runner, and ADK sections below all hang off that route.
             </p>
 
             <h2 id="one-components-seal-model-tool-and-message-shapes">4. Components Seal Model, Tool, And Message Shapes</h2>
+            <p>
+              Do not let generic message types hide the business records. The Compose refund graph carries
+              <code>RefundRequest{order_id, reason}</code> from the user, <code>OrderSnapshot{status, amount}</code> from the order
+              service, <code>RiskContext{score, policy}</code> from risk evaluation, and finally
+              <code>DecisionDraft{action, rationale}</code> into generation. Graph generics constrain these transitions.
+              <code>[]*schema.Message</code> later describes the ADK model ledger; it is not the order record.
+            </p>
             <p>
               Eino's component layer is idiomatic Go. <code>BaseModel[M]</code> uses a sealed type constraint: message type <code>M</code> can only be <code>*schema.Message</code> or <code>*schema.AgenticMessage</code>. It exposes <code>Generate</code> and <code>Stream</code>. <code>BaseChatModel</code> is the <code>*schema.Message</code> alias and takes conversation history. The old <code>ChatModel.BindTools</code> path is deprecated because it mutates the instance and can race under concurrency. <code>ToolCallingChatModel.WithTools</code> returns an immutable per-request variant. <code>AgenticModel</code> is the <code>*schema.AgenticMessage</code> alias and receives tools through request options.
               Source:
@@ -413,6 +427,11 @@ ADK layer
                 reconstruct the graph's internal state, and the interrupt token alone is not that state.
               </p>
             </div>
+            <p>
+              The checkpoint also does not wrap an external risk call or refund write in one transaction. Task calculation may
+              select a node again after recovery. Reads must tolerate repeat queries; writes need idempotency keys, deduplication, or
+              compensation. Eino can restore graph state without promising exactly-once behavior for every business side effect.
+            </p>
 
             <h2 id="four-callbacks-are-aspects-not-loose-logging-hooks">7. Callbacks Are Aspects, Not Loose Logging Hooks</h2>
             <p>
@@ -507,6 +526,13 @@ ADK layer
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/agent_tool.go#L133-L214">agent tool setup and resume</a>
               and
               <a href="https://github.com/cloudwego/eino/blob/e8832e223b93a7f45b1cc3d491239c14f94717c0/adk/agent_tool.go#L216-L279">agent tool event loop</a>.
+            </p>
+            <h3>10.1 Graph Completion Produces An Output; Business Adoption Comes Later</h3>
+            <p>
+              Reaching <code>END</code> or exhausting the iterator only produces a <code>DecisionDraft</code>. The application still
+              validates data freshness, required rules, unresolved interrupts, and approval for high-risk actions. Only the refund
+              system accepting an idempotent write and returning a receipt makes the change adopted. Keeping produced, validated,
+              and adopted separate prevents the false conclusion that “the graph ended, therefore the money was refunded.”
             </p>
 
             <h2 id="eight-put-it-back-beside-the-earlier-frameworks">11. Put It Back Beside The Earlier Frameworks</h2>
