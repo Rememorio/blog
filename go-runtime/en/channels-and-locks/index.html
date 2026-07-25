@@ -94,9 +94,21 @@
           </p>
 
           <h2>2. <code>hchan</code> Holds Both a Buffer and Waiters</h2>
+          <pre><code class="language-text">One fetchd result handoff:
+the handler creates a result channel with capacity N
+  → each worker owns its local fetchResult
+  → send copies directly to a waiting receiver when possible
+  → otherwise it copies into a free buffer slot
+  → only when neither path works does the sender wait
+  → after N receives, the handler owns the batch it encodes</code></pre>
           <p>
             <code>make(chan fetchResult, n)</code> eventually creates a <code>runtime.hchan</code>. It is more than “a queue”: <code>qcount/dataqsiz</code> describe the ring buffer,
             <code>sendx/recvx</code> are write/read positions, <code>sendq/recvq</code> hold blocked senders and receivers, <code>closed</code> records closure, and <code>lock</code> protects those fields and related sudogs.
+          </p>
+          <p>
+            Read those fields in four groups: how many buffer slots are occupied; where the next read and write occur; who is waiting
+            without a match; and whether the channel is closed plus what protects that state. “The result changes owner” is an application
+            protocol. A slice, map, or pointer field still copies only its descriptor and may share underlying data.
           </p>
 
           <pre><code class="language-go">type hchan struct {
@@ -213,8 +225,18 @@ goready(sg.g, skip+1)</code></pre>
           </p>
 
           <h2 id="selectgo">3. <code>selectgo</code> Is a Three-Pass Protocol</h2>
+          <pre><code class="language-go">select {
+case results &lt;- result:
+case &lt;-ctx.Done():
+    return
+}</code></pre>
           <p>
             A multi-case select does not start multiple goroutines or execute every ready case. The runtime generates a randomized <code>pollorder</code>, then a stable <code>lockorder</code> sorted by <code>hchan</code> address so every select locks its channels in a consistent order.
+          </p>
+          <p>
+            For this application code, the runtime answers only three questions: can either case proceed now; if neither can, how can
+            one worker register both waits; and after one case wins, how are the losing wait tickets removed? The three passes below
+            implement those three answers.
           </p>
 
           <figure class="figure"><img src="../assets/selectgo-three-pass.png" alt="Go selectgo three-pass protocol: prepare randomized pollorder and lockorder sorted by hchan address; pass one looks for a ready case; if none, pass two enqueues one sudog for the same G on each channel and parks; after one case wins the wake-up, pass three removes losers and releases sudogs" /></figure>
@@ -249,9 +271,16 @@ releaseSudog(sglist)</code></pre>
           <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/select.go#L122-L307">preparation and pass 1</a>, <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/select.go#L309-L405">passes 2/3</a>.</span>
 
           <h2 id="mutex">4. The <code>sync.Mutex</code> Fast Path Is One CAS</h2>
+          <pre><code class="language-go">mu.Lock()
+counts["completed"]++
+mu.Unlock()</code></pre>
           <p>
             Go 1.26's public <code>sync.Mutex</code> delegates to <code>internal/sync.Mutex</code>, whose core is <code>state int32</code> plus <code>sema uint32</code>.
             Uncontended <code>Lock</code> uses CAS to change state from zero to <code>mutexLocked</code> and returns, so short low-contention critical sections never enter a runtime wait table.
+          </p>
+          <p>
+            These three lines promise that only one worker at a time performs the read-increment-write operation. CAS, state, and the
+            semaphore are simply the uncontended and contended implementation paths that preserve that promise.
           </p>
 
           <figure class="figure"><img src="../assets/mutex-fast-slow-handoff.png" alt="Go sync.Mutex source paths: Lock first attempts the CAS fast path; contention may spin, add a waiter, and use runtime SemacquireMutex, semaRoot, sudog, and gopark; Unlock wakes a competitor in normal mode and uses direct handoff plus goyield in starvation mode after an implementation threshold" /></figure>

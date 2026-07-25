@@ -91,9 +91,20 @@
           </p>
 
           <h2>二、<code>hchan</code> 同时保存缓冲区与等待者</h2>
+          <pre><code class="language-text">一次 fetchd 请求的结果交接：
+handler 创建容量为 N 的结果 channel
+  → 每个 worker 先独占自己的 fetchResult
+  → send 能直接交给接收者，就当场复制
+  → 否则有空位就复制进 buffer
+  → 两条路都不通，发送者才等待
+  → handler 收到 N 份结果后负责编码</code></pre>
           <p>
             <code>make(chan fetchResult, n)</code> 最终创建一个 <code>runtime.hchan</code>。它不仅是“一个队列”：<code>qcount/dataqsiz</code> 描述环形缓冲，
             <code>sendx/recvx</code> 是写读位置，<code>sendq/recvq</code> 保存阻塞发送者和接收者，<code>closed</code> 记录关闭状态，<code>lock</code> 保护这些字段和相关 sudog。
+          </p>
+          <p>
+            可以先把字段分成四组读：buffer 里有多少格；下一次从哪里读写；谁因没有配对而等待；channel 是否关闭以及谁保护这些状态。
+            “结果换了主人”是业务协议；若结果含 slice、map 或 pointer，发送仍只复制说明卡，底层对象可能继续共享。
           </p>
 
           <pre><code class="language-go">type hchan struct {
@@ -210,8 +221,17 @@ goready(sg.g, skip+1)</code></pre>
           </p>
 
           <h2 id="selectgo">三、<code>selectgo</code> 是一个三遍协议</h2>
+          <pre><code class="language-go">select {
+case results &lt;- result:
+case &lt;-ctx.Done():
+    return
+}</code></pre>
           <p>
             多 case select 不会创建多条 goroutine，也不会让所有 ready case 一起执行。runtime 先生成随机 <code>pollorder</code>，再按 <code>hchan</code> 地址生成稳定的 <code>lockorder</code>，以统一顺序锁住涉及的 channel，避免相反锁序。
+          </p>
+          <p>
+            对这段业务代码，runtime 只需回答三件事：现在有没有一个 case 能走；都不能走时怎样让同一个 worker 同时登记两种等待；
+            其中一个赢了以后怎样撤掉另一张等待票。下面的三遍扫描正好对应这三个问题。
           </p>
 
           <figure class="figure"><img src="../assets/selectgo-three-pass.png" alt="Go selectgo 三遍协议：准备随机 pollorder 和按 hchan 地址排序的 lockorder；第一遍找 ready case；无 ready 时第二遍为一个 G 在每个 channel 入队 sudog 并 gopark；一个 case 唤醒成为 winner 后，第三遍移除 losers 并释放 sudog" /></figure>
@@ -246,9 +266,16 @@ releaseSudog(sglist)</code></pre>
           <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/select.go#L122-L307">准备与 Pass 1</a>、<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/select.go#L309-L405">Pass 2/3</a>。</span>
 
           <h2 id="mutex">四、<code>sync.Mutex</code> 的快路径只有一次 CAS</h2>
+          <pre><code class="language-go">mu.Lock()
+counts["completed"]++
+mu.Unlock()</code></pre>
           <p>
             Go 1.26 的 public <code>sync.Mutex</code> 把实现委托给 <code>internal/sync.Mutex</code>，核心只有 <code>state int32</code> 与 <code>sema uint32</code>。
             无竞争 <code>Lock</code> 用 CAS 把 state 从 0 改为 <code>mutexLocked</code>；成功即可返回，所以短且低竞争的临界区不会进入 runtime 等待表。
+          </p>
+          <p>
+            这三行的业务含义是：任何时刻只有一个 worker 能完成“读取旧值、加一、写回”这组动作。CAS、state 与 semaphore
+            只是 Mutex 在“没人争”和“有人争”时维持这个承诺的两条实现路径。
           </p>
 
           <figure class="figure"><img src="../assets/mutex-fast-slow-handoff.png" alt="Go sync.Mutex 源码路径：Lock 先用 CAS 进入快路径；竞争时 spin、增加 waiter 并通过 runtime SemacquireMutex、semaRoot、sudog 与 gopark 等待；Unlock 在 normal 模式唤醒竞争，在超过实现阈值后用 starvation direct handoff 与 goyield" /></figure>

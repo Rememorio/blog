@@ -202,10 +202,21 @@
               finds two URLs and starts two workers. A worker pauses while waiting for a network response and continues when data
               arrives. Finally, the handler gathers both results and writes JSON.
             </p>
+            <pre><code class="language-text">1. The listener accepts one connection
+2. The connection yields one /fetch request
+3. The handler reads two URLs
+4. Two workers visit the upstream sites
+5. The handler gathers two results
+6. The connection writes JSON to the caller</code></pre>
             <p>
               No single request object performs that whole story. Several owners take turns. Here, <em>owner</em> simply means the code
               that creates some state, decides when its lifetime ends, and cleans it up. Learn the owners first; the type names in the
               table are only Go 1.26.0's concrete implementation of this relay.
+            </p>
+            <p>
+              One counterexample prevents a common mix-up: <strong>one connection is not one request.</strong> A client may open one TCP
+              connection, send request A, receive its response, and then send request B. HTTP/1 normally handles both in sequence on the
+              same connection path. A second client connecting at the same time creates another connection path.
             </p>
 
             <div class="table-wrap">
@@ -404,6 +415,12 @@ for {
               Request cancellation does not begin at the call to <code>r.Context()</code>. A connection context sits above it, outbound
               work sits below it, and the source links the lifetimes with nested contexts.
             </p>
+            <p>
+              Keep following the worker that visits <code>go.dev</code>. If the caller disconnects early, the server cancels the request
+              context. The worker used that same context for its outbound request, so <code>client.Do</code> can observe the stop signal.
+              Cancellation is a notification, not a runtime command that deletes a goroutine; the call must return, the response body
+              must be cleaned up, and the worker must exit under their respective owners.
+            </p>
 
             <figure class="figure">
               <img
@@ -490,6 +507,16 @@ w = &amp;response{
               back to <code>DefaultServeMux</code>, and calls <code>handler.ServeHTTP</code>. In <code>fetchd</code>, that enters our
               handler and eventually reaches <code>h.client.Do(req)</code>.
             </p>
+            <pre><code class="language-text">worker calls client.Do
+  → try to reuse a connection
+  → otherwise queue a new dial
+  → write the request once a connection arrives
+  → wait for response headers and body
+  → read and close the body before the connection can return to the pool</code></pre>
+            <p>
+              <code>RoundTrip</code>, <code>getConn</code>, and <code>persistConn</code> below are not three new stories. They are the
+              standard-library names for those six steps.
+            </p>
 
             <pre><code class="language-go">func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
     handler := sh.srv.Handler
@@ -557,6 +584,12 @@ w = &amp;response{
               This is the part often compressed into “Go uses nonblocking I/O.” Application and standard-library code still use a
               blocking interface: if no response data exists, <code>Read</code> waits. For a pollable network descriptor, the bottom layer
               first attempts a nonblocking syscall. Only <code>EAGAIN</code> transfers the wait to the poller.
+            </p>
+            <p>
+              Keep following the same worker. When the kernel says “no data yet,” the runtime records which socket it is waiting for and
+              lets the thread run other work. When data arrives, the worker first becomes runnable; it resumes reading only after the
+              scheduler selects it again. <code>EAGAIN</code>, netpoll, and <code>runtime_pollWait</code> are implementation names for
+              that pause-and-resume sequence.
             </p>
 
             <figure class="figure">

@@ -75,6 +75,16 @@
             因此看到延迟上涨时，先问请求卡在哪一段：还没拿到连接，已经发出但服务器没回，还是拿到了 HTTP/2 连接却没有可用 stream 或窗口？
             连接池的意义，是让这些资源由一个长期存在的 owner 统一复用和限流，而不是简单保存一袋 socket。
           </p>
+          <pre><code class="language-text">20 个请求到同一个站点：
+先到的请求借走现有连接或 stream
+  → 资源够：立刻写出请求
+  → 连接额度满：在 GetConn 前后排队
+  → HTTP/2 stream 满：等一张 stream 票
+  → 已经写出：等上游响应或流控额度</code></pre>
+          <p>
+            所以“连接复用了”只回答有没有重复建 TCP/TLS，不能回答请求是否排队。诊断时要给同一条请求分别记录拿资源、写请求、
+            收响应三个时间点，才能知道等待属于池、上游还是协议流控。
+          </p>
           <p>
             一个共享 <code>Transport</code> 同时维护按 connect method 分组的 idle connection、等待 idle 的请求票据、
             正在 dial 的票据和 per-host 总连接计数。cache key 不只是裸 hostname，还受 scheme、address、proxy 与是否强制 HTTP/1 等连接方法影响。
@@ -158,6 +168,13 @@ case &lt;-treq.ctx.Done():
           </p>
 
           <h3>2.4 <code>Close</code> 是释放资源，不自动等于可复用</h3>
+          <pre><code class="language-text">短响应：读到 resp.Body 的真实 EOF → Close → 连接可以回池
+超限响应：LimitReader 自己返回 EOF → 底层 body 仍有数据
+        → Close 走 early-close → HTTP/1 连接不能回池</code></pre>
+          <p>
+            两条路都正确释放了响应资源，但只有第一条证明这条 HTTP/1 连接已经读到消息边界。先记住这个对比，
+            再看 <code>bodyEOFSignal</code> 怎样把 true/false 交给连接读循环。
+          </p>
           <figure class="figure"><img src="../assets/http1-connection-reuse.png" alt="Transport.getConn 先找 idle connection 再排 dial，MaxConnsPerHost 满时等待；HTTP/1 persistConn 的 bodyEOFSignal 只有看到底层 io.EOF 才 tryPutIdleConn，EOF 前 Close 会关闭连接，LimitReader 到 N 不等于底层 EOF" /></figure>
 
           <pre><code class="language-go">waitForBodyRead := make(chan bool, 2)
@@ -203,6 +220,11 @@ resp.Body = &amp;bodyEOFSignal{
           <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1057-L1178">tryPutIdleConn</a> 与 HTTP/1/HTTP/2 waiter 分支。</span>
 
           <h2 id="http2">三、HTTP/2 把“一连接一请求”变成“一连接多 stream”</h2>
+          <p>
+            先想象两个 worker 同时抓网页：它们共用一条 TCP/TLS 通道，但各拿一张独立的 stream 票，响应片段可以在通道上交错。
+            每张票有自己的“小水杯”——stream 流控窗口；整条连接还有所有 stream 共用的“大水箱”——connection 流控窗口。
+            任一额度用完都要等对端归还；能多路复用，不等于没有排队和背压。
+          </p>
           <p>
             一个 <code>http2ClientConn</code> 持有底层 TLS connection、<code>streams map[uint32]*http2clientStream</code>、
             <code>nextStreamID</code>、<code>maxConcurrentStreams</code>、connection-level flow window 与写锁。
@@ -304,6 +326,12 @@ go test -race ./...
 go vet ./...</code></pre>
 
           <h2 id="diagnosis">五、联合诊断从“在哪一层慢”开始</h2>
+          <pre><code class="language-text">一次 P99 排查：
+httptrace 发现 GetConn → GotConn 变长
+  → 应用指标确认同一 host 的 in-flight 到上限
+  → goroutine profile 找到等待 getConn 的 owner
+  → execution trace 区分 runnable 排队与纯连接等待
+  → 修正容量或上游延迟假设，再用同一指标验证</code></pre>
           <p>
             P99 上升时先写一个可证伪假设：在 GetConn 排队、DNS/Connect/TLS、等待 upstream headers、读取 body、runtime runnable、锁、GC assist，
             还是数据竞争？每个工具只回答一层，不能拿一张 goroutine dump 同时证明网络、池配置和 GC。

@@ -195,9 +195,19 @@
               浏览器请求 <code>/fetch</code> 后，服务先从监听端口接到一条连接，再从连接里读出一个 HTTP 请求。handler 解析出两个 URL，
               启动两个 worker 去抓网页；worker 等网络响应时会暂停，数据到达后再继续；最后 handler 汇总结果并写回 JSON。
             </p>
+            <pre><code class="language-text">① 监听端口接到一条连接
+② 从连接里读出一次 /fetch 请求
+③ handler 取出两个网址
+④ 两个 worker 分别访问上游
+⑤ handler 收齐两份结果
+⑥ 连接把 JSON 写回调用方</code></pre>
             <p>
               这里没有一个“请求对象”从头包办到底，而是几位负责人依次接手。源码里常把负责人叫 <em>owner</em>：谁创建状态、谁决定它何时结束、谁负责清理。
               先记住负责人，再看表里的类型名；类型名只是这段接力在 Go 1.26.0 中的具体实现。
+            </p>
+            <p>
+              还有一个容易混淆的反例：<strong>一条连接不等于一次请求。</strong>同一个客户端可以只建立一条 TCP 连接，先发送请求 A，
+              收到响应后再发送请求 B；HTTP/1 默认沿同一条连接路径依次处理它们。另一个客户端同时连入，才会出现另一条连接路径。
             </p>
 
             <div class="table-wrap">
@@ -392,6 +402,11 @@ for {
               看请求取消，不能只从业务代码里的 <code>r.Context()</code> 开始。它上面还有连接 context，下面还有出站请求；
               源码用嵌套 context 把生命周期接起来。
             </p>
+            <p>
+              继续跟住“访问 <code>go.dev</code>”的 worker：调用方如果提前断开，服务端会取消这次请求的 context；
+              worker 又用同一个 context 创建出站请求，所以 <code>client.Do</code> 也能收到停止信号。取消只是通知，不会把 goroutine
+              从 runtime 里强行删除；调用返回、response body 清理、worker 退出，仍要由各自的 owner 完成。
+            </p>
 
             <figure class="figure">
               <img
@@ -477,6 +492,16 @@ w = &amp;response{
               <code>DefaultServeMux</code>，最后调用 <code>handler.ServeHTTP</code>。
               对 <code>fetchd</code> 来说，从这里开始进入我们的 handler，再走到 <code>h.client.Do(req)</code>。
             </p>
+            <pre><code class="language-text">worker 调用 client.Do
+  → 先找一条可复用连接
+  → 没找到就排队建立新连接
+  → 拿到连接后写出请求
+  → 等响应头和响应体
+  → 读完并关闭 body，连接才有机会回池</code></pre>
+            <p>
+              下面的 <code>RoundTrip</code>、<code>getConn</code> 和 <code>persistConn</code> 不是三条新的故事，
+              只是这六步在标准库中的名字。
+            </p>
 
             <pre><code class="language-go">func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
     handler := sh.srv.Handler
@@ -541,6 +566,11 @@ w = &amp;response{
               现在来到整条路线最容易被一句“Go 是非阻塞 I/O”带过的地方。应用和大部分标准库代码确实按阻塞式接口写：
               没读到响应，就在 <code>Read</code> 等。但对可轮询的网络描述符，底层先做一次非阻塞 syscall；只有返回
               <code>EAGAIN</code>，才把等待交给 poller。
+            </p>
+            <p>
+              仍然跟住同一个 worker：内核回答“现在没有数据”后，runtime 记住它在等哪个 socket，让当前线程去跑别的任务；
+              数据到达时，这个 worker 先从“等待”变成“可以运行”，等调度器再次选中才继续读取。<code>EAGAIN</code>、
+              netpoll 和 <code>runtime_pollWait</code>，只是这段暂停与恢复的实现细节。
             </p>
 
             <figure class="figure">

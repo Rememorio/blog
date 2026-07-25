@@ -79,6 +79,17 @@
             waiting on the server, or does it have an HTTP/2 connection but no stream slot or window? A pool gives these resources one
             long-lived owner for reuse and limits; it is not simply a bag of sockets.
           </p>
+          <pre><code class="language-text">Twenty requests target one site:
+early requests borrow existing connections or streams
+  → capacity available: write immediately
+  → connection limit full: queue around GetConn
+  → HTTP/2 stream slots full: wait for a stream ticket
+  → request already written: wait for upstream response or flow credit</code></pre>
+          <p>
+            “The connection was reused” answers only whether TCP/TLS setup was repeated; it does not answer whether the request queued.
+            Record resource acquisition, request write, and response arrival for the same request to separate pool, upstream, and
+            protocol-flow waiting.
+          </p>
           <p>
             A shared <code>Transport</code> coordinates idle connections grouped by connect method, request tickets waiting for an
             idle connection, in-progress dials, and per-host total connection counts. The cache key is more than a hostname: scheme,
@@ -169,6 +180,13 @@ case &lt;-treq.ctx.Done():
           </p>
 
           <h3>2.4 <code>Close</code> Releases Resources; It Does Not Promise Reuse</h3>
+          <pre><code class="language-text">short response: read real resp.Body EOF → Close → connection may return to pool
+capped response: LimitReader returns its own EOF → underlying body has data
+               → Close takes early-close path → HTTP/1 connection cannot return</code></pre>
+          <p>
+            Both paths release response resources correctly, but only the first proves that this HTTP/1 message boundary was reached.
+            Keep that contrast in mind before reading how <code>bodyEOFSignal</code> reports true or false to the connection read loop.
+          </p>
           <figure class="figure"><img src="../assets/http1-connection-reuse.png" alt="Transport.getConn first seeks an idle connection and then queues a dial; MaxConnsPerHost waits when full; HTTP/1 persistConn returns through tryPutIdleConn only when bodyEOFSignal sees underlying io.EOF, while Close before EOF closes the connection and a LimitReader reaching N is not underlying EOF" /></figure>
 
           <pre><code class="language-go">waitForBodyRead := make(chan bool, 2)
@@ -219,6 +237,12 @@ resp.Body = &amp;bodyEOFSignal{
           <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1057-L1178">tryPutIdleConn</a> and its HTTP/1/HTTP/2 waiter branches.</span>
 
           <h2 id="http2">3. HTTP/2 Turns One Connection into Many Streams</h2>
+          <p>
+            Picture two workers fetching pages at once. They share one TCP/TLS passage but hold separate stream tickets, so response
+            frames can interleave. Each ticket has a small cup—the stream flow-control window—and the connection has one shared tank—the
+            connection window. Exhausting either credit makes work wait. Multiplexing removes one bottleneck; it does not remove queues
+            or backpressure.
+          </p>
           <p>
             One <code>http2ClientConn</code> owns the TLS connection, a
             <code>streams map[uint32]*http2clientStream</code>, <code>nextStreamID</code>,
@@ -329,6 +353,12 @@ go test -race ./...
 go vet ./...</code></pre>
 
           <h2 id="diagnosis">5. Joint Diagnosis Starts by Locating the Slow Layer</h2>
+          <pre><code class="language-text">One P99 investigation:
+httptrace shows GetConn → GotConn growing
+  → application metrics confirm the host's in-flight limit
+  → a goroutine profile identifies getConn waiters and their owner
+  → an execution trace separates runnable delay from connection waiting
+  → change the capacity or upstream-latency hypothesis and verify with the same metric</code></pre>
           <p>
             When P99 rises, write a falsifiable hypothesis: GetConn queueing, DNS/Connect/TLS, upstream response headers, body
             reading, runtime runnable delay, locks, GC assist, or a data race? Each tool answers one layer. A goroutine dump cannot
