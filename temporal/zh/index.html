@@ -111,6 +111,23 @@
             </ul>
 
             <p>
+              把四块积木拼到同一件事上，可以先写出下面这张教学用任务卡。它不是 Temporal SDK 的请求格式，而是帮助我们在后文始终追踪同一个对象：
+            </p>
+
+            <pre><code class="language-text">任务身份：mv-20260710-42
+原始输入：song://summer.wav + “霓虹公路，八个镜头”
+流程规则：脚本 -> 镜头并发生成 -> 验收 -> 合成 -> 通知
+已经确认：脚本存于 object://mv-42/treatment.json
+正在等待：scene-03 的 provider job vid-8831
+最终产物：尚未产生
+用户可见状态：6 / 8 个镜头完成</code></pre>
+
+            <p>
+              原始音频、脚本和视频本体属于对象存储；任务身份和推进事实属于 Temporal；“6 / 8”是业务从 Workflow 状态投影给前端的视图。
+              这三个位置不能混成一份“大状态”：大文件不适合塞进历史，前端状态也不能反过来成为流程是否完成的权威。
+            </p>
+
+            <p>
               Workflow 和 Activity 代码都由业务部署的 <strong>Worker</strong> 进程运行。Worker 不是第五份持久状态，而是随时可以被替换的执行者。
               可以把它记成一句更朴素的话：<strong>Temporal Service 保存任务卡和事实本；Worker 只是临时来干活的人。</strong>
               durable 不是“一个 goroutine 活得很久”，而是“goroutine 可以消失，任务身份和已完成事实仍然存在”。
@@ -146,7 +163,8 @@
               <p>
                 <strong>阅读契约。</strong>
                 这篇文章始终跟随同一支 AI MV。读完后，应当能用自己的话解释 Temporal 是什么、四块积木分别做什么、
-                一次任务怎样按顺序推进，以及哪一种外部副作用仍然必须由业务做幂等。
+                一次任务怎样按顺序推进、Worker 与事实本各能改变什么、代码升级为什么也要照顾 replay，
+                以及哪一种外部副作用仍然必须由业务做幂等。
               </p>
             </div>
 
@@ -183,7 +201,8 @@
 
             <h2>三、一次创建请求怎样变成可恢复的工作流</h2>
             <p>
-              现在把刚才的前两步落到实现。创建请求先回答三个普通问题：这是哪个业务任务、它遵循哪套流程规则、哪组 Worker 可以处理它。
+              现在把刚才的任务卡落到实现。创建请求不会把整张教学卡原样发给 Temporal；它先回答三个普通问题：
+              这是哪个业务任务、它遵循哪套流程规则、哪组 Worker 可以处理它。
               SDK 分别用 Workflow ID、Workflow Type、Task Queue 和输入表达这些答案，再调用 <code>StartWorkflowExecution</code>。
               Temporal 仓库的 README 也明确指出：这个仓库是
               <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/README.md#L64-L65">Temporal Server</a>，
@@ -218,12 +237,28 @@
               <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/docs/architecture/README.md#L17-L35"><code>docs/architecture/README.md</code></a>。
             </p>
 
-            <p>用形状级事件简化表示，刚启动时保存的不是 Go 调用栈，而是足以重建下一步的事实：</p>
+            <p>
+              下面把同一支 MV 多走几步。字段和不影响这段解释的中间事件经过简化，但参与者、Command 与已接受事件的顺序是关键：
+            </p>
 
-            <pre><code class="language-json">[
-  { "event": "WorkflowExecutionStarted", "workflowId": "mv-20260710-42" },
-  { "event": "WorkflowTaskScheduled", "taskQueue": "mv-orchestrator" }
-]</code></pre>
+            <pre><code class="language-text">Client -> Temporal Service
+  StartWorkflowExecution(workflow_id=mv-20260710-42, input_ref=object://mv-42/input.json)
+Temporal Service -> Event History
+  WorkflowExecutionStarted
+
+Workflow Worker -> Temporal Service
+  Command: ScheduleActivity(write-treatment)
+Temporal Service -> Event History
+  ActivityTaskScheduled
+Activity Worker -> Temporal Service
+  ActivityTaskCompleted(result_ref=object://mv-42/treatment.json)
+
+Workflow Worker -> Temporal Service
+  Command: ScheduleActivity(submit-scene-03)
+Activity Worker -> Temporal Service
+  ActivityTaskCompleted(provider_job_id=vid-8831)
+Webhook API -> Temporal Service
+  WorkflowExecutionSignaled(scene-03-ready, artifact_ref=object://mv-42/scene-03.mp4)</code></pre>
 
             <p>
               Worker 从 Task Queue 取走 Workflow Task，重放 Workflow 函数，直到它遇到需要等待的 Activity、Timer、Signal 或 Child Workflow，
@@ -231,6 +266,25 @@
               <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/matching/matching_engine.go#L668-L735"><code>PollWorkflowTaskQueue</code></a>
               展示的正是 worker 轮询和取任务的服务边界。
             </p>
+
+            <p>
+              这里最容易漏掉的区别是：<strong>Worker 提议 Command，Temporal Service 接受状态转换并追加事实。</strong>
+              Worker 崩溃时，尚未被服务端接受的提议可以消失；已经进入 Event History 的事实则成为下一位 Worker 的输入。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>参与者</th><th>它能读到什么</th><th>它能改变什么</th><th>它不能冒充什么</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Client / 业务 API</td><td>业务输入、Workflow ID、查询结果。</td><td>请求创建、Signal、Update 或取消。</td><td>不能直接改写 Event History。</td></tr>
+                  <tr><td>Workflow Worker</td><td>历史投影出的 Workflow 状态。</td><td>返回 Timer、Activity、Child Workflow 等 Commands。</td><td>不能把本地内存当权威状态。</td></tr>
+                  <tr><td>Activity Worker</td><td>一次 Activity 的输入和 heartbeat details。</td><td>执行副作用，返回 result、failure 或 heartbeat。</td><td>不能宣称整个 Workflow 已完成。</td></tr>
+                  <tr><td>Temporal Service</td><td>已持久化的执行状态、队列与计时器。</td><td>接受事件、调度 Task、驱动恢复。</td><td>不替业务生成视频或判断内容是否合格。</td></tr>
+                </tbody>
+              </table>
+            </div>
 
             <h2>四、Workflow 管控制流，Activity 承担真实世界</h2>
             <p>
@@ -293,7 +347,7 @@
                 alt="Temporal replay 恢复图，Worker A 崩溃后 Worker B 读取 Event History，跳过已完成步骤并从第一个未记录动作继续"
               />
               <figcaption>
-                replay 会重新运行 Workflow 代码，但不会重新执行历史中已经完成并记录结果的 Activity。
+                replay 会重新运行与旧历史兼容的 Workflow 代码，但不会重新执行历史中已经完成并记录结果的 Activity。
               </figcaption>
             </figure>
 
@@ -319,6 +373,29 @@
               <a href="https://docs.temporal.io/encyclopedia/detecting-activity-failures">Detecting Activity Failures</a>。
               服务端对应入口也把 heartbeat 的两个用途写在注释里：报告 liveness 与 progress，见
               <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/history/history_engine.go#L630-L641"><code>RecordActivityTaskHeartbeat</code></a>。
+            </p>
+
+            <h3>5.2 进程可以换，旧执行依赖的 Workflow 语义不能突然换</h3>
+            <p>
+              “任意 Worker 都能接手”还有一个前提：它运行的 Workflow 代码必须能解释已有历史。
+              假设旧历史记录的是“镜头完成后直接合成”，新版本却在同一位置无条件插入“先运行内容审核 Activity”；
+              旧执行 replay 时，新代码产生的 Command 就可能和历史不一致。进程替换解决的是机器故障，不自动解决不兼容的代码升级。
+            </p>
+
+            <pre><code class="language-text">旧执行的历史：scene-ready -> compose
+不安全的直接替换：scene-ready -> moderate -> compose
+
+安全发布要回答：
+1. 旧执行继续由兼容代码处理，还是通过版本路由固定在旧 Worker？
+2. 新分支是否通过 SDK 的 patch / version 机制显式加入？
+3. 发布前能否用真实 Event History 做 replay test？
+4. 新版本失败时，旧执行和新执行分别怎样回滚？</code></pre>
+
+            <p>
+              Temporal 当前的
+              <a href="https://docs.temporal.io/production-deployment/worker-deployments">Worker Deployments 指南</a>
+              把 Worker Versioning 作为安全发布新 Workflow 代码的推荐默认方式，并把 patching 作为无法使用版本化部署时的兼容手段。
+              对持续几十分钟或数小时的 AI 任务，这不是运维附注，而是 durable execution 能否在多次发布后仍可重放的一部分。
             </p>
 
             <h2>六、最危险的缝：外部服务已经成功，回执却丢了</h2>
@@ -365,6 +442,29 @@
               因此“Temporal 中显示 Canceled”与“所有外部算力立刻停止”不能画等号。
             </p>
 
+            <h3>6.3 Provider 说完成、Workflow 结束、产品可交付是三个状态</h3>
+            <p>
+              另一个常见误读是把外部 provider 的 <code>succeeded</code> 直接当成产品完成。
+              回调只能证明 provider 声称任务结束；业务还要确认对象可读、格式与时长正确、镜头清单完整、取消没有抢先发生，并把通过验收的产物引用写回 Workflow。
+              Workflow 完成以后，产品层才应把这支 MV 标成可下载或可发布，并决定何时通知用户。
+            </p>
+
+            <pre><code class="language-text">provider produced
+-> Activity verifies artifact and cost
+-> Temporal records artifact_ref
+-> Workflow satisfies all completion conditions
+-> product marks the MV deliverable
+-> notification is sent idempotently
+
+任何一道验收门失败
+-> 不宣称可交付
+-> 重试、补偿或进入人工处理</code></pre>
+
+            <p>
+              这样就把“外部产出了文件”“流程有了完成证据”“产品允许交付”分开了。
+              Temporal 能保存并恢复这条验收链，但视频质量标准、预算上限和最终发布权限仍由业务定义。
+            </p>
+
             <h2>七、tRPC-Agent-Go 在 worker 内搭流程，Temporal 管 worker 外的生命</h2>
             <p>
               对 Agent 框架而言，Temporal 不是另一套 GraphAgent。两者回答的问题不同：tRPC-Agent-Go 负责模型、工具、子 Agent、事件流和图节点怎样执行；
@@ -382,23 +482,31 @@
             </figure>
 
             <h3>7.1 tRPC-Agent-Go 已经有哪些接近的积木</h3>
+            <p>
+              先界定固定源码快照里的真实状态：<code>agent/taskrun</code> 定义了可替换的 Controller 接口，
+              仓库随附并被示例采用的是 <code>inprocess.Service</code>；多节点 durable controller 是留给产品实现的扩展面，
+              不是“文件已经存在所以主路径已经分布式”。Graph checkpoint 与 detached cancel 已实现，但各自只覆盖下面表中的局部边界。
+            </p>
             <div class="table-wrap">
               <table>
                 <thead>
-                  <tr><th>能力</th><th>当前能解决什么</th><th>还没有自动解决什么</th></tr>
+                  <tr><th>能力</th><th>快照中的状态</th><th>当前能解决什么</th><th>还没有自动解决什么</th></tr>
                 </thead>
                 <tbody>
-                  <tr><td><code>WithDetachedCancel</code></td><td>父请求 cancel 后，当前进程里的 run 可以继续。</td><td>进程重启和多节点恢复。</td></tr>
-                  <tr><td>Dynamic Workflow</td><td>临时 Python 代码编排多个 Agent。</td><td>第一版明确是前台一次性执行，不保存执行状态。</td></tr>
-                  <tr><td>Graph checkpoint</td><td>保存 state、frontier，支持显式 resume 和 time travel。</td><td>谁发现 owner 死亡、谁抢占并恢复、外部 Activity 语义。</td></tr>
-                  <tr><td><code>taskrun.Controller</code></td><td>run ID、status、wait、cancel、child session 的控制面。</td><td>内置实现是单进程；分布式存储、队列和 lease 由产品实现。</td></tr>
+                  <tr><td><code>WithDetachedCancel</code></td><td>已实现的 RunOption。</td><td>父请求 cancel 后，当前进程里的 run 可以继续。</td><td>进程重启和多节点恢复。</td></tr>
+                  <tr><td>Dynamic Workflow</td><td>已实现，文档明确是第一版前台一次性执行。</td><td>临时 Python 代码编排多个 Agent。</td><td>不保存可跨进程恢复的执行状态。</td></tr>
+                  <tr><td>Graph checkpoint</td><td>已实现的 checkpoint / resume 机制。</td><td>保存 state、frontier，支持显式 resume 和 time travel。</td><td>谁发现 owner 死亡、谁抢占并恢复、外部 Activity 语义。</td></tr>
+                  <tr><td><code>taskrun.Controller</code></td><td>接口已实现；随附 controller 是 in-process。</td><td>run ID、status、wait、cancel、child session 的控制面。</td><td>分布式存储、队列、lease 与跨节点接管由产品实现。</td></tr>
                 </tbody>
               </table>
             </div>
 
             <p>
-              这些边界都能从源码直接验证。Dynamic Workflow 文档称第一版为
+              这些边界都能从源码直接验证。<a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/agent/invocation.go#L674-L684"><code>WithDetachedCancel</code></a>
+              只改变 parent context 的取消传播；Dynamic Workflow 文档称第一版为
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/docs/mkdocs/zh/dynamic-workflow.md#L299-L315">“前台、一次性执行”</a>；
+              Graph 文档把 checkpoint 描述为
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/docs/mkdocs/zh/graph.md#L78-L84">显式恢复与 time travel 的基础</a>；
               taskrun 文档要求多节点实现基于
               <a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/docs/mkdocs/zh/taskrun.md#L7-L23">外部存储、队列、lease 与跨节点取消</a>；
               内置 FileStore 加载到未结束 run 时，
@@ -412,6 +520,20 @@
               LLM 与工具副作用需要更强幂等。细粒度接法则把 LLM call、tool call、视频提交和人工等待分别变成 Activity 或 Child Workflow；
               恢复点和可观测性更好，但会把 Agent loop 改造成 durable state machine，接入成本明显更高。
             </p>
+
+            <p>把同一个 <code>scene-03</code> 放进两种方案，重复边界才会清楚。下面是集成合约，不是当前 tRPC-Agent-Go 已内置的 Temporal adapter：</p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>接法</th><th>代表性持久单位</th><th>Temporal 记录什么</th><th>Worker 中途崩溃后</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>粗粒度</td><td>整个 Agent run：run ID、输入引用、幂等作用域。</td><td>一次 Activity 的 scheduled / completed，以及最终产物引用。</td><td>最后结果未落历史时，整个 <code>runner.Run</code> attempt 可能重做。</td></tr>
+                  <tr><td>细粒度</td><td>一个逻辑步骤：scene ID、tool/model 操作、稳定副作用键。</td><td>每个步骤的 result reference、等待点和完成事实。</td><td>只从第一个未记录步骤继续，但 Agent loop 必须显式建模成可重放状态机。</td></tr>
+                </tbody>
+              </table>
+            </div>
 
             <p>
               因此更稳妥的产品边界不是让 Agent 框架重造 Temporal，而是保留一个可替换的 durable controller 接口：
@@ -462,6 +584,8 @@
                   <tr><td>外部副作用</td><td>Activity + 幂等键 + provider job ledger。</td><td>重试不会静默制造重复成本。</td></tr>
                   <tr><td>长步骤进度</td><td>Heartbeat checkpoint 或外部进度表。</td><td>失败恢复不必从零开始。</td></tr>
                   <tr><td>视频与音频产物</td><td>对象存储，只在 history 保存引用。</td><td>工作流历史保持小而可重放。</td></tr>
+                  <tr><td>Workflow 代码版本</td><td>Worker Deployment / patch 路由与 replay tests。</td><td>发布后旧执行仍能解释自己的历史。</td></tr>
+                  <tr><td>产品可交付状态</td><td>业务验收记录与发布权限。</td><td>provider 成功不被误当成用户结果已经可用。</td></tr>
                   <tr><td>Agent 节点内部状态</td><td>tRPC-Agent-Go session/graph/checkpoint。</td><td>Agent runtime 与 durable control plane 各守边界。</td></tr>
                 </tbody>
               </table>
@@ -487,6 +611,7 @@
               <li><a href="https://docs.temporal.io/activities">Temporal Activities</a></li>
               <li><a href="https://docs.temporal.io/encyclopedia/detecting-activity-failures">Activity failure detection and heartbeat</a></li>
               <li><a href="https://docs.temporal.io/encyclopedia/workflow-message-passing">Signals, Queries, and Updates</a></li>
+              <li><a href="https://docs.temporal.io/production-deployment/worker-deployments">Temporal Worker Deployments</a></li>
               <li><a href="https://github.com/trpc-group/trpc-agent-go/tree/8f8042aa8350b0fb37c93873cef1f343d462dc7a">trpc-group/trpc-agent-go 固定源码快照</a></li>
             </ul>
           </section>
