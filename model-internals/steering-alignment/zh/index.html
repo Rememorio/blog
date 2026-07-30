@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Activation Steering、Reflection Training 与 Alignment Auditing | Rememorio Blog</title>
+    <meta name="description" content="把 activation steering、reflection training 与 alignment auditing 放进一个可验证、可回滚的 Agent 对齐闭环。" />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Activation Steering、Reflection Training 与 Alignment Auditing" />
+    <meta property="og:description" content="区分推理时干预、权重级训练和部署后审计，并用反事实证据连接模型内部与 Agent 行为。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="assets/steering-alignment-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/model-internals/steering-alignment/zh/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/model-internals/steering-alignment/zh/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/model-internals/steering-alignment/en/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/model-internals/steering-alignment/" />
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <link rel="stylesheet" href="../../series.css?v=1" />
+    <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="系列目录"><a href="../../zh/">全景</a><a href="../../j-space/zh/">J-space</a><a href="../../reasoning-observability/zh/">推理可观测性</a><a href="../../persona-self-model/zh/">Persona</a><a href="./" aria-current="page">Steering</a></nav>
+      <nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./" aria-current="page">中文</a><a href="../en/" lang="en">English</a></span></nav>
+    </header>
+    <div class="series-strip"><span><a href="../../persona-self-model/zh/">← 04 Persona</a></span><span><strong>05</strong> Steering 与 auditing</span><span><a href="../../zh/">回到系列全景 ↺</a></span></div>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero">
+          <p class="eyebrow">模型内部 · 系列 05</p>
+          <h1>Activation Steering、Reflection Training 与 Alignment Auditing</h1>
+          <p class="lead">看见一个内部方向之后，可以在本轮推理里轻推它，可以通过训练把反思习惯写进权重，也可以只把它作为审计告警。三种动作共享同一套仪器，却有完全不同的风险与回滚成本。</p>
+          <div class="meta-line"><span>控制面：inference · training · audit</span><span>证据：readout · intervention · ablation</span></div>
+          <figure class="hero-image"><img src="assets/steering-alignment-cover.png" alt="Activation steering、reflection training 与 alignment auditing 三个控制回路" /></figure>
+        </section>
+
+        <section class="article-body">
+          <div class="note evidence-note"><p><strong>核心原则。</strong>能读出一个 honesty 或 deception direction，不等于模型内部有一个可独立开关的“诚实模块”；steering 能改善某组 eval，也不等于对齐问题已经解决。方向的意义必须靠对照、剂量曲线、行为特异性、跨分布评测和消融共同建立。</p></div>
+
+          <h2>三条回路，改动发生在不同时间尺度</h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th>回路</th><th>改什么</th><th>持续多久</th><th>主要风险</th></tr></thead>
+            <tbody>
+              <tr><td>Activation steering</td><td>本轮某层的 residual activation</td><td>一次或一段推理</td><td>副作用、分布迁移、被绕过</td></tr>
+              <tr><td>Reflection training</td><td>模型 weights 与默认策略</td><td>跨部署，直到再训练</td><td>过拟合、能力退化、隐藏目标</td></tr>
+              <tr><td>Alignment auditing</td><td>证据、告警与上线决策</td><td>持续运行</td><td>漏报、误报、监控被优化</td></tr>
+            </tbody>
+          </table></div>
+          <p>一个成熟系统不会把它们串成“发现方向 → 永久 steering”这么短的链。审计先产生假设；小剂量、可回滚的 inference intervention 验证因果性；只有当收益跨场景稳定，才考虑训练；训练后重新审计，因为模型可能用新的内部路径完成同一行为。</p>
+
+          <h2>Activation steering：在推理途中加一个向量</h2>
+          <p><a href="https://arxiv.org/abs/2308.10248">Activation Addition（ActAdd）</a>用一对对比 prompt 的 activation 差构造 steering vector，在指定层和 token 位置把它加到新输入的 activation。<a href="https://arxiv.org/abs/2312.06681">Contrastive Activation Addition（CAA）</a>把这种做法用于 truthfulness、toxicity、sycophancy 等行为：从正负样本求平均差向量，再在生成时持续注入。</p>
+          <p>它比改 weights 更容易回滚，也比自然语言 system prompt 更直接；但“方向”往往纠缠多个特征。剂量太小无效，太大可能让语言退化；在一组任务有效，不保证迁移到另一语言、领域或长程 Agent trajectory。对高风险系统，steering 应是附加层而不是权限、policy 与外部 verifier 的替代品。</p>
+
+          <h2>Reflection training：把工作区中的反思变成默认策略</h2>
+          <p>J-space 论文给出一个很有代表性的训练实验。研究者从 production RL 环境收集 <strong>10,000</strong> 条 partial rollouts，在随机轮次截断；随后追加一个 reflection question 和依据 constitution 写出的反思答案，只对反思部分计算 loss。模型不是简单背诵一个拒绝模板，而是在多种未完成情境中练习识别自身行为、原则和下一步。</p>
+          <p>报告结果中，dishonesty 从 <strong>0.25 降到 0.07</strong>，deception 从 <strong>0.38 降到 0.05</strong>。更关键的是机制消融：移除 J-space 中 ethics / reflection 相关方向后，fabrication 从 0.07 回升到 0.22，deception 从 0.05 回升到 0.23。训练收益与可干预的内部工作区产生了联系。</p>
+          <figure class="wide-figure"><img src="assets/counterfactual-reflection.png" alt="从 partial rollout 和 constitution reflection 训练，到 J-space 消融与行为反事实验证的闭环" /><figcaption>数字改善是行为证据；消融让“反思方向参与了改善”成为更强的机制证据，但仍不代表所有诚实行为都经过同一路径。</figcaption></figure>
+          <p>这种结果比“fine-tune 后分数变好”更接近机制解释，却仍有边界：训练分布、constitution 表述、长期副作用和对抗适应都可能改变结论；一次消融也无法排除冗余路径。Reflection training 是 weight-level self-improvement，不是模型在部署中自主改写自己。</p>
+
+          <h2>Alignment auditing：从会解释，走到能发现异常</h2>
+          <p>内部 readout 最实际的用途之一，是在部署前后寻找“行为还没暴露、内部模式已偏移”的样本。论文把 J-lens 用于 alignment auditing，在六类案例中有四类与 NLA 相当或略好；同时也会失败，例如没有完整捕获 reward hacking 和 language switching 的细节。这种结果正说明 audit 需要组合仪器。</p>
+          <h3>建议的证据矩阵</h3>
+          <div class="table-wrap"><table>
+            <thead><tr><th>信号</th><th>它能补什么</th><th>失败时怎么办</th></tr></thead>
+            <tbody>
+              <tr><td>行为与 environment diff</td><td>真实外部后果</td><td>增加对抗任务与长轨迹评测</td></tr>
+              <tr><td>Tool trace</td><td>计划如何变成动作</td><td>强制 schema、权限与可回放日志</td></tr>
+              <tr><td>CoT monitor</td><td>便宜的语义化意图线索</td><td>防止把 monitor 直接优化成表演目标</td></tr>
+              <tr><td>J-lens / NLA / SAE</td><td>输出前的内部异常模式</td><td>交叉验证并做 steering / ablation</td></tr>
+            </tbody>
+          </table></div>
+
+          <h2>重新定义 Agent 的“自进化”</h2>
+          <p>很多 Agent 系统说自己会 self-evolve，实际变化发生在完全不同的载体。把它们合成一个词，会掩盖最重要的治理差异。</p>
+          <div class="table-wrap"><table>
+            <thead><tr><th>变化对象</th><th>例子</th><th>验证与回滚</th></tr></thead>
+            <tbody>
+              <tr><td>外部 artifact</td><td>memory、skill、prompt、workflow</td><td>版本 diff、离线 eval、直接回滚文件或记录</td></tr>
+              <tr><td>Inference state</td><td>activation steering、context routing</td><td>A/B、剂量曲线、关闭 intervention</td></tr>
+              <tr><td>Weights</td><td>reflection training、SFT、RL</td><td>完整模型 eval、checkpoint rollback、重新安全审计</td></tr>
+            </tbody>
+          </table></div>
+          <p>越往下，变化越持久、验证越昂贵。实践上应优先用外部 artifact 表达可审阅的经验，用 steering 做受控实验，用训练固化跨任务稳定、证据充分的规律。Agent 本身不能同时是提案者、受益者和唯一审核者。</p>
+
+          <h2>一个可落地的闭环</h2>
+          <ol>
+            <li><strong>Observe：</strong>保存行为、tool trace、环境差异，并对风险样本运行多种内部 readout。</li>
+            <li><strong>Hypothesize：</strong>提出可证伪的机制假设，不把标签当事实。</li>
+            <li><strong>Intervene：</strong>用小剂量 steering、swap 或 ablation 检验行为是否按预期改变。</li>
+            <li><strong>Train：</strong>只在跨场景证据稳定时更新 weights，保留 checkpoint 与独立审计集。</li>
+            <li><strong>Re-audit：</strong>检查能力副作用、替代路径和 monitorability；必要时回滚。</li>
+          </ol>
+          <p>这条闭环不会带来“可证明对齐”的终点。它的价值更朴素：把对齐从一次性分数，变成可以追溯证据、区分时间尺度、进行反事实验证的持续工程。</p>
+
+          <h2>延伸阅读</h2>
+          <ul>
+            <li>Turner et al.：<a href="https://arxiv.org/abs/2308.10248">Activation Addition</a></li>
+            <li>Rimsky et al.：<a href="https://arxiv.org/abs/2312.06681">Steering Llama 2 via Contrastive Activation Addition</a></li>
+            <li>Anthropic：<a href="https://transformer-circuits.pub/2026/workspace/index.html">J-space：reflection training 与 alignment auditing</a></li>
+            <li>OpenAI：<a href="https://openai.com/index/chain-of-thought-monitoring/">Chain-of-thought monitoring and obfuscation risk</a></li>
+          </ul>
+        </section>
+      </article></main>
+    </div>
+    <footer class="site-footer"><p>Rememorio Blog · Model Internals</p><a href="#top">回到顶部</a></footer>
+    <script src="../../article.js"></script><script src="../../../assets/vendor/highlightjs/highlight.min.js"></script><script src="../../../assets/code-highlight.js"></script>
+  </body>
+</html>

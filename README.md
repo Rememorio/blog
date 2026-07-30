@@ -17,6 +17,7 @@ and GitHub Pages.
 | Blog home | Language gateway and bilingual home pages. | [Gateway](https://rememorio.github.io/blog/) / [中文](https://rememorio.github.io/blog/zh/) / [English](https://rememorio.github.io/blog/en/) |
 | Go from Request to Production | Bilingual source-reading series that follows one HTTP request through Go language semantics, `net/http`, the runtime, the kernel boundary, and production diagnostics. | [Gateway](https://rememorio.github.io/blog/go-runtime/) / [中文](https://rememorio.github.io/blog/go-runtime/zh/) / [English](https://rememorio.github.io/blog/go-runtime/en/) |
 | AI Engineering | Bilingual systems series on prompts, context, harnesses, loops, and evals. | [Gateway](https://rememorio.github.io/blog/ai-engineering/) / [中文](https://rememorio.github.io/blog/ai-engineering/zh/) / [English](https://rememorio.github.io/blog/ai-engineering/en/) |
+| Model Internals | Bilingual five-part series connecting activations, J-space, silent and latent reasoning, persona representations, activation steering, reflection training, and alignment auditing to agent action, memory, and self-evolution. | [Gateway](https://rememorio.github.io/blog/model-internals/) / [中文](https://rememorio.github.io/blog/model-internals/zh/) / [English](https://rememorio.github.io/blog/model-internals/en/) / [J-space](https://rememorio.github.io/blog/model-internals/j-space/) / [Reasoning Observability](https://rememorio.github.io/blog/model-internals/reasoning-observability/) / [Persona and Self-Model](https://rememorio.github.io/blog/model-internals/persona-self-model/) / [Steering and Alignment](https://rememorio.github.io/blog/model-internals/steering-alignment/) |
 | Agent Framework Source Notes | Bilingual source-reading series comparing agent frameworks by runtime ownership, including [earendil-works/pi](https://github.com/earendil-works/pi), [agentscope-ai/agentscope](https://github.com/agentscope-ai/agentscope), [google/adk-python](https://github.com/google/adk-python), [agno-agi/agno](https://github.com/agno-agi/agno), [microsoft/autogen](https://github.com/microsoft/autogen), [crewAIInc/crewAI](https://github.com/crewAIInc/crewAI), [cloudwego/eino](https://github.com/cloudwego/eino), and [trpc-group/trpc-agent-go](https://github.com/trpc-group/trpc-agent-go), plus a protocol-boundary chapter on MCP, A2A, AG-UI, and ACP. | [Gateway](https://rememorio.github.io/blog/agent-framework/) / [中文](https://rememorio.github.io/blog/agent-framework/zh/) / [English](https://rememorio.github.io/blog/agent-framework/en/) / [Protocols 中文](https://rememorio.github.io/blog/agent-framework/zh/agent-protocols/) / [Protocols English](https://rememorio.github.io/blog/agent-framework/en/agent-protocols/) |
 | Claude Code Source Notes | Bilingual source-reading series on the public [Rememorio/claude-code](https://github.com/Rememorio/claude-code) mirror. | [Gateway](https://rememorio.github.io/blog/claude-code/) / [中文](https://rememorio.github.io/blog/claude-code/zh/) / [English](https://rememorio.github.io/blog/claude-code/en/) |
 | Codex Source Notes | Bilingual source-reading series on [openai/codex](https://github.com/openai/codex). | [Gateway](https://rememorio.github.io/blog/codex/) / [中文](https://rememorio.github.io/blog/codex/zh/) / [English](https://rememorio.github.io/blog/codex/en/) |
@@ -44,6 +45,14 @@ stay stable as new essays are added.
 │   ├── assets/                 # Shared language-neutral figures and styles
 │   ├── zh/                     # Chinese articles
 │   └── en/                     # English articles
+├── model-internals/            # Model internals and agent action series
+│   ├── index.html              # Series language gateway
+│   ├── zh/                     # Chinese overview and figures
+│   ├── en/                     # English overview and figures
+│   ├── j-space/                # Jacobian lens and workspace-like reasoning
+│   ├── reasoning-observability/ # CoT, NLA, SAE, and latent reasoning
+│   ├── persona-self-model/     # Persona vectors, Assistant axis, introspection
+│   └── steering-alignment/     # Steering, reflection training, and auditing
 ├── agent-framework/             # Agent framework source-reading series
 │   ├── index.html              # Series language gateway
 │   ├── zh/                     # Chinese articles and figures

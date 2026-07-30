@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>模型内部：从 Activation 到 Agent 行为 | Rememorio Blog</title>
+    <meta name="description" content="沿着 activation、隐式推理、可见 CoT、tool call、runtime 与 environment，建立模型内部机制和 Agent 行为之间的完整地图。" />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="模型内部：从 Activation 到 Agent 行为" />
+    <meta property="og:description" content="一套关于 J-space、latent reasoning、persona、activation steering 与 alignment auditing 的五篇系列。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="assets/activation-to-action-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/model-internals/zh/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/model-internals/zh/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/model-internals/en/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/model-internals/" />
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+    <link rel="stylesheet" href="../../hermes-agent/styles.css?v=site-nav-series" />
+    <link rel="stylesheet" href="../series.css?v=1" />
+    <link rel="stylesheet" href="../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../zh/" aria-label="博客首页"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="系列目录">
+        <a href="./" aria-current="page">全景</a>
+        <a href="../j-space/zh/">J-space</a>
+        <a href="../reasoning-observability/zh/">推理可观测性</a>
+        <a href="../persona-self-model/zh/">Persona</a>
+        <a href="../steering-alignment/zh/">Steering</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch"><a class="active" href="./" aria-current="page">中文</a><a href="../en/" lang="en">English</a></span>
+      </nav>
+    </header>
+
+    <div class="series-strip">
+      <span><strong>01</strong> 全景篇</span>
+      <span>下一篇：<a href="../j-space/zh/">J-space 与 silent reasoning →</a></span>
+    </div>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">模型内部 · 系列 01</p>
+            <h1>从 Activation 到 Agent 行为</h1>
+            <p class="lead">Agent 修改了一个文件。这个动作究竟来自参数里的能力、当前 token 的 activation、没说出口的推理、可见 CoT、长期记忆，还是 runtime 对 tool call 的执行？这篇先把这些层放回一条因果链。</p>
+            <div class="meta-line"><span>范围：模型内部机制 × Agent 系统</span><span>方法：行为、轨迹与 activation 交叉取证</span></div>
+            <figure class="hero-image"><img src="assets/activation-to-action-cover.png" alt="从模型内部 activation 流向 Agent 行动的手绘全景图" /></figure>
+          </section>
+
+          <section class="article-body">
+            <div class="note scope-note"><p><strong>证据边界。</strong>Activation readout 能发现与概念或行为相关、甚至具有因果作用的内部方向，但它不是模型全部计算的逐字翻译；CoT 也不是内部推理的完整录像。本文把“观察到的相关性”“干预得到的因果证据”和“关于心智的解释”严格分开。</p></div>
+
+            <h2>先看整条链：模型不会直接碰到世界</h2>
+            <p>一次 Agent 行动至少跨过六层：参数提供长期能力和倾向；本轮输入在 residual stream 中形成 activation；模型可能做不进入文本的内部计算；decoder 产出自然语言或结构化 tool call；runtime 校验权限并真正调用工具；环境返回结果，再成为下一轮上下文。</p>
+            <div class="concept-chain" aria-label="从模型内部到外部行动的链路">
+              <span>weights</span><b>→</b><span>activation</span><b>→</b><span>silent / visible reasoning</span><b>→</b><span>tool call</span><b>→</b><span>runtime</span><b>→</b><span>environment</span>
+            </div>
+            <p>因此，“模型决定删除文件”和“系统删除了文件”不是同一件事。前者是输出分布中的选择，后者还受工具 schema、审批、sandbox、重试策略与执行反馈约束。研究 J-space 或 persona direction，能解释模型侧的中间变量，却不会替 runtime 承担权限边界。</p>
+
+            <h2>四种状态，四种保存期限</h2>
+            <figure class="wide-figure"><img src="assets/state-horizons.png" alt="Activation、轨迹、外部记忆与模型参数四种状态期限的对比图" /><figcaption>同样叫“记住”，可能只活一个 forward pass，也可能跨会话、甚至被写进参数。</figcaption></figure>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>载体</th><th>典型期限</th><th>能回答什么</th><th>不要误认成</th></tr></thead>
+                <tbody>
+                  <tr><td>Activation</td><td>一次 forward pass</td><td>当前计算正在表达、路由什么</td><td>长期记忆</td></tr>
+                  <tr><td>CoT / trace</td><td>被输出或记录后可保存</td><td>模型愿意写出的部分推理与行动轨迹</td><td>完整内部计算</td></tr>
+                  <tr><td>外部 memory / skill</td><td>跨轮次、跨会话</td><td>历史事实、经验、流程与可复用资产</td><td>模型权重改变</td></tr>
+                  <tr><td>Weights</td><td>跨部署，直到再次训练</td><td>能力、先验与稳定行为倾向</td><td>某一轮具体想法</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>这也划出了两个相邻系列的边界：<a href="../../agent-memory/zh/">Agent Memory</a>研究外部状态怎样写入、召回并进入 model view；<a href="../../hermes-agent/zh/self-evolution/">Agent 自进化</a>常常修改 prompt、skill、memory 与 workflow。只有当训练真正更新权重，变化才进入最慢的那一层。</p>
+
+            <h2>五篇文章，共用一张问题地图</h2>
+            <div class="route-grid">
+              <a class="route-card" href="./"><span>01 · 全景</span><strong>Activation → action</strong><p>分清模型内部、可见轨迹、外部记忆与执行环境。</p></a>
+              <a class="route-card" href="../j-space/zh/"><span>02 · Workspace</span><strong>J-space</strong><p>一个小而可读、可写、与灵活推理相关的 workspace-like 表征。</p></a>
+              <a class="route-card" href="../reasoning-observability/zh/"><span>03 · Readout</span><strong>推理可观测性</strong><p>比较 CoT monitoring、NLA、SAE 与 latent reasoning。</p></a>
+              <a class="route-card" href="../persona-self-model/zh/"><span>04 · Identity</span><strong>Persona 与自我模型</strong><p>post-training 如何选择、稳定默认 Assistant 角色。</p></a>
+              <a class="route-card" href="../steering-alignment/zh/"><span>05 · Intervention</span><strong>Steering 与 auditing</strong><p>把推理时干预、训练时反思和部署后审计放进闭环。</p></a>
+            </div>
+
+            <h2>为什么 J-space 值得单独看</h2>
+            <p>Anthropic 的 <a href="https://transformer-circuits.pub/2026/workspace/index.html">J-space 研究</a>没有声称找到“思维本身”，而是找到 residual stream 中一个很小的、能通过 vocabulary 解释的稀疏 subframe。它同时满足 report、directed modulation、internal reasoning、flexible generalization 与 selectivity 五类检验：可以读出概念、沿概念方向干预、改变下游计算，又不会承载模型的全部自动处理。</p>
+            <p>这正好补上 Agent 研究常缺的一层。行为评测告诉我们任务成没成；trace 告诉我们说了什么、调用了什么；外部 memory 告诉我们保存了什么。J-lens、NLA 与 SAE 则试图回答：在输出之前，中间计算有哪些可观测结构？答案依旧不完整，但足以让监控从单一日志升级成多层证据。</p>
+
+            <h2>对 Agent 设计最直接的三个结论</h2>
+            <h3>不要让一条观测通道独占真相</h3>
+            <p>CoT 可能省略关键信息，activation verbalizer 可能编造解释，SAE 可能发生 feature splitting。可靠的审计应同时检查最终行为、工具轨迹、可见推理、内部 readout 与环境结果；不同信号互相矛盾，本身就是需要调查的事件。</p>
+            <h3>把“自进化”拆成三个控制面</h3>
+            <p>写 memory 或 skill，是外部资产进化；activation steering，是推理时短暂改写状态；reflection training，才是通过训练把行为倾向写入 weights。三者的回滚成本、验证方法和权限模型完全不同。</p>
+            <h3>把内部解释当作仪器读数</h3>
+            <p>仪器可以校准、对照和做反事实实验，却不等于被测系统的自传。最强证据通常不是“它说自己想了什么”，而是读出、干预、消融、行为变化与跨场景复现共同指向同一机制。</p>
+
+            <h2>延伸阅读</h2>
+            <ul>
+              <li>Anthropic：<a href="https://www.anthropic.com/research/global-workspace">A new lens on the global workspace of language models</a></li>
+              <li>Anthropic：<a href="https://www.anthropic.com/research/reasoning-models-dont-say-think">Reasoning models don't always say what they think</a></li>
+              <li>OpenAI：<a href="https://openai.com/index/chain-of-thought-monitoring/">Monitoring reasoning models for misbehavior and the risks of promoting obfuscation</a></li>
+              <li>Anthropic：<a href="https://www.anthropic.com/research/persona-vectors">Persona vectors</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+    <footer class="site-footer"><p>Rememorio Blog · Model Internals</p><a href="#top">回到顶部</a></footer>
+    <script src="../article.js"></script>
+    <script src="../../assets/vendor/highlightjs/highlight.min.js"></script>
+    <script src="../../assets/code-highlight.js"></script>
+  </body>
+</html>
