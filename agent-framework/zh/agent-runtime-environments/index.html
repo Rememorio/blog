@@ -1,0 +1,754 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent 框架源码阅读（四）：Agent 的工作现场在哪里</title>
+    <meta
+      name="description"
+      content="Agent 框架源码阅读第四篇：用同一项脚本任务讲清 Coding / General 与 Local / Cloud 是两条坐标，并沿 Pi、AgentScope、Agno 和 tRPC-Agent-Go 区分 workspace、sandbox、session、artifact 与 memory。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Agent 框架源码阅读（四）：Agent 的工作现场在哪里" />
+    <meta
+      property="og:description"
+      content="会执行代码不等于 Coding Agent，运行在云端也不等于没有 workspace。关键在于谁拥有工作现场，以及哪些状态能够恢复。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/agent-runtime-worksites.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-framework/zh/agent-runtime-environments/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-framework/zh/agent-runtime-environments/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-framework/en/agent-runtime-environments/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-framework/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(31, 119, 123, 0.34);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      .shape-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin: 18px 0 22px;
+      }
+
+      .shape-box {
+        border: 1px solid rgba(24, 55, 82, 0.14);
+        border-radius: 8px;
+        background: rgba(255, 250, 240, 0.72);
+        min-width: 0;
+        padding: 14px;
+      }
+
+      .shape-box h3,
+      .shape-box h4 {
+        margin-top: 0;
+      }
+
+      .shape-box pre {
+        max-width: 100%;
+        overflow-x: auto;
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+
+        .shape-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+    <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Agent 框架系列</a>
+        <a href="../agentscope-runtime/">上一篇</a>
+        <a href="../agent-protocols/">下一篇</a>
+        <a href="#state-owners">四种状态</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/agent-runtime-environments/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Agent 框架源码阅读 · 第四篇</p>
+            <h1>Agent 的工作现场在哪里</h1>
+            <p class="lead">
+              同一句“修改脚本、运行检查并交付结果”，既可以进入用户电脑上的 repository，也可以进入云端临时分配的 sandbox。
+              两边都能读文件、写代码、调用模型，真正改变架构的却是：工作现场由谁拥有，哪些状态会留下，失败后能恢复到哪里。
+            </p>
+            <div class="meta-line">
+              <span>主题：Coding / General</span>
+              <span>坐标：Local / Cloud</span>
+              <span>重点：Workspace / Artifact / Memory</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/agent-runtime-worksites.png"
+                alt="Agent 工作现场手绘对照图：同一任务分别进入本地工作区与云端运行时，本地以 repository、代码和测试为中心，云端把 sandbox workspace 与持久化的 session、artifact、memory 分开管理"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <h2>一、同一项脚本任务，为什么会长成两套 Runtime</h2>
+            <p>
+              假设用户交来一项很普通的任务：“把数据清洗脚本改成支持 <code>region</code> 字段，运行检查，再把结果交给我。”
+              我们先不问产品叫 Coding Agent 还是 General Agent，只看任务怎样发生。
+            </p>
+
+            <p>
+              第一种场景里，Agent 从已经打开的 repository 开始。它知道当前目录，读取源码和项目规则，修改文件，运行测试，
+              再把 diff、退出码和测试结果留在同一个工作区。用户第二天回来，文件与 Git 状态通常还在；但昨天启动的后台进程、
+              尚未完成的工具调用和模型会话是否还在，是另外三个问题。
+            </p>
+
+            <p>
+              第二种场景里，用户只上传了一份压缩包。服务先创建 task 与 session，再给这次运行分配 sandbox，
+              把输入材料恢复到 workspace。Agent 仍然可以改文件和跑命令，但当前 worker 与 sandbox 都可能被回收。
+              最终报告必须离开临时现场，保存成有用户、会话和版本归属的 artifact；下次请求也不能只靠“碰巧还在这台机器的目录”继续。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <strong>先记住结论：</strong>
+                General / Coding 描述产品把哪种工作对象放在中心；Local / Cloud 描述执行环境与持久状态由谁拥有。
+                它们是两条坐标，不是一条从“普通”到“高级”的能力等级。
+              </p>
+            </div>
+
+            <p>
+              这篇固定跟踪同一项脚本任务，只回答五个问题：
+            </p>
+            <ol>
+              <li>“workspace 是第一公民”具体承诺了什么？</li>
+              <li>会执行代码，为什么还不一定是 Coding Agent？</li>
+              <li>云端 sandbox、workspace 与 durable storage 为什么必须拆开？</li>
+              <li>Session、Artifact、Memory 和文件目录各自保存什么？</li>
+              <li>本地与云端恢复分别会在哪些地方停止？</li>
+            </ol>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                本文用 Pi 的 coding harness、AgentScope 的 service example、Agno 的 AgentOS，以及 tRPC-Agent-Go 的
+                Session、CodeExecutor、workspace、Artifact 与 Memory 公开源码说明可见契约。文中的四象限与“工作现场”是跨框架的工程归纳；
+                不推断任何产品未公开的容器实现、存储拓扑、调度策略或保留时长。
+              </p>
+            </div>
+
+            <h2>二、第一公民不是“工具列表里有 bash”</h2>
+            <p>
+              如果 Agent 的 tools 里出现 <code>read_file</code> 和 <code>bash</code>，我们最多只能确认模型可以请求两种动作。
+              “第一公民”是更强的运行契约：runtime 不仅暴露操作，还要认识操作发生在哪个对象上，并接住它的整个生命周期。
+            </p>
+
+            <p>
+              回到这次脚本修改。一个真正的一等 workspace 至少要回答五件事：
+            </p>
+            <ol>
+              <li><strong>身份：</strong>这是哪个 repository、branch、task 或 workspace，而不是一个随手拼出的路径。</li>
+              <li><strong>操作：</strong>读取、搜索、patch、shell、测试和 Git 都围绕同一个现场发生。</li>
+              <li><strong>治理：</strong>路径、命令、网络、Secrets 与审批有明确边界。</li>
+              <li><strong>证据：</strong>文件变化、命令退出码、测试报告和生成物可以被观察与关联。</li>
+              <li><strong>恢复：</strong>进程或客户端离开以后，runtime 知道哪些状态可以重新装载，哪些已经丢失。</li>
+            </ol>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>只“拥有一个工具”</th>
+                    <th>把对象做成第一公民</th>
+                    <th>差别会在哪里暴露</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>bash(command)</code></td>
+                    <td>命令绑定 workspace、权限、环境、取消和结果记录</td>
+                    <td>失败后能否知道命令在哪运行、改了什么</td>
+                  </tr>
+                  <tr>
+                    <td><code>write_file(path)</code></td>
+                    <td>文件属于 repository 或 task workspace，并能形成 diff</td>
+                    <td>下一轮读取的是同一份状态，还是另一台机器的空目录</td>
+                  </tr>
+                  <tr>
+                    <td>返回下载链接</td>
+                    <td>Artifact 有 owner、版本、媒体类型和生命周期</td>
+                    <td>链接失效后，服务能否按 task/session 重新找到结果</td>
+                  </tr>
+                  <tr>
+                    <td>把几句话写进数据库</td>
+                    <td>Memory 有用户作用域、更新、删除、检索和采用规则</td>
+                    <td>旧事实怎样被纠正，多个用户怎样避免串线</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以，通用 Agent 加一个代码解释器后，可以完成代码任务；Coding Agent 也可以借助文件和 shell 写报告、整理数据、制作演示。
+              分类不能靠“能做什么”硬切。更稳定的判断是：<strong>产品默认围绕什么对象组织上下文、权限、结果和恢复。</strong>
+            </p>
+
+            <h2>三、先分任务坐标，再分部署坐标</h2>
+
+            <h3>3.1 Coding / General：哪种工作对象处在中心</h3>
+            <p>
+              Coding-oriented Agent 通常把 project 或 repository 当作主对象。模型输入会主动吸收项目规则、文件结构和当前 diff；
+              工具结果天然表现为文件修改、命令输出和测试证据；完成标准往往是“patch 正确、测试通过、改动可审查”。
+            </p>
+            <p>
+              General-purpose Agent 更常把 user task、session 或业务记录放在中心。文件可能只是输入材料，代码执行只是处理材料的一种手段；
+              最终结果也可能是答案、表格、报告、CRM 更新或审批记录。它更关心用户身份、业务权限、跨渠道 session 与 artifact 交付。
+            </p>
+
+            <h3>3.2 Local / Cloud：谁拥有执行环境与持久状态</h3>
+            <p>
+              Local 不等于“只有命令行”，Cloud 也不等于“没有文件系统”。这里问的是 authoritative worksite 在哪里。
+              本地型 runtime 通常直接借用用户机器的目录、进程、凭据与操作系统身份；云端型 runtime 则由服务分配 worker 或 sandbox，
+              并把需要跨 worker 生存的状态放到外部 owner。
+            </p>
+
+            <p>
+              两条轴交叉后，四个象限都成立：
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>形态</th>
+                    <th>工作现场</th>
+                    <th>常见第一公民</th>
+                    <th>首要工程压力</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>本地 Coding Agent</td>
+                    <td>用户机器上的 repository</td>
+                    <td>cwd、files、Git、shell、tests</td>
+                    <td>项目信任、权限、环境污染与可审查 patch</td>
+                  </tr>
+                  <tr>
+                    <td>云端 Coding Agent</td>
+                    <td>远程 repository workspace 或受管开发环境</td>
+                    <td>task、repo snapshot、patch、build/test artifact</td>
+                    <td>环境重建、Secrets、网络策略、并发与成本</td>
+                  </tr>
+                  <tr>
+                    <td>本地通用 Agent</td>
+                    <td>个人设备与桌面应用</td>
+                    <td>用户文件、桌面工具、个人上下文</td>
+                    <td>设备权限、隐私、应用间副作用</td>
+                  </tr>
+                  <tr>
+                    <td>云端通用 Agent</td>
+                    <td>多租户 service + 临时或受管 sandbox</td>
+                    <td>user、session、task、artifact、business tool</td>
+                    <td>租户隔离、恢复、配额、审计与长期状态</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这张表不是四种互斥产品。云端控制面可以把某些命令交给本地执行器；本地客户端也可以租用远程 sandbox。
+              混合架构里最重要的不是给整套产品贴一个标签，而是逐项标出 workspace、执行权限、durable record 和最终副作用的 owner。
+            </p>
+
+            <h2>四、本地 Coding Harness 为什么天然围绕 Workspace</h2>
+            <p>
+              Pi 提供了一个足够清楚的本地参照。它把模型接入、agent loop、coding harness 与终端 UI 拆成
+              <a href="https://github.com/earendil-works/pi/blob/34582ef34beec868b0df4fb969385b8af5960c45/README.md#L13-L45">四层 package</a>。
+              可复用 core 负责模型、工具调用和事件；coding-agent 层再装配 read、write、edit、bash、resources、session tree 与 compaction。
+              这说明 workspace 能力不是 provider API 自带的，而是产品 runtime 主动接走的责任。
+            </p>
+
+            <p>
+              把脚本任务写成运行记录，可以看到本地路径里哪些对象天然稳定：
+            </p>
+            <pre><code class="language-text">Task C-17：增加 region 字段
+worksite = repository / branch
+
+read schema.py
+edit cleaner.py
+bash pytest -q
+  -&gt; exit 1：缺少 fixture
+edit test_cleaner.py
+bash pytest -q
+  -&gt; exit 0
+
+observable result = files + diff + test output</code></pre>
+
+            <p>
+              会话账本与磁盘仍然不是一回事。Pi 的 <code>SessionManager</code> 用 append-only JSONL tree 保存 message、tool result、
+              model change、branch 与 compaction entry；当前 leaf 决定恢复哪条会话路径。
+              <a href="https://github.com/earendil-works/pi/blob/34582ef34beec868b0df4fb969385b8af5960c45/packages/coding-agent/src/core/session-manager.ts#L406-L466">上下文重建</a>
+              可以恢复 model-visible history，却不会把 repository 自动回滚到旧 leaf。真正试验另一份代码状态仍需要 Git branch、worktree 或 sandbox。
+            </p>
+
+            <p>
+              安全边界也直接继承现场。Pi 的 project trust 决定是否加载项目中的 settings、extensions、skills 和 prompts，
+              但官方
+              <a href="https://github.com/earendil-works/pi/blob/34582ef34beec868b0df4fb969385b8af5960c45/packages/coding-agent/docs/security.md#L1-L37">Security 文档</a>
+              明确说它不是 sandbox。没有额外 gate 时，文件与命令仍继承启动进程的操作系统权限。
+              本地带来了丰富环境，也把用户机器变成了真实 blast radius。
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>本地磁盘存在，只能证明某些文件还在。</strong>
+                它不自动证明旧 shell 进程仍活着、外部 API 没有重复执行、会话可以重放，或模型能解释每一处现存修改。
+              </p>
+            </div>
+
+            <h2>五、云端 Runtime 为什么要把现场拆成多个 Owner</h2>
+            <p>
+              云端版本不能假定下一次请求一定落在同一进程。于是“一个目录”必须被拆成几种不同承诺：
+              task/session 保存运行身份，sandbox 提供当前执行环境，workspace 承载可变文件，artifact store 保存已交付结果，
+              memory store 保存以后还要检索的知识。
+            </p>
+
+            <h3>5.1 先创建运行身份，再租用执行环境</h3>
+            <p>
+              一个典型的服务路径会先把用户请求正规化成带身份的 run，再为需要执行代码的步骤准备 sandbox。
+              下面只是 shape-level 路径，不对应任何私有产品 schema：
+            </p>
+            <pre><code class="language-text">request
+  {user_id, task_id, session_id, input_refs}
+
+service plane
+  -&gt; authorize tenant and tool policy
+  -&gt; lease sandbox
+  -&gt; restore task workspace
+  -&gt; run agent loop and stream events
+  -&gt; promote selected outputs to artifacts
+  -&gt; persist run/session state
+  -&gt; release or snapshot sandbox</code></pre>
+            <p>
+              顺序里最关键的是“promote selected outputs”。临时目录中的 cache、依赖、半成品与日志不会因为任务结束就全部成为永久资产；
+              应用必须决定哪些文件带着 owner、版本和媒体类型离开现场。
+            </p>
+
+            <h3>5.2 Service plane 接住多用户与重连，但不能靠组件名证明恢复</h3>
+            <p>
+              AgentScope 的 example service 把 <code>create_app</code>、<code>RedisStorage</code>、message bus、
+              <code>LocalWorkspaceManager</code>、MCP 与 subagent template 接到一起。
+              <a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/examples/agent_service/main.py#L39-L108">这条装配路径</a>
+              证明它考虑了 service、storage 和 workspace；但单独看见 <code>RedisStorage</code>，仍不足以证明 pending tool state、
+              event cursor 与 workspace snapshot 已经支持跨进程恢复。
+            </p>
+
+            <p>
+              Agno 把平台责任展示得更完整。<code>AgentOS</code> 同时装配 agents、teams、workflows、database、authorization、
+              registry、scheduler、tracing 和 interfaces；初始化时还会注入 OS-level database/checkpoint 并开启 event storage。
+              对应源码在
+              <a href="https://github.com/agno-agi/agno/blob/c581db4c65676765ac8956d79120454dc83a6795/libs/agno/agno/os/app.py#L220-L384"><code>AgentOS.__init__</code></a>
+              与
+              <a href="https://github.com/agno-agi/agno/blob/c581db4c65676765ac8956d79120454dc83a6795/libs/agno/agno/os/app.py#L589-L674">运行对象初始化</a>。
+              这类 service plane 的第一公民是 run、session、identity 与 platform service，不是某台 worker 的 cwd。
+            </p>
+
+            <h3>5.3 CodeExecutor、Workspace 与 Artifact 解决三种问题</h3>
+            <p>
+              tRPC-Agent-Go 的源码把这条边界说得很直白：
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/codeexecutor/codeexecutor.go#L23-L42"><code>CodeExecutor</code></a>
+              回答“程序怎样运行”；
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/skill/run.go#L918-L935"><code>stageSkill</code></a>
+              为一次执行准备可写工作副本；
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/artifact/service.go#L14-L78"><code>artifact.Service</code></a>
+              则按 Session、文件名与 revision 保存交付文件。
+            </p>
+            <p>
+              因此“支持代码执行”只覆盖中间那段尝试。若没有 workspace owner，输入、依赖与中间文件没有一致现场；
+              若没有 artifact owner，最终报告仍困在可能被回收的目录。三者可以由同一台机器实现，但语义上不能合并。
+            </p>
+
+            <h2 id="state-owners">六、四种状态，不是一块磁盘</h2>
+            <p>
+              现在把同一项任务的状态摆在一起。Session、Workspace、Artifact 和 Memory 都可能最终落到文件或数据库，
+              但存储介质相同不代表生命周期相同。
+            </p>
+
+            <figure class="hero-image">
+              <img
+                src="../assets/agent-runtime-state-owners.png"
+                alt="Agent Runtime 四种状态手绘图：Session 账本保存运行经过，Workspace 承载可变文件，选中的文件被提升为 Artifact，完成后的会话证据再经提炼进入跨会话 Memory；文件持久化不等于进程恢复或长期记忆"
+              />
+            </figure>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>状态 owner</th>
+                    <th>这次任务里保存什么</th>
+                    <th>谁会再次读取</th>
+                    <th>它不承诺什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Session ledger</td>
+                    <td>消息、事件、tool call/result、暂停点与 run 状态</td>
+                    <td>恢复 runtime、构造下一轮 model view、前端回放</td>
+                    <td>不保存完整工作目录，也不撤销业务副作用</td>
+                  </tr>
+                  <tr>
+                    <td>Workspace</td>
+                    <td>源码、输入文件、依赖、临时输出与当前修改</td>
+                    <td>文件工具、shell、代码执行器和测试</td>
+                    <td>目录还在不代表进程、会话和网络连接还在</td>
+                  </tr>
+                  <tr>
+                    <td>Artifact</td>
+                    <td>被选中交付的报告、图片、压缩包或构建结果</td>
+                    <td>用户、前端、后续工具或业务系统</td>
+                    <td>生成成功不代表内容已经验证或正式采用</td>
+                  </tr>
+                  <tr>
+                    <td>Memory</td>
+                    <td>跨会话仍有价值的 fact、episode、偏好或方法</td>
+                    <td>未来 session 的检索与上下文装配</td>
+                    <td>不是原始 transcript，也不应该收下全部文件</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>6.1 为什么 Artifact 必须经过“提升”</h3>
+            <p>
+              Workspace 是尝试现场，允许出现失败脚本、未完成报告和大量缓存；Artifact 是产品承诺，应该只保存明确选择的输出。
+              tRPC-Agent-Go 的 <code>workspace_save_artifact</code> 就把已有 workspace 文件保存成 artifact reference，
+              并把引用写进 state delta。源码在
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/tool/workspaceexec/save_artifact.go#L61-L160">文件提升路径</a>。
+              这不是一次普通 copy，而是 owner 从“当前执行现场”变成“按 session 可引用的交付物”。
+            </p>
+
+            <h3>6.2 为什么 Memory 必须经过“提炼”</h3>
+            <p>
+              如果把每条日志、每份文件和每个失败尝试都写进长期 Memory，未来检索只会得到噪声。
+              tRPC-Agent-Go 的 Memory Service 把跨 Session 的 fact 与 episode 放在独立接口中；
+              当前 Session 仍保存原始运行记录。公开边界见
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go#L155-L236"><code>memory.Service</code></a>。
+              自动抽取还要在 run 完成后读取增量消息、判断是否值得提炼，再执行 add/update/delete，而不是每轮必写。
+            </p>
+
+            <h2>七、Coding Agent 的 Memory 为什么看起来不一样</h2>
+            <p>
+              Coding Agent 有一个很强的外部状态源：repository 本身。项目规则可以写进说明文件，设计决策可以留在文档，
+              代码变化进入 Git，测试把预期固化成可执行证据。未来任务重新打开同一个 project 时，这些材料无需先被压成一段“用户记忆”。
+            </p>
+
+            <p>
+              但不能因此说“filesystem 就是 Memory”。文件可能只是当前实现，也可能包含过时注释、构建缓存和用户不希望长期保留的材料。
+              Session compaction 解决模型窗口压力，Git 记录代码版本，project instructions 约束工作方式，semantic Memory 才负责跨任务检索事实或经验。
+              它们可以都落在文件上，却仍然有不同 owner 与采用规则。
+            </p>
+
+            <p>
+              云端通用 Agent 更难借用一个稳定 repository 作为共同事实源。同一用户可能从多个入口发起任务，请求落到不同 worker，
+              业务数据还分散在外部系统。因此它通常更依赖 user/app-scoped Memory store、Session store、knowledge retrieval 与 Artifact store。
+              这不是因为 General Agent “记性更好”，而是因为状态必须从单机环境外部化，才能被多节点重新找到。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>需要留下的东西</th>
+                    <th>Coding-oriented 默认落点</th>
+                    <th>Cloud general-purpose 默认落点</th>
+                    <th>采用前要检查</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>项目约束</td>
+                    <td>repository instructions、Skill、配置</td>
+                    <td>应用策略、tenant 配置、tool policy</td>
+                    <td>作用域和优先级是否正确</td>
+                  </tr>
+                  <tr>
+                    <td>当前任务进度</td>
+                    <td>session ledger + workspace + Git</td>
+                    <td>run/session store + sandbox snapshot</td>
+                    <td>能否关联同一个 task 与副作用</td>
+                  </tr>
+                  <tr>
+                    <td>跨任务知识</td>
+                    <td>项目文档、已审查 Skill、可选 Memory</td>
+                    <td>user/app Memory、knowledge store</td>
+                    <td>来源、更新、删除和隐私边界</td>
+                  </tr>
+                  <tr>
+                    <td>最终交付</td>
+                    <td>commit、patch、build/test artifact</td>
+                    <td>versioned artifact 或业务记录</td>
+                    <td>内容校验、回归、审批与发布</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>八、恢复时，最容易混淆的是四种“还在”</h2>
+            <p>
+              用户说“昨天的任务还在吗”，可能同时在问四件事：对话记录还在吗，文件还在吗，进程还活着吗，外部副作用已经发生了吗。
+              Runtime 若只回答一个“是”，就会把不同恢复层级混成虚假保证。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>中断</th>
+                    <th>本地现场通常还剩什么</th>
+                    <th>云端现场必须外部化什么</th>
+                    <th>恢复边界</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>客户端断线</td>
+                    <td>本地进程可能仍运行</td>
+                    <td>run id、event cursor、buffer 或 event store</td>
+                    <td>重连事件流不等于重启计算</td>
+                  </tr>
+                  <tr>
+                    <td>Agent 进程退出</td>
+                    <td>磁盘文件通常仍在</td>
+                    <td>Session、pending state、workspace snapshot</td>
+                    <td>未持久化的工具内部状态会丢失</td>
+                  </tr>
+                  <tr>
+                    <td>执行环境回收</td>
+                    <td>不常发生或由用户自己管理</td>
+                    <td>输入引用、环境描述、snapshot、artifact</td>
+                    <td>文件可重建不代表后台进程可续跑</td>
+                  </tr>
+                  <tr>
+                    <td>外部写入超时</td>
+                    <td colspan="2">都需要幂等键、业务回执或补偿记录</td>
+                    <td>恢复 agent loop 不能证明副作用 exactly-once</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Agno 的 API 路由提供了一个很好的区分：<code>continue</code> 可以从持久化 run state 推进执行，
+              <code>resume</code> 则用 <code>last_event_index</code> 补发 missed events 并重连仍在运行的流。
+              两条路径分别见
+              <a href="https://github.com/agno-agi/agno/blob/c581db4c65676765ac8956d79120454dc83a6795/libs/agno/agno/os/routers/agents/router.py#L885-L1152">continue run</a>
+              和
+              <a href="https://github.com/agno-agi/agno/blob/c581db4c65676765ac8956d79120454dc83a6795/libs/agno/agno/os/routers/agents/router.py#L1576-L1648">resume stream</a>。
+              “继续计算”与“重新看见事件”是两种恢复，不能因为都叫 resume 就合并。
+            </p>
+
+            <h2>九、把同一项任务完整重放一遍</h2>
+            <div class="shape-grid">
+              <section class="shape-box">
+                <h3>本地 Coding 路径</h3>
+                <pre><code class="language-text">用户选择 repository
+  -&gt; Agent 读取项目规则
+  -&gt; files / shell / tests 在同一 cwd
+  -&gt; Session 记录工具与模型过程
+  -&gt; Git diff 保存可审查修改
+  -&gt; 测试与人工 review 验证
+  -&gt; 用户决定是否 commit / merge</code></pre>
+              </section>
+              <section class="shape-box">
+                <h3>云端服务路径</h3>
+                <pre><code class="language-text">服务创建 task / session
+  -&gt; 鉴权并分配 sandbox
+  -&gt; 恢复 workspace 与输入
+  -&gt; Agent 执行并流式发事件
+  -&gt; 选中输出提升为 artifact
+  -&gt; 校验器或审批验证结果
+  -&gt; 产品决定发布或交付</code></pre>
+              </section>
+            </div>
+
+            <p>
+              两条路径最后都必须分开三个状态。Agent 产生 patch 或报告，只能说明 <strong>output produced</strong>；
+              测试、schema 校验、安全扫描或业务规则通过，才是 <strong>output validated</strong>；
+              commit、merge、发布、写入业务系统或由用户接收，才是 <strong>output adopted</strong>。
+              本地丰富的工具面与云端完整的 service plane 都不能替代最后两道门。
+            </p>
+
+            <h2>十、最后用这组问题选择 Runtime</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>设计问题</th>
+                    <th>答案偏左时</th>
+                    <th>答案偏右时</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>主要对象是长期 repository，还是一次 user task？</td>
+                    <td>优先 coding-oriented workspace</td>
+                    <td>优先 task/session service plane</td>
+                  </tr>
+                  <tr>
+                    <td>authoritative files 在用户设备，还是由服务管理？</td>
+                    <td>本地权限、project trust、Git 是核心</td>
+                    <td>snapshot、artifact、tenant identity 是核心</td>
+                  </tr>
+                  <tr>
+                    <td>依赖与后台进程是否必须跨天保留？</td>
+                    <td>可复用现有开发环境</td>
+                    <td>需要 named environment 或明确重建合同</td>
+                  </tr>
+                  <tr>
+                    <td>请求是否会跨 worker、入口或设备继续？</td>
+                    <td>本地 session 可能已经足够</td>
+                    <td>必须外部化 run、event、pending state</td>
+                  </tr>
+                  <tr>
+                    <td>哪些知识要跨任务生效？</td>
+                    <td>项目文件、文档、Skill 可先承担</td>
+                    <td>需要 user/app Memory 与检索治理</td>
+                  </tr>
+                  <tr>
+                    <td>最终产物怎样进入真实世界？</td>
+                    <td>patch/test/review/merge</td>
+                    <td>artifact validation/approval/publish</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="note key-point">
+              <p>
+                <strong>可复用判断：</strong>
+                不要问“这个 Agent 能不能写代码”，要问 workspace 是否有稳定身份，执行权限由谁治理，
+                Session、文件、进程和 Artifact 分别能活多久，Memory 对谁可见，以及最终结果由谁验证并采用。
+              </p>
+            </div>
+
+            <p>
+              <a href="../agent-protocols/">下一篇把这些 owner 放到系统边界上</a>。
+              当前端、工具服务、远程 Agent、编辑器与模型 provider 可以独立实现和升级时，
+              runtime 还需要公开约定怎样发现能力、创建任务、传输事件和关联结果。
+              这时再读 MCP、A2A、AG-UI 与 Agent Client Protocol，就能看清每条协议连接的是哪两个工作现场。
+            </p>
+
+            <h2 id="sources">参考源码与延伸阅读</h2>
+            <ul>
+              <li><a href="https://github.com/earendil-works/pi/blob/34582ef34beec868b0df4fb969385b8af5960c45/README.md">Pi Agent Harness README</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/34582ef34beec868b0df4fb969385b8af5960c45/packages/coding-agent/src/core/session-manager.ts">Pi <code>SessionManager</code></a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/34582ef34beec868b0df4fb969385b8af5960c45/packages/coding-agent/docs/security.md">Pi Security</a></li>
+              <li><a href="https://github.com/agentscope-ai/agentscope/blob/ae9819017d6c195967a8f17b0ab4e70ff803f5a3/examples/agent_service/main.py">AgentScope agent service example</a></li>
+              <li><a href="https://github.com/agno-agi/agno/blob/c581db4c65676765ac8956d79120454dc83a6795/libs/agno/agno/os/app.py">Agno <code>AgentOS</code></a></li>
+              <li><a href="https://github.com/agno-agi/agno/blob/c581db4c65676765ac8956d79120454dc83a6795/libs/agno/agno/os/routers/agents/router.py">Agno AgentOS run routes</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/codeexecutor/codeexecutor.go">tRPC-Agent-Go <code>CodeExecutor</code></a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/artifact/service.go">tRPC-Agent-Go Artifact Service</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/blob/d3b50fd90d60b4ece8a78e89cf890a4f06d78235/memory/memory.go">tRPC-Agent-Go Memory Service</a></li>
+              <li><a href="../pi-agent-harness/">本系列：Pi Agent Harness</a></li>
+              <li><a href="../agentscope-runtime/">本系列：AgentScope Runtime</a></li>
+              <li><a href="../agno-platform/">本系列：Agno Agent Platform</a></li>
+              <li><a href="../trpc-agent-go/">本系列：tRPC-Agent-Go Runtime</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script src="../../table-labels.js"></script>
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        const headings = [...article.querySelectorAll("h2, h3, h4")];
+        const slugCounts = new Map();
+        const slugify = (text) => {
+          const raw = text
+            .trim()
+            .toLowerCase()
+            .replace(/<[^>]+>/g, "")
+            .replace(/["'“”‘’]/g, "")
+            .replace(/[^\p{Script=Han}\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          const base = raw || "section";
+          const count = slugCounts.get(base) || 0;
+          slugCounts.set(base, count + 1);
+          return count ? base + "-" + (count + 1) : base;
+        };
+        const root = document.createElement("ol");
+        root.className = "toc-list";
+        const stack = [{ level: 2, list: root }];
+        headings.forEach((heading) => {
+          if (!heading.id) heading.id = slugify(heading.textContent || "");
+          const level = Number(heading.tagName.slice(1));
+          while (stack.length && level < stack[stack.length - 1].level) stack.pop();
+          if (level > stack[stack.length - 1].level) {
+            const parent = stack[stack.length - 1].list.lastElementChild;
+            const child = document.createElement("ol");
+            child.className = "toc-sublist";
+            if (parent) parent.appendChild(child);
+            stack.push({ level, list: child });
+          }
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = "#" + heading.id;
+          link.textContent = heading.textContent || "";
+          link.className = "toc-link toc-level-" + level;
+          item.appendChild(link);
+          stack[stack.length - 1].list.appendChild(item);
+        });
+        toc.appendChild(root);
+      })();
+    </script>
+    <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+    <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>
