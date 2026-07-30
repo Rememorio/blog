@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Code 源码阅读（二）：Memory 不是聊天记录，而是长期指令层</title>
+    <meta
+      name="description"
+      content="沿 Claude Code 公开镜像源码拆解 Memory：CLAUDE.md、auto memory、session memory、agent memory、auto dream 怎样写入账本、投影到 user context，并影响 prompt cache 前缀。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Claude Code 源码阅读（二）：Memory 不是聊天记录，而是长期指令层" />
+    <meta
+      property="og:description"
+      content="Memory 不是 transcript，也不是模型权重里的记忆。它先落到不同账本，再在每轮请求里被投影成模型可见上下文。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/memory-layer-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/zh/memory-layer/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/memory-layer/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/claude-code/en/memory-layer/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/claude-code/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(197, 139, 45, 0.38);
+        background: rgba(197, 139, 45, 0.12);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      .note.reading-contract {
+        border-color: rgba(31, 119, 123, 0.32);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .shape-example {
+        margin: 28px 0;
+      }
+
+      .shape-example pre {
+        margin-bottom: 8px;
+      }
+
+      .article-body pre code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .shape-example figcaption {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+    <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Claude Code 系列</a>
+        <a href="../overview/">上一篇：总览</a>
+        <a href="../context-management/">下一篇：上下文</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/memory-layer/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Claude Code 源码阅读 · 第二篇</p>
+            <h1>Memory 不是聊天记录，而是长期指令层</h1>
+            <p class="lead">
+              上一篇我们沿一次任务走完整条 runtime 主线。现在回到一个更日常的问题：为什么你在一个项目里告诉 Claude Code
+              “测试用这个命令”“不要改生成文件”“这个目录有特殊约定”，它下一次还能照着做？答案不是模型突然长了记忆，
+              而是 Claude Code 把长期规则、偏好和经验放进几本不同的账本，再在每轮请求前投影给模型。
+            </p>
+            <div class="meta-line">
+              <span>项目：Claude Code</span>
+              <span>主题：memory / user context / prompt cache</span>
+              <span>范围：公开镜像源码与官方文档</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/memory-layer-cover.png"
+                alt="Claude Code Memory 分层图，展示 CLAUDE.md、auto memory、agent memory 这些长期材料的不同存储与投影边界"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先把容易混的几句话拆开。你在终端里看到的聊天滚动历史叫会话过程；写在磁盘里的 transcript 是证据记录；
+              <code>CLAUDE.md</code>、auto memory、agent memory 这类长期材料才更接近 Claude Code 说的 memory。
+              它们都可能影响下一轮模型，但影响方式不一样：有的进入每轮 user context，有的先进入 memory prompt 或后台账本，
+              有的只属于某个 agent 的 system prompt。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                本篇先给结论：<strong>Memory 不是聊天记录的别名，而是 runtime 在请求前可投影的一组长期账本。</strong>
+                它能影响 prompt cache，因为一旦进入 model-visible request prefix，文本变化就可能改变缓存前缀；但 memory
+                “动态”不等于每轮必变，也不等于所有记忆都会直接塞进 system prompt。
+              </p>
+            </div>
+
+            <div class="note reading-contract">
+              <p>
+                <strong>阅读契约：</strong>这篇追踪一个代表性规则“这个项目测试必须跑 <code>pnpm test</code>”：
+              它可以被人写进 <code>CLAUDE.md</code>，也可能被 auto memory 记录，或被某个 agent 作为 scoped memory 使用；
+              源码怎样发现它、缓存它、投影到对应 prompt 入口、什么时候后台更新、哪里会影响 prompt cache。
+                读完应该能回答：Memory 存在哪里，谁能写，哪一轮模型能看见，和 transcript、context、prompt cache 分别是什么关系。
+              </p>
+            </div>
+
+            <p>
+              证据边界先摆出来。产品层说法参考
+              <a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory 文档</a>、
+              <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic prompt caching 文档</a>；
+              源码层说法来自
+              <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
+              公开镜像不是 Anthropic 官方源码仓库，所以本文只把可见客户端代码写成事实；feature gate、服务端缓存和模型内部行为只按可见请求形状做边界化推断。
+              文末也放了一篇小林 Coding 的参考阅读，但正文不会把外部讲法当成源码证据。
+            </p>
+
+            <h2>一、先从一条项目规则开始</h2>
+            <p>
+              假设你在一个仓库里反复告诉 Claude Code：“这个项目不要跑 <code>npm test</code>，要跑 <code>pnpm test</code>。”
+              如果每次都靠聊天历史撑着，这条规则很脆弱：一旦 compact、resume、开新会话，旧消息不一定还在模型视野里。
+              所以更稳的做法，是把它变成长期材料。
+            </p>
+
+            <p>
+              Claude Code 最朴素的长期材料是 <code>CLAUDE.md</code>。官方文档把它说成项目约定、常用命令和偏好的存放处；
+              源码里的
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/claudemd.ts#L1-L26"><code>claudemd.ts</code> 文件头注释</a>
+              则把加载顺序写得更细：managed memory、user memory、project memory、local memory。它还支持
+              <code>@include</code>，会从当前目录一路向上找 <code>CLAUDE.md</code>、<code>.claude/CLAUDE.md</code>
+              和 <code>.claude/rules/*.md</code>。
+            </p>
+
+            <figure class="shape-example">
+              <pre><code class="language-text">representative rule
+
+raw sentence:
+  "这个项目测试必须跑 pnpm test"
+
+possible stores:
+  CLAUDE.md             -> team-visible project rule
+  CLAUDE.local.md       -> private local rule
+  auto memory file      -> learned note for future turns
+  agent memory          -> scoped to one agent's future work
+
+	later projection:
+	  CLAUDE.md / rules -> user context -> model-visible request
+	  auto MEMORY.md    -> user context or relevant-memory attachments
+	  auto policy text  -> memory prompt section
+	  agent memory      -> selected agent system prompt</code></pre>
+	              <figcaption>先别把所有账本画成一根管子。关键是同一条规则会经历“写入账本”和“投影给模型”两个阶段，中间隔着 owner、入口和可见时机。</figcaption>
+	            </figure>
+
+            <h3>1.1 <code>CLAUDE.md</code> 是人写的长期规则</h3>
+            <p>
+              源码的
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/claudemd.ts#L790-L910"><code>getMemoryFiles()</code></a>
+              会先处理 managed / user 级别，再从当前工作目录向上收集 project / local 级别。这里有两个重要信号：
+              第一，memory 文件不是“上一轮聊天”；它是文件系统里的指令材料。第二，越靠近当前目录的规则优先级越高，
+              这让 monorepo 子目录可以覆盖上层约定。
+            </p>
+
+            <p>
+              所以 <code>CLAUDE.md</code> 适合放“如果模型不知道就容易做错”的东西：测试命令、代码生成禁区、
+              PR 约定、危险目录、团队口径。它不适合做流水账。流水账应该在 transcript；源码事实应该让模型重新读文件；
+              memory 只保存那些以后会反复影响决策的规则。
+            </p>
+
+            <h3>1.2 auto memory 是后台学到的长期经验</h3>
+            <p>
+              新一些的源码还多了 auto memory。<a href="https://github.com/Rememorio/claude-code/blob/main/src/memdir/paths.ts#L22-L55"><code>isAutoMemoryEnabled()</code></a>
+              表明它默认开启，但会被 <code>CLAUDE_CODE_DISABLE_AUTO_MEMORY</code>、<code>--bare</code>、远程持久化条件和设置项关掉。
+              存储路径由
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/memdir/paths.ts#L207-L230"><code>getAutoMemPath()</code></a>
+              解析，默认落到当前项目对应的 memory 目录。
+            </p>
+
+            <p>
+              这条线不是每轮前台都硬写。<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/extractMemories/extractMemories.ts#L1-L14"><code>extractMemories.ts</code></a>
+              的文件头说明，它在完整 query loop 结束、模型给出最终响应且没有继续工具调用时运行，用 forked agent
+              从当前 session transcript 抽取 durable memories。源码还特意让这个 fork 共享父会话 prompt cache，
+              并在
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/extractMemories/extractMemories.ts#L166-L222"><code>createAutoMemCanUseTool()</code></a>
+              里限制工具：读可以宽，写只能写 memory 目录，shell 只能读。
+            </p>
+
+            <h3>1.3 session memory 和 auto dream 是支线，不是当前回合主线</h3>
+            <p>
+              还有一条容易误读的路径叫 session memory。<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/SessionMemory/sessionMemory.ts#L1-L5"><code>SessionMemory</code></a>
+              的注释说得很清楚：它自动维护当前对话的 markdown notes，用 forked subagent 在后台周期性抽取关键信息，
+              不打断主对话。触发上也不是“想到就写”，<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/SessionMemory/sessionMemory.ts#L134-L180"><code>shouldExtractMemory()</code></a>
+              同时看 token 阈值、工具调用数量和最后一轮是否还有工具调用。
+            </p>
+
+            <p>
+              再往后，<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/autoDream/autoDream.ts#L1-L11"><code>autoDream</code></a>
+              是周期性整理：时间门槛、session 数量门槛和锁都满足时，才用 forked agent 回看多段会话并整理 memory。
+	              这说明 Claude Code 的“学习”更像后台整理档案，而不是主线程回答时临时把每句话都写进一个神秘黑盒。
+	            </p>
+
+	            <h3>1.4 三类 memory 不是同一个 prompt 入口</h3>
+	            <p>
+	              到这里要收一次边界。封面图是概念库存：它把长期材料放在一张桌面上，方便看清 owner；
+	              但源码执行时并不会把所有 memory 都合流到同一个入口。真正会直接走
+	              <code>getUserContext()</code>、再被 <code>prependUserContext()</code> 包成 meta user message 的，不只是
+	              <code>CLAUDE.md</code>、<code>.claude/rules</code> 这类 claudemd 规则；auto memory 的 <code>MEMORY.md</code>
+	              entrypoint 也会在 feature 允许时被
+	              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/claudemd.ts#L979-L992"><code>getMemoryFiles()</code></a>
+	              收进去，另一些模式则会用 relevant-memory attachments 替代 index 注入。auto memory 的
+	              <a href="https://github.com/Rememorio/claude-code/blob/main/src/memdir/memdir.ts#L419-L506"><code>loadMemoryPrompt()</code></a>
+	              主要提供写入和检索规则这一段 system prompt 动态 section；agent memory 的
+	              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/agentMemory.ts#L138-L177"><code>loadAgentMemoryPrompt()</code></a>
+	              则只拼进被选中 agent 的 prompt。
+	            </p>
+
+	            <table>
+	              <thead>
+	                <tr>
+	                  <th>长期材料</th>
+	                  <th>源码入口</th>
+	                  <th>读法</th>
+	                </tr>
+	              </thead>
+	              <tbody>
+	                <tr>
+	                  <td><code>CLAUDE.md</code> / <code>.claude/rules</code></td>
+	                  <td><code>getMemoryFiles()</code> -> <code>getUserContext()</code> -> <code>prependUserContext()</code></td>
+	                  <td>每轮 user context 路径，进入 API-bound messages 前部。</td>
+	                </tr>
+	                <tr>
+	                  <td>auto memory / <code>MEMORY.md</code></td>
+	                  <td><code>getMemoryFiles()</code>、<code>loadMemoryPrompt()</code>、后台 extract / dream</td>
+	                  <td>内容 entrypoint 可进 user context 或 attachment；写入/检索规则进 memory prompt section。</td>
+	                </tr>
+	                <tr>
+	                  <td>agent memory</td>
+	                  <td><code>loadAgentMemoryPrompt()</code></td>
+	                  <td>只进入对应 agent 的 prompt，不是父会话的 user context。</td>
+	                </tr>
+	              </tbody>
+	            </table>
+
+	            <h2>二、Memory 怎样进入下一轮请求</h2>
+	            <p>
+	              现在来看你最关心的那句话：“它是不是包到 system reminder 里，然后塞到 system prompt？”
+	              如果这里的“它”指 <code>CLAUDE.md</code> / rules 这条 user context 路径，方向接近，但源码边界不严谨。
+	              它确实被包进 <code>&lt;system-reminder&gt;</code>；但在可见源码里，这不是追加到
+	              <code>systemPrompt</code> 字符串，而是被构造成一个 meta user message，prepend 到 messages 前面。
+            </p>
+
+            <p>
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts#L152-L188"><code>getUserContext()</code></a>
+	              会调用 <code>getMemoryFiles()</code>，把过滤后的 <code>CLAUDE.md</code> / rules 文件整理成
+	              <code>claudeMd</code>，再加上当前日期。随后 <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L657-L664"><code>query()</code></a>
+              在调用模型前，把 <code>messagesForQuery</code> 交给
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts#L449-L474"><code>prependUserContext()</code></a>。
+              后者生成的内容长这样：
+            </p>
+
+            <figure class="shape-example">
+              <pre><code class="language-text">shape-level request before API call
+
+systemPrompt:
+  default system prompt + system context
+
+messages:
+  meta user:
+    &lt;system-reminder&gt;
+    # claudeMd
+    ...CLAUDE.md content...
+    # currentDate
+    Today's date is ...
+    &lt;/system-reminder&gt;
+
+  ...projected conversation messages...</code></pre>
+              <figcaption>它叫 system-reminder，但源码 owner 是 user message。这个细节会影响我们判断 prompt cache 的位置。</figcaption>
+            </figure>
+
+            <h3>2.1 进入 model-visible view，不等于变成 transcript</h3>
+            <p>
+	              这条 meta user message 会进入本轮 API-bound messages，所以模型可以看见它。但这不等于它是用户真实输入的一句话，
+	              也不等于 transcript 里的每条旧消息都会原样变成 memory。这里讨论的是 claudemd user context 路径；
+	              auto memory 和 agent memory 另有 prompt 入口。transcript 是会话证据，二者在下一篇上下文管理里会继续分账。
+            </p>
+
+            <p>
+              这个边界能解释 compact 后为什么 <code>CLAUDE.md</code> 还会回来：compact 改写的是旧 conversation view；
+              memory 文件仍在文件系统里。compact 后只要重新加载 user context，项目规则就会重新投影进下一轮。
+              这不是 summary “完美保存了记忆”，而是 runtime 重新读了一份长期规则。
+            </p>
+
+            <h3>2.2 cache 不是被“memory 动态”自动打爆</h3>
+            <p>
+              现在回到 prompt cache。Anthropic prompt caching 文档讲的是 provider 复用请求前缀。源码里
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3062-L3110"><code>addCacheBreakpoints()</code></a>
+              会给 messages 放 cache marker，而且注释强调每个请求只有一个 message-level <code>cache_control</code>。
+              因此只要 memory 被 prepend 到 messages 前面，它就属于“可能影响前缀形状”的材料。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../assets/memory-cache-boundary.png"
+                alt="Claude Code Memory 与 Prompt Cache 边界图，展示 memory unchanged 时前缀稳定，memory changed 时 prefix break 需要重写"
+              />
+              <figcaption>关键不是 memory 是否叫动态，而是它在本轮 API view 里是否改变了可缓存前缀。</figcaption>
+            </figure>
+
+            <p>
+              但这不是说 memory 一开，cache 就废了。源码里 <code>getUserContext()</code> 被 memoize，
+              <code>getMemoryFiles()</code> 也有 cache；<a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/claudemd.ts#L1111-L1125"><code>clearMemoryFileCaches()</code></a>
+              和 reset path 只有在设置、compact、文件重载等场景才清。换句话说，稳定轮次里 memory 文本不变，
+              provider 看到的前缀仍然可能稳定；memory 文件变了，或者 auto memory 写入后进入之后的请求，
+              那才是可能打断旧前缀的点。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                更精确的说法是：Memory 会参与 prompt cache 的前缀纪律。它不是 system prompt 的隐藏魔法，
+                也不是每轮随机变化的黑盒；它是一段被 runtime 注入到 API-bound messages 前面的用户上下文。
+	              当这段上下文或 memory prompt section 稳定，cache 有机会复用；当它们在 API-bound 前缀里变化，
+	              前缀就可能需要重写。
+              </p>
+            </div>
+
+            <h2>三、为什么不把所有东西都写进 Memory</h2>
+            <p>
+              如果 memory 能跨轮次影响模型，那是不是所有读过的文件、踩过的坑、跑过的命令都应该写进去？源码给出的答案其实很克制。
+              auto memory fork 写入有权限边界；session memory 有阈值；auto dream 有时间、session 数量和锁。它们都在避免一件事：
+              把临时证据误升级成长期规则。
+            </p>
+
+            <table>
+              <thead>
+                <tr>
+                  <th>内容</th>
+                  <th>适合放哪里</th>
+                  <th>为什么</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>团队约定、测试命令、禁区</td>
+                  <td><code>CLAUDE.md</code> / <code>.claude/rules</code></td>
+                  <td>这是未来每次都可能影响决策的长期规则。</td>
+                </tr>
+                <tr>
+                  <td>本机偏好、私人路径、个人习惯</td>
+                  <td><code>CLAUDE.local.md</code> 或 user memory</td>
+                  <td>需要跨会话，但不该提交给团队。</td>
+                </tr>
+                <tr>
+                  <td>本轮调查证据、命令输出、diff 细节</td>
+                  <td>transcript / runtime history</td>
+                  <td>它们是证据，不一定应该长期影响未来任务。</td>
+                </tr>
+                <tr>
+                  <td>反复出现的用户偏好或工作方式</td>
+                  <td>auto memory / agent memory</td>
+                  <td>适合被整理成长期经验，但要经过抽取、去重和后续重载。</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <p>
+              这也是为什么 Memory 章应该放在上下文管理之前。Memory 先回答“长期材料从哪里来、谁能写、什么时候可见”；
+              下一篇再回答“这些材料和聊天历史、工具结果、compact summary 一起进入请求时，runtime 怎样减压”。
+              到最后的 Prompt Cache 章，我们再把这条线收回来：稳定前缀不是天生的，是这些 owner 边界共同维护出来的。
+            </p>
+
+            <h2>四、把误读压成四条规则</h2>
+            <ol>
+              <li><strong>Memory 不是 transcript。</strong>transcript 记录发生过什么；memory 保存以后还会反复影响决策的规则和经验。</li>
+              <li><strong><code>&lt;system-reminder&gt;</code> 不是 system prompt。</strong>源码里它由 <code>prependUserContext()</code> 生成，是 meta user message。</li>
+              <li><strong>动态 memory 不等于每轮变。</strong>只有当被投影进 API view 的 memory 文本或请求形状变化时，才可能影响旧缓存前缀。</li>
+              <li><strong>后台学习不是当前回答的魔法。</strong>extract memories、session memory、auto dream 都是有触发门槛、权限边界和存储位置的 side path。</li>
+            </ol>
+
+            <p>
+              所以我们可以用一句话收束：Claude Code 的 Memory 是“长期账本 + 轮次投影”，不是“更长的聊天记录”。
+              一旦接受这个模型，后面的上下文管理就顺了：compact 处理旧 view，transcript 保留证据，memory 重新加载规则，
+              prompt cache 则奖励那些在 API view 里保持稳定的前缀。
+            </p>
+
+            <section id="sources">
+              <h2>参考源码与资料</h2>
+              <ul>
+                <li><a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory 文档</a></li>
+                <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic prompt caching 文档</a></li>
+	                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/claudemd.ts"><code>src/utils/claudemd.ts</code></a></li>
+	                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/memdir/memdir.ts"><code>src/memdir/memdir.ts</code></a></li>
+	                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts"><code>src/context.ts</code></a></li>
+	                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts"><code>src/utils/api.ts</code></a></li>
+	                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/agentMemory.ts"><code>src/tools/AgentTool/agentMemory.ts</code></a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/extractMemories/extractMemories.ts"><code>src/services/extractMemories/extractMemories.ts</code></a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/SessionMemory/sessionMemory.ts"><code>src/services/SessionMemory/sessionMemory.ts</code></a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/autoDream/autoDream.ts"><code>src/services/autoDream/autoDream.ts</code></a></li>
+                <li><a href="https://mp.weixin.qq.com/s?__biz=MzUxODAzNDg4NQ==&amp;mid=2247558299&amp;idx=1&amp;sn=cf16eb429a2c530589b31b80c2ded866&amp;chksm=f98ca031cefb2927c43ad5dcfee1cb810fc1f1374455b5041b75c38d1159293d5614c8b5915c&amp;cur_album_id=4404340926102421504&amp;scene=190#rd">小林 Coding：Claude Code Memory 参考阅读</a></li>
+              </ul>
+            </section>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const toc = document.getElementById("toc");
+        const headings = [...document.querySelectorAll(".article-body h2, .article-body h3, .article-body h4")];
+        if (!toc || headings.length === 0) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+    <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+    <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>
