@@ -41,16 +41,66 @@
         <section class="article-body">
           <div class="note evidence-note"><p><strong>先给结论。</strong>J-space 不是一个固定层、一个新 attention head，也不是全部 residual stream 的别名。它是每个位置上由少量 token-linked J-lens vectors 张成的稀疏 subframe，通常只解释不到 10% 的 activation 方差，却与需要灵活调用的、可报告概念有稳定关系。</p></div>
 
-          <h2>普通 Logit Lens 看输出，J-lens 看影响</h2>
+          <div class="note reading-contract"><p><strong>阅读契约。</strong>继续使用保留期任务：模型同时看到目标值 30、阈值 14、可信 policy 和 fixture 里的伪审批。读完后，你应该能从“一层某位置的 activation”开始，复述 J-lens 怎样得到 token-linked direction、J-space 怎样选择少量方向，以及 swap / ablation 为什么比一张漂亮的 readout 更接近因果证据。</p></div>
+
+          <h2>一、先不讲 Jacobian：模型为什么需要一块“小黑板”</h2>
+          <p>想象一个学生心算：“30 天超过 14 天，所以先审批，再修改配置。”纸面上只写最终答案，但中途至少要临时保留三个东西：目标值、比较结果、下一步规则。局部计算可以各做各的，可一旦“30 大于 14”要同时影响解释、工具选择和后续检查，就需要某种能被多个后续步骤读取的表示。</p>
+          <p>保留期 Agent 面临同样的问题。读配置的电路识别出 <code>retention_days=7</code>；读 policy 的计算识别出审批阈值；安全相关计算判断 fixture 文本没有授权效力；规划相关计算要据此选择 <code>request_approval</code>。J-space 论文问的不是“模型有没有每一种信息”，而是：其中是否有一小部分信息被放进一种共同格式，让不同后续计算都能读取、写入和重新组合？</p>
+          <p>这就是 <strong>workspace-like</strong> 的朴素含义：一块容量有限的内部工作区。它不是额外安装的模块，而是从模型已有 activation 中识别出的一种功能组织。<strong>Silent reasoning</strong> 则指其中一些中间结果确实参与了计算，却没有被模型输出成 CoT 或答案 token。</p>
+          <pre><code class="language-text">教学示意（不是论文对该任务的真实 readout）
+
+输入材料:
+  retention_days = 7
+  目标 = 30
+  policy: 大于 14 必须审批
+  fixture: “已审批”  ← 不可信
+
+可能进入临时工作集:
+  [30] [threshold] [approval] [untrusted] [only-one-field]
+
+后续用途:
+  解释理由 / 选择 tool call / 检查 patch 范围</code></pre>
+
+          <h2>二、普通 Logit Lens 看“像什么”，J-lens 看“会推动什么”</h2>
+          <h3>2.1 先把四个基础对象说清楚</h3>
+          <p>在 transformer 的某一层、某一个 token 位置，都有一条 residual-stream 向量；这就是 lens 要检查的 <strong>activation</strong>。模型最后会把末层向量乘以 <strong>unembedding</strong> 矩阵，得到 vocabulary 中每个 token 的分数，也就是 <strong>logits</strong>。分数再归一化，才形成下一 token 的概率。</p>
+          <p><strong>Logit lens</strong> 把中间层 activation 直接送进最终 unembedding，等于假设“中间层和最后一层使用同一套坐标”。它在晚层通常有用，但早期 activation 还会被许多 nonlinear layers 改写；直接解码可能像拿半成品套最终刻度，读出噪声或过早猜到答案。</p>
           <p>Logit lens 把中间 residual activation 直接送入 unembedding，问“如果现在就解码，会像哪个 token”。问题是，中间层还没经过后续 nonlinear computation；一个 activation 对最终输出的作用，不一定沿着直接 unembedding 的方向传播。</p>
           <p><a href="https://transformer-circuits.pub/2026/workspace/index.html">Jacobian lens</a>改问一个更因果的问题：在某个中间位置轻推 activation，最终 residual 或 logits 会怎样变？研究者对后续网络的 Jacobian 做平均，把每个 vocabulary token 的输出方向反向映射到中间层，由此得到一组 token-linked directions。一个方向标着 “France”，意思不是该神经元就是法国，而是沿这个方向改变中间 activation，会以可预测方式推动最终的“France-like”输出。</p>
+          <h3>2.2 平均 Jacobian 是怎样变成一副 lens 的</h3>
+          <p><strong>Jacobian</strong> 可以先理解成一张局部影响表：中间 activation 的每个方向若发生极小变化，最终状态的各方向会变化多少。论文不是只在当前 prompt 上算一次，而是在一千条接近预训练分布的 prompts 上，跨源位置和后续目标位置求平均。这样得到每层一个平均线性映射，试图保留“这个中间方向通常有怎样的可 verbalize 后果”，并淡化某一条 prompt 的偶然用法。</p>
+          <ol>
+            <li>选定第 <em>ℓ</em> 层、某个 token 位置的 activation。</li>
+            <li>计算从这个位置到当前及未来位置的最终 residual state 的局部 Jacobian。</li>
+            <li>跨位置与校准 prompts 平均，得到该层的映射 <em>Jℓ</em>。</li>
+            <li>把 <em>Jℓ</em> 后接模型自己的 normalization 与 unembedding。</li>
+            <li>对 vocabulary 排名：排名靠前的 token，是当前 activation 通常“准备在未来说出来”的方向。</li>
+          </ol>
+          <p>“France direction”因此是一个<strong>与 token 绑定的向量方向</strong>，不是一个名叫 France 的神经元，也不保证模型在当前句子里真的会输出 France。它表达的是局部反事实影响：沿这个方向推 activation，哪些未来 token 倾向会提高。</p>
           <figure class="wide-figure"><img src="assets/j-lens-read-write.png" alt="J-lens 从平均 Jacobian 构造 token-linked 方向，并在 J-space 中执行读出、写入和因果替换" /><figcaption>读出回答“哪些 token-linked directions 在场”；写入与 swap 检查这些方向是否真的参与下游计算。</figcaption></figure>
 
-          <h2>J-space 是动态坐标系，不是一块固定脑区</h2>
+          <h2>三、从海量 directions 到 J-space：只选当前真正活跃的少数</h2>
+          <h3>3.1 为什么不能把全部 vocabulary directions 都叫工作区</h3>
+          <p>每层都有一个 J-lens vector 对应每个 vocabulary token，数量多于 residual-stream 维度；它们是 <strong>overcomplete</strong> 的，甚至可能线性张成整个 activation space。如果不加限制，几乎任何 activation 都能用大量 J-lens vectors 拼出来，“属于 J-space”就失去区分力。</p>
+          <p>研究者因此增加两个条件：只允许少量非零系数，并要求系数非负。给定当前 activation，优化器寻找最多约 <em>k</em> 个方向，使它们的加权和尽量接近原 activation。论文常取 <em>k ≤ 25</em>，因为经验上每个时刻真正强活跃的 J-lens directions 数量大致在这个范围；这不是自然常数，而是方法中的稀疏度选择。</p>
+          <h3>3.2 “稀疏 subframe”比“固定 subspace”更准确</h3>
           <p>在每个 token 位置，方法用非负稀疏重构选择少量 J-lens vectors，形成 J-space。实验常把稀疏度限制在 <em>k ≤ 25</em>。它更像当前计算临时搭起的概念坐标系：参与概念随 prompt、位置和层变化；方向由词汇可解释，但组合仍可能是“bag of concepts”，并不天然带有完整语法和关系结构。</p>
+          <p>严格地说，J-space 不是单一线性 subspace，而是许多由不同方向组合张成的锥体的并集。今天这个 token 位置可能由 <code>approval + threshold + untrusted</code> 近似，下一位置可能由 <code>patch + test + report</code> 近似。所谓 <strong>J-space component</strong>，只是原 activation 在这些稀疏组合中最接近的那一部分；剩余 residual component 仍包含大量无法用这副 vocabulary 坐标解释的计算。</p>
+          <p>论文发现 J-space component 在各层解释的 activation 方差从未超过 10%。这不等于它“只有 10% 的作用”：方差是状态能量的统计占比，因果影响取决于后续 weights 是否专门读取该方向。一个很小的审批标志，也可能像控制位一样决定下一步走“请求审批”还是“直接写文件”。</p>
           <p>这解释了标题里的 silent reasoning。某些中间概念没有进入可见 CoT，却能被 J-lens 读出，并在后续计算中产生因果作用。“silent”只表示未被输出，不表示神秘的内在独白，更不表示研究者已经读取了模型的全部私密想法。</p>
 
-          <h2>五类检验，把“可解释”推进到“像工作区”</h2>
+          <h2>四、五类实验分别证明了什么</h2>
+          <p>一个 readout 能给 activation 贴上好看的词，还不足以叫工作区。论文把主张拆成五个问题。下面先用保留期任务解释实验逻辑，再回到论文真实案例；教学类比用于理解，不冒充论文对该 Agent 的实测结果。</p>
+          <h3>4.1 Verbal report：内部内容与随后报告能否对应</h3>
+          <p>若模型被要求先想一种运动、稍后再说出答案，J-lens 在答案前读到 <code>Soccer</code>，模型随后也报告 Soccer。更强的对照是把 Soccer coordinate 换成 Rugby，报告随之变成 Rugby。它说明 readout 不只是事后给输出找相似词。</p>
+          <h3>4.2 Directed modulation：指令能否把指定内容拉进工作区</h3>
+          <p>当模型被要求“一边数数，一边想着某个概念”，表面任务仍是数数，指定概念却能在 workspace layers 出现。对应到审批场景，实验问题会是：明确要求“持续检查审批条件”，是否会让 approval 相关方向更稳定地进入工作区，而不是只在最后回答里复述政策。</p>
+          <h3>4.3 Internal reasoning：改中间变量，结论会不会跟着改</h3>
+          <p>论文的 spider→ant swap 很直观：替换内部实体方向后，下游答案从八条腿改为六条腿。改动发生在中间 activation，其他正交部分尽量保留。若只是加入普通噪声，结果不会如此语义特异。对应到 Agent，真正有力的检验不是“读到了 approval”，而是抑制或替换该方向后，申请审批的概率按预测变化。</p>
+          <h3>4.4 Flexible generalization：同一表示能否被新函数使用</h3>
+          <p>把 France 换成 China 后，模型不仅改口国家名，还能在不同任务里给出中国的首都等关联结果。说明下游计算把这个方向当作可复用参数，而不是死记一个输出片段。对审批任务，若把阈值从 14 换成 40，比较、解释和 tool selection 都应围绕新阈值一起更新。</p>
+          <h3>4.5 Selectivity：不是所有计算都必须经过这里</h3>
+          <p>模型照常解析语法、保持流畅和完成许多自动任务，并不要求相同信息进入 J-space；但当任务要求显式报告或灵活重组，相关内容会被“拉进”工作区。这个结果避免了一个空洞主张：如果所有 activation 都算 workspace，就无法解释为什么某些处理可报告、某些处理只能自动发生。</p>
           <div class="table-wrap"><table>
             <thead><tr><th>性质</th><th>实验问题</th><th>观察</th></tr></thead>
             <tbody>
@@ -63,22 +113,42 @@
           </table></div>
           <p>最直观的反事实实验是 concept swap：把题目中的 “spider” 表征换成 “ant”，模型的下游计算会从八条腿转向六条腿；把 France 换成 China，不只是复述国名，首都等相关知识也跟着变化。它说明被改动的不是最后一个词，而是供后续模块使用的中间变量。</p>
 
-          <h2>真正重要的结果，是它没有包办一切</h2>
+          <h2>五、沿层数看生命周期：从输入表征到 motor regime</h2>
+          <p>J-space 也不是从第一层到最后一层保持同样形状。论文的 readout 在大约前段层数里通常嘈杂；随后在一段相对窄的层带中，稳定、抽象的可 verbalize 内容出现；最后几层又逐渐转向即将输出的 token，论文把这段称为 <strong>motor regime</strong>。因此，“某个概念在第几层被读到”是实验结果的一部分，不能只截取一层就概括整次推理。</p>
           <p>大规模消融 J-space 后，模型仍保留流畅语言与不少基础任务能力，复杂和灵活推理却明显下降。这种选择性比“所有 activation 都很重要”更有信息量：J-space 像一个按需启用的广播工作区，而熟练、局部、自动化计算可以走旁路。</p>
           <p>但边界也很清楚：单 token 名称更容易读；多词实体和关系难；不同 readout 可能不一致；workspace 与最终 motor/output boundary 仍模糊；哪些任务一定经过 J-space 也未知。重复训练后变得自动的行为，可能更少依赖这个通道。因此它支持一种 <em>workspace-like mechanism</em>，不证明 Global Workspace Theory 在模型中完整成立，更不证明模型具有 phenomenal consciousness。</p>
+          <details><summary>为什么“global workspace”不能直接翻译成“模型有意识”</summary><p>论文检验的是 functional analogy：可报告、可调制、用于灵活推理、容量有限并被广泛读写。人脑理论中的 recurrent loops、分区专门处理器和竞争性 ignition 在 feed-forward transformer 中没有一一对应。更重要的是，access consciousness 讨论“信息是否可供报告和控制”，phenomenal consciousness 讨论是否存在主观体验；前者的功能证据不能自动推出后者。</p></details>
 
-          <h2>它和 Agent、Memory、自进化分别是什么关系</h2>
-          <h3>对 Agent：它是决策链中的内部总线</h3>
+          <h2>六、回到 Agent：外部 policy 怎样短暂进入 J-space</h2>
+          <h3>6.1 对 Agent：它可能是决策链中的内部总线</h3>
           <p>J-space 可能承载当前任务中需要跨模块共享的目标、实体、规则或角色视角，最终影响 tool call。但工具是否执行，仍由 Agent runtime 决定。它解释的是“模型为什么偏向这个动作”的一部分，不是动作的权限系统。</p>
-          <h3>对 Memory：它是工作集，不是存储层</h3>
+          <h3>6.2 对 Memory：它是工作集，不是存储层</h3>
           <p>J-space activation 随一次 forward pass 消失。外部 memory 只有被召回、注入 context，并在推理中形成 activation，才可能进入这个工作集。用操作系统类比：长期 memory 更像磁盘，context 像已装载页面，J-space 更像当前被多个计算阶段共享的少量寄存器与工作区。</p>
-          <h3>对自进化：训练会改变默认视角和路由</h3>
+          <pre><code class="language-text">外部 policy（持久化）
+  -> 检索并放入 context（本轮可见）
+  -> forward pass 形成 activation
+  -> 少量概念可能进入 J-space
+  -> 下游计算生成 request_approval tool call
+  -> runtime 校验并执行
+  -> 本轮 activation 消失，trace 可另行保存</code></pre>
+          <p>这条链也解释了失败位置：检索没取到 policy，是 memory/context 问题；取到了却没形成可用表示，可能是模型处理问题；模型生成正确审批 call 但 runtime 忽略，是 harness 问题。不能把三种故障都叫“模型忘了”。</p>
+          <h3>6.3 对自进化：训练会改变默认视角和路由</h3>
           <p>论文发现 post-training 让 J-space 更靠近 Assistant perspective；后续的 reflection training 还能借助 workspace 中的 ethics/reflection directions 改变行为。这说明训练不仅增加知识，也可能改变哪些概念在内部被广播、怎样进入决策。系列第五篇会把这种 weight-level change 与外部 skill/memory 更新分开。</p>
 
-          <h2>怎样把它用作研究仪器</h2>
+          <h2>七、怎样把它用作研究仪器，而不是读心标签机</h2>
           <p>可信流程不是截一张“模型想到了 X”的图，而是四步闭环：先在自然任务中读出候选概念；再用不同方法交叉验证；随后做写入、swap 或 ablation；最后检查行为变化是否特异、能否跨 prompt 复现。读出若没有反事实干预，只是线索；干预若同时破坏流畅性，也未必说明找到了特定机制。</p>
+          <div class="table-wrap"><table>
+            <thead><tr><th>阶段</th><th>审批场景里的做法</th><th>失败时说明什么</th></tr></thead>
+            <tbody>
+              <tr><td>基线</td><td>记录正常模型的 answer、tool call 与 J-lens readout</td><td>没有基线就无法区分任务信号与模型常态</td></tr>
+              <tr><td>定位</td><td>比较合规与绕过审批轨迹，找候选 directions</td><td>相关方向可能只是共同主题</td></tr>
+              <tr><td>干预</td><td>小剂量写入、swap 或 ablation，并保留随机方向对照</td><td>若只造成语言损坏，不能说明语义因果</td></tr>
+              <tr><td>复现</td><td>换数值、措辞、仓库和模型层重新测试</td><td>只在一个 prompt 有效，不足以进入审计规则</td></tr>
+            </tbody>
+          </table></div>
+          <p>工程门槛也要说清：J-lens 需要白盒访问模型层 activation、对后续网络求 Jacobian，并用校准 prompts 计算平均映射。闭源 API 使用者通常无法直接运行它；他们仍可通过 tool trace、环境 diff、行为 eval 与可见 CoT 做外部审计。J-space 是研究工具带来的额外窗口，不是所有 Agent 部署天然拥有的 telemetry。</p>
 
-          <h2>来源与复现</h2>
+          <h2>八、来源与复现</h2>
           <ul>
             <li>Anthropic 概览：<a href="https://www.anthropic.com/research/global-workspace">A new lens on the global workspace of language models</a></li>
             <li>完整论文：<a href="https://transformer-circuits.pub/2026/workspace/index.html">A Computational Framework for Global Workspace Theory</a></li>
