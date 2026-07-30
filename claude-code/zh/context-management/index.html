@@ -298,6 +298,12 @@ messages = [
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L250-L307"><code>query()</code></a>。
               这个函数每次进模型循环时，都会先拿到当前 messages、toolUseContext、模型配置和缓存策略；然后在发请求前，按一串固定顺序处理上下文压力。
             </p>
+            <p>
+              先把这串顺序讲成人话：它不是“一上来就总结”，而是先问五个更小的问题。上一张 compact
+              交接单之后还有哪些消息？单条工具结果有没有超预算？旧历史里有没有可以先 snip 的部分？
+              旧工具结果该直接清空，还是走 cache editing？已经提交过的 Context Collapse 能不能把 API view
+              投影短一点？这些都还不够，才轮到 auto compact 把长会话压成 summary。
+            </p>
 
             <figure class="figure">
               <img
@@ -328,9 +334,17 @@ messages = [
             <p>
               后面几步就像收拾桌面：先丢掉已经不需要的旧包装，再看需不需要正式搬家。<code>HISTORY_SNIP</code> 打开时，
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L396-L410"><code>snipCompactIfNeeded()</code></a>
-              会先运行，并把释放出的 token 差额传给 auto compact。紧接着，
+              会先运行，并把释放出的 token 差额传给 auto compact。这里要先纠正一个容易混淆的点：
+              <strong>snip 不是把工具结果替换成 <code>[Old tool result content cleared]</code> 的那条路径</strong>。
+              这个占位符定义在 <code>microCompact.ts</code>，属于后面的 time-based microcompact。
+              源码里没有把 feature-gated 的 <code>snipCompact.ts</code> 展开到当前源树，所以这篇只根据调用点和恢复注释讲它的可见边界：
+              它会改变这次 query 的消息视图，并把 <code>tokensFreed</code> 传下去，避免 auto compact 还按旧 usage 误判。
+            </p>
+
+            <p>
+              紧接着，
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L412-L426"><code>microcompact</code></a>
-              会清理可压缩的工具结果。
+              才开始处理旧工具结果。它关心的不是“把整段会话总结一下”，而是工具结果这种高占用、低语义密度的块：能少发就少发，能不破坏热缓存就不破坏。
             </p>
 
             <p>
@@ -355,10 +369,16 @@ messages = [
                 </thead>
                 <tbody>
                   <tr>
+                    <td><code>HISTORY_SNIP</code></td>
+                    <td><code>query()</code> 进入 microcompact 之前，历史里有可 snip 的低价值片段。</td>
+                    <td>改变这次 API-bound message view，并返回 <code>tokensFreed</code>。</td>
+                    <td>先降压，并让后面的 auto compact 阈值计算扣掉这部分释放量。</td>
+                  </tr>
+                  <tr>
                     <td>time-based microcompact</td>
                     <td>距离上次主循环 assistant message 超过阈值，缓存前缀已经偏冷。</td>
                     <td>直接把旧工具结果正文替换成占位文本。</td>
-                    <td>减少下一次要重写的 prompt 体积。</td>
+                    <td>减少下一次要重写的 prompt 体积；因为源码判断缓存已冷，不再为旧热前缀做 cache edit。</td>
                   </tr>
                   <tr>
                     <td>cached microcompact</td>
@@ -378,13 +398,14 @@ messages = [
 
             <div class="note">
               <p>
-                这里有个很容易读错的点：microcompact 不是“把整段会话总结”。它处理的是旧工具结果这种高占用、低语义密度的内容。
-                总结旧对话是 compact 的职责，发生在更靠后的层。也正因为它不急着改写整段历史，cached microcompact 才能成为
-                最后一篇 Prompt Cache 的伏笔：能不动本地账本时，就把删除动作推迟到 API 层，让稳定前缀继续有复用机会。
+                那么占位符会不会影响 Prompt Cache？会改变这一次请求文本，这是事实；但 time-based microcompact 的前提也是
+                “距离上次 assistant message 太久，server cache 已经过期，完整 prefix 本来就要重写”。所以它不是把一个本来能命中的热缓存打碎，
+                而是在冷缓存重写前，把旧工具结果换成更短的占位文本。真正要保护热前缀时，源码选择的是 cached microcompact：
+                本地 message 不动，删除动作留给 API 层的 <code>cache_edits</code>。
               </p>
             </div>
 
-            <h3>2.3 第三步：context collapse 抢在 auto compact 前面</h3>
+            <h3>2.3 第三步：Context Collapse 是 read-time projection</h3>
             <p>
               如果 <code>CONTEXT_COLLAPSE</code> 打开，<code>query()</code> 会在 auto compact 之前调用
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L428-L447"><code>contextCollapse.applyCollapsesIfNeeded()</code></a>。
@@ -392,9 +413,30 @@ messages = [
               这意味着 UI 还可以保留更完整的历史，而 API view 可以先投影成更短的形状。
             </p>
 
+            <figure class="shape-example">
+              <pre><code class="language-text">进入 collapse projection 之前：
+  active messages = M1 M2 M3 M4 M5 M6 M7 M8 M9 M10
+  collapse store = C1: summary(M2...M8)
+
+投影后的 API-bound view：
+  active messages = M1 C1(summary message) M9 M10
+
+REPL / resume 侧：
+  原始历史、commit log、staged snapshot 仍由运行时保存和重放</code></pre>
+              <figcaption>Context Collapse 更像“按已提交 summary 重新投影这次请求”，不是把 REPL 数组立刻改成一份永久摘要。</figcaption>
+            </figure>
+
             <p>
-              为什么它要排在 auto compact 前？因为如果 collapse 已经把上下文压到阈值以下，就没必要把一大段会话压成单一 summary。
-              这是典型的“先保细粒度，再做有损压缩”的策略。
+              所以你说“是不是构造一个 summary + 去掉裁剪的 + 增量消息的请求”，方向基本对，但要把 owner 说准：
+              <code>query()</code> 构造的是<strong>模型这次要看的投影视图</strong>。已经归档的历史 span 不再原样进入 API view，
+              而是由 collapse store 里的 summary message 代表；span 后面的增量消息继续保留。REPL 的完整历史和恢复元数据则不等于这次 API payload。
+            </p>
+
+            <p>
+              这当然也会影响 Prompt Cache，因为 provider 看到的前缀形状变了：第一次从“旧详细前缀”切到“summary + 增量消息”时，
+              旧前缀不能当作完全相同的请求继续复用。但它排在 auto compact 前，是为了避免另一种更重的损失：如果 projection
+              已经把上下文压到阈值以下，就不必把整段会话合成一个更粗的 compact summary。换句话说，Context Collapse
+              是用一个新的、较短的稳定前缀，换掉越来越昂贵的旧详细前缀；后续轮次可以围绕这个投影视图重新形成缓存收益。
             </p>
 
             <h3>2.4 最后才轮到 auto compact</h3>
@@ -700,6 +742,7 @@ installed message =
               <li><a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory 文档</a></li>
               <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic prompt caching 文档</a></li>
               <li><a href="https://docs.anthropic.com/en/api/messages">Anthropic Messages API</a></li>
+              <li><a href="https://mp.weixin.qq.com/s?__biz=MzUxODAzNDg4NQ==&amp;mid=2247557638&amp;idx=1&amp;sn=81cbd4fa599c9664a7eb6100cc26a3b2">小林 Coding：上下文压缩参考阅读</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts#L113-L188">context.ts：system/user context</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts#L437-L474">utils/api.ts：appendSystemContext / prependUserContext</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L365-L535">query.ts：pre-API context pipeline</a></li>
