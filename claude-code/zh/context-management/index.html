@@ -332,19 +332,39 @@ messages = [
 
             <h3>2.2 第二步：先用小刀，不急着搬家</h3>
             <p>
-              后面几步就像收拾桌面：先丢掉已经不需要的旧包装，再看需不需要正式搬家。<code>HISTORY_SNIP</code> 打开时，
+              后面几步就像收拾桌面：先把不该再进模型的旧页抽出来，再看需不需要正式搬家。<code>HISTORY_SNIP</code> 打开时，
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L396-L410"><code>snipCompactIfNeeded()</code></a>
-              会先运行，并把释放出的 token 差额传给 auto compact。这里要先纠正一个容易混淆的点：
-              <strong>snip 不是把工具结果替换成 <code>[Old tool result content cleared]</code> 的那条路径</strong>。
-              这个占位符定义在 <code>microCompact.ts</code>，属于后面的 time-based microcompact。
-              源码里没有把 feature-gated 的 <code>snipCompact.ts</code> 展开到当前源树，所以这篇只根据调用点和恢复注释讲它的可见边界：
-              它会改变这次 query 的消息视图，并把 <code>tokensFreed</code> 传下去，避免 auto compact 还按旧 usage 误判。
+              会在 microcompact 之前运行。它释放出的 token 差额会继续传给 auto compact，
+              因为被 snip 掉的消息已经不在这次 API view 里了，但幸存 assistant message 上的 usage 可能还带着 snip 前的 token 估算。
             </p>
 
             <p>
-              紧接着，
+              那 snip 到底干了什么？从公开源树能看到的是它的<strong>投影和恢复契约</strong>：
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messages.ts#L4631-L4655"><code>getMessagesAfterCompactBoundary()</code></a>
+              默认会再调用 <code>projectSnippedView()</code>，也就是 compact boundary 之后还要过滤 snipped messages；
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/components/Messages.tsx#L486-L498">UI 渲染则显式传入 <code>includeSnipped: true</code></a>，
+              让用户还能在 scrollback 里看到完整历史。换句话说，snip 不是删掉磁盘账本，也不是把内容改成一句占位符，
+              而是把某些中间消息从模型下一次会看的视图里摘出去。
+            </p>
+
+            <p>
+              这和 compact 的边界也不一样。<a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1958-L1982">resume 代码的注释</a>
+              说得很直白：compact boundary 是截断一个前缀，snip 删除的是中间 ranges；JSONL 仍然 append-only，
+              所以 snip boundary 必须记录执行时移除的 <code>removedUuids</code>，加载会话时再重放同一组删除，并把幸存消息的
+              <code>parentUuid</code> 跨过缺口重新接上。否则恢复出来的 conversation chain 会把 snip 前的历史又拼回来，
+              甚至直接撑爆上下文。
+            </p>
+
+            <p>
+              这样就能理解它为什么叫“小刀”：它不是一次完整搬家，不生成新的全局 summary，也不负责清理所有旧工具结果；
+              它是在保留本地证据和 UI scrollback 的同时，把模型视图里的某些低价值中段挖掉。后面的 <code>/compact</code>
+              路径也会先投影 snipped view，避免 compact model 把已经主动移出活动上下文的内容又总结回来。
+            </p>
+
+            <p>
+              snip 之后，才轮到
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L412-L426"><code>microcompact</code></a>
-              才开始处理旧工具结果。它关心的不是“把整段会话总结一下”，而是工具结果这种高占用、低语义密度的块：能少发就少发，能不破坏热缓存就不破坏。
+              处理旧工具结果。它关心的不是“把整段会话总结一下”，而是工具结果这种高占用、低语义密度的块：能少发就少发，能不破坏热缓存就不破坏。
             </p>
 
             <p>
@@ -370,9 +390,9 @@ messages = [
                 <tbody>
                   <tr>
                     <td><code>HISTORY_SNIP</code></td>
-                    <td><code>query()</code> 进入 microcompact 之前，历史里有可 snip 的低价值片段。</td>
-                    <td>改变这次 API-bound message view，并返回 <code>tokensFreed</code>。</td>
-                    <td>先降压，并让后面的 auto compact 阈值计算扣掉这部分释放量。</td>
+                    <td><code>query()</code> 进入 microcompact 之前，活动历史里存在可移出模型视图的中间 ranges。</td>
+                    <td>API-bound view 过滤这些消息；UI scrollback 和 JSONL 仍保留证据，resume 通过 <code>removedUuids</code> 重放删除。</td>
+                    <td>先移走低价值中段，并让后面的 auto compact 阈值计算扣掉 <code>tokensFreed</code>。</td>
                   </tr>
                   <tr>
                     <td>time-based microcompact</td>
@@ -401,7 +421,9 @@ messages = [
                 那么占位符会不会影响 Prompt Cache？会改变这一次请求文本，这是事实；但 time-based microcompact 的前提也是
                 “距离上次 assistant message 太久，server cache 已经过期，完整 prefix 本来就要重写”。所以它不是把一个本来能命中的热缓存打碎，
                 而是在冷缓存重写前，把旧工具结果换成更短的占位文本。真正要保护热前缀时，源码选择的是 cached microcompact：
-                本地 message 不动，删除动作留给 API 层的 <code>cache_edits</code>。
+                本地 message 不动，删除动作留给 API 层的 <code>cache_edits</code>。snip 对 Prompt Cache 的影响则更接近一次
+                model-visible view 的中段删除：它会改变 provider 看到的消息序列，但它不是这个占位符路径，也不是 cached microcompact
+                那种专门用 cache edit 表达删除的路径。
               </p>
             </div>
 
@@ -746,6 +768,8 @@ installed message =
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts#L113-L188">context.ts：system/user context</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts#L437-L474">utils/api.ts：appendSystemContext / prependUserContext</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L365-L535">query.ts：pre-API context pipeline</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messages.ts#L4631-L4655">utils/messages.ts：snip 后的 active message projection</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1958-L1982">sessionStorage.ts：resume 时重放 snip removals</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L659-L708">query.ts：callModel request options</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L253-L529">microCompact.ts：microcompact paths</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/autoCompact.ts#L28-L90">autoCompact.ts：threshold calculation</a></li>
