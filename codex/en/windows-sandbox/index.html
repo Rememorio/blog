@@ -1,0 +1,619 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Source Notes XIII: Windows Sandbox</title>
+    <meta
+      name="description"
+      content="A source-guided walkthrough of Codex on Windows: how runtime permission decisions become local users, ACLs, firewall rules, a command runner, and restricted process tokens."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex Source Notes XIII: Windows Sandbox" />
+    <meta
+      property="og:description"
+      content="Codex on Windows turns runtime permission policy into OS-enforced boundaries through sandbox users, ACLs, firewall rules, and a command runner."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/windows-sandbox-boundary.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/en/windows-sandbox/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/windows-sandbox/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/windows-sandbox/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(163, 89, 52, 0.3);
+        background: rgba(163, 89, 52, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+    <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="Article shortcuts">
+        <a href="../">Codex series</a>
+        <a href="../memory-layer/">Previous: memory</a>
+        <a href="#sources">Sources</a>
+      </nav>
+      <nav class="site-actions" aria-label="Site actions">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="Language switch">
+          <a href="../../zh/windows-sandbox/" lang="zh-CN">中文</a>
+          <a class="active" href="./" lang="en" aria-current="page">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents">
+        <div class="toc-title">Contents</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex Source Notes · Part XIII</p>
+            <h1>Windows Sandbox: How Runtime Authority Lands in the OS</h1>
+            <p class="lead">
+              Part V stopped at <code>SandboxAttempt</code>: a tool call may be
+              approved, rejected, run with narrower authority, or retried with
+              escalation. But <code>SandboxAttempt</code> is a Codex runtime
+              decision. On Windows, that decision still has to become user
+              identity, file ACLs, firewall rules, and process tokens the
+              operating system will enforce.
+            </p>
+            <div class="meta-line">
+              <span>Project: openai/codex</span>
+              <span>Topic: Windows sandbox</span>
+              <span>Scope: official engineering post + public source</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/windows-sandbox-boundary.png"
+                alt="Codex Windows sandbox diagram showing sandbox attempt, setup, sandbox users, runner, restricted token, file ACL, and firewall"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              From the product surface, sandboxing can look like a switch: allow
+              workspace writes, block the network, ask for approval when needed.
+              Source reading has to go one layer lower. A prompt can ask the
+              model to be careful, and a UI can label a run as sandboxed, but the
+              machine is protected only when the operating system receives a
+              boundary it can enforce.
+            </p>
+
+            <p>
+              OpenAI's engineering post
+              <a href="https://openai.com/index/building-codex-windows-sandbox/">"Building a Windows sandbox for Codex"</a>
+              frames the problem directly. On macOS, Codex can lean on Seatbelt.
+              On Linux, it can use seccomp and bubblewrap. Windows did not offer
+              one primitive that matched the local coding-agent workflow. Users
+              should not have to choose between approving nearly every command
+              and giving the agent full local access, so Codex had to map its
+              permission model onto Windows security concepts.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The throughline for this chapter is:
+                <strong>the Windows sandbox is the operating-system landing layer for permission policy.</strong>
+                Codex first decides what authority a tool call should receive.
+                Setup prepares sandbox users, file ACLs, and firewall rules.
+                At execution time, a command runner starts under the sandbox user
+                and launches the real child process with a restricted token.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Reading contract.</strong>
+                We follow the Windows local execution path: why existing Windows
+                primitives did not fit, what the unelevated prototype solved and
+                missed, why elevated setup exists, why the command runner must
+                live on the sandbox-user side, and how this all plugs back into
+                the tool-permission story from Part V.
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>Evidence boundary.</strong>
+                Product background comes from the OpenAI engineering post.
+                Implementation details come from public <code>openai/codex</code>
+                source. This article covers the local Windows sandbox backend and
+                does not infer private remote-execution infrastructure.
+              </p>
+            </div>
+
+            <h2>1. Reconnect to Part V: Runtime Chooses the Execution Shape</h2>
+            <p>
+              Part V split side effects into several gates. Permission hooks can
+              inspect or block. Approval policy decides when a human must confirm.
+              <code>ToolOrchestrator</code> turns a model-requested action into a
+              reviewed tool invocation and then an attempted sandbox shape. The
+              exec backend finally starts the command.
+            </p>
+
+            <p>
+              By then, Codex knows how the command should run: read-only,
+              workspace-write, offline, online, or escalated. Windows does not
+              understand a Rust enum named <code>SandboxAttempt</code>. It
+              understands users, access-control entries, restricted tokens,
+              firewall rules, pipes, process handles, and exit statuses.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Codex runtime decision</th>
+                    <th>Windows needs</th>
+                    <th>Source landing point</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Whether this command may write the workspace.</td>
+                    <td>File-system ACLs and a restricted token.</td>
+                    <td><code>workspace_acl.rs</code>, <code>token.rs</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>Whether this command may reach the network.</td>
+                    <td>A principal that firewall rules can identify.</td>
+                    <td><code>sandbox_users.rs</code>, <code>firewall.rs</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>How the child process starts and reports output.</td>
+                    <td>A runner process, pipes, ConPTY or stdio.</td>
+                    <td><code>runner_client.rs</code>, <code>command_runner/win.rs</code>.</td>
+                  </tr>
+                  <tr>
+                    <td>How failure reaches the user and retry loop.</td>
+                    <td>Spawn result, exit status, and streamed output.</td>
+                    <td><code>exec.rs</code>, <code>unified_exec</code>.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              This table translates "permission" from product vocabulary into
+              materials the OS can apply. The Windows API names that follow exist
+              to move one of those materials into place.
+            </p>
+
+            <h2>2. Why Existing Windows Isolation Primitives Did Not Fit</h2>
+            <p>
+              The engineering post walks through three candidates. AppContainer
+              offers strong application-container isolation, but it belongs to a
+              packaged-app model and does not naturally host arbitrary command
+              lines, compilers, and project folders. Windows Sandbox provides a
+              temporary VM boundary, which is clean but heavy for per-command
+              agent work. Mandatory Integrity Control can lower process integrity
+              and restrict some writes, but it does not by itself express the
+              workspace-write and network combinations Codex needs.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Candidate</th>
+                    <th>What it provides</th>
+                    <th>Why it did not become the main path</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>AppContainer</td>
+                    <td>Application-container isolation.</td>
+                    <td>It is a poor fit for arbitrary CLI tools, build systems, and existing project directories.</td>
+                  </tr>
+                  <tr>
+                    <td>Windows Sandbox</td>
+                    <td>A temporary VM boundary.</td>
+                    <td>The startup, file mapping, and interaction costs are too high for ordinary tool calls.</td>
+                  </tr>
+                  <tr>
+                    <td>MIC</td>
+                    <td>Lower-integrity execution and some write restrictions.</td>
+                    <td>It helps, but it does not fully model Codex's file and network permission profile.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Codex needs a boundary that stays close to the user's development
+              environment. Commands run in the actual repository. They can read
+              sources and dependencies. Writes are narrowed to permitted roots.
+              Network access is blocked by default, with explicit online and
+              proxy cases. That is a set of constraints around a normal developer
+              workflow, not simply a request to place the process in a heavy box.
+            </p>
+
+            <h2>3. The Unelevated Prototype: Writes Were Tractable, Network Was Not</h2>
+            <p>
+              The first prototype in the OpenAI post avoided administrator
+              privileges. The core idea was simple: create a restricted token for
+              the child process and use file ACLs to decide which paths it could
+              write. The current source still shows that direction through
+              <code>CreateRestrictedToken</code>, restricting SIDs, and flags such
+              as <code>WRITE_RESTRICTED</code>.
+            </p>
+
+            <pre><code class="language-rust">CreateRestrictedToken(
+    base_token,
+    DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
+    ...
+)</code></pre>
+
+            <p>
+              File access fits that shape reasonably well. Codex can grant write
+              access to workspace roots and add explicit deny rules for control
+              directories. <code>workspace_acl.rs</code> protects subdirectories
+              such as <code>.codex</code> and <code>.agents</code> so a sandboxed
+              child cannot damage the agent's own control plane.
+            </p>
+
+            <p>
+              Network access was the weak point. The prototype could route
+              programs through proxy environment variables and replace common
+              network binaries, but those controls depend on cooperation. A
+              process that opens sockets directly can bypass them. Without an
+              elevated setup step, Codex did not have a principal that Windows
+              Firewall could reliably use for descendants of the sandboxed command.
+            </p>
+
+            <div class="note key-point">
+              <p>
+                The unelevated prototype established the key split:
+                <strong>file writes can be narrowed with ACLs; network access needs a harder identity boundary.</strong>
+                That is why the redesign introduces two sandbox users and
+                firewall rules tied to those users.
+              </p>
+            </div>
+
+            <h2>4. Elevated Setup: Turn Network Policy into User Identity</h2>
+            <p>
+              The redesigned path starts by preparing local security materials
+              through an elevated setup step. The two usernames are explicit in
+              the source:
+            </p>
+
+            <pre><code class="language-rust">const OFFLINE_USERNAME: &amp;str = "CodexSandboxOffline";
+const ONLINE_USERNAME: &amp;str = "CodexSandboxOnline";</code></pre>
+
+            <p>
+              <code>CodexSandboxOffline</code> is the default offline identity.
+              <code>CodexSandboxOnline</code> is the identity used when network
+              access is allowed. Setup creates or refreshes these local users,
+              generates random passwords, protects the secrets with DPAPI, and
+              writes them to <code>sandbox_users.json</code>. It needs elevation
+              because creating local users, adjusting ACLs, and managing firewall
+              rules are system-level operations.
+            </p>
+
+            <p>
+              This turns network permission into a Windows-enforced boundary.
+              Firewall rules can block outbound traffic for the offline user. If
+              a local proxy is configured, Codex can add loopback exceptions to
+              the proxy ports. The online user is reserved for commands that were
+              explicitly allowed to access the network. The child process no
+              longer needs to voluntarily honor proxy environment variables for
+              the main network boundary to exist.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Setup material</th>
+                    <th>What it protects</th>
+                    <th>Why it must exist before command launch</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>CodexSandboxOffline</code></td>
+                    <td>Default offline execution identity.</td>
+                    <td>Firewall rules can block outbound network by user.</td>
+                  </tr>
+                  <tr>
+                    <td><code>CodexSandboxOnline</code></td>
+                    <td>Explicit online execution identity.</td>
+                    <td>Network authority becomes an identity choice, not an env-var convention.</td>
+                  </tr>
+                  <tr>
+                    <td>Workspace ACLs</td>
+                    <td>Writable roots, read-only roots, denied roots.</td>
+                    <td>The file system must know which SIDs can write before the child starts.</td>
+                  </tr>
+                  <tr>
+                    <td>Firewall rules</td>
+                    <td>Offline outbound blocking and proxy exceptions.</td>
+                    <td>Network policy must be active before the process can connect.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Setup is therefore not just "installing a sandbox executable." It
+              lays down operating-system boundaries: ACLs for files, principals
+              for the network stack, and prepared identities that the runner can
+              select at command time.
+            </p>
+
+            <h2>5. Command Runner: The Real Child Starts from the Sandbox Side</h2>
+            <p>
+              One problem remains after setup. The Codex parent process usually
+              runs as the real user. It needs the final command to start as a
+              sandbox user, while still receiving stdin, stdout, stderr, terminal
+              resize events, and the exit code.
+            </p>
+
+            <p>
+              The source splits that job into two stages. In
+              <code>runner_client.rs</code>, Codex creates pipes, locates
+              <code>codex-command-runner.exe</code>, and calls
+              <code>CreateProcessWithLogonW</code> to start the runner under the
+              selected sandbox user. Inside the runner, <code>command_runner/win.rs</code>
+              reads a <code>SpawnRequest</code>, derives a narrower restricted
+              token from the sandbox user's token, and launches the actual command
+              through ConPTY or ordinary stdio.
+            </p>
+
+            <pre><code class="language-text">Codex parent
+  -> CreateProcessWithLogonW(sandbox user, command runner)
+  -> send SpawnRequest over pipes
+  -> runner creates restricted token
+  -> runner launches the real command
+  -> stdout/stderr/status stream back to Codex</code></pre>
+
+            <p>
+              The extra hop solves both identity and interaction. The final
+              command is born inside <code>CodexSandboxOffline</code> or
+              <code>CodexSandboxOnline</code>, so firewall and ACL rules apply.
+              Codex still observes the command lifecycle: it can write stdin,
+              read output, handle resize, wait for termination, and project the
+              result into protocol events and rollout evidence.
+            </p>
+
+            <h2>6. Back to the Codex Runtime: What the Platform Sandbox Protects</h2>
+            <p>
+              Now place this back on the Part V tool path. The model never
+              directly receives authority to run commands. It requests a tool.
+              Codex turns that request into a reviewable invocation, evaluates
+              hooks and approval policy, chooses a sandbox profile, and then lets
+              the Windows backend translate that choice into an OS-enforced
+              process boundary.
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Layer</th>
+                    <th>Question it answers</th>
+                    <th>How failure should surface</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Approval / hooks</td>
+                    <td>Is this side effect allowed?</td>
+                    <td>Reject, ask for approval, or emit an explainable event.</td>
+                  </tr>
+                  <tr>
+                    <td><code>SandboxAttempt</code></td>
+                    <td>Which permission profile should this command receive?</td>
+                    <td>Try a narrower or wider shape; trigger retry when appropriate.</td>
+                  </tr>
+                  <tr>
+                    <td>Windows setup</td>
+                    <td>Does this machine have enforceable local boundaries prepared?</td>
+                    <td>Report missing setup, elevation failure, or unsupported environment.</td>
+                  </tr>
+                  <tr>
+                    <td>Command runner</td>
+                    <td>Did the real child start under the right user and token?</td>
+                    <td>Spawn failure, pipe failure, exit status, and captured output.</td>
+                  </tr>
+                  <tr>
+                    <td>Events / rollout</td>
+                    <td>Can clients and recovery code see what happened?</td>
+                    <td>Structured event, tool output, and retry or diagnostic material.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              The Windows sandbox is therefore not a detached security appendix
+              to the Codex series. It is the platform implementation of the
+              permission-and-sandbox chapter: runtime policy chooses the shape,
+              setup prepares boundaries, the runner places commands inside those
+              boundaries, and events plus rollout carry the result back.
+            </p>
+
+            <h2>7. Common Misreads When Reading This Code</h2>
+            <p>
+              First, the sandbox is not a prompt constraint. Prompting can guide
+              the model, but commands need OS enforcement once they leave the
+              model loop. Second, it is not a full VM. Codex wants to run normal
+              development commands in the user's current repository, so the
+              boundary stays close to the workspace and user identities. Third,
+              setup success does not mean every command will succeed; it only
+              means the local security materials exist. Each run still depends on
+              the chosen permission profile, paths, network mode, and runner state.
+            </p>
+
+            <p>
+              A useful final test is to ask five questions for any model-requested
+              command: why was it allowed, which user identity launched it, where
+              can it write, can it reach the network, and who can see the evidence
+              if it fails? The Windows sandbox layer exists to hand those answers
+              to the operating system.
+            </p>
+
+            <h2 id="sources">Sources</h2>
+            <ul>
+              <li><a href="https://openai.com/index/building-codex-windows-sandbox/">OpenAI engineering post: Building a Windows sandbox for Codex</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/core/src/exec.rs#L91-L128"><code>ExecParams</code> and sandbox manager selection</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/core/src/exec.rs#L599-L740"><code>exec_windows_sandbox</code> choosing elevated backend or legacy restricted-token path</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/setup.rs#L48-L54"><code>CodexSandboxOffline</code> / <code>CodexSandboxOnline</code> username constants</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/setup.rs#L300-L329">Setup refresh payload with read/write/deny roots, sandbox users, and proxy ports</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs#L54-L91">Provisioning sandbox group, offline/online users, and random passwords</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs#L405-L462">Protecting sandbox-user secrets with DPAPI and writing <code>sandbox_users.json</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/firewall.rs#L30-L43">Codex Windows sandbox firewall rule names and descriptions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/firewall.rs#L55-L206">Offline user's loopback exceptions and outbound block rules</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/workspace_acl.rs#L13-L27"><code>.codex</code> / <code>.agents</code> write-protection rules</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/token.rs#L448-L505"><code>CreateRestrictedToken</code>, restricting SIDs, and <code>WRITE_RESTRICTED</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs#L310-L365">Starting the command runner as the selected sandbox user</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs#L1-L8">Command runner responsibility comment</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs#L234-L287">Runner deriving a restricted token from the permission profile</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/unified_exec/src/backends/elevated.rs#L111-L190">unified_exec elevated backend building the Windows sandbox session</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen ? `${base}-${seen + 1}` : base;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          link.dataset.index = index;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (const knownLevel of [2, 3, 4]) {
+            if (knownLevel > level) lastItems.delete(knownLevel);
+          }
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (!visible.length) return;
+            const id = visible[0].target.id;
+            links.forEach((link) => {
+              link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+            });
+          },
+          { rootMargin: "-18% 0px -68% 0px", threshold: 0.01 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+    <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+    <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>

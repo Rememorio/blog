@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex 源码阅读（十三）：Windows 沙箱，权限边界怎样落到操作系统</title>
+    <meta
+      name="description"
+      content="沿 OpenAI 官方 Windows sandbox 工程文章和 openai/codex 源码，拆解 Codex 怎样把权限策略落到 Windows 用户身份、ACL、防火墙、command runner 和 restricted token。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Codex 源码阅读（十三）：Windows 沙箱，权限边界怎样落到操作系统" />
+    <meta
+      property="og:description"
+      content="Codex 的 Windows sandbox 不是一句策略开关，而是一条从 runtime 权限到操作系统执行边界的落地路径。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/windows-sandbox-boundary.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/codex/zh/windows-sandbox/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/codex/zh/windows-sandbox/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/codex/en/windows-sandbox/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/codex/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(163, 89, 52, 0.3);
+        background: rgba(163, 89, 52, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--teal);
+      }
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+    <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Codex 系列</a>
+        <a href="../memory-layer/">上一篇：Memory</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/windows-sandbox/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Codex 源码阅读 · 第十三篇</p>
+            <h1>Windows 沙箱，权限边界怎样落到操作系统</h1>
+            <p class="lead">
+              第五篇讲到 <code>SandboxAttempt</code> 时，我们停在了 runtime 的选择：
+              一次工具调用可以被批准、拒绝、降权执行，或者在失败后请求更高权限。
+              但 <code>SandboxAttempt</code> 只是 Codex 自己的决策结果。到了 Windows 上，
+              这份决策还要变成真实的用户身份、文件 ACL、防火墙规则和进程令牌。
+            </p>
+            <div class="meta-line">
+              <span>项目：openai/codex</span>
+              <span>主题：Windows sandbox</span>
+              <span>范围：官方工程文章 + 公开源码</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/windows-sandbox-boundary.png"
+                alt="Codex Windows 沙箱图，展示 sandbox attempt、setup、sandbox users、runner、restricted token、file ACL 和 firewall 的关系"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              如果只看产品体验，沙箱像是一个开关：允许写工作区、禁止联网、必要时请求审批。
+              但源码阅读不能停在这个说法上。模型请求执行命令以后，真正保护本机的不是一句 prompt，
+              也不是 UI 上的标签，而是操作系统愿意承认的边界。
+            </p>
+
+            <p>
+              OpenAI 官方的
+              <a href="https://openai.com/zh-Hans-CN/index/building-codex-windows-sandbox/">《为 Codex 构建 Windows 沙箱》</a>
+              把问题说得很具体：macOS 可以借助 Seatbelt，Linux 可以借助 seccomp/bubblewrap，
+              Windows 没有一个刚好匹配本地 coding agent 工作流的现成原语。用户又不应该在
+              “几乎每条命令都审批”和“完全放开本机访问”之间二选一。于是 Codex 需要自己把
+              runtime 权限策略落到 Windows 的安全模型里。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                本篇的主线是：<strong>Windows sandbox 是权限策略的操作系统落地层。</strong>
+                Codex 先在 runtime 里决定这次工具调用能拿到什么权限，再通过 setup 准备
+                sandbox 用户、文件 ACL 和防火墙规则；真正执行命令时，command runner 以
+                sandbox 用户身份启动，再派生出受限 token 的子进程。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>阅读契约。</strong>
+                这篇只追 Windows 本地执行链路：为什么现成 Windows 方案不够用，
+                未提权原型解决了什么、漏掉了什么，提权 setup 为什么出现，command runner
+                为什么要站到 sandbox 用户一侧，以及这些机制怎样接回第五篇的工具权限主线。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>证据边界。</strong>
+                产品背景来自 OpenAI 官方工程文章；实现细节来自 <code>openai/codex</code>
+                公开源码。本文只讨论本地 Windows sandbox backend，不推断 OpenAI 私有服务端如何执行远程任务。
+              </p>
+            </div>
+
+            <h2>一、先接回第五篇：runtime 只决定“应该怎样执行”</h2>
+            <p>
+              第五篇里，我们把副作用拆成几道关口：permission hooks 可以提前观察或拒绝，
+              approval policy 决定是否需要人类确认，<code>ToolOrchestrator</code> 把一次模型工具请求整理成
+              <code>SandboxAttempt</code>，最后 exec backend 负责真正启动命令。
+            </p>
+
+            <p>
+              到这里，Codex 已经知道“这条命令应该在什么权限下执行”。例如：只读、允许写工作区、
+              禁止网络、允许网络、或者需要提权重试。可是 Windows 内核不会理解
+              <code>SandboxAttempt</code> 这个 Rust 类型。它只认用户身份、访问控制列表、令牌权限、
+              防火墙规则和进程创建 API。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Codex runtime 层</th>
+                    <th>Windows 必须看到的东西</th>
+                    <th>源码落点</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>这次命令能不能写工作区。</td>
+                    <td>文件系统 ACL 和受限 token。</td>
+                    <td><code>workspace_acl.rs</code>、<code>token.rs</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>这次命令能不能联网。</td>
+                    <td>可被防火墙规则识别的本地用户身份。</td>
+                    <td><code>sandbox_users.rs</code>、<code>firewall.rs</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>这次命令怎样启动并把输出带回 Codex。</td>
+                    <td>runner 进程、匿名管道、ConPTY 或 stdio。</td>
+                    <td><code>runner_client.rs</code>、<code>command_runner/win.rs</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>失败时如何暴露给上层。</td>
+                    <td>exit status、spawn result、streamed output。</td>
+                    <td><code>exec.rs</code>、<code>unified_exec</code>。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这张表很重要。它把“权限”从产品词汇拆成了 Windows 能执行的材料。
+              后面每个 Windows API 名字，都是为了解决其中一个材料问题，不需要提前背。
+            </p>
+
+            <h2>二、Windows 难点：现成隔离方案都差一点</h2>
+            <p>
+              官方文章先评估了三类方案。AppContainer 是 UWP 应用模型的一部分，
+              约束强，但把任意命令、用户工程目录和开发工具链塞进去并不自然。Windows Sandbox
+              更像一台临时 VM，隔离清楚，却很重，和 Codex 需要在用户当前工作区里快速读写的节奏不合。
+              Mandatory Integrity Control 可以降低完整性级别，能限制一部分写入，但网络控制和开发体验仍然不够完整。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>候选方案</th>
+                    <th>能提供什么</th>
+                    <th>为什么没有成为主路径</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>AppContainer</td>
+                    <td>应用容器级隔离。</td>
+                    <td>更适合打包应用，不适合把任意 CLI、编译器和仓库命令原样放进去。</td>
+                  </tr>
+                  <tr>
+                    <td>Windows Sandbox</td>
+                    <td>临时 VM 边界。</td>
+                    <td>隔离粒度太重，启动、文件映射和交互成本不适合每次工具调用。</td>
+                  </tr>
+                  <tr>
+                    <td>MIC</td>
+                    <td>低完整性进程，限制部分写入。</td>
+                    <td>能帮上忙，但不能单独表达 Codex 对工作区写入和网络访问的组合策略。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              Codex 需要的边界更贴近日常开发：命令要在原仓库里跑，能读依赖和源码，
+              但写入要收在允许的目录里；默认不能随便联网，必要时又要支持在线模式和代理例外。
+              这不是一个“把进程关进盒子里”的单点问题，而是一组要和开发工具链共存的约束。
+            </p>
+
+            <h2>三、未提权原型：文件写入先收住，网络还不够硬</h2>
+            <p>
+              官方文章里提到的第一版原型没有要求管理员权限。它的思路很直接：
+              给子进程一个受限 token，再用文件 ACL 控制哪些路径可写。源码里的
+              <code>CreateRestrictedToken</code> 调用也能看到这个方向：token 会被加上 restricting SID，
+              并带上 <code>WRITE_RESTRICTED</code> 这类标志。
+            </p>
+
+            <pre><code class="language-rust">CreateRestrictedToken(
+    base_token,
+    DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
+    ...
+)</code></pre>
+
+            <p>
+              文件这边比较容易落地：工作区可写，仓库里的敏感控制目录还能额外加拒绝写入。
+              例如 <code>workspace_acl.rs</code> 会保护 <code>.codex</code> 和 <code>.agents</code>
+              子目录，避免 sandbox 子进程把 Codex 自己的控制面写坏。
+            </p>
+
+            <p>
+              难点出在网络。未提权原型可以通过环境变量把网络请求引到 proxy，也可以用替身可执行文件拦截某些常见命令。
+              但这类方案本质上依赖进程配合：程序如果直接开 socket，或者绕过约定的环境变量，
+              Codex 就很难在不提权的情况下把它完全拦住。官方文章也把这点作为重新设计的关键原因。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                未提权原型已经说明一件事：<strong>文件写入可以靠 ACL 收口，网络访问必须找到更硬的身份边界。</strong>
+                这就是后面两个 sandbox 用户和防火墙规则出现的根因。
+              </p>
+            </div>
+
+            <h2>四、提权 setup：把网络边界变成 Windows 用户身份</h2>
+            <p>
+              重新设计后的核心变化，是先用一个提权 setup 准备本机安全材料。源码里这两个用户名写得非常直白：
+            </p>
+
+            <pre><code class="language-rust">const OFFLINE_USERNAME: &amp;str = "CodexSandboxOffline";
+const ONLINE_USERNAME: &amp;str = "CodexSandboxOnline";</code></pre>
+
+            <p>
+              <code>CodexSandboxOffline</code> 用于默认离线执行，<code>CodexSandboxOnline</code>
+              用于允许联网的执行。setup 会创建或刷新这些本地用户，生成随机密码，把 secret
+              通过 DPAPI 保护后写入 <code>sandbox_users.json</code>。这一步需要管理员权限，
+              因为创建本地用户、调整 ACL、写防火墙规则都属于系统级配置。
+            </p>
+
+            <p>
+              这个设计的好处在于：Windows 防火墙可以按用户身份建立规则。
+              offline 用户的出站网络默认被 block；如果 Codex 配置了本地代理，就只放行指向代理端口的 loopback
+              例外。online 用户则用于明确允许联网的场景。这样，网络权限不再靠子进程自觉读取环境变量，
+              而是落在 Windows 可以强制执行的 principal 上。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>setup 产物</th>
+                    <th>保护什么</th>
+                    <th>为什么必须提前准备</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>CodexSandboxOffline</code></td>
+                    <td>默认离线身份。</td>
+                    <td>让防火墙可以按用户维度拦截出站网络。</td>
+                  </tr>
+                  <tr>
+                    <td><code>CodexSandboxOnline</code></td>
+                    <td>允许联网身份。</td>
+                    <td>把“允许网络”从环境变量升级成明确身份选择。</td>
+                  </tr>
+                  <tr>
+                    <td>工作区 ACL</td>
+                    <td>可写根、只读根、拒绝写入根。</td>
+                    <td>命令启动前，文件系统需要已经知道哪些 SID 可以写。</td>
+                  </tr>
+                  <tr>
+                    <td>防火墙规则</td>
+                    <td>offline 用户的出站网络和代理例外。</td>
+                    <td>网络拦截必须在进程尝试连接前生效。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以 setup 不是“安装一个沙箱程序”这么简单。它是在用户机器上铺好几条操作系统边界：
+              文件系统认 ACL，网络栈认用户身份，后续 runner 才能把一次工具调用放进正确边界里。
+            </p>
+
+            <h2>五、command runner：真正的子进程从 sandbox 用户一侧出生</h2>
+            <p>
+              有了 sandbox 用户，还剩一个实际问题：Codex 主进程通常以真实用户身份运行，
+              它怎样让最终命令在 sandbox 用户身份下启动，同时还能拿回 stdin/stdout、exit code 和 terminal 尺寸变化？
+            </p>
+
+            <p>
+              源码把这件事拆成两段。第一段在 <code>runner_client.rs</code>：
+              Codex 创建管道，找到 <code>codex-command-runner.exe</code>，再用
+              <code>CreateProcessWithLogonW</code> 以 sandbox 用户身份启动 runner。
+              第二段在 runner 进程内部：runner 通过 IPC 读到 <code>SpawnRequest</code>，
+              再基于当前 sandbox 用户 token 派生更窄的 restricted token，最后用 ConPTY 或普通 stdio
+              启动真正的命令。
+            </p>
+
+            <pre><code class="language-text">Codex 主进程
+  -> CreateProcessWithLogonW(sandbox user, command runner)
+  -> 通过 pipe 发送 SpawnRequest
+  -> runner 创建 restricted token
+  -> runner 启动真正命令
+  -> stdout/stderr/status 流回 Codex</code></pre>
+
+            <p>
+              这一步看起来绕，但它解决了身份和交互两个问题。身份方面，最终命令出生在
+              <code>CodexSandboxOffline</code> 或 <code>CodexSandboxOnline</code> 的世界里，
+              防火墙和 ACL 可以生效。交互方面，Codex 仍然保留对命令生命周期的观察：
+              可以写 stdin、读输出、处理 resize、等待退出，也能把结果投影回 protocol event 和 rollout。
+            </p>
+
+            <h2>六、放回 Codex 主线：平台沙箱保护的到底是什么</h2>
+            <p>
+              现在回到第五篇的工具权限主线。模型没有直接获得“运行命令”的能力；
+              它只能提出工具请求。Codex runtime 先把请求变成可审查的工具调用，
+              再按配置、hook 和 approval policy 决定权限。Windows backend 接手时，
+              它的任务是把这份权限决定变成 OS 能强制执行的进程边界。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>层级</th>
+                    <th>负责的问题</th>
+                    <th>失败时应该怎样暴露</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>approval / hooks</td>
+                    <td>这次副作用是否被允许。</td>
+                    <td>拒绝、请求审批、返回可解释事件。</td>
+                  </tr>
+                  <tr>
+                    <td><code>SandboxAttempt</code></td>
+                    <td>这次命令应在什么权限轮廓下运行。</td>
+                    <td>选择更窄或更宽的尝试，必要时触发 retry。</td>
+                  </tr>
+                  <tr>
+                    <td>Windows setup</td>
+                    <td>本机是否已经具备可执行边界。</td>
+                    <td>提示需要 setup、提权失败或环境不支持。</td>
+                  </tr>
+                  <tr>
+                    <td>command runner</td>
+                    <td>真正子进程是否按 sandbox 用户和 restricted token 启动。</td>
+                    <td>spawn failure、pipe failure、exit status、captured output。</td>
+                  </tr>
+                  <tr>
+                    <td>event / rollout</td>
+                    <td>客户端和恢复路径能否看到事实。</td>
+                    <td>结构化事件、工具输出、后续 retry 或诊断材料。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这样看，Windows sandbox 不是 Codex 系列里一块孤立的安全附录。
+              它是第五篇“权限与 sandbox”的平台实现篇：runtime 决定策略，setup 准备边界，
+              runner 把命令放进边界，事件和 rollout 把结果带回主线。
+            </p>
+
+            <h2>七、读源码时容易误会的几件事</h2>
+            <p>
+              第一，沙箱不是 prompt 约束。prompt 可以要求模型谨慎，但模型之外的命令执行需要 OS 边界兜底。
+              第二，它也不是一台完整 VM。Codex 的目标是在当前工作区里跑开发命令，所以它更像一组贴着仓库和用户身份工作的本地边界。
+              第三，setup 成功不代表每次命令都一定成功；它只说明本机材料准备好了，后续还要看权限轮廓、路径、网络和 runner 状态。
+            </p>
+
+            <p>
+              最后要记住一个判断标准：当一条命令被模型提出时，Codex 希望能回答五个问题：
+              这条命令为什么被允许，在哪个用户身份下跑，能写哪里，能不能联网，失败时谁能看到证据。
+              Windows sandbox 这一层，就是把这些答案交给操作系统执行。
+            </p>
+
+            <h2 id="sources">参考源码</h2>
+            <ul>
+              <li><a href="https://openai.com/zh-Hans-CN/index/building-codex-windows-sandbox/">OpenAI 官方工程文章：为 Codex 构建 Windows 沙箱</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/core/src/exec.rs#L91-L128"><code>ExecParams</code> 和 sandbox manager 选择本轮执行边界</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/core/src/exec.rs#L599-L740"><code>exec_windows_sandbox</code> 在 elevated backend 与 legacy restricted-token path 之间选择</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/setup.rs#L48-L54"><code>CodexSandboxOffline</code> / <code>CodexSandboxOnline</code> 用户名常量</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/setup.rs#L300-L329">setup refresh payload：read/write/deny roots、sandbox 用户和 proxy ports</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs#L54-L91">创建 sandbox 用户组、offline/online 用户和随机密码</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs#L405-L462">DPAPI 保护 sandbox 用户 secret 并写入 <code>sandbox_users.json</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/firewall.rs#L30-L43">Codex Windows sandbox firewall 规则命名和说明</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/firewall.rs#L55-L206">offline 用户的 loopback 例外和出站 block 规则</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/workspace_acl.rs#L13-L27"><code>.codex</code> / <code>.agents</code> 写保护规则</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/token.rs#L448-L505"><code>CreateRestrictedToken</code>、restricting SID 和 <code>WRITE_RESTRICTED</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs#L310-L365">Codex 启动 sandbox 用户身份下的 command runner</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs#L1-L8">command runner 的职责说明</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs#L234-L287">runner 根据 permission profile 派生 restricted token</a></li>
+              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/unified_exec/src/backends/elevated.rs#L111-L190">unified_exec elevated backend 构造 Windows sandbox session</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen ? `${base}-${seen + 1}` : base;
+          }
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          link.dataset.index = index;
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          for (const knownLevel of [2, 3, 4]) {
+            if (knownLevel > level) lastItems.delete(knownLevel);
+          }
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (!visible.length) return;
+            const id = visible[0].target.id;
+            links.forEach((link) => {
+              link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+            });
+          },
+          { rootMargin: "-18% 0px -68% 0px", threshold: 0.01 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+    <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+    <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>
