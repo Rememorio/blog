@@ -339,12 +339,42 @@ messages = [
             </p>
 
             <p>
-              那 snip 到底干了什么？从公开源树能看到的是它的<strong>投影和恢复契约</strong>：
+              那 snip 到底干了什么？先说结论：它不是“时间久了就从最开头开始删”。如果用户最开始布置了一个任务，
+              后面跑了几百轮工具调用，按时间裁掉最早消息当然会把任务目标、约束和验收标准一起弄丢。Claude Code
+              已经有 compact boundary 负责截断旧前缀；snip 这把小刀处理的是<strong>活动上下文里的指定中间段</strong>。
+            </p>
+
+            <figure class="shape-example">
+              <pre><code class="language-text">不是这样：
+  U0(最初任务) A1 T1 A2 T2 ... A80 T80
+  -> 按时间删掉最早 N 条
+
+而是更接近这样：
+  API-bound copy:  U0[id:a1] A1 T1 U2[id:b7] ... U80[id:k9]
+  snip boundary:   removedUuids = [uuid(T12), uuid(A13), uuid(T13), ...]
+  next API view:   U0 A1 T1 U2 ... [中间一段被过滤] ... U80
+
+本地 UI / JSONL：
+  仍保留原始消息；resume 时按 removedUuids 重放同一组删除</code></pre>
+              <figcaption>snip 的可见契约是“按 UUID 移出模型视图”，不是“按时间裁掉最老前缀”。</figcaption>
+            </figure>
+
+            <p>
+              从公开源树能看到的是它的<strong>投影和恢复契约</strong>：
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messages.ts#L4631-L4655"><code>getMessagesAfterCompactBoundary()</code></a>
               默认会再调用 <code>projectSnippedView()</code>，也就是 compact boundary 之后还要过滤 snipped messages；
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/components/Messages.tsx#L486-L498">UI 渲染则显式传入 <code>includeSnipped: true</code></a>，
               让用户还能在 scrollback 里看到完整历史。换句话说，snip 不是删掉磁盘账本，也不是把内容改成一句占位符，
               而是把某些中间消息从模型下一次会看的视图里摘出去。
+            </p>
+
+            <p>
+              为什么能做到“指定中间段”？因为 Claude Code 会给 API-bound 的用户消息追加稳定的
+              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messages.ts#L195-L204"><code>[id:...]</code> 短标签</a>；
+              注释说明这些标签是给 snip tool 引用消息用的，而且只改 API-bound copy，不改存储消息。
+              所以 snip 的删除单位不是“第几分钟之前的所有东西”，而是一次 snip execution 选中的消息 UUID 集合。
+              公开快照没有暴露 selector 的具体策略和 prompt，因此这篇不把“怎么判定低价值”写成源码事实；
+              能确定的是执行结果会落成 <code>removedUuids</code>，后续投影和恢复都围绕这组 UUID 工作。
             </p>
 
             <p>
@@ -359,6 +389,8 @@ messages = [
               这样就能理解它为什么叫“小刀”：它不是一次完整搬家，不生成新的全局 summary，也不负责清理所有旧工具结果；
               它是在保留本地证据和 UI scrollback 的同时，把模型视图里的某些低价值中段挖掉。后面的 <code>/compact</code>
               路径也会先投影 snipped view，避免 compact model 把已经主动移出活动上下文的内容又总结回来。
+              另外，源码里还专门注明 <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolSearch.ts#L537-L540">带 <code>tool_reference</code> 的消息会被 snip 保护</a>，
+              这也说明它不是简单按时间扫过去，而是在删除前要尊重后续运行仍依赖的引用。
             </p>
 
             <p>
@@ -401,9 +433,9 @@ messages = [
                 <tbody>
                   <tr>
                     <td><code>HISTORY_SNIP</code></td>
-                    <td><code>query()</code> 进入 microcompact 之前，活动历史里存在可移出模型视图的中间 ranges。</td>
-                    <td>API-bound view 过滤这些消息；UI scrollback 和 JSONL 仍保留证据，resume 通过 <code>removedUuids</code> 重放删除。</td>
-                    <td>先移走低价值中段，并让后面的 auto compact 阈值计算扣掉 <code>tokensFreed</code>。</td>
+                    <td><code>query()</code> 进入 microcompact 之前，某次 snip execution 已经选出要移出模型视图的消息 UUID。</td>
+                    <td>API-bound view 按 <code>removedUuids</code> 过滤中间 ranges；UI scrollback 和 JSONL 仍保留证据，resume 再重放删除。</td>
+                    <td>不是按时间删最早前缀，而是先移走可指定的低价值中段，并让 auto compact 阈值扣掉 <code>tokensFreed</code>。</td>
                   </tr>
                   <tr>
                     <td>time-based microcompact</td>
@@ -779,8 +811,10 @@ installed message =
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts#L113-L188">context.ts：system/user context</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts#L437-L474">utils/api.ts：appendSystemContext / prependUserContext</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L365-L535">query.ts：pre-API context pipeline</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messages.ts#L195-L204">utils/messages.ts：snip message id tags</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messages.ts#L4631-L4655">utils/messages.ts：snip 后的 active message projection</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1958-L1982">sessionStorage.ts：resume 时重放 snip removals</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolSearch.ts#L537-L540">toolSearch.ts：snip 保护 tool_reference 消息</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L659-L708">query.ts：callModel request options</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L253-L529">microCompact.ts：microcompact paths</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/autoCompact.ts#L28-L90">autoCompact.ts：threshold calculation</a></li>
