@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reading OpenClaw, Part 1: How One Message Completes an Agent Turn</title>
+    <meta name="description" content="Trace one OpenClaw message through ChannelPlugin, sessionKey, queues, the embedded agent, tool events, lifecycle completion, and ReplyPayload." />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Reading OpenClaw, Part 1: How One Message Completes an Agent Turn" />
+    <meta property="og:description" content="Establish the end-to-end runtime path before opening seven deeper system boundaries." />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/overview-runtime-route.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/openclaw/en/overview/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/openclaw/zh/overview/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/openclaw/en/overview/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/openclaw/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="Article shortcuts"><a href="../">OpenClaw series</a><a href="#route">Reading route</a><a href="#sources">Sources</a></nav>
+      <nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a href="../../zh/overview/" lang="zh-CN">中文</a><a class="active" href="./" lang="en" aria-current="page">English</a></span></nav>
+    </header>
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">Reading OpenClaw · Part 1</p>
+            <h1>How one message completes an agent turn</h1>
+            <p class="lead">OpenClaw looks like an agent product connected to many chat channels, models, and tools. The most useful way into its source is not the feature list. It is a concrete ownership question: after a user sends a Telegram message, who decides which session owns it, who returns tool results to the model, and who can prove that the run has ended?</p>
+            <div class="meta-line"><span>Part 1 / 8</span><span>Source snapshot: c549250</span><span>Topic: end-to-end runtime path</span><span>Evidence: public source and official docs</span></div>
+            <nav class="series-strip" aria-label="OpenClaw series"><span class="series-current"><strong>01</strong> Message path: ChannelPlugin to ReplyPayload</span><a href="../"><strong>Route map</strong> See the complete eight-part sequence</a></nav>
+            <figure class="hero-image"><img src="../../assets/overview-runtime-route.png" alt="OpenClaw runtime route from ChannelPlugin through runChannelInboundEvent, sessionKey, dispatchReplyFromConfig, runReplyAgent, and runEmbeddedAgentInternal to ReplyPayload, with the tool loop inside the embedded agent" /></figure>
+          </section>
+          <section class="article-body">
+            <p>We will follow one task throughout the article. A user writes in Telegram: “Check the failing project tests, fix them, and send the result back here.” The sentence is short. The runtime work is not. OpenClaw must decide whether the event may start an agent turn, which durable session owns it, whether that session already has a run in flight, what the model is allowed to see and do, and how text or media should return to Telegram.</p>
+            <p>Collapsing all of that into “receive message → call model → send answer” makes three common failures impossible to explain. Why can the same human share context across some chat surfaces but not others? Why can a caller still be waiting after assistant text has appeared? If a tool changed a file and final delivery failed, should the system replay the input, resume a run, or only retry delivery?</p>
+            <p>This opening chapter therefore stays on one inbound turn. It connects the main call path, the state owners, and the terminal signal. Later chapters zoom into each boundary rather than repeating a shallow overview of every feature.</p>
+            <div class="note"><p><strong>Reading contract.</strong>By the end, you should be able to explain why a provider event first becomes normalized context; why <code>sessionKey</code> constrains behavior before model selection; how model and tools hand control back and forth; why the <code>assistant</code>, <code>tool</code>, and <code>lifecycle</code> streams are not interchangeable; and why <code>ReplyPayload</code> is an outbound value rather than the state of the run.</p></div>
+            <p><strong>Evidence boundary.</strong>This article pins OpenClaw at commit <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250bfae8ff40822099c9af93ed05ff540579</a>. Names and call order come from that snapshot; product-level contracts are checked against the official <a href="https://docs.openclaw.ai/concepts/agent-loop">Agent Loop</a>, <a href="https://docs.openclaw.ai/concepts/messages">Messages</a>, and <a href="https://docs.openclaw.ai/concepts/session">Session</a> docs. Source can establish structure and ownership. It cannot, by itself, prove latency, reliability, or security properties in every deployment.</p>
+
+            <h2>1. A turn is larger than a model request</h2>
+            <p>Our user sent one message, but the agent may contact the model four times: once to decide to read the test log, again to search the relevant code, again after editing to run the tests, and finally to explain the verified result. A <strong>turn is not one model request</strong>. It is the lifecycle from inbound admission through a run-level terminal state and outbound handling.</p>
+            <p>This distinction puts tool execution in the right place. A tool is not an optional postscript after the “real” model work. Its result becomes evidence for the next model decision. The turn remains alive while the runtime can still produce another tool call, request interaction, compact and retry, or enter a recoverable branch.</p>
+            <div class="table-wrap"><table><thead><tr><th>Object</th><th>What it owns</th><th>What it does not own</th></tr></thead><tbody>
+              <tr><td>Message</td><td>A channel event and its text, media, sender, and thread facts.</td><td>It does not inherently choose a session or start an agent.</td></tr>
+              <tr><td>Model request</td><td>One runtime view sent to one provider/model candidate.</td><td>It is not the whole turn and does not own delivery.</td></tr>
+              <tr><td>Agent turn</td><td>Admission, session, queues, model, tools, events, termination, and reply handling.</td><td>It need not contain exactly one request or only text output.</td></tr>
+              <tr><td>Session</td><td>Durable identity, history ownership, and a concurrency boundary across turns.</td><td>It is neither the active Promise nor the final reply.</td></tr>
+            </tbody></table></div>
+
+            <h2>2. A message enters the channel kernel, not the model</h2>
+            <p>Telegram, Discord, Slack, and WebChat deliver very different raw objects. OpenClaw keeps those provider details at the plugin and adapter boundary. The shared <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/channels/turn/kernel.ts#L186-L235"><code>runChannelTurn</code></a> first asks the adapter to ingest a raw event into normalized input, then classifies whether that event may begin an agent turn.</p>
+            <p>Receiving an event is therefore not the same thing as running an agent. A channel-owned interaction, an observe-only event, or a rejected admission can end before any model work. The kernel even has a policy-controlled history path for dropped events. Admission is itself a fact worth recording; the absence of a reply is not enough to tell an operator what happened.</p>
+            <pre><code class="language-typescript">const input = await params.adapter.ingest(params.raw);
+const eventClass = (await params.adapter.classify?.(input)) ?? DEFAULT_EVENT_CLASS;
+
+if (!eventClass.canStartAgentTurn) {
+  return { admission: { kind: "handled", reason: `event:${eventClass.kind}` }, dispatched: false };
+}</code></pre>
+            <p>The transferable rule is simple: translate provider-owned events into product-owned inputs before applying shared admission and lifecycle policy. Otherwise every channel reimplements deduplication, audit, history, and error semantics—and every fix becomes a partial fix.</p>
+
+            <h2>3. Routing produces a sessionKey before model selection</h2>
+            <p>Once admitted, the message needs an owner. OpenClaw routing produces more than an agent name. It contributes to a stable <code>sessionKey</code> that can incorporate channel, account, peer, thread, binding, and agent configuration. Messages with different keys belong to different state domains even if both later use the same provider and model.</p>
+            <p>That is why model selection is not the earliest important decision. A provider/model candidate can fail over during a run. Session identity must already exist so queues, persistent state, and the reply operation have something stable to own. The signature and setup of <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply/agent-runner-run.ts#L71-L112"><code>runReplyAgent</code></a> carry <code>sessionEntry</code>, <code>sessionStore</code>, <code>sessionKey</code>, <code>queueKey</code>, and resolved queue policy alongside model information.</p>
+            <div class="note"><p><strong>Debugging shortcut.</strong>When “the same user” appears to have lost context, compare route resolution and <code>sessionKey</code> before changing prompts or memory. Many apparent context failures were already split into separate sessions upstream of the model.</p></div>
+
+            <h2>4. Queues protect causal history, not only throughput</h2>
+            <p>Suppose the user sends “fix the tests” and immediately follows with “do not edit generated files.” If both turns read the old transcript and write independently, the second constraint can land after the first tool action—or two runs can mutate the same workspace concurrently. OpenClaw uses both a session lane and a global lane to keep these concerns separate.</p>
+            <p>In <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-runner/run-orchestrator.ts#L159-L204"><code>runEmbeddedAgentOrchestrated</code></a>, a lane controller exposes <code>enqueueSession</code> and <code>enqueueGlobal</code>. The code enters the session lane, waits for prior deferred transcript maintenance for that session, and only then enters the global concurrency gate.</p>
+            <ul>
+              <li>The <strong>session lane</strong> protects ordered reads and writes within one state domain.</li>
+              <li>The <strong>global lane</strong> limits expensive concurrent runs across the process without turning one busy session into a lock on every other session.</li>
+            </ul>
+            <p>Queue modes therefore change semantics, not just performance. Steering, following up, interrupting, and collecting are different answers to one ownership question: may a new message join the active run, must it become the next author of the transcript, or should it replace the run? Part three will trace those modes in detail.</p>
+
+            <h2>5. dispatchReplyFromConfig is a staged, short-circuiting pipeline</h2>
+            <p>With route and session prepared, the request reaches <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply/dispatch-from-config.ts#L22-L100"><code>dispatchReplyFromConfig</code></a>. The name sounds like a thin configuration switch. The inner function instead advances through request gathering, delivery preparation, operation context, operation, route, execution, finalization, and audit.</p>
+            <pre><code class="language-typescript">const gathered = await gatherDispatchRequest(params, messageAuditTerminal);
+if (gathered.status === "complete") return gathered.result;
+
+const delivery = await prepareDispatchDelivery(gathered.state);
+const context = await prepareDispatchOperationContext(delivery.state);
+const operation = await prepareDispatchOperation(context.state);
+const route = await chooseDispatchRoute(operation.state);
+const execution = await prepareDispatchExecution(route.state);
+const executed = await executeDispatch(execution.state);
+return (await finalizeDispatchAndAudit(executed.state)).result;</code></pre>
+            <p>The repeated <code>status === "complete"</code> checks matter. A command handler, policy decision, or no-model response can terminate in its own stage without pretending an embedded agent succeeded. On error, the function commits or releases its inbound dedupe claim according to replay safety, records the dispatch and processing outcome, and returns the runtime to an idle state. “Can we retry?” is already being shaped by possible side effects.</p>
+
+            <h2>6. runReplyAgent is the seam between channel semantics and the runtime</h2>
+            <p>Branches that require a model eventually enter <code>runReplyAgent</code>. This layer knows about typing indicators, block streaming, reply threading, partial replies, session state, queue policy, model resolution, and tool progress. It is not merely a model wrapper. It turns internal run events into progress and payloads that a channel can consume.</p>
+            <p>The same seam checks duplicate restart-recovery sources before model execution. It reloads the durable session entry, compares the source turn id with an existing claim, and can retire the claim or return without redoing work. That check belongs here: earlier layers do not yet have enough durable run ownership, while a later check could repeat tool side effects.</p>
+            <p>Only now does our test-fixing request have permission to execute. Everything before it established ownership, ordering, delivery, and replay constraints.</p>
+
+            <h2>7. The model–tool loop lives inside runEmbeddedAgentInternal</h2>
+            <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-runner/run-orchestrator.ts#L77-L112"><code>runEmbeddedAgent</code></a> is a plugin-facing JavaScript boundary. It strips host-only fields before calling <code>runEmbeddedAgentInternal</code>. The internal entry captures a lifecycle generation, resolves configuration, and enters the orchestrator. Inside the lanes, the orchestrator resolves workspace, agent directory, model candidates, and harness runtime.</p>
+            <p>“Embedded” does not mean “a stateless call.” It means the agent harness runs inside the OpenClaw process. Before an attempt starts, the runtime still assembles workspace and bootstrap files, system prompt, skill snapshot, governed tools, session transcript, and model candidates. Parts four through six will separate those inputs and their policy owners.</p>
+            <pre><code class="language-typescript">while (!terminal) {
+  const assistant = await model.respond(runtimeView);
+  emit("assistant", assistant);
+
+  if (!assistant.toolCalls.length) break;
+  for (const call of assistant.toolCalls) {
+    emit("tool", { phase: "start", call });
+    const result = await governedToolRunner.execute(call);
+    emit("tool", { phase: "end", call, result });
+    runtimeView.append(result);
+  }
+}</code></pre>
+            <p>This is pseudocode, not a pasted implementation. Its ownership is the important part: the model proposes structured tool calls; the governed runner performs real actions; results re-enter the runtime view for another model decision. That is why the Tool arrow in the figure loops around <code>runEmbeddedAgentInternal</code>, not around channel ingress or <code>ReplyPayload</code>.</p>
+
+            <h2>8. Three event streams carry three different facts</h2>
+            <figure class="hero-image"><img src="../../assets/overview-event-streams.png" alt="OpenClaw embedded-agent assistant, tool, and lifecycle streams; only lifecycle end or error releases agent.wait" /></figure>
+            <p>A caller cannot wait until the final answer to observe a long run. OpenClaw subscription handlers separate <code>assistant</code>, <code>tool</code>, and <code>lifecycle</code> streams. They may occur close together, but they answer different questions.</p>
+            <div class="table-wrap"><table><thead><tr><th>Stream</th><th>Fact represented</th><th>Typical consumer</th><th>Why it is not a run terminal</th></tr></thead><tbody>
+              <tr><td><code>assistant</code></td><td>Text and message content the model is producing.</td><td>Streaming UI, partial delivery, transcript assembly.</td><td>Text can be followed by a tool call.</td></tr>
+              <tr><td><code>tool</code></td><td>A tool call started, progressed, or ended and produced a result.</td><td>Progress, audit, media, and side-effect tracking.</td><td>Another tool or model response may follow.</td></tr>
+              <tr><td><code>lifecycle</code></td><td>The run started or reached an end/error terminal.</td><td><code>agent.wait</code>, registries, recovery, terminal delivery.</td><td>It is the run-level terminal protocol.</td></tr>
+            </tbody></table></div>
+            <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-subscribe.handlers.lifecycle.ts#L39-L64"><code>handleAgentStart</code></a> emits a lifecycle start. <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-subscribe.handlers.lifecycle.ts#L66-L132"><code>handleAgentEnd</code></a> cannot simply check whether the last assistant message contains text. It also considers deterministic side effects, message-tool delivery evidence, accepted session spawns, cron creation, incomplete tool-use turns, and replay validity before deriving a terminal liveness state.</p>
+            <p>Only lifecycle termination points to <code>agent.wait</code> in the figure. Treating assistant text as completion can release resources before a tool executes. Treating the last tool result as completion can omit the model's final explanation. <strong>Output visibility and run termination need separate protocols.</strong></p>
+
+            <h2>9. State has owners; “context” is not one bucket</h2>
+            <figure class="hero-image"><img src="../../assets/overview-state-owners.png" alt="State ownership in an OpenClaw turn: FinalizedMsgContext links through sessionKey to durable SessionEntry and openclaw-agent.sqlite, runEmbeddedAgentInternal owns the temporary runtime view, and ReplyPayload carries outbound content" /></figure>
+            <p>By this point it is tempting to call everything “context.” The source exposes several distinct surfaces. <code>FinalizedMsgContext</code> carries normalized inbound facts. <code>SessionEntry</code> and transcript data live in durable session storage. The embedded agent constructs a temporary runtime view for this attempt. <code>ReplyPayload</code> describes channel-agnostic outbound content.</p>
+            <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply-payload.ts#L26-L48"><code>ReplyPayload</code></a> can hold text, fallback text, media, attachments, presentation, and delivery preferences. It does not own the session and should not become the only recovery record. <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/config/sessions/types.ts#L294-L329"><code>SessionEntry</code></a>, in contrast, carries durable identity and recovery-related state such as session id, update time, restart recovery fields, and plugin extensions.</p>
+            <p>This yields a practical diagnostic order:</p>
+            <ol>
+              <li>Wrong inbound content: inspect normalized <code>FinalizedMsgContext</code>.</li>
+              <li>Mixed history or reordering: inspect <code>sessionKey</code>, the session lane, and durable session/transcript state.</li>
+              <li>A missing instruction in the model view: inspect runtime assembly and compaction.</li>
+              <li>A correct model answer that never reached the channel: inspect <code>ReplyPayload</code>, delivery adaptation, and audit.</li>
+            </ol>
+            <p>These failures look similar from a chat window, but they belong to different owners. Prompt changes cannot repair routing, and transcript rewrites cannot repair provider delivery.</p>
+
+            <h2>10. Failure is a side-effect decision, not one catch block</h2>
+            <p>Return to the test-fixing task. The tool has edited a file, then the model provider times out. Replaying from the original message may edit the file twice. Declaring a clean failure leaves a real side effect unowned. OpenClaw tracks replay validity, delivery evidence, source claims, lifecycle generations, and terminal states at different layers to answer whether the original input remains safe to execute.</p>
+            <ul>
+              <li><strong>Ingest/drop/handled:</strong> no agent began, so this is not a model failure.</li>
+              <li><strong>Command or policy short circuit:</strong> dispatch already has a complete result; no embedded run exists.</li>
+              <li><strong>Model or tool error:</strong> failover or abandonment depends on visible output and possible side effects.</li>
+              <li><strong>Interrupted tool-use turn:</strong> earlier assistant text does not make an unfinished tool chain a successful end.</li>
+              <li><strong>Duplicate recovery source:</strong> a durable claim can justify retiring or skipping work instead of re-executing it.</li>
+            </ul>
+            <p>A reliable agent runtime does not merely “have retries.” It can say who has evidence that a retry is safe. Process-local Promise rejection is not enough once external effects may have happened.</p>
+
+            <h2 id="route">11. Why the next seven chapters follow this order</h2>
+            <figure class="hero-image"><img src="../assets/openclaw-reading-route.png" alt="Eight-part OpenClaw source-reading order: main path, Gateway, routing and sessions, context and memory, capability assembly, security boundary, multi-agent, and always-on recovery" /></figure>
+            <p>This chapter established coordinates rather than exhausting every subsystem. The remaining ownership breaks become seven focused readings:</p>
+            <ol>
+              <li><strong>Gateway:</strong> why it is a control plane rather than merely a WebSocket server.</li>
+              <li><strong>Routing and sessions:</strong> how bindings, peers, threads, <code>sessionKey</code>, queues, and transcripts define ownership.</li>
+              <li><strong>Context and memory:</strong> how workspace, bootstrap, system prompt, history, compaction, and memory stay separate.</li>
+              <li><strong>Capability assembly:</strong> where tools, skills, plugins, and hooks enter the runtime.</li>
+              <li><strong>Security boundary:</strong> how tool policy, sandbox, elevated execution, approvals, and channel identity constrain side effects.</li>
+              <li><strong>Multi-agent:</strong> how session tools, subagents, and ACP create new run owners and return results.</li>
+              <li><strong>Always-on recovery:</strong> how heartbeat, cron, durable tasks, and restart recovery extend a turn beyond one process lifetime.</li>
+            </ol>
+            <p>The order moves from “how one run completes” to “how a long-lived system stays coherent.” Starting with cron or subagents would make a new session look like an ordinary function call. Missing the event and tool boundaries would make it impossible to decide what restart recovery should actually recover.</p>
+
+            <h2>12. Five rules that travel beyond OpenClaw</h2>
+            <ol>
+              <li><strong>Normalize first, apply shared admission second.</strong>Channel plugins own provider differences; the core owns turn lifecycle.</li>
+              <li><strong>Establish state identity before selecting execution resources.</strong>Session and queue ownership usually constrain correctness earlier than provider/model choice.</li>
+              <li><strong>The model proposes; the runtime acts.</strong>Tool calls, side effects, and tool results require explicit seams.</li>
+              <li><strong>Content events are not terminal events.</strong>Assistant, tool, and lifecycle streams serve presentation, execution observation, and completion.</li>
+              <li><strong>Replay safety follows evidence of side effects.</strong>Once actions may have happened, use durable claims and terminal evidence instead of unconditional retries.</li>
+            </ol>
+            <p>With those rules in hand, part two can pull the camera back from one turn to the Gateway. “Control plane” will then describe concrete protocol ownership—who may observe, configure, start, wait for, and recover these runs—rather than an architecture label pasted onto a server.</p>
+
+            <h2 id="sources">Source and documentation index</h2>
+            <ul>
+              <li><a href="https://github.com/openclaw/openclaw/tree/c549250bfae8ff40822099c9af93ed05ff540579/src/channels/turn">Channel turn kernel</a>: normalization, admission, and dispatch lifecycle.</li>
+              <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply/dispatch-from-config.ts">dispatch-from-config.ts</a>: staged reply dispatch and error closure.</li>
+              <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply/agent-runner-run.ts">agent-runner-run.ts</a>: the seam from channel behavior to the embedded agent.</li>
+              <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-runner/run-orchestrator.ts">run-orchestrator.ts</a>: session/global lanes and runtime assembly.</li>
+              <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-subscribe.handlers.lifecycle.ts">Lifecycle handlers</a>: run start/end/error and terminal classification.</li>
+              <li><a href="https://docs.openclaw.ai/concepts/agent-loop">Agent Loop</a>, <a href="https://docs.openclaw.ai/concepts/messages">Messages</a>, and <a href="https://docs.openclaw.ai/concepts/session">Session</a>: official conceptual contracts.</li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+    <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+    <script defer src="../../../assets/code-highlight.js?v=1"></script>
+    <script defer src="../../article.js?v=1"></script>
+  </body>
+</html>

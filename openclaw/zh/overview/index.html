@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenClaw 源码阅读（一）：一条消息怎样跑完整个 Agent 回合</title>
+    <meta name="description" content="沿一条真实消息追踪 OpenClaw 的 ChannelPlugin、sessionKey、队列、embedded agent、工具事件、生命周期与 ReplyPayload。" />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="OpenClaw 源码阅读（一）：一条消息怎样跑完整个 Agent 回合" />
+    <meta property="og:description" content="先把 OpenClaw 最长的一条主线跑通，再拆它的七组系统边界。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/overview-runtime-route.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/openclaw/zh/overview/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/openclaw/zh/overview/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/openclaw/en/overview/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/openclaw/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="文章快捷入口"><a href="../">OpenClaw 系列</a><a href="#route">阅读路线</a><a href="#sources">参考源码</a></nav>
+      <nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/overview/" lang="en">English</a></span></nav>
+    </header>
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">OpenClaw 源码阅读 · 第一篇</p>
+            <h1>一条消息怎样跑完整个 Agent 回合</h1>
+            <p class="lead">OpenClaw 看起来像一个接了许多聊天渠道、工具和模型的 Agent 产品。可真正把它读懂的入口不是功能清单，而是一条更具体的问题：用户从 Telegram 发来一句话以后，谁决定它属于哪个会话，谁让工具结果回到模型，谁又确认这一轮已经结束？</p>
+            <div class="meta-line"><span>系列 1 / 8</span><span>源码快照：c549250</span><span>主题：端到端运行主线</span><span>证据：公开源码与官方文档</span></div>
+            <nav class="series-strip" aria-label="OpenClaw 系列"><span class="series-current"><strong>01</strong> 消息主线：从 ChannelPlugin 到 ReplyPayload</span><a href="../"><strong>路线图</strong> 查看完整八篇阅读顺序</a></nav>
+            <figure class="hero-image"><img src="../../assets/overview-runtime-route.png" alt="OpenClaw 一条消息的运行路线，从 ChannelPlugin 经过 runChannelInboundEvent、sessionKey、dispatchReplyFromConfig、runReplyAgent、runEmbeddedAgentInternal 到 ReplyPayload，工具循环位于 embedded agent 内部" /></figure>
+          </section>
+          <section class="article-body">
+            <p>先设定一个会贯穿全文的任务。用户在 Telegram 里说：“检查项目的失败测试，修好后把结果发回这里。”这句话表面上只有十几个字，系统内部却必须完成一串不能颠倒的判断：消息是不是允许启动一个 Agent 回合；它应该落进哪个会话；同一会话是否已经有任务在跑；模型能看见什么；工具能做什么；最后的文字和附件又由谁交回 Telegram。</p>
+            <p>如果把这些步骤粗暴地压成“收消息 → 调模型 → 发回答”，我们会立刻解释不了三个故障。第一，两个渠道里的同一个人为什么有时共享上下文、有时完全隔离；第二，模型明明已经输出文字，为什么调用方仍然等不到一个完成信号；第三，工具真的改了文件但最终回复发送失败时，系统究竟应该重跑、续跑，还是只补发结果。</p>
+            <p>所以第一篇暂时不深入某一种渠道、某一种工具或某一种恢复算法。我们只做一件事：沿着一次真实的 inbound turn，把主调用链、状态归属和终止信号连接起来。后面七篇会把这里略过的边界逐个放大。</p>
+
+            <div class="note"><p><strong>阅读契约。</strong>读完以后，你应该能不看图复述：一条渠道消息为什么先变成规范化上下文；<code>sessionKey</code> 为什么比模型名更早决定行为；同一轮里模型与工具怎样来回接力；<code>assistant</code>、<code>tool</code>、<code>lifecycle</code> 三条事件流为什么不能互相替代；以及 <code>ReplyPayload</code> 为什么只是出站载荷，而不是整个运行状态。</p></div>
+            <p><strong>证据边界。</strong>本文固定在 OpenClaw 提交 <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250bfae8ff40822099c9af93ed05ff540579</a>。函数名、类型和顺序来自该快照；产品层行为同时参照官方的 <a href="https://docs.openclaw.ai/concepts/agent-loop">Agent Loop</a>、<a href="https://docs.openclaw.ai/concepts/messages">Messages</a> 与 <a href="https://docs.openclaw.ai/concepts/session">Session</a> 文档。源码能证明调用和数据边界，但不能自动证明所有部署中的延迟、可靠性或安全效果。</p>
+
+            <h2>一、先认清“一轮”到底是什么</h2>
+            <p>在我们的例子里，用户只发了一条消息，但 Agent 可能经历四次模型交互：先决定读取测试日志，看到日志后搜索源码，修改文件后执行测试，最后把测试结果整理成回答。因此 <strong>turn 不是一次模型请求</strong>。它是一段从入站消息被接纳，到运行进入可观察终态，再到结果被出站策略处理的生命周期。</p>
+            <p>这一区分很重要。把模型请求当成 turn，会把工具执行误认为“模型外的一段附加逻辑”；而在 Agent runtime 里，工具结果恰恰是下一次模型判断的输入。只有最后不再产生工具调用、等待交互或可恢复分支时，这一轮才可能进入终态。</p>
+            <div class="table-wrap"><table><thead><tr><th>对象</th><th>负责什么</th><th>不负责什么</th></tr></thead><tbody>
+              <tr><td>消息</td><td>表达一次来自渠道的事件与文本、媒体、发送者等事实。</td><td>不天然决定会话，也不保证能启动 Agent。</td></tr>
+              <tr><td>模型请求</td><td>给某个 provider/model 一份当前视图，并获得 assistant/tool-use 输出。</td><td>不等于整个回合，也不直接拥有渠道投递。</td></tr>
+              <tr><td>Agent turn</td><td>串起接纳、会话、队列、模型、工具、事件、终态与出站处理。</td><td>不要求只有一次模型调用，也不保证只有文字结果。</td></tr>
+              <tr><td>会话</td><td>为一串相关 turn 提供持久身份、并发边界和历史归属。</td><td>不是正在运行的那一个 Promise，也不是最终回复。</td></tr>
+            </tbody></table></div>
+
+            <h2>二、消息先进入渠道内核，而不是直接进入模型</h2>
+            <p>Telegram、Discord、Slack 或 WebChat 的原始事件各不相同。OpenClaw 没让下游运行时理解每家 SDK 的原始对象，而是把渠道差异收在插件与 adapter 边界。共享入口 <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/channels/turn/kernel.ts#L186-L235"><code>runChannelTurn</code></a> 先调用 adapter 的 <code>ingest</code>，得到一份规范化输入，再判断事件类型是否允许启动 Agent turn。</p>
+            <p>这意味着“收到事件”和“运行 Agent”不是同义词。已被渠道自己处理的事件、观察事件、被 admission 规则丢弃的事件，都可以在模型运行之前结束。源码甚至为被 drop 的消息保留了受策略控制的 history 记录路径：这提示我们，<strong>接纳结果本身也是运行事实</strong>，不能只用“有没有回复”推断发生了什么。</p>
+            <pre><code class="language-typescript">const input = await params.adapter.ingest(params.raw);
+const eventClass = (await params.adapter.classify?.(input)) ?? DEFAULT_EVENT_CLASS;
+
+if (!eventClass.canStartAgentTurn) {
+  return { admission: { kind: "handled", reason: `event:${eventClass.kind}` }, dispatched: false };
+}</code></pre>
+            <p>这段摘录不是完整实现，却暴露了第一条可迁移规则：把 provider-owned 事件先转换成 product-owned 输入，再做共享接纳。否则每个渠道都会复制去重、审计、历史、错误处理和生命周期逻辑，修复一个边界时就可能漏掉另外五个入口。</p>
+
+            <h2>三、路由先产生 sessionKey，模型选择还在后面</h2>
+            <p>消息通过接纳后，系统需要回答“它属于谁”。OpenClaw 的路由结果不只是一个 agent 名称，还会影响 <code>sessionKey</code>。这个 key 把渠道、账号、peer、thread、binding 和 agent 配置折叠成一个稳定的会话地址。两条消息只要得到不同的 key，就应该被视为不同状态域；即使它们稍后恰好使用同一个模型，也不能据此合并历史。</p>
+            <p>这也是为什么模型选择不是主线最早的决策。provider/model 可以在运行中回退或被 runtime plugin 解析，而 session identity 必须先为队列、持久状态和回复操作提供所有权。<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply/agent-runner-run.ts#L71-L112"><code>runReplyAgent</code></a> 的参数同时携带 <code>sessionEntry</code>、<code>sessionStore</code>、<code>sessionKey</code>、<code>queueKey</code> 与 resolved queue；这正说明一次运行不是由模型名称单独定位的。</p>
+            <div class="note"><p><strong>一个实用判断。</strong>遇到“同一个用户为什么失忆”时，先比较两次消息的 route 与 <code>sessionKey</code>，再看模型和 prompt。许多看似上下文丢失的问题，其实在进入模型之前就已经被路由成两个会话。</p></div>
+
+            <h2>四、队列不是性能附件，而是 transcript 的因果秩序</h2>
+            <p>假设用户连续发送两句：“先修测试”，紧接着又说“不要改生成文件”。如果两轮同时读取旧 transcript、分别写入新消息，最终历史就可能把第二条约束放到错误位置，甚至让两个工具调用交错修改同一个 workspace。OpenClaw 因此同时维护 session lane 与 global lane。</p>
+            <p>在 <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-runner/run-orchestrator.ts#L159-L204"><code>runEmbeddedAgentOrchestrated</code></a> 中，lane controller 暴露 <code>enqueueSession</code> 与 <code>enqueueGlobal</code>。代码先进入会话队列，等待该会话之前的 deferred transcript maintenance，再进入全局并发门。顺序表达了两个不同约束：</p>
+            <ul>
+              <li><strong>session lane</strong> 保护同一状态域里的读写顺序，让后一轮看到前一轮已经提交的维护与 transcript；</li>
+              <li><strong>global lane</strong> 控制整个进程可以同时占用多少昂贵运行资源，但不应该让一个拥堵会话长期锁住所有其他会话。</li>
+            </ul>
+            <p>因此队列策略会改变产品语义，而不只是吞吐。steer、follow-up、interrupt 和 collect 的差别，本质上是在回答新消息应该进入当前运行、排在它后面，还是终止它。第三篇会专门拆这组策略；这里先记住：<strong>队列决定谁有权成为同一 transcript 的下一位作者。</strong></p>
+
+            <h2>五、dispatchReplyFromConfig 把“大函数”拆成可终止阶段</h2>
+            <p>会话与队列准备好以后，请求进入 <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply/dispatch-from-config.ts#L22-L100"><code>dispatchReplyFromConfig</code></a>。从名字看，它像一个简单的配置分发器；实际内层连续经过 gather、delivery、operation context、operation、route、execution、finalize 与 audit。</p>
+            <pre><code class="language-typescript">const gathered = await gatherDispatchRequest(params, messageAuditTerminal);
+if (gathered.status === "complete") return gathered.result;
+
+const delivery = await prepareDispatchDelivery(gathered.state);
+const context = await prepareDispatchOperationContext(delivery.state);
+const operation = await prepareDispatchOperation(context.state);
+const route = await chooseDispatchRoute(operation.state);
+const execution = await prepareDispatchExecution(route.state);
+const executed = await executeDispatch(execution.state);
+return (await finalizeDispatchAndAudit(executed.state)).result;</code></pre>
+            <p>反复出现的 <code>status === "complete"</code> 很值得注意。它允许命令处理、策略拒绝、无需模型的回复或其他短路路径在自己的阶段结束，而不用伪装成一次 embedded agent 成功。异常路径还会根据重放安全性 commit 或 release inbound dedupe claim，并记录 dispatch、processed 与 idle 状态。于是“失败后能否重试”不再由一个宽泛的 catch 决定，而取决于此前是否可能产生副作用。</p>
+
+            <h2>六、runReplyAgent 是渠道语义与 Agent runtime 的接缝</h2>
+            <p><code>dispatchReplyFromConfig</code> 最终把需要模型执行的分支交给 <code>runReplyAgent</code>。这一层既知道渠道侧的 typing、block streaming、reply threading 和 partial reply，也知道 Agent 侧的 session、queue、model 与 tool progress。它不是“模型 wrapper”，而是一条接缝：向内启动运行，向外把运行事件塑造成渠道可消费的进度和结果。</p>
+            <p>接缝还负责处理重复恢复来源。源码在真正调用模型之前读取 session entry，并用 source turn id 判断这是不是一次 provider redelivery；如果已经属于完成的恢复来源，就清理 typing 并直接返回。这个位置很合理：去重太早看不到持久所有权，太晚又可能重复执行工具副作用。</p>
+            <p>我们的“修复失败测试”到这里才真正获得执行资格。前面的步骤没有浪费，它们先确定了谁拥有这次运行、它排在哪里、结果该投递到哪里，以及重复消息是否能安全重放。</p>
+
+            <h2>七、runEmbeddedAgentInternal 里面才是模型—工具循环</h2>
+            <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-runner/run-orchestrator.ts#L77-L112"><code>runEmbeddedAgent</code></a> 是插件可见的 JavaScript 边界，会剥离只属于 host 的字段，然后进入 <code>runEmbeddedAgentInternal</code>。internal 版本捕获运行生命周期 generation、解析配置，再把任务交给 orchestrator。进入队列后，orchestrator 才解析 workspace、agent directory、模型候选与 harness runtime。</p>
+            <p>这说明“embedded”不是“无状态的小模型调用”。它只是运行位于 OpenClaw 进程中的 Agent harness。真正开始一次 attempt 前，runtime 仍要装配 workspace、bootstrap files、system prompt、skills snapshot、工具集合、session transcript 和模型候选。第四到第六篇会分别拆这些材料与策略。</p>
+            <p>循环的核心可以用一个不绑定具体 SDK 的伪代码概括：</p>
+            <pre><code class="language-typescript">while (!terminal) {
+  const assistant = await model.respond(runtimeView);
+  emit("assistant", assistant);
+
+  if (!assistant.toolCalls.length) break;
+  for (const call of assistant.toolCalls) {
+    emit("tool", { phase: "start", call });
+    const result = await governedToolRunner.execute(call);
+    emit("tool", { phase: "end", call, result });
+    runtimeView.append(result);
+  }
+}</code></pre>
+            <p>关键不是语法，而是所有权：模型只提出结构化 tool call；工具 runner 才执行真实动作；结果重新进入 runtime view，让模型决定下一步。图中的 Tool 箭头因此只环绕 <code>runEmbeddedAgentInternal</code>，不会从渠道层或 <code>ReplyPayload</code> 直接伸到工具。</p>
+
+            <h2>八、三条事件流讲的是三种事实</h2>
+            <figure class="hero-image"><img src="../../assets/overview-event-streams.png" alt="OpenClaw embedded agent 的 assistant、tool 与 lifecycle 三条事件流；只有 lifecycle 的 end 或 error 终态解锁 agent.wait" /></figure>
+            <p>模型—工具循环运行时，外部不能等到最后才知道发生了什么。OpenClaw 的 subscription handler 把事件分成 <code>assistant</code>、<code>tool</code> 与 <code>lifecycle</code> 三条流。它们有时在同一毫秒附近出现，却回答不同问题。</p>
+            <div class="table-wrap"><table><thead><tr><th>事件流</th><th>表达的事实</th><th>典型消费者</th><th>为什么不能当终态</th></tr></thead><tbody>
+              <tr><td><code>assistant</code></td><td>模型正在形成哪些文本、推理可见块或消息内容。</td><td>流式 UI、partial reply、transcript 组装。</td><td>一段文字之后仍可能继续调用工具。</td></tr>
+              <tr><td><code>tool</code></td><td>哪项工具调用开始、更新或结束，以及结果怎样。</td><td>进度展示、审计、媒体与副作用跟踪。</td><td>一个工具结束不代表后续没有模型或其他工具。</td></tr>
+              <tr><td><code>lifecycle</code></td><td>整个 run 已 start、end 或 error，并携带终止相关状态。</td><td><code>agent.wait</code>、运行注册表、恢复与终态投递。</td><td>它本身就是 run 级终态协议。</td></tr>
+            </tbody></table></div>
+            <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-subscribe.handlers.lifecycle.ts#L39-L64"><code>handleAgentStart</code></a> 发出 <code>stream: "lifecycle"</code> 与 <code>phase: "start"</code>。<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-subscribe.handlers.lifecycle.ts#L66-L132"><code>handleAgentEnd</code></a> 则不能只看最后一条 assistant 是否有字：它还要检查确定性副作用、message tool 投递、已接受的 session spawn、cron 创建、未完成 tool-use turn 和 replay validity，最后把运行归类为 working、blocked、abandoned 等状态。</p>
+            <p>这就是为什么图中只有 lifecycle 终态连向 <code>agent.wait</code>。若调用者看见 assistant 文本就宣布完成，可能在工具尚未执行时提前释放资源；若看见最后一个 tool result 就完成，又可能漏掉模型根据结果生成的最终答复。<strong>输出可见性与运行终止性必须分开建模。</strong></p>
+
+            <h2>九、状态有主人，不能都塞进“上下文”</h2>
+            <figure class="hero-image"><img src="../../assets/overview-state-owners.png" alt="OpenClaw 一轮中的状态所有权：FinalizedMsgContext 经 sessionKey 关联 SessionEntry 与 openclaw-agent.sqlite，runEmbeddedAgentInternal 拥有临时 runtime view，最终产生 ReplyPayload" /></figure>
+            <p>走到这里，最容易出现的误解是把所有东西都叫“上下文”。实际上，一轮至少跨过四种表面。<code>FinalizedMsgContext</code> 是渠道数据规范化后的入站事实；<code>SessionEntry</code> 与 transcript 落在持久 session 存储里；embedded agent 为本次模型调用构造临时 runtime view；最后 <code>ReplyPayload</code> 只描述渠道无关的出站内容。</p>
+            <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply-payload.ts#L26-L48"><code>ReplyPayload</code></a> 可以携带 text、fallbackText、media、attachments、presentation 与 delivery 偏好。它没有承担整个 session 的职责，也不应该成为恢复运行的唯一证据。相反，<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/config/sessions/types.ts#L294-L329"><code>SessionEntry</code></a> 包含 sessionId、updatedAt、restart recovery state 和 plugin extensions 等持久信息。</p>
+            <p>把这几个表面拆开，会得到一个很实用的排障顺序：</p>
+            <ol>
+              <li>消息内容不对，先查渠道 normalize 后的 <code>FinalizedMsgContext</code>；</li>
+              <li>历史串错或并发错序，查 <code>sessionKey</code>、session lane 与持久 session/transcript；</li>
+              <li>模型没看到某条规则，查本轮 runtime view 的装配与 compaction；</li>
+              <li>模型已经答对但渠道没发出，查 <code>ReplyPayload</code> 到 delivery adapter 的映射与审计。</li>
+            </ol>
+            <p>这四类问题长得很像，却由不同 owner 修复。如果试图在 prompt 里修路由，或靠修改 transcript 解决渠道投递，系统只会变得更难解释。</p>
+
+            <h2>十、失败不是一个 catch，而是副作用后的决策</h2>
+            <p>现在回到“修复测试”的任务。假设模型已经调用工具修改文件，随后 provider 超时。简单重跑可能再次修改同一文件；简单宣布失败又会让已经发生的副作用无人认领。OpenClaw 在多个层次记录 replay validity、tool delivery evidence、source claim、lifecycle generation 与 terminal state，目的都是判断：这次运行是否还能安全地从原输入重新执行。</p>
+            <p>几个提前终止路径尤其值得区分：</p>
+            <ul>
+              <li><strong>ingest/drop/handled：</strong>Agent 根本没有启动，不应该伪造模型失败；</li>
+              <li><strong>command 或策略短路：</strong>dispatch 阶段已经得到完整结果，embedded agent 不参与；</li>
+              <li><strong>模型或工具错误：</strong>需要结合是否已有可见输出和副作用判断 failover、abandon 或补充错误结果；</li>
+              <li><strong>中断中的 tool-use turn：</strong>即使之前已有 assistant 文本，也不能把未完成工具链标成正常 end；</li>
+              <li><strong>重复恢复来源：</strong>持久 claim 已证明这条 source turn 被处理过，应该退休 claim 或跳过，而不是再次执行。</li>
+            </ul>
+            <p>所以可靠 Agent runtime 的问题不是“有没有 retry”，而是“谁能证明 retry 仍然安全”。判断依据必须来自持久所有权和副作用证据，不能只来自进程内 Promise 是否 rejected。</p>
+
+            <h2 id="route">十一、接下来七篇为什么要按这个顺序</h2>
+            <figure class="hero-image"><img src="../assets/openclaw-reading-route.png" alt="OpenClaw 源码阅读八篇顺序，从消息主线开始，再到 Gateway、路由与会话、上下文与记忆、能力装配、安全边界、多 Agent、常驻与恢复" /></figure>
+            <p>第一篇故意把很多名字只点到为止，因为它的任务是建立坐标系。后续七篇沿主线上的 ownership break 依次展开：</p>
+            <ol>
+              <li><strong>Gateway：</strong>为什么它是控制平面，而不只是 WebSocket server；RPC、事件与客户端怎样共享协议。</li>
+              <li><strong>路由与会话：</strong>binding、peer、thread、<code>sessionKey</code>、队列与 transcript 怎样决定“这句话属于谁”。</li>
+              <li><strong>上下文与记忆：</strong>workspace、bootstrap、system prompt、session history、compaction 与 memory 如何分层。</li>
+              <li><strong>能力装配：</strong>tools、skills、plugins、hooks 在哪一层进入 runtime，谁能改变能力表面。</li>
+              <li><strong>安全边界：</strong>tool policy、sandbox、elevated、approval 与渠道身份如何共同约束副作用。</li>
+              <li><strong>多 Agent：</strong>session tools、subagent 与 ACP 怎样创建新的运行所有者，又怎样回传结果。</li>
+              <li><strong>常驻与恢复：</strong>heartbeat、cron、durable task 与 restart recovery 如何把一次 turn 延伸到进程之外。</li>
+            </ol>
+            <p>这个顺序从“一次如何完成”走向“长期如何不乱”。如果直接从 cron 或多 Agent 开始，很容易把新 session 当成普通函数调用；如果没有先认清 tool 与 lifecycle 事件，又很难判断跨重启恢复究竟应该恢复哪一层状态。</p>
+
+            <h2>十二、把 OpenClaw 主线压成五条可迁移规则</h2>
+            <ol>
+              <li><strong>先规范化，再共享接纳。</strong>渠道插件拥有 provider 差异，核心拥有 turn admission 和生命周期。</li>
+              <li><strong>先确定状态身份，再选择执行资源。</strong><code>sessionKey</code> 与队列所有权通常比 provider/model 更早决定正确性。</li>
+              <li><strong>模型提出动作，runtime 执行动作。</strong>tool call、tool side effect 与 tool result 必须保留清晰边界。</li>
+              <li><strong>内容事件不等于终态事件。</strong>assistant、tool、lifecycle 应分别服务展示、执行观测与 run completion。</li>
+              <li><strong>重试安全由副作用证据决定。</strong>一旦动作可能发生，就需要持久 claim、投递证据和可恢复终态，而不是无条件重跑。</li>
+            </ol>
+            <p>有了这五条规则，我们就能进入下一篇：把镜头从一条 turn 拉远，看看 Gateway 为什么既接客户端，又管理配置、节点、事件与运行控制。那时“控制平面”不会再是抽象架构词，而是所有这些运行所有权怎样被远程观察和操纵的具体协议。</p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul>
+              <li><a href="https://github.com/openclaw/openclaw/tree/c549250bfae8ff40822099c9af93ed05ff540579/src/channels/turn">Channel turn kernel</a>：渠道规范化、接纳与 dispatch 生命周期。</li>
+              <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply/dispatch-from-config.ts">dispatch-from-config.ts</a>：回复分发阶段与错误收口。</li>
+              <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply/agent-runner-run.ts">agent-runner-run.ts</a>：渠道语义与 embedded agent 的接缝。</li>
+              <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-runner/run-orchestrator.ts">run-orchestrator.ts</a>：session/global lanes 与运行装配。</li>
+              <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-subscribe.handlers.lifecycle.ts">lifecycle handlers</a>：run start/end/error 与终态分类。</li>
+              <li><a href="https://docs.openclaw.ai/concepts/agent-loop">Agent Loop</a>、<a href="https://docs.openclaw.ai/concepts/messages">Messages</a>、<a href="https://docs.openclaw.ai/concepts/session">Session</a>：官方概念文档。</li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+    <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+    <script defer src="../../../assets/code-highlight.js?v=1"></script>
+    <script defer src="../../article.js?v=1"></script>
+  </body>
+</html>
