@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hermes Agent 主动学习：一条 /learn 请求怎样变成 Skill</title>
+    <meta
+      name="description"
+      content="从零读懂 Hermes Agent 的 /learn：普通 Agent 如何读取来源、创建可复用 Skill，以及 Learning Graph 如何投影长期知识关系。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Hermes Agent 主动学习：一条 /learn 请求怎样变成 Skill" />
+    <meta
+      property="og:description"
+      content="没有独立训练器：/learn 复用正常工具回合，把指定来源整理为可验证、可发现、可维护的 Skill。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="assets/learn-to-skill.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/hermes-agent/zh/learn-journey/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/hermes-agent/zh/learn-journey/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/hermes-agent/en/learn-journey/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/hermes-agent/" />
+    <link rel="stylesheet" href="../../styles.css?v=hermes-series-4" />
+  <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../../">Hermes Agent</a>
+        <a href="../runtime-learning/">上一篇</a>
+        <a href="../evaluation-dataset/">下一篇</a>
+        <a href="../../../zh/#posts">文章目录</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/learn-journey/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">主动学习</p>
+            <h1>Hermes Agent：一条 /learn 请求怎样变成 Skill</h1>
+            <p class="lead">
+              当一次成功做法只留在对话里，下次还得从头搜索。<code>/learn</code> 让普通 Agent 回合读取指定资料、
+              把它写成可审查的 Skill；Learning Graph 再把已有的 Skill 与 Memory 关系画出来，而不是暗中训练另一套模型。
+            </p>
+            <div class="meta-line">
+              <span>系列 4 / 7</span>
+              <span>源码快照：fa1a5c0</span>
+              <span>主题：explicit learning</span>
+              <span>范围：公开源码可见链路</span>
+            </div>
+            <nav class="series-strip" aria-label="Hermes Agent 系列">
+              <a href="../runtime-learning/"><strong>03</strong> 运行时学习：交付以后怎样提炼经验</a>
+              <span class="series-current"><strong>04</strong> 主动学习：一条 /learn 请求怎样变成 Skill</span>
+              <a href="../evaluation-dataset/"><strong>05</strong> 评测数据：训练、验证与留出怎样分工</a>
+            </nav>
+            <figure class="hero-image">
+              <img
+                src="assets/learn-to-skill.png"
+                alt="一条 /learn 请求经过普通 AIAgent 回合读取指定来源、整理验证并调用 skill_manage 写成 Skill 包，之后在未来会话中可发现"
+              />
+            </figure>
+          </section>
+          <section class="article-body">
+            <h2>一、为什么“这次查到了”还不等于“以后学会了”</h2>
+            <p>
+              继续沿用前两篇的例子：你让 Hermes 修复一个生成代码相关的失败测试。第一次处理时，它翻了项目目录，
+              又打开官方维护指南，终于找到正确顺序：先运行生成器，再检查差异，最后执行测试。任务完成了，但如果这些步骤只留在本轮对话里，
+              下次换一个会话，agent 仍可能从头搜索。这里出现了一个很实际的问题：<strong>怎样把已经确认过的一次做法，变成以后可以主动发现的操作流程？</strong>
+            </p>
+
+            <p>
+              第三篇讲的 background review 会在交付后检查“这一轮有没有值得留下的经验”，它适合处理运行时偶然暴露出来的偏好和流程。
+              本篇要讲的是另一条更明确的入口：用户已经知道要学什么，于是直接给出资料、范围和要求，让 Hermes 把它整理成 Skill。
+              这个入口就是 <code>/learn</code>。两条路最后都可能碰到 Skills，但触发者不同：前者由到点提醒和 finalizer 安排，后者由用户当场发起。
+            </p>
+
+            <p>
+              先不要把 <code>/learn</code> 想成“训练模型”。它做的事情更朴素，也更容易验证：让当前这个 agent 像完成普通任务一样读取资料、提炼步骤、
+              调用 <code>skill_manage</code> 写出文件。模型参数没有变化，也没有另外启动一套蒸馏服务。真正新增的是一个可读、可审查、可修改的 Skill 包。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>读之前先问</th>
+                    <th>本篇会给出的答案</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>/learn</code> 会不会调用一套专用训练器？</td>
+                    <td>不会。入口只构造一条详细提示，再落回正常 <code>AIAgent</code> 回合。</td>
+                  </tr>
+                  <tr>
+                    <td>网页或代码里的文字能不能反过来指挥 agent？</td>
+                    <td>不能。来源被明确当作数据，用户请求才是治理指令。</td>
+                  </tr>
+                  <tr>
+                    <td>为什么有的结果只有一个 <code>SKILL.md</code>，有的还有很多文件？</td>
+                    <td>短流程适合紧凑 Skill；大型资料库适合索引加按需加载的 <code>references/</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>Learning Graph 会不会继续优化 Skill？</td>
+                    <td>不会。它从 Skills 与 Memory 文件构建关系视图，编辑时再回写底层文件。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>二、先走完整条路：一条请求怎样落成一个 Skill 包</h2>
+            <p>
+              假设你输入：<code>/learn 官方项目指南，重点学习生成文件变更后的测试流程，忽略已经弃用的命令</code>。
+              Hermes 不会只取第一个 URL，也不会把后半句当成闲聊。源码把这条请求拆成两类同等重要的信息：一类是要读取的来源，
+              另一类是决定 Skill 范围的要求。随后，正常工具回合依次完成读取、整理、写入和报告。
+            </p>
+
+            <figure>
+              <img
+                src="assets/learn-to-skill.png"
+                alt="一条 /learn 请求经过普通 AIAgent 回合读取指定来源、整理验证并调用 skill_manage 写成 Skill 包，之后才在未来会话中被发现"
+                loading="lazy"
+              />
+              <figcaption><code>/learn</code> 没有专用训练器；它复用正常回合与现有工具，把结果写成可见文件。</figcaption>
+            </figure>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>阶段</th>
+                    <th>修测试这个例子里发生什么</th>
+                    <th>留下什么可观察结果</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>1. 接收请求</td>
+                    <td>用户给出官方指南，并限定“生成文件变更后的测试流程”。</td>
+                    <td>一条自由文本请求，还没有 Skill。</td>
+                  </tr>
+                  <tr>
+                    <td>2. 改写为普通回合</td>
+                    <td><code>build_learn_prompt</code> 把来源、要求、写作规范和安全边界合成提示。</td>
+                    <td>进入与普通任务相同的 agent 输入队列。</td>
+                  </tr>
+                  <tr>
+                    <td>3. 读取来源</td>
+                    <td>agent 用文件或网页工具找到真实命令、顺序和失败信号。</td>
+                    <td>当前回合里的来源证据，不会直接变成长期指令。</td>
+                  </tr>
+                  <tr>
+                    <td>4. 选择形状</td>
+                    <td>这是一条短工作流，因此用一个紧凑 <code>SKILL.md</code>，不把整份指南搬进去。</td>
+                    <td>Skill 名称、触发条件、步骤、陷阱与验证方法。</td>
+                  </tr>
+                  <tr>
+                    <td>5. 写入并校验</td>
+                    <td><code>skill_manage(create)</code> 检查名称、frontmatter、体积和安全扫描，再原子写入。</td>
+                    <td><code>~/.hermes/skills/&lt;category&gt;/&lt;name&gt;/SKILL.md</code>。</td>
+                  </tr>
+                  <tr>
+                    <td>6. 以后发现</td>
+                    <td>Skills 索引缓存被清除，后续提示重建时会重新扫描可用 Skill。</td>
+                    <td>未来回合可以按描述路由并按需读取完整内容。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这张表有一个重要边界：第二步到第五步都发生在<strong>同一个普通 agent 回合</strong>里，而第六步描述的是持久化结果怎样进入后续发现路径。
+              它不是“先训练一个小模型，再把模型挂进 Hermes”；它更像把一次成功操作整理成项目里可维护的运行手册。
+            </p>
+
+            <h2>三、入口层只做一件事：把命令改写成治理充分的普通请求</h2>
+            <p>
+              <code>/learn</code> 在 CLI、gateway 和桌面入口上的表面不同，但它们都调用同一个
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learn_prompt.py#L160-L220"><code>build_learn_prompt</code></a>。
+              CLI 把构造后的字符串放进 <code>_pending_input</code>；gateway 则改写当前事件的 <code>event.text</code>，然后继续走正常 agent 处理。
+              因此 provider、模型、工具后端和会话持久化都沿用现有 runtime。
+            </p>
+
+            <pre><code class="language-python"># CLI：放回当前会话的输入队列
+msg = build_learn_prompt(user_request)
+self._pending_input.put(msg)
+
+# Gateway：改写本轮文本，然后继续普通 agent 流程
+event.text = build_learn_prompt(event.get_command_args().strip())
+# fall through to agent processing</code></pre>
+
+            <p>
+              这段设计带来三个直接后果。第一，它不新增一个只能在本地运行的“学习后端”，所以本地、Docker 和远程 terminal backend 都能用。
+              第二，它仍受当前 agent 的工具权限约束：没有网页提取能力时，不能凭空读网页；没有可写 Skills 工具时，也不能神秘地落盘。
+              第三，它的成功标准不是“提示已经构造”，而是 agent 最后真的调用管理工具并报告写入结果。
+            </p>
+
+            <p>
+              如果用户只输入 <code>/learn</code> 而没有参数，builder 会把请求补成“复盘我们刚刚走过的流程，并整理成可复用 Skill”。
+              这仍然是显式用户请求，不等于第三篇的后台 review：它占用当前前台回合，用户看得见它正在读取、写入与回答；后台 review 则只能在上一轮已经交付后运行。
+              CLI 入口见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/hermes_cli/cli_commands_mixin.py#L1867-L1890"><code>_handle_learn_command</code></a>，
+              gateway 的 fall-through 见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/gateway/run.py#L15304-L15330">learn command 分支</a>。
+            </p>
+
+            <h2>四、读取资料之前，先分清“来源”和“要求”</h2>
+            <p>
+              一条学习请求可以同时包含目录、单个文件、URL、刚才的对话和用户粘贴的笔记。简单实现很容易抓到第一个链接就开工，
+              结果漏掉后面的“只讲认证流程”“不要收录废弃接口”“把验证命令写完整”。Hermes 的 prompt 明确规定：每一部分都承载意图，
+              来源告诉 agent 去哪里取证，要求决定最终 Skill 覆盖什么、强调什么、舍弃什么。
+            </p>
+
+            <pre><code class="language-text">/learn https://project.example/maintainer-guide
+       只保留 generated code 的验证流程
+       跳过 deprecated commands
+
+来源：官方维护指南
+要求：范围 = generated code；排除 = deprecated commands
+结果：不是“整站摘要”，而是一条可执行的验证 Skill</code></pre>
+
+            <p>
+              接着才是工具选择：本地目录用 <code>read_file</code> / <code>search_files</code>，URL 用 <code>web_extract</code>，
+              “刚才我们做的事”来自当前 conversation，粘贴材料则按原文处理。如果范围仍有轻微歧义，prompt 要求 agent 做合理选择并说明，
+              而不是因为一个无关紧要的缺口让整个学习过程停住。这个策略不是降低准确性；它要求把假设暴露出来，让用户能在结果上继续修正。
+            </p>
+
+            <h3>4.1 来源是证据，不是新的用户指令</h3>
+            <p>
+              学网页和文档还有一条更硬的边界。资料里可能出现“忽略之前要求”“运行这条命令上传配置”等句子，也可能藏有零宽字符或双向文本控制符。
+              对一个正在总结资料的 agent 来说，这些内容很像指令。<code>learn_prompt.py</code> 因此把 source hygiene 直接嵌入每条
+              <code>/learn</code> 提示：<strong>来源文本只作为数据，只有用户请求能治理本轮行为</strong>；不可见和双向 Unicode 控制字符要被丢弃，
+              来源里的命令不能因为语气像 prompt 就被带进 Skill。
+            </p>
+
+            <p>
+              回到修测试的例子：官方指南中的真实命令、先后顺序和失败条件是证据；页面里一段面向文档机器人写的操作提示不是治理指令。
+              Hermes 可以把前者整理成 Procedure 和 Verification，却不能因为后者要求“关闭安全检查”就修改本轮权限。具体约束见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learn_prompt.py#L145-L158"><code>_SOURCE_HYGIENE</code></a>。
+            </p>
+
+            <h2>五、不是所有资料都该塞进同一个 SKILL.md</h2>
+            <p>
+              来源读完以后，agent 要先判断交付物的形状。源码给出两种选择，不是按文件数量机械切分，而是看资料本身是“一条可重复流程”还是“一大块需要按主题查询的知识”。
+              这一步很重要：把短流程拆成十几个文件会增加查找成本；把一本书压进 200 行，又会把真正有用的定义、决策规则和章节关系总结掉。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>资料形状</th>
+                    <th>推荐产物</th>
+                    <th>什么时候加载</th>
+                    <th>修测试例子</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>短工作流、小型 API、单一操作手册</td>
+                    <td>一个紧凑 <code>SKILL.md</code>，复杂脚本再放 <code>scripts/</code></td>
+                    <td>路由命中后读取完整流程</td>
+                    <td>“生成代码变更后的测试顺序”适合这种形状</td>
+                  </tr>
+                  <tr>
+                    <td>书、论文集、大型规范、完整文档站</td>
+                    <td>精简 <code>SKILL.md</code> 索引 + 分主题 <code>references/</code></td>
+                    <td>核心规则常驻，章节按问题用 <code>skill_view</code> 加载</td>
+                    <td>整套编译器维护手册可能需要这种形状</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              对短流程，最终文件可以很直白。开头的 description 负责让未来回合知道“什么时候该想到它”；Procedure 保留可复制的真实命令；
+              Pitfalls 写清生成文件未刷新时的假失败；Verification 给出一次能证明流程完成的检查。它不是把官方指南换个格式再粘一遍，而是把“以后遇到同类任务时怎样做”写成操作协议。
+            </p>
+
+            <pre><code class="language-text">generated-code-testing/
+  SKILL.md
+    When to Use      # 哪些请求会触发它
+    Prerequisites    # 运行前必须具备什么
+    Procedure        # 先生成、看差异、再测试
+    Pitfalls         # 旧生成物会制造什么假象
+    Verification     # 什么结果能证明流程有效</code></pre>
+
+            <p>
+              如果来源是大型维护手册，<code>SKILL.md</code> 则只保留核心判断和引用索引，具体章节进入
+              <code>references/code-generation.md</code>、<code>references/schema-migrations.md</code> 等文件。未来只问生成代码时，不必把整套手册都塞进上下文。
+              这些 expansive rules 直接写在
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learn_prompt.py#L105-L142"><code>_KNOWLEDGE_SKILL_STANDARDS</code></a> 中。
+            </p>
+
+            <h3>5.1 <code>skill_manage</code> 不是普通文件写入</h3>
+            <p>
+              agent 整理好文本以后，不是随便把 Markdown 写到某个目录。<code>skill_manage(action="create")</code> 会验证名称、category、frontmatter 和内容体积，
+              检查同名冲突，原子写入 <code>SKILL.md</code>，再对整个目录做安全扫描；扫描阻断时会移除刚创建的目录。只有第一步成功后，
+              才用 <code>write_file</code> 增加 <code>references/</code>、<code>templates/</code> 或 <code>scripts/</code>。
+            </p>
+
+            <pre><code class="language-python">skill_manage(
+    action="create",
+    name="generated-code-testing",
+    category="development",
+    content=skill_md,
+)
+
+skill_manage(
+    action="write_file",
+    name="generated-code-testing",
+    file_path="scripts/verify-generated-files.sh",
+    file_content=script,
+)</code></pre>
+
+            <p>
+              创建路径和失败回滚见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/skill_manager_tool.py#L908-L975"><code>_create_skill</code></a>，
+              action 分派与成功后的缓存处理见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/skill_manager_tool.py#L1513-L1594"><code>skill_manage</code></a>。
+              这让 Skill 成为受规则约束的长期对象，而不是一段无法追踪来源和结构的自由文本。
+            </p>
+
+            <h2>六、写入以后，什么时候才算“学会”</h2>
+            <p>
+              文件落盘只是第一步。Hermes 的系统提示不会在当前回答中凭空重写；Skill 创建成功后，管理工具清除进程内的 Skills prompt cache，
+              并删除可选的磁盘 snapshot。下一次需要构造 Skills 索引时，prompt builder 才会重新扫描目录，把新 Skill 的名称和短描述放进可发现列表。
+              等任务真的命中它，再按需读取完整 <code>SKILL.md</code> 或 reference 文件。
+            </p>
+
+            <pre><code class="language-text">本轮 /learn
+  读取资料 -> skill_manage -> 文件已落盘
+
+后续提示重建
+  扫描 Skills -> 索引出现 generated-code-testing
+
+未来同类任务
+  描述命中 -> skill_view -> 读取步骤 -> 执行并验证</code></pre>
+
+            <p>
+              所以“学会”在这里不是模型内部多了一个不可见能力，而是三件可检查的事同时成立：文件真实存在，短描述能把合适任务路由过来，
+              正文给出了能执行和验证的流程。缓存清理实现见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/prompt_builder.py#L1377-L1387"><code>clear_skills_system_prompt_cache</code></a>。
+            </p>
+
+            <p>
+              还有一个与第三篇 Curator 相关的细节：前台 <code>/learn</code> 创建的是用户主动要求的 Skill，源码不会把它标成 background-review 创建。
+              Curator 的可选语义整理只应处理 agent 自行沉淀的候选，不能把用户主动建立的知识资产当成自动清理材料。两条学习路径共享文件格式，
+              但 provenance 仍然不同。
+            </p>
+
+            <h2>七、Learning Graph：把已经存在的关系画出来</h2>
+            <p>
+              Skill 越积越多以后，另一个问题出现了：用户怎样看见“我已经学过什么，它们和哪些记忆相关”？Hermes 的桌面 Journey 面板用
+              Learning Graph 回答这个问题。这里最容易产生的误会是把图上的节点和边理解成“另一个学习算法”。实际上，
+              <code>agent/learning_graph.py</code> 做的是读取底层文件、构造 JSON 视图；它不运行任务，不修改 Skill，也不比较哪个 Skill 更好。
+            </p>
+
+            <figure>
+              <img
+                src="assets/learning-graph-view.png"
+                alt="Learning Graph 从 Skills、MEMORY.md 与 USER.md 投影节点和关系，浏览后通过 edit 或 delete 回写底层文件；图本身不训练也不判断 Skill 优劣"
+                loading="lazy"
+              />
+              <figcaption>Graph 是可浏览的关系投影；真正的长期状态仍在 Skill 与 Memory 文件里。</figcaption>
+            </figure>
+
+            <h3>7.1 哪些东西会成为节点</h3>
+            <p>
+              Skill 节点来自 profile 目录，而不是把所有 bundled base Skills 全部画出来；当前实现进一步要求它有真实学习信号：由 agent 创建，或至少被使用过。
+              节点会携带 category、时间戳、use count、state、created-by 和 pinned 等展示字段。Memory 节点则来自
+              <code>MEMORY.md</code> 与 <code>USER.md</code>：两个文件按裸 <code>§</code> 分隔，每一段成为一张可读卡片。
+              建图入口见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learning_graph.py#L259-L324"><code>build_learning_graph</code></a>。
+            </p>
+
+            <p>
+              注意，节点的 <code>state</code>、<code>use_count</code> 和 <code>pinned</code> 只是把已有生命周期与使用记录带到视图里。
+              Graph 不根据连线数量把 Skill 变成 active，也不因为节点孤立就 archive。第三篇讲的 Curator 仍然拥有生命周期迁移；这里负责的是显示，不是裁决。
+            </p>
+
+            <h3>7.2 两种边代表两种强度完全不同的关系</h3>
+            <p>
+              Skill 与 Skill 之间的边来自 frontmatter 里的 <code>related_skills</code>。只有两个端点都真实存在时才建边，并按无向关系去重。
+              这是一条作者显式声明的关系。Memory 与 Skill 之间没有这样的声明，于是实现采用一个很轻的词法启发：把标题和正文转成长度至少为 3 的 token；
+              Skill 全名出现在 Memory 中加 6 分，名称 token 重叠再加分；分数大于 0 的候选按分数排序，每张 Memory 卡最多连前 4 个 Skill。
+            </p>
+
+            <pre><code class="language-python">score = 0
+if skill_name_lower in memory_text:
+    score += 6
+score += len(skill_name_tokens &amp; memory_tokens)
+
+if score > 0:
+    candidates.append((score, skill.name))
+
+edges.extend(top_four(candidates))</code></pre>
+
+            <p>
+              因此虚线只能读成“词面上可能相关”，不能读成“模型已经证明两者存在因果关系”。例如 Memory 里写了
+              <code>generated code</code>，它可能同时连到测试 Skill 和代码生成 Skill；这有助于浏览和定位，却不是语义合并依据。
+              显式边见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learning_graph.py#L156-L170"><code>build_edges</code></a>，
+              词法边见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learning_graph.py#L218-L245"><code>_memory_skill_edges</code></a>。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>图中元素</th>
+                    <th>来源</th>
+                    <th>可以怎样理解</th>
+                    <th>不能推出什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Skill 节点</td>
+                    <td>profile Skill + usage/provenance 记录</td>
+                    <td>这条长期流程已经存在并有学习信号</td>
+                    <td>节点越大或越新就一定更好</td>
+                  </tr>
+                  <tr>
+                    <td>Memory 节点</td>
+                    <td><code>MEMORY.md</code> / <code>USER.md</code> 的分段</td>
+                    <td>这是一条长期事实、偏好或用户画像片段</td>
+                    <td>它已经被编译成 Skill</td>
+                  </tr>
+                  <tr>
+                    <td>Skill 实线</td>
+                    <td><code>related_skills</code></td>
+                    <td>作者显式声明了关联</td>
+                    <td>两条 Skill 已经合并</td>
+                  </tr>
+                  <tr>
+                    <td>Memory-Skill 虚线</td>
+                    <td>名称与 token 的词法重叠</td>
+                    <td>浏览时值得一起看看</td>
+                    <td>经过 embedding、评测或因果验证</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2>八、在图上编辑，真正改的是哪一本账</h2>
+            <p>
+              关系图不是只读海报。Journey 的 CLI、TUI 和桌面 REST 都可以根据 node id 查看、编辑或删除节点，
+              但 <code>learning_mutations.py</code> 不会把修改存在一份独立 graph database 里。它把节点 ID 解析回原始文件：Skill 节点 ID 就是 Skill 名称；
+              Memory 节点 ID 形如 <code>memory:&lt;source&gt;:&lt;index&gt;</code>，再定位到 <code>MEMORY.md</code> 或 <code>USER.md</code> 的对应分段。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>用户动作</th>
+                    <th>底层发生什么</th>
+                    <th>保护边界</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>编辑 Skill</td>
+                    <td>完整改写对应 <code>SKILL.md</code>，成功后清 Skills 缓存</td>
+                    <td>仍经过 Skill frontmatter、体积和安全检查</td>
+                  </tr>
+                  <tr>
+                    <td>删除 Skill</td>
+                    <td>归档 Skill，并给出 curator restore 命令</td>
+                    <td>pinned Skill 必须先 unpin，不做不可恢复删除</td>
+                  </tr>
+                  <tr>
+                    <td>编辑 Memory</td>
+                    <td>替换对应 <code>§</code> 分段，再用原子写入保存文件</td>
+                    <td>空内容不被当作编辑，需显式 delete</td>
+                  </tr>
+                  <tr>
+                    <td>删除 Memory</td>
+                    <td>移除对应分段并重写源文件</td>
+                    <td>索引过期时拒绝操作，要求刷新 Graph</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这种设计保住了单一事实来源：Graph 可以随时重建，文件才是持久状态。Skill 编辑和归档见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learning_mutations.py#L121-L176"><code>delete_node</code> / <code>edit_node</code></a>，
+              Memory 的原子回写与 Skills 缓存清理见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learning_mutations.py#L179-L198">helpers</a>。
+              这也解释了为什么图上的 Memory index 可能“过期”：前面的分段被删掉后，旧索引不再可信，正确做法是刷新投影，而不是猜一个新位置继续写。
+            </p>
+
+            <h2>九、把整条旅程重新播放一次</h2>
+            <p>
+              现在可以把例子从头走完。第一次修生成代码测试时，agent 临时读取官方指南并完成任务；用户发现这条流程以后还会重复，于是用
+              <code>/learn</code> 指定同一份指南与关注范围。入口把请求改写成普通回合，agent 把来源当证据，选用紧凑 Skill 形状，
+              通过 <code>skill_manage</code> 写出 <code>generated-code-testing</code>。后续提示重建后，新会话可以从 Skill 索引发现它；
+              Learning Graph 则把这条 Skill、相关 Skill 和包含 <code>generated code</code> 的 Memory 片段画到一起，方便用户检查和维护。
+            </p>
+
+            <p>
+              这条链里没有一步可以单独叫“学习完成”。只读取资料，得到的是本轮上下文；只写文件但 description 无法路由，未来任务找不到它；
+              只画出 Graph，也没有新增任何能力。Hermes 的主动学习之所以可理解，是因为每一层都有明确产物：普通回合负责取证，
+              <code>skill_manage</code> 负责受控持久化，prompt builder 负责未来发现，Learning Graph 负责可视化已有关系。
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>到这里，我们只证明“知识被整理并可再次调用”，还没有证明“新 Skill 比旧 Skill 更好”。</strong>
+                下一篇会先解决这把尺子：评测题从哪里来，一条任务记录包含什么，训练集、验证集和最终留出集各自允许参与哪一步。
+                只有先把任务与分组边界讲清楚，后面的 DSPy / GEPA 优化才不会变成“拿同一批题反复改，再拿同一批题宣布进步”。
+                <a href="../evaluation-dataset/">继续阅读：评测题怎样变成可信的比较尺子</a>。
+              </p>
+            </div>
+
+            <h2 id="sources">参考源码</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/NousResearch/hermes-agent/tree/fa1a5c0485a6a912517ef2ded76e39907aa26087">NousResearch/hermes-agent 固定源码快照</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learn_prompt.py#L1-L27"><code>/learn</code> 的模块级执行契约</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learn_prompt.py#L30-L220">Skill 写作规范、来源卫生与 prompt builder</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/hermes_cli/cli_commands_mixin.py#L1867-L1890">CLI <code>/learn</code> 入口</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/gateway/run.py#L15304-L15330">Gateway <code>/learn</code> fall-through</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/skill_manager_tool.py#L908-L975">Skill 创建、原子写入与安全回滚</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/skill_manager_tool.py#L1513-L1594">Skill action 分派与缓存失效</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learning_graph.py#L29-L170">Skill 节点与显式关系边</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learning_graph.py#L178-L324">Memory 节点、词法边与完整 Graph payload</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/learning_mutations.py#L1-L198">Graph 节点到 Skills / Memory 文件的回写路径</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+  <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>
