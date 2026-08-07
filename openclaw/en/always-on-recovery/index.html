@@ -1,0 +1,168 @@
+<!doctype html><html lang="en"><head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenClaw Source Reading, Part 8: How Heartbeat, Automations, and Recovery Keep an Agent Running</title>
+  <meta name="description" content="Trace OpenClaw heartbeat, automations, background tasks, and restart recovery to understand scheduled wakes, durable ledgers, idempotent delivery, bounded resume, and fail-closed recovery." />
+  <meta name="theme-color" content="#f5f1e8" /><meta property="og:title" content="OpenClaw Source Reading, Part 8: How Heartbeat, Automations, and Recovery Keep an Agent Running" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/always-on-time-sources.png" />
+  <link rel="canonical" href="https://rememorio.github.io/blog/openclaw/en/always-on-recovery/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/openclaw/zh/always-on-recovery/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/openclaw/en/always-on-recovery/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/openclaw/" />
+  <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+</head><body id="top">
+  <header class="site-header"><a class="brand" href="../../../en/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">OpenClaw series</a><a href="../multi-agent/">Previous</a><a href="#sources">Sources</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a href="../../zh/always-on-recovery/" lang="zh-CN">中文</a><a class="active" href="./" lang="en">English</a></span></nav></header>
+  <div class="article-shell"><aside class="toc-panel" aria-label="Article contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
+    <section class="article-hero">
+      <p class="eyebrow">OpenClaw source reading · Part 8</p><h1>How Heartbeat, Automations, and Recovery Keep an Agent Running</h1>
+      <p class="lead">“Always on” does not mean one model call that never ends, nor does it mean replaying an old conversation every few minutes. OpenClaw gives time, execution, recording, delivery, and recovery to different owners. Heartbeat performs approximate periodic checks in a main session. Automations persist precise schedules. The background-task ledger records work detached from the main conversation. Restart recovery reads durable claims, transcripts, and delivery receipts to decide whether to continue, ask for a resend, or stop retrying. The system stays useful over time because state is recoverable and replay is bounded—not because one process is immortal.</p>
+      <div class="meta-line"><span>Part 8 / 8</span><span>Source snapshot: c549250</span><span>Topic: heartbeat · automation · durability · recovery</span><span>Prerequisite: multi-agent</span></div>
+      <nav class="series-strip"><a href="../overview/"><strong>01</strong> Main path</a><a href="../gateway/"><strong>02</strong> Gateway</a><a href="../routing-sessions/"><strong>03</strong> Routing</a><a href="../context-memory/"><strong>04</strong> Context</a><a href="../capability-assembly/"><strong>05</strong> Capabilities</a><a href="../security-boundaries/"><strong>06</strong> Security</a><a href="../multi-agent/"><strong>07</strong> Multi-agent</a><span class="series-current"><strong>08</strong> Recovery</span></nav>
+      <figure class="hero-image"><img src="../../assets/always-on-time-sources.png" alt="The three owners behind always-on OpenClaw work: heartbeat checks a main session periodically; Automations persist at, every, and cron schedules; Tasks record queued, running, and terminal activity in task_runs, then completion can wake the main session; schedule, run, record, and wake remain separate" /></figure>
+    </section>
+    <section class="article-body">
+      <p>Imagine an operations Agent that checks for noteworthy changes every half hour, publishes a report at 07:00 on weekdays, launches an isolated investigation when a build event arrives, notifies the requester as soon as a long task finishes, and continues an interrupted conversation after a Gateway upgrade. A single <code>while (true) { sleep(...) }</code> loop cannot answer the difficult questions: should missed ticks be replayed, where does each run live, how do you prevent duplicate external sends, and who decides what to do after the process disappears halfway through a turn?</p>
+      <p>OpenClaw answers by separating clock, work, ledger, and delivery. A scheduler owns timing. A session and agent runtime execute one turn. Task and cron history record what happened. Channel delivery owns receipts for external effects. Recovery reconstructs only from those durable facts. In-memory promises, sockets, and model streams may vanish; ownership evidence must not be guessed.</p>
+      <div class="note"><p><strong>Reading contract.</strong>By the end, you should be able to identify the owners of heartbeat, automation, and task state; explain why disabling automations also stops scheduled heartbeat; distinguish heartbeat run context from delivery target; explain how cron treats overdue jobs after restart; show why a task is a ledger rather than a scheduler; separate execution success from delivery success; describe how the Gateway finds an interrupted main session; decide when recovery resumes or emits a resend notice; and map tombstone, lost, autoDisabled, and the crash-loop breaker to the infinite loop each one prevents.</p></div>
+      <p><strong>Evidence boundary.</strong>The article remains pinned to <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a>. Defaults, attempt counts, and retention windows describe that snapshot. The durable lessons are ownership, idempotency fencing, and fail-closed recovery.</p>
+
+      <h2>1. “Always on” contains four independent questions</h2>
+      <div class="table-wrap"><table><thead><tr><th>Question</th><th>Primary owner</th><th>Durable fact</th><th>What it cannot replace</th></tr></thead><tbody>
+        <tr><td>When should work wake?</td><td>Heartbeat monitor, Automations scheduler, or hook</td><td>Job, schedule, next run, trigger state</td><td>Proof that the work completed</td></tr>
+        <tr><td>Who is executing?</td><td>Session lane, agent run, or child runtime</td><td>sessionKey, runId, runtime ownership</td><td>Proof that output reached a user</td></tr>
+        <tr><td>What happened?</td><td>Task registry, cron history, transcript</td><td>queued, running, terminal, result</td><td>The next scheduler tick</td></tr>
+        <tr><td>Did the user receive it?</td><td>Delivery queue, receipt, requester session</td><td>Delivery claim, idempotency key, provider receipt</td><td>Permission to replay unsafe work</td></tr>
+      </tbody></table></div>
+      <p>Most “occasional duplicate reminder” and “task vanished after restart” failures come from merging two of these columns. A task row that still says running does not prove a process is alive. A succeeded agent run does not prove delivery. An enabled cron job does not mean every occurrence missed during downtime should be replayed.</p>
+
+      <h2>2. Time enters through more than a timer</h2>
+      <p>OpenClaw can wake from a user or ChannelPlugin message, heartbeat cadence, an <code>at</code>/<code>every</code>/<code>cron</code> schedule, an authenticated webhook, Gmail PubSub, a supervised stream, background task completion, or a restart-sentinel continuation. They may all end in an Agent turn, but their admission identity and duplicate semantics differ.</p>
+      <p>An external webhook needs authentication and an idempotency key. A cron occurrence has job and run identity. A child completion already has task and run identity. A heartbeat is a system-owned monitor tick. Flattening all of them into an ordinary user message would discard that provenance.</p>
+
+      <h2>3. Heartbeat is a main-session check, not a background task</h2>
+      <p>A heartbeat is a periodic Agent turn, running in the Agent’s main session by default. It can consume monitor scratch, session context, and the configured bootstrap, then report either “nothing needs attention” or an alert. It does not create a background task record. Ordinary interactive turns do not create one either. Detached ACP, subagent, automation, Gateway-backed CLI, and selected background exec or media work do.</p>
+      <p>That boundary changes diagnosis. The absence of a heartbeat row in <code>/tasks</code> is expected. Inspect the monitor job, last-heartbeat summary, and heartbeat logs for periodic checks. Use the task board for detached execution, not for storing the next cadence.</p>
+
+      <h2>4. Automations own the heartbeat tick</h2>
+      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/cron/heartbeat-monitor.ts"><code>cron/heartbeat-monitor.ts</code></a> converges every heartbeat-enabled Agent into one system-owned automation job. Its declaration key resembles <code>heartbeat:&lt;agentId&gt;</code>; its payload kind is <code>heartbeat</code>; its session target is <code>main</code>. Configuration is desired state, while the persisted monitor row owns the actual tick and phase anchor.</p>
+      <p>Consequently, <code>cron.enabled=false</code> or <code>OPENCLAW_SKIP_CRON=1</code> stops scheduled heartbeats. There is no hidden fallback timer. Gateway startup and configuration reload write heartbeat configuration into the monitor job, while <code>doctor --fix</code> can materialize a missing or stale declaration. Disabling cadence can leave a disabled row and its scratch intact for later re-enablement.</p>
+      <p>The usual default cadence is 30 minutes; selected Anthropic OAuth or token defaults become one hour when no explicit value exists. Cadence is a monitoring interval, not a precise service-level guarantee. Use a cron schedule for “09:00 every weekday.”</p>
+
+      <h2>5. Heartbeat uses a quiet completion protocol</h2>
+      <p>The default prompt says to follow monitor scratch, keep recurring work in Automations, avoid inferring stale tasks from old chat, and return <code>HEARTBEAT_OK</code> when there is nothing to report. The structured path calls <code>heartbeat_respond</code>: <code>notify=false</code> records a silent outcome, while <code>notify=true</code> carries notificationText. A structured response takes precedence over the text fallback.</p>
+      <p><code>HEARTBEAT_OK</code> at the beginning or end is recognized and stripped; if the remainder is short, the whole response is suppressed. The same token in the middle has no special meaning, and an alert should omit it. The point is not saving a few characters. It turns “the check succeeded and nothing changed” into an auditable terminal result that is quiet by default.</p>
+      <pre><code class="language-javascript">{
+  agents: {
+    defaults: {
+      heartbeat: {
+        every: "30m",
+        target: "last",
+        lightContext: true,
+        isolatedSession: true,
+        activeHours: { start: "09:00", end: "22:00" }
+      }
+    }
+  }
+}</code></pre>
+
+      <h2>6. Run session and delivery target are independent axes</h2>
+      <p><code>heartbeat.session</code> selects the model context, defaulting to main. <code>target</code>, <code>to</code>, and <code>accountId</code> select an external destination. With <code>target="none"</code>, the turn still executes but does not send outward. Only <code>target="last"</code> resolves the most recent deliverable channel. Pointing the run at a thread session does not automatically choose that thread as an outbound target.</p>
+      <p><code>isolatedSession=true</code> creates a new transcript for each check, avoiding the entire conversation history while delivery can still use main-session routing context. <code>lightContext=true</code> also skips workspace bootstrap and injects monitor scratch directly. Those options suit narrow probes; a monitor that depends on durable conversation decisions or workspace instructions must explicitly pay for the additional context.</p>
+
+      <h2>7. Scheduled heartbeat yields to active work</h2>
+      <p>A scheduled heartbeat defers when the main lane or automation lane is busy, another reply or embedded run for the Agent is active, or the resolved target session has active or queued work. Manual and immediate wakes bypass the broad same-Agent check but still honor the main, automation, and target-session guards. Sibling Agents do not pause each other.</p>
+      <p>Active hours add an IANA, user, or host timezone window. A tick outside the window is skipped until the next in-window tick; it is not automatically caught up. Equal start and end create a zero-width window and skip everything. Business-critical timing needs an explicit timezone and missed-run policy in Automations, not an approximate heartbeat cadence.</p>
+
+      <h2>8. Automations are the durable scheduler</h2>
+      <p>Automations run inside the Gateway process. Job definitions, runtime state, and run history live in shared SQLite. The scheduler supports one-shot <code>at</code>, fixed <code>every</code>, timezone-aware <code>cron</code>, and event sources such as on-exit or supervised streams. The Gateway must be running to fire a schedule, but restart does not erase it.</p>
+      <p>Every automation run creates a task record, including main-session jobs. The task notify policy is silent because the scheduler owns delivery. A successful one-shot job deletes itself by default unless configured to remain. Recurring top-of-hour cron expressions may be staggered to reduce synchronized load; exact timing is an explicit choice.</p>
+      <p>At startup, overdue isolated agent-turn jobs are rescheduled instead of replayed immediately in the channel-connect window. Persistence therefore does not mean “execute every tick missed during downtime.” A workflow that requires catch-up should read an external durable watermark, calculate the unprocessed interval, and make its business action idempotent.</p>
+
+      <h2>9. One job can use four session shapes</h2>
+      <div class="table-wrap"><table><thead><tr><th>sessionTarget</th><th>Context</th><th>Best fit</th><th>Main risk</th></tr></thead><tbody>
+        <tr><td><code>main</code></td><td>Self-contained system event in a scheduler-owned lane</td><td>Reminders, wakeups, light main-session work</td><td>Does not automatically include heartbeat scratch</td></tr>
+        <tr><td><code>isolated</code></td><td>Fresh <code>cron:&lt;jobId&gt;</code> transcript per run</td><td>Reports, background chores, one-shot analysis</td><td>Needs a complete prompt and delivery plan</td></tr>
+        <tr><td><code>current</code></td><td>Bound to the creator’s current session</td><td>Recurring work that deliberately depends on this conversation</td><td>History growth and stale context</td></tr>
+        <tr><td><code>session:custom-id</code></td><td>Persistent named session across runs</td><td>Long workflows that accumulate context</td><td>State drift and the need for reset/archive policy</td></tr>
+      </tbody></table></div>
+      <p>A main-session automation event does not automatically inherit the default heartbeat prompt or monitor scratch; the event must request that context explicitly. An isolated run carries safe model and thinking preferences but does not inherit stale channel routing, elevation, origin, or ACP binding from an older row. A fresh session must re-resolve side-effect routing, not merely change the transcript id.</p>
+
+      <h2>10. Unattended jobs need authority fixed at creation</h2>
+      <p>No person is present to clarify a scheduled job or approve an unexpected host action. Its final result should be a deliverable or a plain failure, not “I am about to begin.” Work requiring interactive approval is a poor unattended schedule. A safer pattern is a read-only scheduled check that notifies a human, followed by a foreground turn for the risky change.</p>
+      <p>An automation created by an Agent persists an explicit tool policy capped by the creator turn’s effective surface. It cannot later widen to tools the creator did not have. An authenticated operator who creates a job without <code>--tools</code> stores an explicit <code>*</code> policy instead. That is operator authorization and must not be confused with least-privilege defaults on the model side.</p>
+      <p>A command payload is even more explicit: it is an operator-admin Gateway automation surface that runs argv on the Gateway host. It does not pass through the model-visible exec tool’s approval or policy. Access to create and edit these jobs belongs behind operator role checks and configuration review.</p>
+
+      <h2>11. Tasks are an activity ledger, not a scheduler</h2>
+      <p>The task registry tracks ACP, subagent, every automation run, Gateway-backed CLI, and selected background exec or media work. State progresses through <code>queued → running → terminal</code>, where terminal may be succeeded, failed, timed_out, cancelled, or lost. Agent-run lifecycle events advance the record automatically; callers do not manually write the state machine.</p>
+      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/tasks/task-registry.store.sqlite.ts"><code>task-registry.store.sqlite.ts</code></a> writes <code>task_runs</code> and <code>task_delivery_state</code> into the shared state database. A record can link requesterSessionKey, childSessionKey, agentId, runId, ownerKey, and deliveryStatus, answering who launched it, where it runs, who owns it, and where its result belongs. It has no scheduling responsibility and does not replace nextRunAt.</p>
+      <pre><code class="language-text">queued → running → succeeded | failed | timed_out | cancelled | lost
+
+executionStatus: succeeded
+deliveryStatus:  session_queued | delivered | failed
+terminalOutcome: succeeded | blocked</code></pre>
+
+      <h2>12. Completion is pushed and can wake heartbeat</h2>
+      <p>A terminal detached task has two broad delivery paths. With a valid requesterOrigin, it may deliver directly to a channel. Group and channel subagent completions normally return through the requester session so the parent can write the visible response. If direct delivery fails or no origin exists, the completion becomes a queued system event for the requester and requests an immediate heartbeat wake rather than waiting for the next scheduled tick.</p>
+      <p>That is why polling is normally the wrong shape. Once work starts, the runtime already knows requester and completion identities. Repeated status calls add model turns and races. Use <code>tasks list</code>, <code>show</code>, and <code>audit</code> for diagnosis, intervention, and operations—not as the normal completion protocol.</p>
+      <p>Execution and delivery stay distinct. A child can succeed while its result queue expires, leaving execution succeeded and terminalOutcome blocked. The canonical result remains available for retry or dismissal. The runtime does not falsify the execution result merely to turn the dashboard red.</p>
+
+      <h2>13. What actually survives a restart?</h2>
+      <figure class="hero-image"><img src="../../assets/always-on-restart-recovery.png" alt="OpenClaw mainRestartRecovery: a running session stores transcript, delivery claim, and dispatch id in SQLite; after Gateway restart, startup scan reads durable state and either resumes, emits a resend notice for an unsafe tail, or tombstones exhausted recovery; a delivery receipt prevents repeated external output" /></figure>
+      <p>Conversation transcripts and session rows live in per-Agent SQLite. Subagent, task, and flow registries, cron jobs, and delivery queues live in shared state. An Agent-requested restart uses a restart sentinel. JavaScript promises, sockets, provider streams, and in-process owners disappear. Recovery does not magically resurrect the latter; it reconciles durable rows against live owners in the new process.</p>
+      <p>A graceful restart first stops accepting new work, then gives active turns and background work a drain budget—five minutes by default. Most upgrades therefore interrupt nothing. Only work that exceeds the budget, or is cut off by a crash, enters recovery. New requests during the drain are explicitly rejected rather than silently queued into a dying process.</p>
+
+      <h2>14. The main session writes a recovery claim before execution</h2>
+      <p>For an ordinary text turn on an existing main session, admission persists the user message, running state, and recovery delivery claim in one SQLite transaction before the model or relevant hook executes. Shutdown marks sessions still active. After a hard crash, startup looks for rows still claiming to run without any live owner in the new process and cleans stale transcript locks.</p>
+      <p>Those three paths complement one another. The admission transaction covers a crash immediately after start. The shutdown marker covers an orderly interruption. The startup orphan scan covers a kill that bypassed cleanup. Guessing solely from “the last transcript item is a user message” would conflate a reply already generated but not delivered with work that was never formally admitted.</p>
+
+      <h2>15. Recovery reuses one dispatch identity</h2>
+      <p>A few seconds after startup, an eligible session receives a synthetic system continuation explaining that restart interrupted the previous turn and asking the Agent to continue from its stored transcript. If a final reply was already generated but not delivered, recovery carries it forward so the system can finish delivery instead of redoing tools.</p>
+      <p>Every retry uses the same durable dispatch identifier, so an ambiguous connection failure cannot launch recovery twice. Startup reconciliation has a short transient retry loop, while each interrupted main-session cycle also has a durable three-attempt dispatch budget retained across restarts. An attempt is charged before dispatch, refunded only on an explicit pre-acceptance rejection, and kept when the outcome is uncertain. The system prefers stopping to replaying an external effect.</p>
+      <p>If foreground work already owns the session, recovery waits rather than racing the lane. Once the budget is exhausted, the cycle is tombstoned. An operator inspects it and starts a replacement with <code>/new</code> or <code>/reset</code>. <code>doctor --fix</code> can repair contradictory flags but does not silently reactivate a tombstoned cycle.</p>
+
+      <h2>16. A resumable transcript does not make every tool replayable</h2>
+      <p>Partial streamed text can remain in the transcript, and continuation resumes beneath it. A dangling tool call is removed from the next provider payload, while the recovered turn is restricted to restart-safe tools. A provider failure, stale pending approval, or other unsafe side-effecting tail is not blindly rerun; the Agent emits a one-time resend notice instead.</p>
+      <p>A message-tool-only reply has stricter durable correlation. The Gateway records a delivery intent before the terminal same-conversation send. Provider success resolves a durable receipt; confirmed failure clears it. Recovery completes a delivered receipt without invoking message again. If the provider outcome is unknown, it fails closed rather than sending twice. Original requester identity, channel and thread restrictions, and source delivery mode remain attached to the claim, so restart cannot change the target.</p>
+      <p>Audited read-only Code Mode work is a narrow exception. Only runs marked restart-safe and filtered to audited read-only tools can be reconstructed. Side-effecting catalog or namespace calls still receive the resend path. Recovery is not a universal retry wrapper around every tool.</p>
+
+      <h2>17. Subagents, tasks, and cron recover under different owners</h2>
+      <p>The main-session scanner excludes subagent, cron, and ACP sessions because they already have specialized owners. The subagent registry restores from SQLite and can resume the original task context. Runs interrupted more than two hours earlier are finalized instead of revived overnight; repeatedly failing children are wedged or tombstoned. ACP execution belongs to its external runtime or connected client, while OpenClaw reconciles managed task and binding state.</p>
+      <p>The task registry loads at startup and a sweeper periodically checks authoritative backing. ACP requires a live in-process turn. A subagent requires its child session. Automation first checks scheduler ownership, then durable run history. Missing backing must outlive a grace window before a task becomes lost, so restart does not instantly classify everything as dead. Terminal tasks are normally retained for seven days, lost records for a shorter window, then pruned through cleanupAfter.</p>
+      <p>Cron definitions and run history survive, and the scheduler re-arms. Missed occurrences still follow the schedule and run type rather than one universal replay policy. Persistence supplies facts from which a decision can be made; it does not manufacture business-level exactly-once behavior. External side effects still need a business key, watermark, or destination API with idempotency.</p>
+
+      <h2>18. Bounded failure keeps “always on” from becoming “retry forever”</h2>
+      <figure class="hero-image"><img src="../../assets/always-on-safety-valves.png" alt="OpenClaw always-on safety valves: main-session recovery tombstones after three attempts; a task without authoritative backing becomes lost after a grace period; recurring automation becomes autoDisabled after ten consecutive execution failures; three unclean boots within five minutes enter safe mode; task_runs, deliveryStatus, and cleanupAfter preserve an auditable outcome" /></figure>
+      <p>Main-session recovery has a durable three-attempt budget. A task missing authoritative backing becomes lost after grace. A recurring automation is autoDisabled after ten consecutive execution failures, and three consecutive schedule-computation errors also stop it. Three unclean boots within five minutes trip a crash-loop breaker: the control plane still starts, while channels and selected side services defer automatic startup.</p>
+      <p>These are not vague declarations that the system “gave up.” They stop automation at an auditable boundary. Tombstone prevents replay of one session’s effects. Lost exposes an orphan. autoDisabled stops a bad schedule from burning resources. Safe mode leaves the control plane available so an operator can repair configuration. After fixing the cause, the operator explicitly enables, resets, retries, or starts the affected component.</p>
+
+      <h2>19. Diagnose always-on work with three ledgers</h2>
+      <pre><code class="language-bash">openclaw automations list --all
+openclaw automations runs --id &lt;jobId&gt; --limit 20
+openclaw tasks list
+openclaw tasks audit
+openclaw sessions --json
+openclaw channels status
+openclaw gateway status
+openclaw logs</code></pre>
+      <p>The first ledger is schedule: enabled state, nextRunAt, timezone, and lastRunStatus. The second is execution: queued/running/terminal task state and whether its live owner exists. The third is delivery and recovery: deliveryStatus, pending queue, session recovery claim, tombstone, and receipt. If a schedule did not fire, inspect Gateway, cron enablement, active hours, and busy guards. If a run did not end, inspect runtime ownership and timeout. If it succeeded without a message, inspect delivery routing and blocked completion. If restart duplicates output, inspect dispatch, idempotency, and receipts before adding retries.</p>
+
+      <h2>20. The eight-part runtime model</h2>
+      <ol>
+        <li><strong>A message first crosses Gateway and routing.</strong>Identity, binding, and sessionKey establish ownership.</li>
+        <li><strong>The session lane establishes time order.</strong>Steer, followup, interrupt, and child trees still obey ownership.</li>
+        <li><strong>Context is a projection for one turn.</strong>Workspace, transcript, memory, and compaction have distinct durability.</li>
+        <li><strong>Capabilities are assembled per turn.</strong>A skill guides; tools, plugins, and hooks enter the executable surface.</li>
+        <li><strong>Security is an intersection.</strong>Policy, sandbox, approval, and elevated answer different questions.</li>
+        <li><strong>Delegation only narrows authority.</strong>A child receives a task contract; the parent keeps final delivery.</li>
+        <li><strong>Always-on behavior needs durable owners.</strong>Schedule, run, task, delivery, and recovery claims each own facts.</li>
+        <li><strong>Recovery must be bounded.</strong>Resume only when safe, fail closed when outcome is unknown, and tombstone or disable repeated failure.</li>
+      </ol>
+      <p>OpenClaw is therefore more than a “Channel → Model → Reply” chat shell. It is an Agent runtime with Gateway as its control plane, sessions as conversation ownership, policy as an authority ceiling, and SQLite state plus idempotent receipts as the bridge across time. Any new feature can be read with the same questions: who owns ingress, who owns state, who may create a side effect, who proves completion, and what evidence permits continuation after the process is gone?</p>
+
+      <h2 id="sources">Source references</h2>
+      <ul>
+        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/cron/heartbeat-monitor.ts">cron/heartbeat-monitor.ts</a>, <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/infra/heartbeat-wake.ts">infra/heartbeat-wake.ts</a>, and <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/heartbeat.ts">auto-reply/heartbeat.ts</a>: monitor convergence, busy guards, wake, and quiet completion.</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/cron/service.ts">cron/service.ts</a>, <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/cron/store.ts">cron/store.ts</a>, and <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/cron/schedule.ts">cron/schedule.ts</a>: persistent jobs, schedules, and scheduler lifecycle.</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/tasks/task-registry.store.sqlite.ts">task-registry.store.sqlite.ts</a> and <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/tasks/task-registry.maintenance.ts">task-registry.maintenance.ts</a>: task and delivery storage, reconciliation, lost state, and retention.</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/main-session-restart-recovery.ts">main-session-restart-recovery.ts</a>, <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/main-session-recovery-state.ts">main-session-recovery-state.ts</a>, and <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server-restart-sentinel.ts">server-restart-sentinel.ts</a>: startup scanning, recovery state, and Agent-requested continuation.</li>
+        <li><a href="https://docs.openclaw.ai/gateway/heartbeat">Heartbeat</a>, <a href="https://docs.openclaw.ai/automation/cron-jobs">Automations</a>, <a href="https://docs.openclaw.ai/automation/tasks">Background tasks</a>, and <a href="https://docs.openclaw.ai/gateway/restart-recovery">Restart recovery</a>: official runtime and recovery contracts.</li>
+      </ul>
+    </section>
+  </article></main></div>
+  <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../article.js?v=1"></script>
+</body></html>
