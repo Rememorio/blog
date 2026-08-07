@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hermes Agent 运行时学习：为什么交付以后才开始自进化</title>
+    <meta
+      name="description"
+      content="沿 finalizer、nudge、background review 与 Curator 读懂 Hermes Agent 如何在交付后提炼单轮经验，并长期整理 Skill。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Hermes Agent 运行时学习：为什么交付以后才开始自进化" />
+    <meta
+      property="og:description"
+      content="先交付当前任务，再用受限 review fork 写账，最后由两阶段 Curator 维护长期技能库。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="assets/learning-after-delivery.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/hermes-agent/zh/runtime-learning/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/hermes-agent/zh/runtime-learning/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/hermes-agent/en/runtime-learning/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/hermes-agent/" />
+    <link rel="stylesheet" href="../../styles.css?v=hermes-series-4" />
+  <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../../">Hermes Agent</a>
+        <a href="../instruction-state/">上一篇</a>
+        <a href="../learn-journey/">下一篇</a>
+        <a href="../../../zh/#posts">文章目录</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/runtime-learning/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">运行时学习</p>
+            <h1>Hermes Agent：为什么交付以后才开始自进化</h1>
+            <p class="lead">
+              自进化不是模型边做任务边总结自己。Hermes 先完成用户的当前目标，再让受限后台分支判断是否值得写账，
+              最后用另一只周期时钟整理长期 Skill 库。三个阶段共享状态，却不共享触发时机和权限。
+            </p>
+            <div class="meta-line">
+              <span>系列 3 / 7</span>
+              <span>源码快照：fa1a5c0</span>
+              <span>主题：runtime learning</span>
+              <span>范围：公开源码可见链路</span>
+            </div>
+            <nav class="series-strip" aria-label="Hermes Agent 系列">
+              <a href="../instruction-state/"><strong>02</strong> 指令与状态：长期信息为什么不能放进同一本账</a>
+              <span class="series-current"><strong>03</strong> 运行时学习：交付以后怎样提炼经验</span>
+              <a href="../learn-journey/"><strong>04</strong> 主动学习：一条 /learn 请求怎样变成 Skill</a>
+            </nav>
+            <figure class="hero-image">
+              <img
+                src="assets/learning-after-delivery.png"
+                alt="Hermes 交付后学习三条时钟图，前台先交付，单轮 review 经 Finalizer 门写入 Memory 或 Skills，周期 Curator 再执行生命周期与可选语义合并"
+              />
+            </figure>
+          </section>
+          <section class="article-body">
+            <h2>一、为什么运行时自进化必须在交付之后发生</h2>
+            <p>
+              前面讲完回合、状态账本和工具边界之后，才适合谈“self-improving”。否则这个词很容易被误解成：
+              模型一边回答一边反思自己，或者每轮结束都把整段对话总结成长期经验。听起来很聪明，实际会带来两个问题。
+              第一，当前任务还没交付，模型就开始分心判断“这件事值不值得记住”；第二，中间试错、临时路径和一次性日志可能被写成长期事实。
+            </p>
+
+            <p>
+              <strong>Nudge 是什么？</strong>这个英文词原意是“轻推一下”。在 Hermes 里，它更接近一个<strong>到点提醒</strong>：
+              运行时用计数器记录已经经过多少用户回合或工具调用迭代，达到配置间隔后，只把对应的 review 标记设为
+              <code>true</code>。它不会往用户消息里塞一段提醒，不会立即调用模型，也不等于已经创建了 Memory 或 Skill。
+              它只是在告诉 finalizer：“这轮安全交付后，可以安排一次复盘，看看有没有值得留下的东西。”
+            </p>
+
+            <p>
+              开头总图故意画了三条不相连的时钟：第一条到“最终回答 · 已交付”为止；第二条只能从 <code>after answer</code> 进入 Finalizer 门；
+              第三条由周期门独立唤醒 Curator。第二节回答“什么时候允许启动复盘”，第三节回答“后台分支看见什么、能写什么”，
+              第四节再回答“单轮经验积累成技能库以后，谁负责长期整理”。
+            </p>
+
+            <p>
+              可以从一个很普通的场景理解：你让 agent 修一个测试失败。它在过程中发现了项目的固定命令、你的提交偏好，
+              还试过几条最后没用上的路径。哪些应该留下？测试日志本身应该进 SessionDB；“以后这个项目先跑某个脚本”可能适合变成 skill；
+              “用户不希望自动改生成文件”可能适合进 Memory；那些走错的临时路径，则不该变成任何长期状态。
+            </p>
+
+            <p>
+              Hermes 的答案不是“每轮自动总结”，而是一条交付后的受控写账流程：当前 turn 先产出最终回答；
+              finalizer 只在满足条件时安排后台 review；review fork 只能使用 memory 和 skills 相关工具；
+              写入落到对应 store；之后的任务再通过正常的 memory 快照、skills 索引或检索路径看到这些变化。当前已经交付的回答不被改写，
+              主会话 transcript 也不会被后台 review 当场重写。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>步骤</th>
+                    <th>发生了什么</th>
+                    <th>为什么这样安排</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>1. 先交付</td>
+                    <td>前台回合完成工具调用和最终回答。</td>
+                    <td>用户要的是当前任务结果，不是等待模型自我总结。</td>
+                  </tr>
+                  <tr>
+                    <td>2. 再判断</td>
+                    <td>finalizer 看本轮是否有 final response、是否被 interrupt、Memory / Skill 的 nudge（到点提醒）是否触发。</td>
+                    <td>避免每轮都跑后台学习，也避免失败或中断回合留下错误经验。</td>
+                  </tr>
+                  <tr>
+                    <td>3. 开后台分支</td>
+                    <td>background review 拿本轮 messages snapshot，fork 一个受限 <code>AIAgent</code> 回看刚才发生的事。</td>
+                    <td>它能看到本轮用户消息、assistant 回复、工具调用和工具结果，但不抢前台任务的上下文。</td>
+                  </tr>
+                  <tr>
+                    <td>4. 限制能写哪里</td>
+                    <td>review fork 只能调用 memory 和 skill 管理工具，外部 memory provider 也被跳过。</td>
+                    <td>自进化只允许写长期账本，不能变成另一个能随意操作环境的 agent。</td>
+                  </tr>
+                  <tr>
+                    <td>5. 以后再生效</td>
+                    <td>写入成功后，后续 turn 通过正常的 Memory / Skills 读取路径使用它。</td>
+                    <td>学习结果影响未来任务，而不是反过来篡改已经交付的这一轮。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以读 Hermes 的自进化，不要先问“模型有没有反思能力”，而要问四个更具体的问题：谁触发这次学习？它能看什么？
+              它能写到哪里？写完什么时候才会影响下一轮？源码里的 background review 和 curator，正好分别回答“单轮之后学什么”
+              和“长期技能库怎么整理”。
+            </p>
+
+            <h2>二、Finalizer：只在回答完成后排 review</h2>
+            <p>
+              先把 finalizer 的最后几步展开。它已经拿到最终回答，先完成 post hook 和外部 memory 同步，然后才检查后台学习门槛。
+              删去异常处理后，关键顺序几乎可以直接从源码读出来：
+            </p>
+
+            <pre><code class="language-python">agent._sync_external_memory_for_turn(...)
+
+if final_response and not interrupted and (
+    _should_review_memory or _should_review_skills
+):
+    agent._spawn_background_review(
+        messages_snapshot=list(messages),
+        review_memory=_should_review_memory,
+        review_skills=_should_review_skills,
+    )</code></pre>
+
+            <p>
+              这个条件里没有“模型觉得自己应该反思”。它只有三个运行时事实：已经形成 final response、这一轮没有被 interrupt、至少一类到点提醒已经触发。
+              Memory 的计数按用户回合累加，Skill 的计数按工具调用迭代累加；达到各自间隔后，它们分别变成
+              <code>_should_review_memory</code> 或 <code>_should_review_skills</code>。完整触发点见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_finalizer.py#L707-L732"><code>turn_finalizer.py</code></a>，
+              两类计数分别见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_context.py#L540-L610"><code>turn_context.py</code></a>
+              和
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/conversation_loop.py#L1600-L1612"><code>conversation_loop.py</code></a>。
+            </p>
+
+            <p>
+              假设 Memory 的间隔是 3 个用户回合：前两轮只是把计数从 0 加到 2，第三轮才产生“该复盘一次”的标记。如果第三轮被中断，
+              finalizer 仍不会启动 review；如果正常交付，review 也可以判断“没有稳定经验”并什么都不写。反过来，如果前台 agent 已经主动用了
+              <code>memory</code> 或 <code>skill_manage</code>，对应计数会被重置；见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/tool_executor.py#L590-L603">工具完成后的计数重置</a>。
+              所以后台 review 不是固定税，而是“这段时间没有显式沉淀，且现在安全结束了，再检查一次”。finalizer 不让 review 参与“当前答案怎么写”，
+              只让它在答案完成后判断“这轮结果是否暴露了可复用信息”。而且它是 best-effort：启动失败不会推翻已交付结果，启动成功也允许最后什么都不写。
+            </p>
+
+            <h2>三、Review fork：同一套 runtime，窄工具面</h2>
+            <p>
+              finalizer 传给 review 的不是一句“请总结经验”，而是完成后的 messages 副本。继续用修测试的例子，snapshot 尾部大致会保留这样的真实顺序：
+            </p>
+
+            <pre><code class="language-text">user: 修复这个失败测试
+assistant -> terminal: 直接运行 pytest
+tool -> assistant: 失败，生成文件尚未更新
+assistant -> terminal: 先运行生成器，再运行 pytest
+tool -> assistant: 测试通过
+assistant: 已修复并验证通过</code></pre>
+
+            <p>
+              因为失败路径和成功路径都在，review 才能提炼“先运行生成器”这条流程，而不是把“直接运行 pytest”也误记成推荐步骤。
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/background_review.py#L1-L17"><code>background_review.py</code> 的模块说明</a>
+              也明确了边界：写入直接落到 memory 或 skill store，主会话和 prompt cache 不被改写。
+            </p>
+
+            <p>
+              但拥有完整 snapshot 不代表拥有完整权限。默认情况下，fork 复用父 agent 的 provider、model、credentials 和 cached system prompt；
+              如果用户给 background review 配置了另一套辅助模型，Hermes 会改用那套 runtime，并把完整历史压成 digest，因为跨模型本来就没有暖缓存可复用。
+              无论走哪条模型路径，fork 都会关闭外部 memory provider 与压缩，并在真正分派工具的位置安装白名单。删减后的形状如下：
+            </p>
+
+            <pre><code class="language-python">review_agent = AIAgent(..., skip_memory=True)
+review_agent._cached_system_prompt = agent._cached_system_prompt
+review_agent.compression_enabled = False
+
+review_whitelist = {
+    tool["function"]["name"]
+    for tool in get_tool_definitions(
+        enabled_toolsets=["memory", "skills"]
+    )
+}
+set_thread_tool_whitelist(review_whitelist)
+try:
+    review_agent.run_conversation(
+        user_message=prompt + "...Only memory/skill tools...",
+        conversation_history=messages_snapshot,
+    )
+finally:
+    clear_thread_tool_whitelist()</code></pre>
+
+            <p>
+              <code>skip_memory=True</code> 防止外部 provider 把 review harness 当成用户对话摄取；关闭压缩避免 fork 与父会话争抢同一个 session lineage；
+              白名单则让它只能读写 Memory 和 Skills，不能继续跑终端、改代码或派生子任务。完整构造见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/background_review.py#L654-L925"><code>_run_review_in_thread</code></a>。
+            </p>
+
+            <p>
+              最新实现还有一道容易忽略的<strong>持久化隔离</strong>。同模型 fork 为了复用 prompt cache，会暂时沿用父会话的 <code>session_id</code>；
+              如果它照常写 SessionDB，review harness 自己的“请复盘这段对话”就会混进真实会话，下一轮甚至可能把它当成用户指令。
+              因此源码把 <code>_persist_disabled</code> 设为 <code>true</code>、清空 <code>_session_db</code>，并阻止 fork 在关闭时结束父会话。
+              它只能通过白名单工具写 Memory 或 Skills，不能把自己的对话写回 transcript。这段边界同样位于
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/background_review.py#L812-L878">review fork 隔离配置</a>。
+            </p>
+
+            <p>
+              写入之后也不会反向改写当前回合。Memory 变化先落盘，下一次重新构造快照时才进入模型视野；skill 变化则影响后续 skills 索引。
+              Review 最后扫描自己的 tool result，只有真的创建或更新了 memory / skill，才向用户汇报一条很短的 self-improvement summary；见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/background_review.py#L939-L997">action summary</a>。
+              没有合格经验时，正确结果就是安静地什么也不写。
+            </p>
+
+            <h2>四、Curator：不是每轮反思，而是长期整理</h2>
+            <p>
+              Background review 解决的是“这一轮之后是否有东西值得保存”。但运行几个月后，问题会换一种形态：技能库里可能同时出现
+              “修改 schema 后先生成代码再测试”“生成文件变化后重跑测试”“测试前刷新 generated files”三条 Skill。它们都可能来自真实成功经验，
+              却未必应该永远作为三份独立说明存在；与此同时，还有一些 Skill 只是暂时少用，不能因为最近没有碰到对应任务就立刻删除。
+              Curator 处理的正是这类<strong>跨很多轮才显现</strong>的维护问题。
+            </p>
+
+            <h3>4.1 它什么时候醒来：不是每轮结束，而是入口定期检查</h3>
+            <p>
+              Curator 不挂在前面那条 finalizer → background review 链上。CLI 会在新会话启动时检查一次，长期运行的 Gateway 则在 housekeeping
+              循环里每小时询问一次；真正是否运行，再由 <code>maybe_run_curator</code> 和 <code>should_run_now</code> 共同决定。把这条触发链先展开，
+              后面的“两阶段”就不会误读成每个 turn 都执行两遍：
+            </p>
+
+            <pre><code class="language-text">CLI 新会话启动 / Gateway 每小时轮询
+  -> curator.enabled 是否开启？
+  -> 是否被 paused？
+  -> 距离 last_run_at 是否已过 interval_hours？
+  -> 调用方报告的空闲时间是否达到 min_idle_hours？
+  -> 是：启动一次 Curator run
+  -> 否：本次检查结束，不读取也不改写 Skill</code></pre>
+
+            <p>
+              默认间隔是 7 天，默认空闲门槛是 2 小时。首次看到一个从未运行过 Curator 的安装时，Hermes 只把
+              <code>last_run_at</code> 记为当前时间，再等待完整的一个间隔，并不会刚升级就立即整理技能库。手动执行
+              <code>hermes curator run</code> 才会绕过这条定期检查。触发入口见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/cli.py#L15150-L15165">CLI 启动钩子</a>、
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/gateway/run.py#L26595-L26622">Gateway 轮询</a>
+              和
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/curator.py#L233-L285"><code>should_run_now</code></a>。
+            </p>
+
+            <h3>4.2 第一阶段：按时间阈值维护生命周期，不调用模型</h3>
+            <p>
+              Hermes 不把使用统计写进 <code>SKILL.md</code>，而是放在 <code>~/.hermes/skills/.usage.json</code> 这个旁路记录里。
+              对每条 Skill，它分别记录“真正加载或引用了多少次”“用 <code>skill_view</code> 看过多少次”“被 patch 过多少次”，以及三种行为最近发生的时间。
+              <code>last_activity_at</code> 不是第四个独立计时器，而是 <code>last_used_at</code>、<code>last_viewed_at</code>、
+              <code>last_patched_at</code> 中最新的一个：
+            </p>
+
+            <pre><code class="language-json">{
+  "generated-code-testing": {
+    "use_count": 12,
+    "view_count": 4,
+    "patch_count": 2,
+    "last_used_at": "2026-04-10T09:00:00Z",
+    "last_viewed_at": "2026-04-12T08:00:00Z",
+    "last_patched_at": "2026-03-28T18:00:00Z",
+    "state": "active",
+    "pinned": false
+  }
+}</code></pre>
+
+            <p>
+              因此这条记录的最后活动时间是 4 月 12 日。计数更新和时间合并分别在
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/skill_usage.py#L852-L940"><code>bump_view</code>、<code>bump_use</code>、<code>bump_patch</code></a>
+              与
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/skill_usage.py#L146-L176">活动时间计算</a>。
+              Curator 的生命周期不是四个互斥状态，而是<strong>三个状态加一个保护开关</strong>：
+            </p>
+
+            <div class="table-wrap">
+              <table class="curator-state-table">
+                <thead>
+                  <tr>
+                    <th>状态或标记</th>
+                    <th>仍会被后续任务发现吗</th>
+                    <th>怎样进入</th>
+                    <th>怎样离开</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>active</code></td>
+                    <td>会</td>
+                    <td>新建、恢复，或 stale 后重新出现近期活动</td>
+                    <td>默认连续 30 天无活动后变成 stale</td>
+                  </tr>
+                  <tr>
+                    <td><code>stale</code></td>
+                    <td>会。目录仍在正常 Skill 路径中</td>
+                    <td>超过 <code>stale_after_days</code></td>
+                    <td>再次活动后在下一次 Curator run 回到 active；继续闲置则归档</td>
+                  </tr>
+                  <tr>
+                    <td><code>archived</code></td>
+                    <td>不会。目录被移到 <code>skills/.archive/</code></td>
+                    <td>默认连续 90 天无活动，或人工归档</td>
+                    <td><code>hermes curator restore &lt;name&gt;</code> 恢复为 active</td>
+                  </tr>
+                  <tr>
+                    <td><code>pinned</code></td>
+                    <td>会；pin 不改变 active / stale，它不是第四种状态</td>
+                    <td>用户显式 pin</td>
+                    <td>用户显式 unpin；开启时自动迁移直接跳过它</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              第一阶段逐条读取这份记录，用同一套可配置阈值做迁移。下面是贴近源码、删去异常处理后的判断顺序：
+            </p>
+
+            <pre><code class="language-python">anchor = newest(last_used_at, last_viewed_at, last_patched_at)
+anchor = anchor or created_at
+
+if skill.pinned or skill.referenced_by_cron:
+    continue
+if now - anchor >= archive_after:
+    archive(skill)                 # 移到 .archive，可恢复
+elif now - anchor >= stale_after and skill.state == "active":
+    skill.state = "stale"
+elif now - anchor &lt; stale_after and skill.state == "stale":
+    skill.state = "active"</code></pre>
+
+            <p>
+              继续用 <code>generated-code-testing</code>：第 10 天被使用，最后活动时间更新为第 10 天；第 41 天运行 Curator 时，
+              因为已经 31 天没有活动，它从 active 变成 stale，但仍可被发现；第 45 天任务再次查看或使用它，时间戳更新，
+              下一次 Curator run 会把它恢复为 active；如果从第 45 天起一直没有活动，第 76 天会再次 stale，第 136 天超过 90 天后才 archived。
+              源码中的完整迁移与“新 Skill 不立即归档”的宽限逻辑见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/curator.py#L305-L380"><code>apply_automatic_transitions</code></a>。
+            </p>
+
+            <p>
+              候选也不是“磁盘里所有 Skill”。Agent 在后台 review 中自主创建并标记的 Skill 会进入；配置
+              <code>prune_builtins: true</code> 时，bundled built-ins 也会进入时间维护，但第一次看到只建立基线，不会立刻归档。
+              Hub 安装、外部目录和受保护的内置 Skill 不进入候选；被 cron job 引用的 Skill 与 pinned Skill 一样跳过自动迁移。
+              候选范围见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/skill_usage.py#L1247-L1285">候选枚举</a>。
+            </p>
+
+            <h3>4.3 所以它不是 LRU，也不是 LFU</h3>
+            <p>
+              “最近使用”“使用次数”“归档”这些词很像缓存淘汰，但 Curator 没有“容量满了必须赶走一个条目”的前提，也不会把全部 Skill 排名后淘汰最后一名。
+              更准确地说，第一阶段是<strong>每条 Skill 独立计时的生命周期规则</strong>，接近带恢复通道的时间阈值管理：
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>问题</th>
+                    <th>LRU / LFU 缓存</th>
+                    <th>Hermes Curator 第一阶段</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>什么时候淘汰</td>
+                    <td>通常在容量或内存压力出现时</td>
+                    <td>定期检查到单条 Skill 超过时间阈值时</td>
+                  </tr>
+                  <tr>
+                    <td>主要决策信号</td>
+                    <td>LRU 看全局最近次序，LFU 看全局频率</td>
+                    <td>看该 Skill 最近一次 use / view / patch 的时间</td>
+                  </tr>
+                  <tr>
+                    <td>是否需要全局排名</td>
+                    <td>需要从候选中选牺牲者</td>
+                    <td>不需要；多条 Skill 可以同时不变、stale 或 archived</td>
+                  </tr>
+                  <tr>
+                    <td>移除是否不可逆</td>
+                    <td>缓存条目通常直接丢弃并可从源重建</td>
+                    <td>只移动到 <code>.archive</code>，可以 restore 或整体 rollback</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              <code>use_count</code>、<code>view_count</code> 和 <code>patch_count</code> 会出现在 status 与候选清单里，便于人和第二阶段理解活跃程度；
+              但自动 stale / archive 并不按频率排序。<code>use_count == 0</code> 只触发一个保护：刚创建、还没等到合适任务的 Skill，
+              至少先活过 stale 窗口，不能因为“零次使用”立即归档。这就是它与 LFU 最容易混淆、也最需要分开的地方。
+            </p>
+
+            <h3>4.4 第二阶段：可选的语义合并，不是默认必跑</h3>
+            <p>
+              时间戳能判断“多久没碰”，却不能判断三条测试 Skill 是否应该合成一条。因此 Curator 才保留第二阶段：把
+              <code>state</code>、<code>pinned</code>、cron 引用、use / view / patch 计数和最后活动时间渲染成候选清单，
+              再让一个受限的辅助 agent 阅读内容关系。但当前源码里 <code>consolidate</code> 默认是 <code>false</code>：
+              普通自动运行只做第一阶段；只有配置 <code>curator.consolidate: true</code>，或手动运行
+              <code>hermes curator run --consolidate</code>，才会付出模型调用成本。
+            </p>
+
+            <pre><code class="language-python">counts = apply_automatic_transitions(now=start)  # Phase 1 总会执行
+
+if not consolidate:
+    write_report("llm: skipped (consolidation off)")
+    return
+
+candidate_list = _render_candidate_list()
+if candidate_list:
+    llm_meta = _run_llm_review(candidate_list)   # Phase 2 可选</code></pre>
+
+            <p>
+              仍以三条测试 Skill 为例。辅助 agent 不是看到名字相似就删除，而是先读取完整 Skill package，判断它们是否属于同一类可复用流程。
+              如果确实重叠，它可以选择或创建一条 <code>generated-code-testing</code> umbrella Skill，把各自独有的步骤写进正文、
+              <code>references/</code>、<code>templates/</code> 或 <code>scripts/</code>，再把已吸收内容的旧目录归档；如果只是某条说明漂移，
+              就 patch 那条 Skill；如果内容已经无效且没有合并去向，才做可恢复的 prune。换句话说，第二阶段的结果是
+              <strong>keep、patch、consolidate 或 archive</strong>，不是让模型重新计算过期天数。
+            </p>
+
+            <pre><code class="language-text">合并前
+  test-after-codegen
+  refresh-generated-files
+  pytest-schema-change
+
+语义判断
+  三者共享“生成代码变化后的验证流程”
+  但各自保留不同工具、失败信号和命令
+
+合并后
+  generated-code-testing/
+    SKILL.md
+    references/schema-change.md
+    scripts/verify-generated-files.sh
+  三个旧目录 -> skills/.archive/（记录 absorbed_into，可恢复）</code></pre>
+
+            <p>
+              <code>pinned</code> 不是模型可随意授予的“优秀等级”，而是用户设置的保护栏；第二阶段必须跳过 pinned Skill。
+              bundled built-ins 在允许清理时最多被归档，不参与内容合并；Hub 与外部目录仍然完全越界。模型阶段的开关和执行顺序见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/curator.py#L1496-L1635"><code>run_curator_review</code></a>，
+              候选字段见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/curator.py#L1473-L1494"><code>_render_candidate_list</code></a>。
+            </p>
+
+            <h3>4.5 整理完成后，谁会看见什么</h3>
+            <p>
+              真正修改前，Curator 会 best-effort 地先尝试为 <code>~/.hermes/skills/</code> 做快照；运行后再把状态、迁移、合并去向、工具调用和恢复信息写入
+              <code>~/.hermes/logs/curator/&lt;timestamp&gt;/</code>。active 与 stale 的目录仍在正常 Skill 树里，所以后续重新扫描技能目录时都能看见；
+              archived 目录位于 <code>.archive</code>，会退出正常发现路径。合并产生的 umbrella Skill 也从后续技能发现开始可用，
+              但不会穿越时间去改写已经交付的当前回合。
+            </p>
+
+            <p>
+              不放心时可以先运行 <code>hermes curator run --dry-run</code>：它跳过自动状态写入，并要求模型只报告、不调用任何修改工具；
+              dry-run 也不会推进正式运行的 <code>last_run_at</code>。如果正式整理结果不对，既可以 restore 单条 archived Skill，
+              也可以用 pre-run snapshot 回滚整次维护。于是“两阶段”的边界就很清楚了：第一阶段只回答“这条 Skill 在生命周期的哪一段”，
+              第二阶段只回答“这些仍值得保留的知识应该怎样组织”。
+            </p>
+
+            <h2>五、结论：三只时钟共同改进，但不能混成一条链</h2>
+            <p>
+              到这里，自进化的流程就完整了：短期任务由前台 turn 解决；单轮之后的偏好和流程沉淀由 background review 解决；
+              多轮累积后的技能库膨胀、过期和合并问题由 curator 解决。三者都叫“改进”，但触发时机、输入快照、决策方式和可写范围都不同。
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>这里完成的是运行时学习，还不是离线优化。</strong>
+                Background review 回答“这一轮有什么值得留下”，curator 回答“长期技能库怎样整理”；它们都没有证明某次 Skill 改写在一组独立任务上表现更好。
+                要回答后一个问题，需要离线评测与优化；在进入那条更重的证据链以前，下一篇先补上用户主动学习的入口。
+                <a href="../learn-journey/">下一篇</a>会沿一条 <code>/learn</code> 请求，看 agent 怎样读取指定资料、创建 Skill，
+                以及 Learning Graph 为什么只是关系视图而不是另一套神秘学习引擎。
+              </p>
+            </div>
+
+            <h2 id="sources">参考源码</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/NousResearch/hermes-agent/tree/fa1a5c0485a6a912517ef2ded76e39907aa26087">NousResearch/hermes-agent 固定源码快照</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_context.py#L540-L610">Memory nudge 的回合计数</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/conversation_loop.py#L1600-L1612">Skill nudge 的迭代计数</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_finalizer.py#L707-L732">交付后的 review 门</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/background_review.py#L654-L925">background review fork 与权限隔离</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/curator.py#L233-L285">Curator 周期门</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/curator.py#L305-L380">第一阶段生命周期迁移</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/skill_usage.py#L1247-L1285">Curator 候选范围</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/curator.py#L1473-L1635">候选清单与可选语义合并</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+  <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>
