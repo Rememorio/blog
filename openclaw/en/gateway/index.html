@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reading OpenClaw, Part 2: Why the Gateway Is a Control Plane</title>
+    <meta name="description" content="Read OpenClaw Gateway ownership through its first WebSocket frame, hello-ok, method registry, roles and scopes, event broadcast, and slow-consumer policy." />
+    <meta name="theme-color" content="#f5f1e8" /><meta property="og:title" content="Reading OpenClaw, Part 2: Why the Gateway Is a Control Plane" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/gateway-control-plane.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/openclaw/en/gateway/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/openclaw/zh/gateway/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/openclaw/en/gateway/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/openclaw/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header"><a class="brand" href="../../../en/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">OpenClaw series</a><a href="../overview/">Previous</a><a href="#sources">Sources</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a href="../../zh/gateway/" lang="zh-CN">中文</a><a class="active" href="./" lang="en">English</a></span></nav></header>
+    <div class="article-shell"><aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
+      <section class="article-hero">
+        <p class="eyebrow">Reading OpenClaw · Part 2</p><h1>Why the Gateway is a control plane</h1>
+        <p class="lead">Part one followed a message, but left a larger “who” unanswered. The CLI, Web UI, desktop app, mobile nodes, and chat channels all operate one OpenClaw system. What makes their state consistent, and what prevents one surface from inheriting every other surface's authority? The answer is not WebSocket alone. It is the Gateway's ownership of protocol, identity, methods, events, and runtime state.</p>
+        <div class="meta-line"><span>Part 2 / 8</span><span>Source snapshot: c549250</span><span>Topic: Gateway control plane</span><span>Prerequisite: message path</span></div>
+        <nav class="series-strip"><a href="../overview/"><strong>01</strong> Message path</a><span class="series-current"><strong>02</strong> Gateway: protocol, identity, control</span><a href="../"><strong>Route map</strong> All eight parts</a></nav>
+        <figure class="hero-image"><img src="../../assets/gateway-control-plane.png" alt="OpenClaw control plane: operator and node clients enter one Gateway over WebSocket; the Gateway owns methods, events, schemas, ChannelPlugin connections, Agent Runtime coordination, and durable state" /></figure>
+      </section>
+      <section class="article-body">
+        <p>Picture an ordinary operating session. The macOS menu bar says the Gateway is online. You start an <code>agent</code> request from the CLI. A Web UI renders tool events for the same run. A phone node contributes camera capability while Telegram continues receiving messages. These look like separate products, but they act on one runtime.</p>
+        <p>If every client opened Telegram, wrote the session database, and launched agents directly, “multiple clients” would become “multiple competing owners.” Processes would fight over provider connections. A config edit would affect only one copy. A node could accidentally expose local commands to every caller. After reconnecting, the Web UI would have no authoritative way to distinguish current state from events it missed.</p>
+        <p>The OpenClaw Gateway removes that split ownership. It is a long-running process that owns messaging surfaces, method dispatch, connection identity, event fanout, and much of runtime coordination. Clients receive control constrained by protocol and scopes, not references to internal objects.</p>
+        <div class="note"><p><strong>Reading contract.</strong>By the end, you should be able to explain why a shared WebSocket server is not yet a control plane; why the first client frame must be <code>connect</code>; why <code>hello-ok</code> is both a welcome and a negotiated baseline; why operator, node, and worker are trust roles rather than UI names; how request, response, and event frames divide labor; and why an event gap is repaired by refreshing state instead of replaying an infinite event log.</p></div>
+        <p><strong>Evidence boundary.</strong>This chapter stays on commit <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a>. Wire shapes come from the <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/packages/gateway-protocol/src/schema/frames.ts">TypeBox frame schemas</a>; connection and broadcast behavior comes from Gateway source. The official <a href="https://docs.openclaw.ai/concepts/architecture">Gateway architecture</a> and <a href="https://docs.openclaw.ai/gateway/protocol">Gateway protocol</a> establish the public contract. Part six will go deeper on authentication, pairing, sandboxing, and elevated execution; this chapter focuses on how the control plane carries an authorization result.</p>
+
+        <h2>1. A control plane is more than a central server</h2>
+        <p>An HTTP or WebSocket server proves only that bytes arrive at one port. A control plane must answer four more questions: who may connect, what a connected identity may call, which authoritative state an operation changes, and how other observers learn about that change. Client copies stay projections only when all four answers have a common owner.</p>
+        <p>The official architecture states a strong invariant: one long-lived Gateway runs per host and is the only place that opens a WhatsApp/Baileys session. It maintains other messaging provider connections as well. Control clients and nodes enter the same WS server but declare different roles and capabilities. The Gateway's centrality therefore begins with <strong>resource ownership</strong>, not network topology.</p>
+        <div class="table-wrap"><table><thead><tr><th>Surface</th><th>Gateway ownership</th><th>Client ownership</th></tr></thead><tbody>
+          <tr><td>Messaging</td><td>Provider connection, inbound admission, outbound send, status.</td><td>Submit governed send/run requests and observe results.</td></tr>
+          <tr><td>Agent runs</td><td>Run registration, session ownership, event fanout, waiting, terminal state.</td><td>Start with an idempotency key and correlate by runId.</td></tr>
+          <tr><td>Configuration</td><td>Active config, reload/restart plan, persistence, audit.</td><td>Read or submit conflict-guarded writes according to scope.</td></tr>
+          <tr><td>Device nodes</td><td>Pairing, identity, connection state, command routing.</td><td>Declare caps/commands/permissions and execute approved work.</td></tr>
+        </tbody></table></div>
+
+        <h2>2. Operator and node share transport, not authority</h2>
+        <p>Operator clients include the CLI, Web UI, and macOS app. They call Gateway methods, read status, start agent runs, and handle approvals. Nodes are iOS, Android, macOS, or headless device execution surfaces. They advertise commands such as camera, screen recording, location, or canvas operations.</p>
+        <p>Both use WebSocket, but a node does not thereby gain arbitrary operator RPC access, and an operator cannot bypass device pairing to execute any node capability. Role enters the handshake. Scopes feed method and event authorization. Node caps, commands, and permissions describe a separate exposed surface. Transport reuse reduces protocol count; role separation preserves the trust boundary.</p>
+        <p>The source also supports a much narrower worker role. The protocol describes a closed allowlist over Gateway-owned loopback/SSH ingress: worker heartbeat, transcript commit, live event, and inference start/cancel, without general operator, node, or plugin dispatch. A mature control plane can share ingress infrastructure while giving different identities distinct protocol universes.</p>
+
+        <h2>3. The first frame must be connect</h2>
+        <figure class="hero-image"><img src="../../assets/gateway-handshake.png" alt="OpenClaw Gateway handshake: connect.challenge precedes req connect; protocol, auth, device, and scopes are checked; success returns hello-ok and failure returns error plus close; req, res, and event frames follow only after the handshake" /></figure>
+        <p>A successful WebSocket upgrade establishes a duplex transport, not a trusted OpenClaw client. The server sends <code>event: connect.challenge</code>; its nonce and timestamp enter the device signature. The client responds with a normal request whose method is <code>connect</code>, carrying its protocol range, client metadata, role, scopes, authentication, and device proof.</p>
+        <p>The pre-auth branch in the <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server/ws-connection/message-handler.ts#L283-L300">message handler</a> validates three things in order: a valid request envelope, <code>method === "connect"</code>, and valid connect params. A perfectly shaped <code>health</code> request still cannot arrive before identity negotiation.</p>
+        <pre><code class="language-typescript">if (!client) {
+  const isRequestFrame = validateRequestFrame(parsed);
+  if (!isRequestFrame || parsed.method !== "connect" || !validateConnectParams(parsed.params)) {
+    setHandshakeState("failed");
+    // structured error, then close
+  }
+}</code></pre>
+        <p>This order avoids a dangerous architecture in which unauthenticated traffic enters the general router and every handler must remember authentication. OpenClaw establishes “this socket has become a client” before method dispatch. Method scopes remain a second authorization layer, but they operate on a negotiated identity.</p>
+
+        <h2>4. hello-ok is a negotiated connection baseline</h2>
+        <p>After authentication and device authorization, <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server/ws-connection/connect-hello.ts#L75-L133"><code>sendGatewayHello</code></a> constructs <code>hello-ok</code>. It is substantially richer than “connected”:</p>
+        <ul>
+          <li><code>server</code> supplies version and connection-specific <code>connId</code>;</li>
+          <li><code>features</code> advertises exposed methods, events, and capabilities;</li>
+          <li><code>snapshot</code> provides presence, health, and state versions;</li>
+          <li><code>auth</code> reports final role/scopes and may issue device tokens;</li>
+          <li><code>policy</code> advertises frame, buffer, tick, attachment, and visibility constraints.</li>
+        </ul>
+        <p>Policy values are not eternal SDK constants. Attachment limits can follow current Gateway configuration, so a client should re-read them on each reconnect. Feature discovery is not a reflection dump of every process helper either; it is the intentionally published protocol surface. Discovery, authorization, versioning, and startup availability have to agree.</p>
+        <p>The snapshot is the client's starting point at handshake time, not an eternal truth. Live changes arrive as events. Reconnects and detected gaps require a fresh read from the authoritative owner.</p>
+
+        <h2>5. Method descriptors keep dispatch and policy together</h2>
+        <p>A fragile server maintains three drifting lists: the router knows handlers, the authorization layer knows scopes, and discovery knows public names. OpenClaw collects name, family, scope, version, startup availability, and control-plane-write policy in <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/methods/core-descriptors.ts#L11-L36"><code>CORE_GATEWAY_METHOD_SPECS</code></a>.</p>
+        <pre><code class="language-typescript">const CORE_GATEWAY_METHOD_SPECS = [
+  ["health", "health", "operator.read", "&lt;=2026.7"],
+  ["status", "health", "operator.read", "&lt;=2026.7"],
+  ["config.get", "config", "operator.read", "&lt;=2026.7"],
+  ["config.patch", "config", "operator.admin", "&lt;=2026.7", { controlPlaneWrite: true }],
+  // ...
+] as const;</code></pre>
+        <p>Registry construction verifies that every core handler has a descriptor, preventing an unclassified handler from bypassing shared scope and write controls. Plugin methods become scoped descriptors too. Legacy handler-only plugin registries default conservatively to admin instead of being silently exposed. Compatibility should preserve callability without weakening unknown authority.</p>
+
+        <h2>6. req, res, and event encode different relationships</h2>
+        <p>After the handshake, the wire has three top-level frame kinds. The <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/packages/gateway-protocol/src/schema/frames.ts#L166-L199">schemas</a> use <code>type</code> as a discriminator:</p>
+        <div class="table-wrap"><table><thead><tr><th>Frame</th><th>Correlation</th><th>Meaning</th></tr></thead><tbody>
+          <tr><td><code>req</code></td><td><code>id</code> and <code>method</code></td><td>The client asks the Gateway to read or perform an operation.</td></tr>
+          <tr><td><code>res</code></td><td>Reuses request <code>id</code></td><td>The RPC returns payload or a structured code/details error.</td></tr>
+          <tr><td><code>event</code></td><td><code>event</code> plus optional <code>seq</code>/<code>stateVersion</code></td><td>The server publishes a change or progress outside request/response waiting.</td></tr>
+        </tbody></table></div>
+        <p>An RPC response must not be confused with long-running task completion. An <code>agent</code> request can return accepted with a <code>runId</code>; assistant, tool, and lifecycle progress then arrive through <code>agent</code> events. A caller that needs terminal completion uses the run/wait protocol instead of pinning the WebSocket request handler to an entire agent turn.</p>
+        <p>This separation lets request timeout, connection loss, and run continuity remain distinct. A CLI exit or HTTP handler return should not automatically cancel root work the Gateway has already admitted.</p>
+
+        <h2>7. Broadcast authorization is per receiver</h2>
+        <p>The Gateway knowing an event does not mean every connection may observe it. <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server-broadcast.ts#L32-L88"><code>EVENT_SCOPE_GUARDS</code></a> classifies agent, chat, cron, approval, pairing, terminal, and other streams. Broadcast also filters role, session subscription, target connection ids, and agent/session visibility.</p>
+        <p>Passive delivery needs authorization just as much as active reads. A pairing-scoped client may participate in device pairing but must not hear chat transcripts. A node must not inherit operator session broadcasts. For session-scoped clients, the subscription registry is authoritative rather than a best-effort UI preference.</p>
+        <p>The broadcaster also keeps per-client sequence numbers. After authorization filtering, clients receive different event sets; one global number would make legitimate scope filtering resemble packet loss. A sequence belongs to a delivery relationship, not to an event's universal identity.</p>
+
+        <h2>8. Events are live notices, not a durable log</h2>
+        <figure class="hero-image"><img src="../../assets/gateway-live-events.png" alt="OpenClaw live events and durable state: when a client observes seq 41, 42, and 44 with 43 missing, it refreshes through the real status RPC and receives a new snapshot; stateVersion helps compare state while events are not replayed" /></figure>
+        <p>The architecture contract is explicit: events are not replayed; clients refresh on gaps. The figure uses the real read method <code>status</code> as one refresh example. A specific domain may instead call <code>health</code>, <code>config.get</code>, or a session query. The principle is more important than a universal state API: <strong>events say that something changed; read RPCs say what is true now.</strong></p>
+        <p><code>stateVersion</code> helps compare versioned presence or health state, but it is not a general event-store offset. Full audit or transcript recovery comes from its durable owner, not from a WS buffer. Separating live observation from durable truth makes disconnect behavior explicit.</p>
+
+        <h2>9. Slow consumers cannot hold the Gateway hostage</h2>
+        <p>A background tab that stops reading can turn unlimited WebSocket buffering into a process-wide memory problem. The <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server-broadcast.ts#L292-L327">broadcast loop</a> checks each socket's <code>bufferedAmount</code>. Low-value events marked <code>dropIfSlow</code> can be skipped; other excessive buffers cause a slow-consumer close.</p>
+        <p>A skipped normal broadcast still advances that client's sequence. The client detects a gap and refreshes instead of believing its state is continuous. Backpressure, sequence detection, and snapshot repair form one design. Implementing only the first silently converts resource protection into stale UI state.</p>
+
+        <h2>10. Shared HTTP process does not imply shared authority</h2>
+        <p>The Gateway HTTP server also hosts the Control UI, canvas/A2UI, webhooks, OpenAI-compatible endpoints, and plugin surfaces. Sharing a process and port lets them use the same owner and configuration; it does not grant every route the same authentication. Source resolves auth, origin, host, plugin descriptors, and content policy by surface.</p>
+        <p>The Gateway's scoped <code>AGENTS.md</code> adds a performance guardrail: a static plugin-owned descriptor should be resolved without materializing the full bundled plugin runtime. Control planes sit on connection, probe, and UI hot paths. Concentrated ownership should not become concentrated eager loading.</p>
+
+        <h2>11. Connection, RPC, and run failures are different boundaries</h2>
+        <ul>
+          <li><strong>Handshake failure:</strong> protocol, auth, device, or scope negotiation fails; the general dispatcher never runs.</li>
+          <li><strong>RPC validation/authorization failure:</strong> the connection can remain valid; the response carries structured failure details.</li>
+          <li><strong>Startup unavailable:</strong> unfinished sidecars can produce retryable <code>UNAVAILABLE</code> with <code>retryAfterMs</code>.</li>
+          <li><strong>Agent run failure:</strong> the initial RPC may already be accepted; lifecycle is observed through the run protocol.</li>
+          <li><strong>Slow consumer:</strong> one projection disconnects; durable Gateway state does not roll back.</li>
+          <li><strong>Gateway restart:</strong> live events disappear; clients reconnect, handshake, and refresh while durable run recovery belongs to part eight.</li>
+        </ul>
+        <p>Calling every one of these “Gateway offline” creates harmful recovery loops: credentials retry forever, accepted runs are duplicated after client timeout, and stale UI state survives reconnect. Recovery begins by identifying whether failure belongs to the connection, the RPC, the run, or the projection.</p>
+
+        <h2>12. Six control-plane rules to carry forward</h2>
+        <ol>
+          <li><strong>Centralize ownership, not merely ports.</strong>Provider connections, authoritative mutations, and run admission need a single owner.</li>
+          <li><strong>Connection identity precedes dispatch.</strong>Negotiate protocol, role, scopes, and device before method routing.</li>
+          <li><strong>Discovery and authorization share a source.</strong>Method names, scopes, startup policy, and write policy cannot drift.</li>
+          <li><strong>Separate RPC acceptance from asynchronous completion.</strong>Request ids correlate RPCs; run ids and events correlate work.</li>
+          <li><strong>Events are hints; durable owners are truth.</strong>Refresh on a gap instead of assuming the live stream is an event store.</li>
+          <li><strong>Make backpressure observable.</strong>Sequence gaps and close reasons let clients turn resource protection into recovery.</li>
+        </ol>
+        <p>Part three follows the route selected by this control plane: how bindings, peers, and threads produce a <code>sessionKey</code>; how queue modes decide whether a message joins the active run or becomes another turn; and why channel plugins cannot be allowed to rewrite session entries and transcripts arbitrarily.</p>
+
+        <h2 id="sources">Source and documentation index</h2>
+        <ul>
+          <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/packages/gateway-protocol/src/schema/frames.ts">frames.ts</a>: authoritative connect, hello-ok, req/res/event shapes.</li>
+          <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server/ws-connection/message-handler.ts">message-handler.ts</a>: pre-auth first frame and authenticated dispatch seam.</li>
+          <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server/ws-connection/connect-hello.ts">connect-hello.ts</a>: hello-ok snapshot, features, auth, and policy.</li>
+          <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/methods/core-descriptors.ts">core-descriptors.ts</a>: method scope, version, startup, and write policy.</li>
+          <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server-broadcast.ts">server-broadcast.ts</a>: event scopes, session filters, per-client sequence, and backpressure.</li>
+          <li><a href="https://docs.openclaw.ai/concepts/architecture">Gateway architecture</a> and <a href="https://docs.openclaw.ai/gateway/protocol">Gateway protocol</a>: public architecture and wire contract.</li>
+        </ul>
+      </section>
+    </article></main></div>
+    <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../article.js?v=1"></script>
+  </body>
+</html>
