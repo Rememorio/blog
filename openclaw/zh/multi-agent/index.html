@@ -1,0 +1,152 @@
+<!doctype html><html lang="zh-CN"><head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenClaw 源码阅读（七）：多 Agent 怎样委派、继承与交付</title>
+  <meta name="description" content="拆开 OpenClaw 的配置级 Agent、原生 subagent 与 ACP harness，读懂 sessions_spawn 的身份、上下文、workspace、工具权限、完成回流、线程绑定与取消边界。" />
+  <meta name="theme-color" content="#f5f1e8" /><meta property="og:title" content="OpenClaw 源码阅读（七）：多 Agent 怎样委派、继承与交付" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/multi-agent-topologies.png" />
+  <link rel="canonical" href="https://rememorio.github.io/blog/openclaw/zh/multi-agent/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/openclaw/zh/multi-agent/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/openclaw/en/multi-agent/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/openclaw/" />
+  <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+</head><body id="top">
+  <header class="site-header"><a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">OpenClaw 系列</a><a href="../security-boundaries/">上一篇</a><a href="#sources">参考源码</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./" lang="zh-CN">中文</a><a href="../../en/multi-agent/" lang="en">English</a></span></nav></header>
+  <div class="article-shell"><aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
+    <section class="article-hero">
+      <p class="eyebrow">OpenClaw 源码阅读 · 第七篇</p><h1>多 Agent 怎样委派、继承与交付</h1>
+      <p class="lead">“再开一个 Agent”在 OpenClaw 里至少有三种完全不同的含义：让 binding 把新消息交给另一套长期 persona，把一项工作交给原生 subagent child session，或者把任务送进 ACP 外部 harness。它们共享一部分 session 基础设施，却拥有不同的状态、权限与交付边界。真正需要读懂的不是如何多跑一个模型，而是谁生成 child identity、哪些上下文可以复制、权限怎样单调收窄，以及完成结果为何必须回到父会话再对外发送。</p>
+      <div class="meta-line"><span>系列 7 / 8</span><span>源码快照：c549250</span><span>主题：delegation · inheritance · delivery</span><span>前置：安全边界</span></div>
+      <nav class="series-strip"><a href="../overview/"><strong>01</strong> 主线</a><a href="../gateway/"><strong>02</strong> Gateway</a><a href="../routing-sessions/"><strong>03</strong> 路由</a><a href="../context-memory/"><strong>04</strong> 上下文</a><a href="../capability-assembly/"><strong>05</strong> 能力</a><a href="../security-boundaries/"><strong>06</strong> 安全</a><span class="series-current"><strong>07</strong> 多 Agent</span></nav>
+      <figure class="hero-image"><img src="../../assets/multi-agent-topologies.png" alt="OpenClaw 多 Agent 的三种拓扑：binding 按 agentId 选择拥有独立 workspace、agentDir 与 sessions 的配置级 Agent；sessions_spawn 创建带 runId 和 childSessionKey 的原生子会话；ACP 把会话交给 acpx 等外部 harness" /></figure>
+    </section>
+    <section class="article-body">
+      <p>先设一个具体场景。主 Agent 正在处理“阅读仓库、跑测试、给出修复建议”：源码检索可以并行，测试可能很慢，最终回复却必须保留当前对话的语气、权限和目标。如果把每个并行工作者都当成一个完整 Agent，就会复制过多长期状态；如果让子任务直接向 Discord 发消息，又会绕过父会话对输出的整合与目标选择；如果把 Claude Code 之类外部 runtime 当成原生 subagent，则会误判工具、登录与 filesystem 的所有权。</p>
+      <p>OpenClaw 的做法是先区分拓扑，再定义继承。配置级 Agent 是长期身份边界；native subagent 是父任务创建的一次受控 child run；ACP session 是 OpenClaw 管理路由和生命周期、但由外部 harness 执行的会话。三者都可能表现成“另一个模型在工作”，源码契约却不相同。</p>
+      <div class="note"><p><strong>阅读契约。</strong>读完后你应该能回答：binding 与 delegation 有什么区别；<code>sessions_spawn</code> 为什么立刻返回；<code>isolated</code> 和 <code>fork</code> 复制什么；<code>workspace</code> 与 <code>cwd</code> 为何不是一回事；子任务工具面怎样从父级继续收窄；<code>sessions_send</code> 为什么不等于向用户发消息；完成通知如何在 wake、handoff 与 durable queue 之间切换；以及何时该选 native subagent、何时该选 ACP。</p></div>
+      <p><strong>证据边界。</strong>本文固定在 <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a>。我们只把该快照源码与官方文档能够证明的行为写成事实；关于“应该把任务拆多细”“该用多贵的模型”会明确当作工程建议，而不是运行时保证。</p>
+
+      <h2>一、先把三种“另一个 Agent”分开</h2>
+      <div class="table-wrap"><table><thead><tr><th>拓扑</th><th>谁创建/选择</th><th>主要状态边界</th><th>适合的问题</th></tr></thead><tbody>
+        <tr><td>配置级 Agent</td><td>静态配置与 channel binding</td><td>独立 workspace、agentDir、auth/model registry、session store</td><td>长期 persona、不同账号或不同信任域</td></tr>
+        <tr><td>Native subagent</td><td>父会话调用 <code>sessions_spawn</code></td><td>新的 child session 与 run；OpenClaw 原生工具/策略</td><td>一次对话内可并行、可收敛的委派任务</td></tr>
+        <tr><td>ACP harness</td><td><code>sessions_spawn(runtime="acp")</code> 或 ACP control surface</td><td>OpenClaw 管路由/绑定/交付，外部 harness 管执行语义</td><td>Claude Code、Gemini CLI、OpenCode 等外部 agent runtime</td></tr>
+      </tbody></table></div>
+      <p>第一类不是“子任务”。binding 在消息入口按 channel、account、peer 或 guild 等条件选出 <code>agentId</code>，然后像前几篇讲的那样解析 sessionKey。第二类才是 delegation：一个已经运行的 Agent 创建 child session，把有限任务和运行契约交给它。第三类虽然也能由 <code>sessions_spawn</code> 发起，但 child 的真实执行器在 ACP backend 之后。</p>
+      <p>这个区分会决定后面所有判断。你不能拿 binding 的隔离承诺解释一次 spawn，也不能拿 native subagent 的 tool policy 推断 ACP harness 内部有哪些工具。</p>
+
+      <h2>二、配置级 Agent 是完整 persona boundary</h2>
+      <p>一个配置级 Agent 不只是一条不同的 system prompt。它有自己的 workspace，用来加载 <code>AGENTS.md</code>、<code>SOUL.md</code>、<code>USER.md</code> 与 memory；有自己的 <code>agentDir</code>，承载认证 profile、模型目录等状态；还有按 agent 划分的 session store。官方多 Agent 文档明确警告不要复用同一个 <code>agentDir</code>，因为这样会混合 credentials 与模型状态。</p>
+      <p>workspace 也不是安全沙箱。它首先是工作目录与 bootstrap 来源；是否进容器、能访问哪些 host path，要继续由上一篇的 sandbox 与 filesystem policy 决定。相反，一些 plugin-owned store 若实现时没有显式 agent scope，仍可能是 Gateway 全局状态，不能因为页面上显示两个 Agent 就自动推断所有插件数据已经分区。</p>
+      <p>因此需要长期人格、不同登录身份或不同收件箱时，用配置级 Agent；只是希望把一次搜索并行出去时，不要复制一整套 persona。</p>
+
+      <h2>三、Binding 只选择入口所有者，不产生委派关系</h2>
+      <p>binding 的职责是确定“这条外部消息一开始属于谁”。例如 Discord account A 进 <code>agentId=ops</code>，Telegram account B 进 <code>agentId=personal</code>。选中后，后续 sessionKey、bootstrap、auth 与 tool policy 都围绕该 Agent 计算。</p>
+      <p>binding 不创建 parent/child 边，不返回 runId，也没有完成结果回流。多条绑定命中优先级属于 routing 规则；subagent 的可见性、取消与 announce 则沿 spawn tree 判断。把两者混在一起，会导致一个常见误配：为了并行任务新建完整 Agent，却没有建立任何能把结果送回当前 requester 的生命周期关系。</p>
+
+      <h2>四、sessions_spawn 返回的是收据，不是答案</h2>
+      <figure class="hero-image"><img src="../../assets/multi-agent-inheritance.png" alt="OpenClaw sessions_spawn 继承契约：父会话得到 runId 与 childSessionKey；上下文默认 isolated、fork 需显式选择；workspace bootstrap 与 cwd 分离；父级有效工具经过 subagent policy 再收窄；sandbox 可 inherit 或 require" /></figure>
+      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/tools/sessions-spawn-tool.ts"><code>sessions-spawn-tool.ts</code></a> 接收任务描述、目标 agent/model、<code>cwd</code>、timeout、thread/mode、cleanup、sandbox 与 context 等字段。真正的执行在后台继续；成功响应是 <code>accepted</code>，核心字段是 <code>runId</code> 与 <code>childSessionKey</code>。</p>
+      <pre><code class="language-json">{
+  "status": "accepted",
+  "runId": "...",
+  "childSessionKey": "agent:main:subagent:...",
+  "mode": "run"
+}</code></pre>
+      <p>这不是“结果暂时为空”，而是异步协议。<code>runId</code> 标识这次执行，<code>childSessionKey</code> 标识可以被 history、status、steer 或 cancel 定位的会话身份。调用方不该在同一个 turn 里每两秒轮询；它应继续做自己的工作，或在已经没有可做之事时主动 yield，把下一次模型可见事件留给完成通知。</p>
+      <p>原生 child key 形如 <code>agent:&lt;agentId&gt;:subagent:&lt;uuid&gt;</code>，ACP 则使用 <code>agent:&lt;agentId&gt;:acp:&lt;uuid&gt;</code>。key 不是装饰性 label：scope、ownership、session visibility 与 delivery 都会使用它。</p>
+
+      <h2>五、Child 收到一份显式任务，而不是隐藏的第二份用户消息</h2>
+      <p>委派文本会作为 child transcript 中第一条可见的 <code>[Subagent Task]</code> 消息出现。运行时 system prompt 再提供 routing、工具与完成规则。这样做的重要性在于 provenance：child 能明确知道“这是父会话交来的任务”，而不是把它伪装成最终用户刚刚说的话。</p>
+      <p>同理，父会话后来收到的 child result 也不是新的用户指令。跨 session 传递的数据标记为 tool-routed/internal provenance；child 输出只能作为证据、草稿或状态报告进入父级推理，不能覆盖 system、owner policy 或用户当前目标。</p>
+      <p>这条边界对 prompt injection 很关键。子任务可能读了不可信网页或仓库文件，并原样带回“忽略之前指令”。父 Agent 应把它当材料，而不是因为来源叫 subagent 就提升信任等级。</p>
+
+      <h2>六、isolated 是默认，fork 是有成本的例外</h2>
+      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/subagent-spawn-context.ts"><code>subagent-spawn-context.ts</code></a> 把上下文模式拆成 <code>isolated</code> 与 <code>fork</code>。isolated 创建干净 child session，child 只看到自己的 bootstrap、显式 task 与本轮 runtime context；它不会自动继承父 transcript。对搜索、测试、阅读指定文件这类边界清楚的任务，这通常更便宜，也更不容易泄漏无关对话。</p>
+      <p><code>context="fork"</code> 会复制/分叉 requester transcript，让 child 从父会话已有历史继续推理。源码要求 requester 与 target 属于同一 Agent，并且父 transcript 可用；准备失败会返回错误，某些 context engine 明确决定跳过时才可能附带 fallback note 回到 isolated。thread-bound native spawn 的默认策略可由 channel thread-binding policy 选择，但这仍不是“所有 spawn 都隐式 fork”。</p>
+      <p>工程上应把 fork 当作高带宽依赖：只有 task 无法用短 contract 表达、必须理解大量先前决策时才使用。为了让 child 知道三个文件名就复制几万 token 历史，会同时增加成本、暴露面与歧义。</p>
+
+      <h2>七、workspace bootstrap 与 cwd 是两条轴</h2>
+      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/subagent-spawn-child-plan.ts"><code>subagent-spawn-child-plan.ts</code></a> 分别计算 <code>spawnedWorkspaceDir</code> 与 <code>spawnedCwd</code>。目标 Agent 的 workspace 决定 bootstrap 文件、Agent 身份与默认工作区；<code>cwd</code> 只改变此次工具运行的当前目录。把 child 指向 <code>/repo/service-a</code>，不会把 service-a 的任意说明文件自动升级成另一个 Agent 的 persona。</p>
+      <p>跨 Agent spawn 时，不会直接继承 requester 的显式 workspace；目标 Agent 按自己的配置解析 workspace。认证 profile 也来自目标 Agent 的 agentDir，而不是从父会话复制 token。正因为如此，<code>agentId</code> override 必须先通过 <code>allowAgents</code>，否则一次 delegation 就可能越过长期身份隔离。</p>
+      <p>sandbox 同样是运行事实，不是字段愿望。<code>sandbox="inherit"</code> 按配置解析 child 是否 sandboxed；<code>sandbox="require"</code> 则在 child 实际无法进入 sandbox 时拒绝 spawn。对于 sandboxed child，任意 cwd override 也不是都可接受：当前源码要求它与目标 workspace 对齐，避免路径语义越出隔离模型。</p>
+
+      <h2>八、子任务权限只能继续收窄</h2>
+      <p>父会话可见的工具先经过完整 policy pipeline，得到 effective surface。spawn 时，这份有效 allowlist 作为 inherited boundary 被记录；child 再叠加 subagent tool policy、sandbox policy 与目标 Agent policy。<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/agent-tools.policy.ts"><code>agent-tools.policy.ts</code></a> 会读取 session 中保存的 <code>inheritedToolAllow</code>/<code>inheritedToolDeny</code>，让后续 child turn 仍受同一上界约束。</p>
+      <p>因此父级没有 exec，child policy 写 allow exec 也不能创造 exec；父级允许 read/exec，subagent policy 可以只留 read。这个“单调收窄”与安全篇的原则一致：delegation 不应成为绕过 sender policy 或 sandbox 的新入口。</p>
+      <p>默认 leaf subagent 还会失去 message 与多数 session-control tools，避免它直接向外部 channel 发送、继续无限分裂或操纵别人的会话。当 <code>maxSpawnDepth</code> 允许两层以上时，中间 orchestrator 才可能得到 spawn/list/history 等受限能力；最深 leaf 仍是叶子。深度、每个 session 的 active children 与 group total 都有 admission limit。</p>
+
+      <h2>九、并行是资源预算，不是免费语法</h2>
+      <p>每个 isolated child 有独立 context window 与 token 消耗，也会占用 provider concurrency、Gateway task slot、sandbox/container 与宿主 CPU。把十个互相依赖的步骤同时 spawn，只会让它们重复读取、产生冲突结果，再把整合成本丢回父级。</p>
+      <p>适合并行的单位通常拥有独立输入与可验证输出：查三个模块、运行三组互不写同一目录的测试、分别审阅 API/状态/安全。需要共享写入顺序或下一步依赖上一步结果时，用父级串行调度更清楚。模型可以为机械检索选择较便宜的 child model，把复杂判断与最终写作留给父级，但这属于调度策略，不是 runtime 自动优化。</p>
+
+      <h2>十、Session visibility 限制谁能看见谁</h2>
+      <p>session tools 不是全局数据库浏览器。visibility 可以是 self、tree、agent 或 all；默认的 tree 让 requester 看见自己与由自己派生的 child tree，而不是同一 Gateway 上所有用户会话。sandboxed requester 的可见性还会被 clamp 到 tree，避免容器内 Agent 借 <code>sessions_list</code> 扫描别的 persona 或 peer。</p>
+      <p><code>sessions_history</code> 返回有界、经过处理的 transcript 视图，比直接读取 session file 更适合跨 session 回顾。取消也沿 ownership tree 收窄：调用方可以停止自己控制的后代，leaf 不能取消另一棵树。这里的“能猜到一个 session key”从不等于“拥有它”。</p>
+
+      <h2>十一、sessions_send 发送给会话，不发送给用户</h2>
+      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/tools/sessions-send-tool.ts"><code>sessions-send-tool.ts</code></a> 把消息送进目标 local model context，用于协作、追问或 steering。它不是 channel delivery API：向 <code>agent:ops:subagent:...</code> send 一条文字，不代表 Discord/Telegram 上出现一条用户可见消息。</p>
+      <p>对外发送属于 conversation/message tool，要携带经过解析的 channel、account、target 与 thread context。OpenClaw 故意分开这两条路径：session messaging 改变推理上下文，external messaging 产生真实副作用。原生 subagent 默认没有 message tool，正是为了让父会话继续拥有最终交付。</p>
+
+      <h2>十二、完成不是“子 Agent 自己发一句话”</h2>
+      <figure class="hero-image"><img src="../../assets/multi-agent-delivery.png" alt="OpenClaw 子任务完成回流：child session 产出 result，经幂等键进入 announce switchboard；优先 wake 或 steer 活跃 requester，必要时 handoff，再失败则进入 durable queue 与 retry；requester session 整合后才沿 deliveryContext 对外投递，sessions_yield 用于让出当前 turn" /></figure>
+      <p>child 结束后，registry 冻结可交付结果，并生成基于 childSessionKey 与 child runId 的稳定 idempotency key。交付目标是 requester/parent session，不是当前随便一个外部地址。若 requester turn 仍活跃，系统优先 wake/steer，把完成事件接到正在运行的上下文；若不能安全注入，则尝试由 requester Agent 接手一次 handoff；暂时不可达时进入 durable queue，等待重试。</p>
+      <p><code>sessions_yield</code> 是与 push completion 配套的控制语义。父 Agent 已经发起后台工作、当前没有别的事可做时，yield 结束本 turn；child completion 随后作为下一条模型可见事件唤醒它。这样既不消耗轮询 token，也不会把“还没完成”反复写进 transcript。</p>
+      <p>嵌套委派按 leaf → parent → parent 的 announce chain 收敛。叶子只向直接父级报告；中间 orchestrator 可以先整合多个叶子，再把一个结果交给顶层 requester。外部用户不需要承受内部 fan-out 的每条噪声。</p>
+
+      <h2>十三、幂等与持久队列保护的是“只交一次”</h2>
+      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/announce-idempotency.ts"><code>announce-idempotency.ts</code></a> 用 child identity 与 run identity 构造稳定键；registry 在内存状态之外保留 execution、completion 与 delivery 状态。网络抖动或 Gateway restart 后，恢复逻辑可以区分“任务完成但未交付”和“已经镜像到 requester transcript”，避免同一结果重复插入。</p>
+      <p>自动重试有边界，不是无限循环。当前实现会为 retryable delivery 维护回退和截止窗口；最终 blocked completion 仍保留为 canonical result，供后续显式 retry/dismiss，而不是静默丢失。这里值得抓住的不是某个具体分钟数，而是状态机把 execution terminal 与 delivery terminal 分开：工作做完，不等于结果已经被父会话看见。</p>
+
+      <h2>十四、父会话负责把结果变成回答</h2>
+      <p>announce 只提取 child 最新可见 assistant result；内部 tool result 不会自动提升为对用户的正文。父会话收到的应是一份有限报告，再结合原始用户意图、其他 child 输出与最新 conversation state 做综合。若用户在子任务执行期间改变目标，父级可以丢弃过期结果，而不是让 child 按旧 delivery target 强行发送。</p>
+      <p>因此高质量 task contract 应包含目标、输入边界、期望输出与禁止副作用。例如“只读比较这三个文件，返回五条有源码路径的差异，不要改文件”比“看看代码”更适合 isolated child。结果也应返回证据与不确定性，而不是把建议伪装成已实施事实。</p>
+
+      <h2>十五、Thread binding 决定后续消息是否回到同一个工作者</h2>
+      <p>一次 <code>mode="run"</code> 适合完成即结束的任务；持久 session 则需要 thread binding 才能让同一 Discord thread 等后续输入继续落到相同 child/harness。绑定是 channel surface 到 session 的路由关系，不等于把 runtime workspace 移进那个 channel。</p>
+      <p>thread-bound native spawn 可按 channel policy 默认选择 fork context；ACP persistent session 则要求 thread 支持和显式绑定。关闭或过期绑定后，新消息回到正常 routing；取消 active turn 只停止眼前一次执行，close session 才终止持久会话并清理绑定。三个动作不能用一个“stop”混称。</p>
+
+      <h2>十六、ACP 把执行语义交给外部 Harness</h2>
+      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/acp-spawn.ts"><code>acp-spawn.ts</code></a> 仍负责 target、requester ownership、session identity、thread/mode、后台 task 与完成投递；真正的模型登录、模型目录、filesystem 行为和 native tools 则由 acpx/对应 harness 管理。OpenClaw 不能假装自己的 built-in/plugin tools 已经自动注入 ACP runtime，除非配置了明确的 MCP bridge。</p>
+      <p>ACP 能力只有在 feature enabled、backend loaded/healthy 且 requester 未被 sandbox policy 阻断时才应出现在 tool surface。对 sandboxed requester，<code>runtime="acp"</code> 会被隐藏或拒绝，因为外部 harness 不是当前 sandbox 的自然延伸。</p>
+      <p>选择原则很简单：需要 OpenClaw 自己的 session/tool/policy 语义，选 native subagent；需要 Claude Code、Gemini CLI、OpenCode 这类现成 agent harness 的能力，选 ACP，并把它视为另一条 trust boundary。不要因为两者都返回 childSessionKey 就认为它们拥有同一工具集。</p>
+
+      <h2>十七、取消、清理与交付是三套状态</h2>
+      <p>cancel/kill 处理 execution：通知正在运行的 child 停止，并可按 session tree 级联。cleanup 决定 child session 完成后保留还是删除。delivery 状态则回答 completion 是否进入 requester。一个任务可能“执行已成功、session 已清理、交付仍待重试”；也可能“执行被取消、取消结果已经成功告知父级”。</p>
+      <p>排障时不要只看 child 进程是否还在。应同时检查 spawn receipt、registry run state、child transcript 的 terminal result、requester delivery state 与 thread binding。把这几层压成一个 boolean，最容易造成幽灵任务或重复回复。</p>
+
+      <h2>十八、沿一条委派链诊断</h2>
+      <pre><code class="language-text">binding / requester identity
+  → sessions_spawn admission
+  → target agent + childSessionKey
+  → context / workspace / cwd / sandbox
+  → inherited tool policy
+  → child execution terminal
+  → completion capture
+  → wake | handoff | durable queue
+  → parent synthesis
+  → external delivery</code></pre>
+      <p>spawn 直接 forbidden，先看 depth、concurrency、allowAgents、sandbox require 与 ACP availability；child 启动却读错规则，看 target Agent workspace 与 context mode；工具缺失，看父级 effective surface 与 subagent policy 的交集；child 已成功而父级没收到，看 idempotency/delivery state；父级收到了但用户没看到，才进入 conversation delivery target、thread 与 channel permission。</p>
+      <p>这个顺序比“再 spawn 一次”更安全。盲目重试可能创建第二个 child run；只有基于同一 idempotency/replay identity 的恢复路径，才能把它当成原任务续跑。</p>
+
+      <h2>十九、从多 Agent 带走九条规则</h2>
+      <ol>
+        <li><strong>先分拓扑。</strong>配置级 Agent、native subagent 与 ACP harness 不是三个同义词。</li>
+        <li><strong>Binding 负责入口，spawn 负责委派。</strong>只有后者建立 parent/child 生命周期。</li>
+        <li><strong>把 accepted 当收据。</strong>保存 runId 与 childSessionKey，等待 push completion。</li>
+        <li><strong>默认 isolated。</strong>只有无法用短 task contract 表达依赖时才 fork transcript。</li>
+        <li><strong>分开 workspace 与 cwd。</strong>前者提供身份/bootstrap，后者只定位本次运行。</li>
+        <li><strong>权限只向下收窄。</strong>child 不能借 delegation 获得父级没有的工具或 sandbox escape。</li>
+        <li><strong>内部消息不是外部投递。</strong><code>sessions_send</code> 改 session context，conversation/message 才触达用户。</li>
+        <li><strong>Child 报告，Parent 交付。</strong>父级保留目标选择、综合判断与最终话语权。</li>
+        <li><strong>分别观察执行与交付。</strong>任务完成和结果到达 requester 是两个 terminal condition。</li>
+      </ol>
+      <p>下一篇把视角从一棵 spawn tree 拉到时间轴：没有用户消息时，heartbeat、cron 与后台任务怎样唤醒 Agent；Gateway 重启后，哪些状态能从 durable store 恢复，哪些只是进程内视图；又该怎样避免“常驻”变成重复执行。</p>
+
+      <h2 id="sources">参考源码与文档</h2>
+      <ul>
+        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/tools/sessions-spawn-tool.ts">sessions-spawn-tool.ts</a>、<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/subagent-spawn-contract.ts">subagent-spawn-contract.ts</a>：spawn 参数与 accepted receipt。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/subagent-spawn-context.ts">subagent-spawn-context.ts</a>、<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/subagent-spawn-child-plan.ts">subagent-spawn-child-plan.ts</a>：context fork、workspace/cwd、sandbox 与 child identity。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/agent-tools.policy.ts">agent-tools.policy.ts</a>、<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/tools/sessions-history-tool.ts">sessions-history-tool.ts</a>、<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/tools/sessions-send-tool.ts">sessions-send-tool.ts</a>：继承 tool policy 与 scoped session access。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/subagent-registry-lifecycle-delivery.ts">subagent-registry-lifecycle-delivery.ts</a>、<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/announce-idempotency.ts">announce-idempotency.ts</a>：completion、幂等与交付状态。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/acp-spawn.ts">acp-spawn.ts</a>、<a href="https://docs.openclaw.ai/tools/subagents">Sub-agents</a>、<a href="https://docs.openclaw.ai/tools/acp-agents">ACP agents</a>、<a href="https://docs.openclaw.ai/concepts/multi-agent">Multi-agent routing</a>：三种拓扑与运行边界。</li>
+      </ul>
+    </section>
+  </article></main></div>
+  <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../article.js?v=1"></script>
+</body></html>
