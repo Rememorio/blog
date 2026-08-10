@@ -2,7 +2,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenClaw 源码阅读（四）：上下文、记忆与压缩怎样共同工作</title>
   <meta name="description" content="从 workspace bootstrap、system prompt、ContextEngine、transcript、memory、pruning 与 compaction，读懂 OpenClaw 每轮究竟给模型看什么。" />
-  <meta name="theme-color" content="#f5f1e8" /><meta property="og:title" content="OpenClaw 源码阅读（四）：上下文、记忆与压缩怎样共同工作" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/context-assembly.png" />
+  <meta name="theme-color" content="#f5f1e8" /><meta property="og:title" content="OpenClaw 源码阅读（四）：上下文、记忆与压缩怎样共同工作" /><meta property="og:type" content="article" /><meta property="og:image" content="../assets/context-assembly.png" />
   <link rel="canonical" href="https://rememorio.github.io/blog/openclaw/zh/context-memory/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/openclaw/zh/context-memory/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/openclaw/en/context-memory/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/openclaw/" />
   <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
 </head><body id="top">
@@ -13,7 +13,7 @@
       <p class="lead">Agent 明明有完整 transcript，为什么仍会“忘记”？因为持久记录不等于本轮模型视野。OpenClaw 每次运行都要从 system prompt、workspace 文件、会话历史、工具 schema、结果与附件中重新组装一个有上限的 runtime view；memory 又是另一套可检索的持久层。理解谁保存、谁注入、谁缩减，才算真正理解“记住”。</p>
       <div class="meta-line"><span>系列 4 / 8</span><span>源码快照：c549250</span><span>主题：context · memory · compaction</span><span>前置：路由与会话</span></div>
       <nav class="series-strip"><a href="../overview/"><strong>01</strong> 主线</a><a href="../gateway/"><strong>02</strong> Gateway</a><a href="../routing-sessions/"><strong>03</strong> 路由与会话</a><span class="series-current"><strong>04</strong> 上下文与记忆</span><a href="../capability-assembly/"><strong>05</strong> 能力装配</a></nav>
-      <figure class="hero-image"><img src="../../assets/context-assembly.png" alt="OpenClaw 每轮上下文组装：system prompt、Project Context、session transcript、tool schemas、结果与附件进入 Context Engine，再形成有界的 Model Context；完整 SKILL.md 按需加载" /></figure>
+      <figure class="hero-image"><img src="../assets/context-assembly.png" alt="OpenClaw 每轮上下文组装：system prompt、Project Context、session transcript、tool schemas、结果与附件进入 Context Engine，再形成有界的 Model Context；完整 SKILL.md 按需加载" /></figure>
     </section>
     <section class="article-body">
       <p>沿用上一篇的 Alice。她和 Agent 已经聊了两周，transcript 也一直存在。今天她问“照上周的决定继续”，Agent 却回答得像第一次听说。最直觉的判断是“历史丢了”，但也可能是历史还在、只是没有进入当前模型窗口；还可能是关键决定只留在长 transcript 里，没有写入长期 memory；或者 compaction 已经把旧对话概括成一份没有保留该细节的摘要。</p>
@@ -79,13 +79,13 @@ transcript != model context</code></pre>
       <p>这条合同值得迁移到所有“外部记忆 + Agent”系统：检索相关性只是读路径；幂等提交、可重复组装和当前 turn 的可见边界才决定状态能不能相信。</p>
 
       <h2>八、Transcript、Memory、Runtime View 有三个 owner</h2>
-      <figure class="hero-image"><img src="../../assets/context-state-owners.png" alt="OpenClaw 三种状态 owner：Transcript 是持久 session record，Memory 由 MEMORY.md 与每日 memory 文件组成并按需检索，Runtime View 是本轮临时 model context；Project Context 单独注入，context 不等于 memory" /></figure>
+      <figure class="hero-image"><img src="../assets/context-state-owners.png" alt="OpenClaw 三种状态 owner：Transcript 是持久 session record，Memory 由 MEMORY.md 与每日 memory 文件组成并按需检索，Runtime View 是本轮临时 model context；Project Context 单独注入，context 不等于 memory" /></figure>
       <p>Transcript 记录某个 sessionId 里真实发生的消息、tool call 与 result，是因果账本。Memory 保存经过筛选、希望跨较长时间复用的事实与决定。Runtime View 则是 assemble 在本轮形成的临时消息序列；请求结束后它本身无需成为新的真相。</p>
       <p><code>MEMORY.md</code> 用于 curated long-term memory，<code>memory/YYYY-MM-DD.md</code> 用于每日记录。main private session 可以把长期 memory 作为受信上下文或检索来源；群组与其他 session 不应无条件拿到同一份私人画像。memory retrieval 是一次有权限边界的选择性桥接，不是“把所有记忆文件 concat 进 prompt”。</p>
       <p>上一章提到的跨会话 recall 也遵循同样边界：它可以从其他获准 transcript 中检索片段，但不会合并 session key，不会改变原 transcript owner。否则“记得相关事实”就会意外变成“继承另一个会话的全部权限”。</p>
 
       <h2>九、Pruning 只缩当前视野，Compaction 会留下持久摘要</h2>
-      <figure class="hero-image"><img src="../../assets/context-compaction-pruning.png" alt="OpenClaw pruning 与 compaction：pruning 只从本轮模型上下文移除较旧 tool results，不改完整 transcript；compaction 把旧消息压成持久 summary，并保留 recent messages" /></figure>
+      <figure class="hero-image"><img src="../assets/context-compaction-pruning.png" alt="OpenClaw pruning 与 compaction：pruning 只从本轮模型上下文移除较旧 tool results，不改完整 transcript；compaction 把旧消息压成持久 summary，并保留 recent messages" /></figure>
       <p>两者都让模型输入变小，但持久语义完全不同。Pruning 在组装时丢弃旧 tool result 的大块内容，只影响 in-memory prompt；磁盘 transcript 仍保留完整结果，之后可以审计或在不同策略下重新组装。它适合处理可复现、已失去即时价值的工具输出。</p>
       <p>Compaction 则把旧 conversation 总结成一条 summary，并把这份摘要写入 transcript，最近消息保持原样。下一轮读取到的历史已经以 summary 代表被折叠区间。摘要因此是一种有损但持久的状态迁移，不只是缓存。</p>
       <div class="table-wrap"><table><thead><tr><th>机制</th><th>本轮 context</th><th>持久 transcript</th><th>适合解决</th></tr></thead><tbody>

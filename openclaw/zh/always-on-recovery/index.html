@@ -2,7 +2,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenClaw 源码阅读（八）：Heartbeat、Automation 与重启恢复怎样让 Agent 常驻</title>
   <meta name="description" content="沿 OpenClaw 的 heartbeat、automations、background tasks 与 restart recovery，读懂周期唤醒、精确定时、持久任务账本、幂等投递、重启续跑与有界失败。" />
-  <meta name="theme-color" content="#f5f1e8" /><meta property="og:title" content="OpenClaw 源码阅读（八）：Heartbeat、Automation 与重启恢复怎样让 Agent 常驻" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/always-on-time-sources.png" />
+  <meta name="theme-color" content="#f5f1e8" /><meta property="og:title" content="OpenClaw 源码阅读（八）：Heartbeat、Automation 与重启恢复怎样让 Agent 常驻" /><meta property="og:type" content="article" /><meta property="og:image" content="../assets/always-on-time-sources.png" />
   <link rel="canonical" href="https://rememorio.github.io/blog/openclaw/zh/always-on-recovery/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/openclaw/zh/always-on-recovery/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/openclaw/en/always-on-recovery/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/openclaw/" />
   <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
 </head><body id="top">
@@ -13,7 +13,7 @@
       <p class="lead">“常驻”不是让一个模型调用永远不结束，也不是每隔几分钟把旧对话再问一遍。OpenClaw 把时间触发、执行记录、完成投递与重启恢复拆成不同 owner：heartbeat 做近似周期的主会话巡检，automations 保存精确 schedule，background task ledger 记录脱离主对话的活动，restart recovery 再从持久 claim、transcript 与 delivery receipt 判断该续跑、告知重发，还是停止重试。系统之所以能长期运行，靠的是可恢复状态和有界重放，而不是一个永不退出的进程。</p>
       <div class="meta-line"><span>系列 8 / 8</span><span>源码快照：c549250</span><span>主题：heartbeat · automation · durability · recovery</span><span>前置：多 Agent</span></div>
       <nav class="series-strip"><a href="../overview/"><strong>01</strong> 主线</a><a href="../gateway/"><strong>02</strong> Gateway</a><a href="../routing-sessions/"><strong>03</strong> 路由</a><a href="../context-memory/"><strong>04</strong> 上下文</a><a href="../capability-assembly/"><strong>05</strong> 能力</a><a href="../security-boundaries/"><strong>06</strong> 安全</a><a href="../multi-agent/"><strong>07</strong> 多 Agent</a><span class="series-current"><strong>08</strong> 常驻恢复</span></nav>
-      <figure class="hero-image"><img src="../../assets/always-on-time-sources.png" alt="OpenClaw 常驻运行的三个 owner：heartbeat 在 main session 做周期巡检；Automations 用 at、every、cron 的持久 schedule 触发 run；Tasks 用 task_runs 记录 queued、running、terminal，完成后可 wake 主会话；schedule、run、record、wake 分层" /></figure>
+      <figure class="hero-image"><img src="../assets/always-on-time-sources.png" alt="OpenClaw 常驻运行的三个 owner：heartbeat 在 main session 做周期巡检；Automations 用 at、every、cron 的持久 schedule 触发 run；Tasks 用 task_runs 记录 queued、running、terminal，完成后可 wake 主会话；schedule、run、record、wake 分层" /></figure>
     </section>
     <section class="article-body">
       <p>想象一个值班 Agent：每半小时看一次有没有值得提醒的事；工作日上午七点生成日报；收到构建事件时启动隔离分析；长任务完成后马上通知；Gateway 升级重启时继续未完成对话。把这些需求都塞进一个“while true + sleep”，会立刻碰到四个问题：错过的 tick 是否补跑，运行记录放哪里，外部消息是否重复发送，进程中断后谁判断上一次做到哪一步。</p>
@@ -102,7 +102,7 @@ terminalOutcome: succeeded | blocked</code></pre>
       <p>execution 与 delivery 继续分开：child succeeded 而 result queue 超时，task 可以保持 execution succeeded，同时 terminalOutcome 是 blocked。canonical result 会保留供 retry/dismiss；不能为了让 dashboard “红起来”就篡改真实执行结果。</p>
 
       <h2>十三、重启时真正幸存的是哪些状态</h2>
-      <figure class="hero-image"><img src="../../assets/always-on-restart-recovery.png" alt="OpenClaw mainRestartRecovery：运行中的 session 把 transcript、delivery claim 与 dispatch id 保存在 SQLite；Gateway restart 后 startup scan 读取持久状态，安全时 resume，尾部不安全时给 resend notice，重试耗尽则 tombstone；最终 delivery receipt 防止重复外发" /></figure>
+      <figure class="hero-image"><img src="../assets/always-on-restart-recovery.png" alt="OpenClaw mainRestartRecovery：运行中的 session 把 transcript、delivery claim 与 dispatch id 保存在 SQLite；Gateway restart 后 startup scan 读取持久状态，安全时 resume，尾部不安全时给 resend notice，重试耗尽则 tombstone；最终 delivery receipt 防止重复外发" /></figure>
       <p>conversation transcript 与 session row 存在 per-agent SQLite；subagent/task/flow registry、cron jobs 与 delivery queue 存在共享 state database；agent-requested restart 另有 restart sentinel。JavaScript promise、socket、provider stream 与 in-process owner 会消失。recovery 的工作不是让后者魔法复活，而是拿 durable row 与新进程的 live owner 对账。</p>
       <p>优雅 restart 会先停止接新工作，然后给 active turn/background task 一个 drain budget，默认最长五分钟。大多数更新因此不需要 resume。超过预算或 crash 导致中断时，session 才进入 recovery path；drain 窗口中新工作明确拒绝，不会悄悄塞进即将退出的进程。</p>
 
@@ -126,7 +126,7 @@ terminalOutcome: succeeded | blocked</code></pre>
       <p>cron job definition 与 run history 会恢复，scheduler re-arm；但 missed occurrence 的处理服从各 schedule/run 类型，而不是统一 replay。持久化提供可判断的事实，不自动提供业务 exactly-once。需要外部副作用 exactly-once 时，job 自己还要使用业务键、watermark 或目标系统的幂等 API。</p>
 
       <h2>十八、有界失败让“常驻”不会变成“永远重试”</h2>
-      <figure class="hero-image"><img src="../../assets/always-on-safety-valves.png" alt="OpenClaw 常驻安全阀：主会话 recovery 三次 attempt 后 tombstone；失去 runtime backing 的 task 经过 grace 标为 lost；recurring automation 连续十次执行失败后 autoDisabled；五分钟内三次 unclean boot 进入 safe mode；task_runs、deliveryStatus、cleanupAfter 保留可审计结果" /></figure>
+      <figure class="hero-image"><img src="../assets/always-on-safety-valves.png" alt="OpenClaw 常驻安全阀：主会话 recovery 三次 attempt 后 tombstone；失去 runtime backing 的 task 经过 grace 标为 lost；recurring automation 连续十次执行失败后 autoDisabled；五分钟内三次 unclean boot 进入 safe mode；task_runs、deliveryStatus、cleanupAfter 保留可审计结果" /></figure>
       <p>主会话 recovery 有三次 durable budget；普通 task 失去 authoritative backing 经 grace 后变 lost；recurring automation 连续十次 execution failure 会 autoDisabled，schedule computation 连续三次错误也会停用；五分钟内三次 unclean boot 会触发 crash-loop breaker，控制平面仍启动，但 channel 等 side services 暂缓 auto-start。</p>
       <p>这些状态不是“系统认输”，而是把自动化停在可审计边界。tombstone 防同一 session 重复 side effect，lost 暴露 orphan，autoDisabled 防定时错误持续烧资源，safe mode 让 operator 还能进入控制平面修配置。修好根因后由 operator 显式 enable、reset、retry 或启动 channel，权限与意图都更清楚。</p>
 

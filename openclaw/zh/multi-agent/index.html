@@ -2,7 +2,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenClaw 源码阅读（七）：多 Agent 怎样委派、继承与交付</title>
   <meta name="description" content="拆开 OpenClaw 的配置级 Agent、原生 subagent 与 ACP harness，读懂 sessions_spawn 的身份、上下文、workspace、工具权限、完成回流、线程绑定与取消边界。" />
-  <meta name="theme-color" content="#f5f1e8" /><meta property="og:title" content="OpenClaw 源码阅读（七）：多 Agent 怎样委派、继承与交付" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/multi-agent-topologies.png" />
+  <meta name="theme-color" content="#f5f1e8" /><meta property="og:title" content="OpenClaw 源码阅读（七）：多 Agent 怎样委派、继承与交付" /><meta property="og:type" content="article" /><meta property="og:image" content="../assets/multi-agent-topologies.png" />
   <link rel="canonical" href="https://rememorio.github.io/blog/openclaw/zh/multi-agent/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/openclaw/zh/multi-agent/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/openclaw/en/multi-agent/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/openclaw/" />
   <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
 </head><body id="top">
@@ -13,7 +13,7 @@
       <p class="lead">“再开一个 Agent”在 OpenClaw 里至少有三种完全不同的含义：让 binding 把新消息交给另一套长期 persona，把一项工作交给原生 subagent child session，或者把任务送进 ACP 外部 harness。它们共享一部分 session 基础设施，却拥有不同的状态、权限与交付边界。真正需要读懂的不是如何多跑一个模型，而是谁生成 child identity、哪些上下文可以复制、权限怎样单调收窄，以及完成结果为何必须回到父会话再对外发送。</p>
       <div class="meta-line"><span>系列 7 / 8</span><span>源码快照：c549250</span><span>主题：delegation · inheritance · delivery</span><span>前置：安全边界</span></div>
       <nav class="series-strip"><a href="../overview/"><strong>01</strong> 主线</a><a href="../gateway/"><strong>02</strong> Gateway</a><a href="../routing-sessions/"><strong>03</strong> 路由</a><a href="../context-memory/"><strong>04</strong> 上下文</a><a href="../capability-assembly/"><strong>05</strong> 能力</a><a href="../security-boundaries/"><strong>06</strong> 安全</a><span class="series-current"><strong>07</strong> 多 Agent</span><a href="../always-on-recovery/"><strong>08</strong> 常驻恢复</a></nav>
-      <figure class="hero-image"><img src="../../assets/multi-agent-topologies.png" alt="OpenClaw 多 Agent 的三种拓扑：binding 按 agentId 选择拥有独立 workspace、agentDir 与 sessions 的配置级 Agent；sessions_spawn 创建带 runId 和 childSessionKey 的原生子会话；ACP 把会话交给 acpx 等外部 harness" /></figure>
+      <figure class="hero-image"><img src="../assets/multi-agent-topologies.png" alt="OpenClaw 多 Agent 的三种拓扑：binding 按 agentId 选择拥有独立 workspace、agentDir 与 sessions 的配置级 Agent；sessions_spawn 创建带 runId 和 childSessionKey 的原生子会话；ACP 把会话交给 acpx 等外部 harness" /></figure>
     </section>
     <section class="article-body">
       <p>先设一个具体场景。主 Agent 正在处理“阅读仓库、跑测试、给出修复建议”：源码检索可以并行，测试可能很慢，最终回复却必须保留当前对话的语气、权限和目标。如果把每个并行工作者都当成一个完整 Agent，就会复制过多长期状态；如果让子任务直接向 Discord 发消息，又会绕过父会话对输出的整合与目标选择；如果把 Claude Code 之类外部 runtime 当成原生 subagent，则会误判工具、登录与 filesystem 的所有权。</p>
@@ -40,7 +40,7 @@
       <p>binding 不创建 parent/child 边，不返回 runId，也没有完成结果回流。多条绑定命中优先级属于 routing 规则；subagent 的可见性、取消与 announce 则沿 spawn tree 判断。把两者混在一起，会导致一个常见误配：为了并行任务新建完整 Agent，却没有建立任何能把结果送回当前 requester 的生命周期关系。</p>
 
       <h2>四、sessions_spawn 返回的是收据，不是答案</h2>
-      <figure class="hero-image"><img src="../../assets/multi-agent-inheritance.png" alt="OpenClaw sessions_spawn 继承契约：父会话得到 runId 与 childSessionKey；上下文默认 isolated、fork 需显式选择；workspace bootstrap 与 cwd 分离；父级有效工具经过 subagent policy 再收窄；sandbox 可 inherit 或 require" /></figure>
+      <figure class="hero-image"><img src="../assets/multi-agent-inheritance.png" alt="OpenClaw sessions_spawn 继承契约：父会话得到 runId 与 childSessionKey；上下文默认 isolated、fork 需显式选择；workspace bootstrap 与 cwd 分离；父级有效工具经过 subagent policy 再收窄；sandbox 可 inherit 或 require" /></figure>
       <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/tools/sessions-spawn-tool.ts"><code>sessions-spawn-tool.ts</code></a> 接收任务描述、目标 agent/model、<code>cwd</code>、timeout、thread/mode、cleanup、sandbox 与 context 等字段。真正的执行在后台继续；成功响应是 <code>accepted</code>，核心字段是 <code>runId</code> 与 <code>childSessionKey</code>。</p>
       <pre><code class="language-json">{
   "status": "accepted",
@@ -84,7 +84,7 @@
       <p>对外发送属于 conversation/message tool，要携带经过解析的 channel、account、target 与 thread context。OpenClaw 故意分开这两条路径：session messaging 改变推理上下文，external messaging 产生真实副作用。原生 subagent 默认没有 message tool，正是为了让父会话继续拥有最终交付。</p>
 
       <h2>十二、完成不是“子 Agent 自己发一句话”</h2>
-      <figure class="hero-image"><img src="../../assets/multi-agent-delivery.png" alt="OpenClaw 子任务完成回流：child session 产出 result，经幂等键进入 announce switchboard；优先 wake 或 steer 活跃 requester，必要时 handoff，再失败则进入 durable queue 与 retry；requester session 整合后才沿 deliveryContext 对外投递，sessions_yield 用于让出当前 turn" /></figure>
+      <figure class="hero-image"><img src="../assets/multi-agent-delivery.png" alt="OpenClaw 子任务完成回流：child session 产出 result，经幂等键进入 announce switchboard；优先 wake 或 steer 活跃 requester，必要时 handoff，再失败则进入 durable queue 与 retry；requester session 整合后才沿 deliveryContext 对外投递，sessions_yield 用于让出当前 turn" /></figure>
       <p>child 结束后，registry 冻结可交付结果，并生成基于 childSessionKey 与 child runId 的稳定 idempotency key。交付目标是 requester/parent session，不是当前随便一个外部地址。若 requester turn 仍活跃，系统优先 wake/steer，把完成事件接到正在运行的上下文；若不能安全注入，则尝试由 requester Agent 接手一次 handoff；暂时不可达时进入 durable queue，等待重试。</p>
       <p><code>sessions_yield</code> 是与 push completion 配套的控制语义。父 Agent 已经发起后台工作、当前没有别的事可做时，yield 结束本 turn；child completion 随后作为下一条模型可见事件唤醒它。这样既不消耗轮询 token，也不会把“还没完成”反复写进 transcript。</p>
       <p>嵌套委派按 leaf → parent → parent 的 announce chain 收敛。叶子只向直接父级报告；中间 orchestrator 可以先整合多个叶子，再把一个结果交给顶层 requester。外部用户不需要承受内部 fan-out 的每条噪声。</p>
