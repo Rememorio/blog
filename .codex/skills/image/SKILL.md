@@ -29,6 +29,14 @@ Default accepted mechanism-scene references in this repository:
 - `claude-code/zh/assets/mcp-tool-pool.png`
 - `claude-code/zh/assets/commands-skills-mcp-cover.png`
 
+These references are not interchangeable color samples. Use
+`commands-skills-mcp-cover.png` as the default paper-temperature, negative-space,
+and palette-restraint authority. Use `agent-fork-cover.png` and
+`agent-selection-gates.png` for mechanism flow, `worker-tool-scope.png` for
+guide-and-prop integration, and `mcp-tool-pool.png` only for unusually dense
+source maps. A denser or more amber reference must not pull a new batch toward
+yellow parchment.
+
 Unless the user names another accepted visual family, the named Claude Code
 figures are the default composition and style authority. Do not blend several
 series' visual grammars in one prompt. Other repository figures may help verify
@@ -154,8 +162,39 @@ Palette:
 - Slate gray: `#52606d` / `#64748b`.
 - Warm amber: `#b7791f`.
 - Soft paper: `#fffaf0` / `#fffffb`.
+- For a multi-figure refresh, select one paper target before the first
+  generation and keep it for the whole batch. Default to `#fffaf0`, perceived
+  as clean warm white rather than cream or yellow. Do not independently sample
+  or reinterpret the background color for each figure.
 - Use bright red only for explicit danger or deletion semantics. A restrained
   red-brown may appear in title or invariant ribbons.
+
+Batch consistency lock:
+
+- A batch is a set of sibling figures that will be viewed as one article or
+  series. Write one shared style-lock paragraph before writing the individual
+  figure briefs, and repeat it verbatim in every generation or edit prompt.
+- The lock must name one paper/color authority, one line/composition authority,
+  the exact paper target, ink color, accent palette, grain strength, edge
+  treatment, shadow strength, and character rendering scale. Individual figure
+  prompts may vary only the teaching role, mechanism, labels, composition, and
+  local prop.
+- Default batch lock for this repository: clean warm-white paper near
+  `#fffaf0`; no overall amber/yellow wash; deep navy `#102a43` ink; restrained
+  teal `#0f766e`, blue `#2d5f8b`, forest `#1f7a4d`, slate `#52606d`, and small
+  amber `#b7791f` accents; red-brown only for title/invariant emphasis; subtle
+  fine paper grain; light edge roughness; crisp medium-fine outlines; minimal
+  soft shadows; generous unpainted breathing room.
+- Do not ask imagegen to average several references. Assign each reference one
+  explicit role and state that the paper/color authority wins any conflict.
+- After the first accepted figure, use it as the sibling batch reference for
+  later figures while retaining the designated Claude Code authority. If a
+  later figure drifts warmer, darker, more saturated, more textured, or more
+  shadowed, repair it before continuing the batch; do not let drift accumulate.
+- For a bilingual batch, accept the source-language figure first, then derive
+  its localized sibling from that accepted raster. The localized sibling must
+  inherit the same batch lock and must not become a second independent style
+  sample.
 
 Line and shape:
 
