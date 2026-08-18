@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SkillOpt-Lite：当 Coding Agent 成为自己的优化器 | Rememorio Blog</title>
+    <meta name="description" content="源码阅读 SkillOpt-Lite：轨迹怎样变成文件，Coding Agent 怎样提取跨样本共性、修改 skill.md，并由 validation gate 决定保留、回滚与最终测试；同时审计 HarnessOpt 与当前 HEAD 的实现边界。" />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="SkillOpt-Lite：当 Coding Agent 成为自己的优化器" />
+    <meta property="og:description" content="从轨迹文件、共性提取和验证门控，读到 HarnessOpt 的可写边界与源码断点。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/skillopt-lite-loop.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/skillopt-lite/zh/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/skillopt-lite/zh/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/skillopt-lite/en/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/skillopt-lite/" />
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+    <link rel="stylesheet" href="../../hermes-agent/styles.css?v=site-nav-series" />
+    <link rel="stylesheet" href="../styles.css?v=1" />
+    <link rel="stylesheet" href="../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../zh/" aria-label="博客首页"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="文章"><a href="./" aria-current="page">SkillOpt-Lite</a></nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite">源码</a>
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换"><a class="active" href="./" aria-current="page">中文</a><a href="../en/" lang="en">English</a></span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">独立源码阅读 · Agent 自进化</p>
+            <h1 class="long-title">SkillOpt-Lite：当 Coding Agent 成为自己的优化器</h1>
+            <p class="lead">这里的“自进化”不更新模型权重。它把失败轨迹、一个可写的 <code>skill.md</code>、Coding Agent 和 validation gate 组装成文本空间优化器：Agent 先观察自己的运行结果，再改写自己的操作说明，只有可比较的验证结果才有权让改动留下。</p>
+            <div class="meta-line"><span>对象：SkillOpt-Lite / HarnessOpt</span><span>方法：固定快照源码审计</span><span>结论：机制成立，公开执行路径仍有断点</span></div>
+            <figure class="hero-image"><img src="../assets/skillopt-lite-loop.png" alt="冻结的模型与 harness 使用 skill.md 执行 train，轨迹写入 failed 和 passed 文件，Coding Agent 修改 skill 后经过 val 的 accept、flat、reject 分支，最后恢复 best 并一次性运行 test" /></figure>
+          </section>
+
+          <section class="article-body">
+            <div class="note evidence-note"><p><strong>证据边界。</strong>本文固定在仓库的一个<a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/tree/4cb4eeef1f95375a9179737ab94cf5e64b9647c6">公开源码快照</a>上阅读。链接到文件或函数的结论属于“已验证源码”；从多个可见约束推导出的判断会明确写成“工程推论”；性能数字只复述项目 <a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/README.md#performance">README</a> 与<a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/images/skillopt_lite.pdf">技术报告</a>，本文没有重跑基准。</p></div>
+
+            <div class="note reading-contract"><p><strong>阅读契约。</strong>我们会一直跟着一个形状级例子：SpreadsheetBench 的一批任务里，多个 Agent 都在写回工作簿时破坏公式或选错 sheet。这个例子来自优化 prompt 明示的 failure buckets，但不虚构项目未公开的具体样本计数。读完后，你应该能回答：谁触发进化、它看到什么、能改什么、谁决定保留、结果何时才算可采用。</p></div>
+
+            <div class="question-grid" aria-label="本文回答的四个问题">
+              <div class="question-card"><span>Question 01</span><strong>到底是谁在学习？</strong><p>模型参数保持冻结，变化落在 <code>skill.md</code> 或受限的 harness 文件上。</p></div>
+              <div class="question-card"><span>Question 02</span><strong>失败怎样变成改动？</strong><p>轨迹先文件化，再跨样本找共性，并用 passed 轨迹反证。</p></div>
+              <div class="question-card"><span>Question 03</span><strong>谁有权接受改动？</strong><p>优化 Agent 只生产 candidate；validation gate 才拥有保留与回滚权。</p></div>
+              <div class="question-card"><span>Question 04</span><strong>公开实现走通了吗？</strong><p>控制逻辑清楚，但当前 HEAD 的脚本、数据口径和 HarnessOpt 命令仍有断点。</p></div>
+            </div>
+
+            <h2>一、先把“自进化”翻译成一个可执行闭环</h2>
+            <p>最容易误读的地方，是把 SkillOpt-Lite 想成一种在线微调。它没有计算梯度，也不改模型参数。更准确的说法是：<strong>把自然语言 skill 当成可部署程序，把 Coding Agent 当成补丁生成器，把 evaluator 当成提交权限。</strong>模型 <code>M</code> 和 harness <code>H</code> 在一次 skill 优化实验里保持不变，真正被搜索的是文本工件 <code>skill.md</code>。</p>
+
+            <p>技术报告把目标写成在任务分布上最大化 <code>H(M, z, s)</code> 的奖励，其中 <code>s</code> 是 skill 文本。由于文本空间离散、harness 和环境不可微，项目不去近似数值梯度，而是利用 rollout 里已经可读的错误、工具调用和执行轨迹。于是优化从“盲试一个方向”变成“像调试程序一样读失败，再编译出一个更好的说明文件”。这是报告所说的 language-mediated program compilation，也是 Lite 版最有价值的心智模型。</p>
+
+            <h3>1.1 五个 owner，不要压成一个“Agent”</h3>
+            <div class="table-wrap"><table>
+              <thead><tr><th>Owner</th><th>拥有的状态</th><th>允许做什么</th><th>不拥有的权力</th></tr></thead>
+              <tbody>
+                <tr><td>目标模型 <code>M</code></td><td>本轮输入与生成轨迹</td><td>按当前 skill 完成任务</td><td>不会自动改写自己的 weights</td></tr>
+                <tr><td>Harness <code>H</code></td><td>工具、循环、超时、环境执行</td><td>把任务跑成可评分结果</td><td>在 SkillOpt-Lite 轮次里默认不改自身</td></tr>
+                <tr><td><code>skill.md</code></td><td>可复用的领域规则与操作范式</td><td>被小补丁改写、快照和回滚</td><td>不证明改动有效</td></tr>
+                <tr><td>Coding Agent</td><td>当前 skill、失败/成功轨迹、源码工具</td><td>诊断共性并生成 candidate</td><td>不能自己宣布 candidate 是 best</td></tr>
+                <tr><td>Evaluator / gate</td><td>split、评分、current/best 账本</td><td>接受、拒绝、恢复与最终报告</td><td>不负责提出补丁内容</td></tr>
+              </tbody>
+            </table></div>
+
+            <h3>1.2 真正的 trainer 是一份 prompt 文件</h3>
+            <p>在 Lite 路径里，训练循环不是由一个新的优化器服务常驻执行，而是由 Coding Agent 读取并执行 <a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/copilot_example/spreadsheetbench/.github/prompts/skillopt-loop.prompt.md#L8-L19"><code>skillopt-loop.prompt.md</code></a>。README 也明确要求：把仓库放进能读 prompt 文件的 Coding Agent，命令要发在 Agent chat 里，而不是普通 shell。换句话说，文件系统不仅保存数据，也保存优化器的控制程序。</p>
+            <p>这带来一个很实际的优点：循环策略可读、可 diff、可按 benchmark 调整。代价也同样直接：prompt 对工作目录、宿主工具、长命令恢复和文件约定非常敏感；文字里的一处路径错误就可能让“算法”在执行前停住。</p>
+
+            <h2>二、一轮优化到底发生什么</h2>
+            <p>现在跟着那批 spreadsheet 任务走一轮。前台产品请求并不会自动触发进化；用户先显式调用 slash command，优化才作为一段离线/维护工作开始。它看到的是固定的当前 skill 和本轮 train rollout，不应该读取 val/test 的任务内容来写补丁。</p>
+
+            <div class="concept-chain" aria-label="SkillOpt-Lite 一轮的状态链"><span>snapshot</span><b>→</b><span>train rollout</span><b>→</b><span>trajectory files</span><b>→</b><span>diagnose</span><b>→</b><span>small patch</span><b>→</b><span>val gate</span><b>→</b><span>next train</span></div>
+
+            <h3>2.1 从 snapshot 到下一批样本</h3>
+            <div class="table-wrap"><table>
+              <thead><tr><th>阶段</th><th>输入快照</th><th>写入</th><th>推进条件</th></tr></thead>
+              <tbody>
+                <tr><td>基线</td><td>初始 <code>skill.md</code>、完整 val</td><td>round-0 best 快照</td><td>记录 baseline 分数</td></tr>
+                <tr><td>Train rollout</td><td>当前 skill + train slice + seed</td><td><code>results.jsonl</code> 与逐条样本文件</td><td>有可读轨迹</td></tr>
+                <tr><td>Improve</td><td>当前 skill + latest train samples</td><td><code>__before.md</code> 与 candidate skill</td><td>存在跨样本、可泛化的模式</td></tr>
+                <tr><td>Val gate</td><td>candidate + 完整 val</td><td>current/best/rollback 状态</td><td>分数跨过门槛，或被判为 flat/reject</td></tr>
+                <tr><td>下一轮</td><td>门控后磁盘上的 skill</td><td>新 seed 的 train samples</td><td>下一次 improve 只看与当前工件匹配的轨迹</td></tr>
+              </tbody>
+            </table></div>
+
+            <pre><code class="language-text">current skill
+  -> snapshot __before.md
+  -> run train(seed = r)
+  -> write failed/*.md + passed/*.md
+  -> diagnose recurring pattern
+  -> patch skill.md
+  -> run full val
+  -> accept | flat | reject
+  -> run train(seed = r + 1)
+final
+  -> restore best snapshot
+  -> run test exactly once</code></pre>
+
+            <h3>2.2 允许什么、禁止什么、什么时候可以什么都不做</h3>
+            <p>Improve prompt 把权限收得很窄：必须先完整读 <code>workspace/skill.md</code>，再抽样读 <code>samples/failed/</code> 与 <code>samples/passed/</code>；只允许改 <code>workspace/</code> 下的 skill，不碰 baseline。它还要求单例 edge case 跳过，只有至少两个失败支持同一模式才提出修改。没有样本时直接停止；找不到稳定共性时也可以不产生有效 patch。这是“可 no-op”的边界，不是每轮必须写点东西。</p>
+            <p>成功输出会落到三类地方：样本目录保存本轮观察，<code>.skillopt/history/</code> 保存可回滚快照，<code>workspace/skill.md</code> 保存下一轮真正使用的工件。后续轮次不是读取一份抽象“记忆”，而是直接看到这些文件，以及由当前 skill 重新生成的新轨迹。</p>
+
+            <h2>三、轨迹文件化：为什么 Coding Agent 能代替一层优化框架</h2>
+            <p>Lite 的关键不是“让 LLM 反思”，而是把反思所需的证据变成 Coding Agent 最擅长处理的对象。<a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/copilot_example/make_samples.py#L215-L265"><code>row_to_md</code></a> 把 <code>results.jsonl</code> 的每一行转成独立 Markdown：frontmatter 里有 id、status、score、env 和 tags，正文再放 Input、Expected、Agent output、Trace 与 Notes。失败和成功分别进入两个目录。</p>
+
+            <figure class="wide-figure"><img src="../assets/trajectory-files.png" alt="results.jsonl 经 row_to_md 拆成逐任务 Markdown，分别进入 failed 和 passed 目录；Coding Agent 比较至少两个重复失败和成功反例后，只对 skill.md 应用不超过四处小改动" /><figcaption>文件化让轨迹可列举、可抽样、可搜索、可引用；passed 不是奖励装饰，而是用来推翻过度概括的反例。</figcaption></figure>
+
+            <h3>3.1 一条样本先解决“它到底看到了什么”</h3>
+            <p>对我们的 spreadsheet 例子，一条样本不只是“失败=0”。它把原始 instruction、期望结果、Agent 输出、末尾 ReAct 轨迹和 <code>fail_reason</code> 放在同一文件里。若是执行阶段失败，prompt 还要求直接读生成的 <code>solution.py</code>；若是 Agent 阶段耗尽 turn，则只追最后几轮它反复卡住的位置。</p>
+
+            <pre><code class="language-text">---
+id: task_x
+status: failed
+score: 0
+tags: [sheet_level, exec]
+---
+## Input
+## Expected
+## Agent output
+## Trace
+## Notes
+fail_reason: ...</code></pre>
+            <p>这是形状级例子，不是项目里的某条真实样本。重要的是 owner 变化：原来埋在 evaluator 输出里的 episode，现在成为有地址的证据单元；Coding Agent 可以先看目录分布，再按需要打开少量高信号文件，而不是把所有长轨迹一次塞进上下文。</p>
+
+            <h3>3.2 Consensus mining 不是多数投票，而是跨任务不变量</h3>
+            <p><a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/copilot_example/spreadsheetbench/.github/prompts/skillopt-improve.prompt.md#L34-L74">读取预算</a>先按 <code>task_type</code> 分桶，再限制失败/成功样本数与总 trace 文本。诊断规则随后要求：</p>
+            <ul>
+              <li><strong>failure-first：</strong>失败与成功建议冲突时，优先修复重复失败，但仍检查成功样本是否会被破坏；</li>
+              <li><strong>至少两个支持：</strong>单一任务特例跳过，不把某个 sheet name、列号或 row count 写进 skill；</li>
+              <li><strong>passed 反证：</strong>同 task type 至少读一条成功轨迹，确认现有 skill 是否已经覆盖该变体；</li>
+              <li><strong>最小有效 patch：</strong>SpreadsheetBench 最多四处 edit，具体代码范式优先于泛泛提醒。</li>
+            </ul>
+            <p>于是“多个任务破坏公式”不会直接变成“永远不要写公式”这种错误规则。更好的补丁会把 owner 和条件写清：何时必须使用 <code>openpyxl</code> 保留 workbook 结构，怎样遍历真实行数，什么时候不能依赖 preview。candidate 到这里才算<strong>产出</strong>，还没有得到有效性证明。</p>
+
+            <h2>四、Validation gate 才拥有提交权限</h2>
+            <p>如果 Coding Agent 能一边诊断、一边宣布自己改对了，闭环就退化成自我说服。SkillOpt-Lite 把内容生成与接受权分开：train 负责产生修改信号，val 负责在不可用于写补丁的任务上选版本，test 在所有选择结束后只运行一次。</p>
+
+            <h3>4.1 Train、val、test 是三套权限，不只是三份文件</h3>
+            <div class="table-wrap"><table>
+              <thead><tr><th>阶段</th><th>优化器可见什么</th><th>允许改变什么</th><th>能回答什么</th></tr></thead>
+              <tbody>
+                <tr><td><code>train</code></td><td>任务内容、失败/成功轨迹、生成代码</td><td>可以驱动 <code>skill.md</code> patch</td><td>“下一处应该试着改什么？”</td></tr>
+                <tr><td><code>val</code></td><td>只返回可比较的 aggregate score</td><td>可以决定接受、flat 或回滚</td><td>“这个 candidate 值得继续保留吗？”</td></tr>
+                <tr><td><code>test</code></td><td>循环完成后才打开</td><td>不再允许影响 candidate 选择</td><td>“最终 best 对未参与选择的样本怎样？”</td></tr>
+              </tbody>
+            </table></div>
+
+            <figure class="wide-figure"><img src="../assets/validation-gate.png" alt="cand_acc 进入 val gate 后分为 accept_new_best、accept、flat 与 reject；只有新最佳同时更新 current_acc 和 best_acc，accept 只更新 current，flat 保留 skill 但不更新分数，reject 从 before 快照恢复，最终 best 快照恢复后才运行 test" /><figcaption>同一个“保留”有不同语义：保留为 current、写入 best、暂留但不承认分数，或从快照回滚。</figcaption></figure>
+
+            <h3>4.2 Lite prompt 的 dead band 比纯 <code>evaluate_gate</code> 多一层状态</h3>
+            <p>仓库里的纯函数 <a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/skillopt/evaluation/gate.py#L76-L148"><code>evaluate_gate</code></a> 只有三种结果：超过 current 且超过 best 是 <code>accept_new_best</code>；只超过 current 是 <code>accept</code>；否则 <code>reject</code>。但 SpreadsheetBench 的 Lite prompt 又包了一层 ±0.02 dead band，并增加 <code>flat</code>：</p>
+            <ul>
+              <li><code>Δ ≥ +0.02</code> 才按 improvement 接受；</li>
+              <li><code>Δ ≤ -0.02</code> 回滚；</li>
+              <li><code>|Δ| &lt; 0.02</code> 时，candidate 仍留在磁盘成为下一批 train 的起点，但 <code>current_acc</code> 与 <code>best</code> 都不更新；</li>
+              <li>若 soft score 提升足够大，prompt 允许把 hard-flat 升格为 accept。</li>
+            </ul>
+            <p>这意味着 flat 不是“接受但不叫接受”，也不是纯 no-op。它能影响下一轮看到的行为分布，却不会成为最终恢复目标；循环结束仍以 best snapshot 为准。文章或实现若只引用 <code>gate.py</code>，就会漏掉这个由 prompt 持有的状态语义。</p>
+
+            <h3>4.3 Val 与 train 隔离，但不是永远未被搜索触碰</h3>
+            <p>项目把 val 称为 held-out，因为 improve 不读取 val item，只用 aggregate score 做 gate。这个隔离是实在的。不过同一套 val 被多轮反复用于选择 candidate，所以从整个优化过程看，它更像<strong>search set</strong>，而不是一次性、完全未接触的最终估计。工程推论是：轮数、dead band 和 stopping rule 都会间接适配这套 val；真正承担最后未见样本估计的是一次性 test。</p>
+
+            <div class="table-wrap"><table>
+              <thead><tr><th>状态</th><th>已经发生</th><th>仍缺什么</th></tr></thead>
+              <tbody>
+                <tr><td>输出已产出</td><td>Coding Agent 写出 candidate <code>skill.md</code></td><td>可比较的独立验证</td></tr>
+                <tr><td>输出已验证</td><td>candidate 通过 val gate，最终 best 运行一次 test</td><td>目标部署的成本、延迟、安全与回滚检查</td></tr>
+                <tr><td>输出已采用</td><td>有权限的人或发布流程把 best 设为真实 Agent 工件</td><td>持续监控与复盘仍不可省略</td></tr>
+              </tbody>
+            </table></div>
+
+            <h2>五、Full SkillOpt 与 Lite：删掉的是中间拓扑，不是证据闭环</h2>
+            <p>同一仓库还保留了 Full SkillOpt 的 Python trainer。<a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/skillopt/engine/trainer.py#L1-L12"><code>trainer.py</code></a> 在文件头列出六阶段：Rollout、Reflect、Aggregate、Select、Update、Evaluate。Lite 没有删掉 rollout 或 evaluation，而是让 Coding Agent 直接在文件系统里承担原来 reflection pooling、patch merge、ranking 和 update orchestration 的大部分工作。</p>
+
+            <figure class="wide-figure"><img src="../assets/full-vs-lite.png" alt="Full SkillOpt 依次经过 rollout、run_reflect、merge_patches、rank_and_select、apply_patch_with_report 与 evaluate_gate，并使用 scheduler、rejection_buffer 和 slow_update；SkillOpt-Lite 缩短为 train、样本文件、Coding Agent、skill.md、val 与 best" /><figcaption>Lite 的“少”不是少做验证，而是把可由强 Coding Agent 与文件工具完成的中间层折叠掉。</figcaption></figure>
+
+            <div class="table-wrap"><table>
+              <thead><tr><th>问题</th><th>Full SkillOpt</th><th>SkillOpt-Lite</th></tr></thead>
+              <tbody>
+                <tr><td>轨迹怎样读</td><td>minibatch reflection 与结构化 patch</td><td>逐条 Markdown + Coding Agent 探索</td></tr>
+                <tr><td>多个建议怎样合并</td><td><code>merge_patches</code> 层级聚合</td><td>Agent 在同一上下文中提取跨任务共性</td></tr>
+                <tr><td>更新幅度</td><td>edit budget / scheduler</td><td>prompt 里的最小修改和 edit 上限</td></tr>
+                <tr><td>失败历史</td><td>rejection buffer / step buffer</td><td>history 快照、文件 diff 与下一轮新样本</td></tr>
+                <tr><td>接受权</td><td>selection/evaluation gate</td><td>full val gate + best snapshot + one-shot test</td></tr>
+              </tbody>
+            </table></div>
+
+            <div class="note caution-note"><p><strong>不要混用两条路径的保证。</strong>Full trainer 的默认配置开启 <a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/configs/_base_/default.yaml#L61-L75"><code>use_slow_update: true</code></a>；其实现还会把 slow-update guidance <a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/skillopt/engine/trainer.py#L1621-L1638">无条件注入 current 与 best，并标记 <code>force_accept</code></a>。这是 Full SkillOpt 的设计，不是 Lite prompt 的严格 val-gated 语义。仓库里有同名概念，不等于它们经过同一控制面。</p></div>
+
+            <h2>六、HarnessOpt：当优化对象从说明书扩到执行器</h2>
+            <p>一旦失败不是 skill wording 造成，而是 preview 太小、code extraction 太脆、超时策略不合适或工具缺失，继续改 <code>skill.md</code> 只会把 harness 缺陷包装成更多提示词。HarnessOpt 的合理出发点，就是把搜索面扩到 Python harness；但可写面一扩大，风险、验证成本和审批权也必须同时升级。</p>
+
+            <figure class="wide-figure"><img src="../assets/harnessopt-boundary.png" alt="SkillOpt-Lite 只允许修改 skill.md 并锁住 Python harness；HarnessOpt 把 skill.md 放进 denylist，只允许编辑 rollout.py、react_agent.py、codegen_agent.py、executor.py、recalc_harness.py 和 adapter.py，并经过 train 80、人工 approve、round-0-best、smoke 6、稍后 val 39 与 test 281" /><figcaption>当前 prompt 采用顺序优化：skill loop 与 harness loop 分开运行，不是在同一轮同时改文本和执行器。</figcaption></figure>
+
+            <h3>6.1 可写面由 allowlist 定义，skill 反而是 denylist</h3>
+            <p>HarnessOpt prompt 明确只允许编辑 <code>rollout.py</code>、<code>react_agent.py</code>、<code>codegen_agent.py</code>、<code>executor.py</code>、<code>recalc_harness.py</code> 与 <code>adapter.py</code>；skill、evaluator、dataloader、configs 和 prompts 都在 denylist。它还说明 skill-content failure 要路由回独立的 <code>/skillopt-loop</code>。这比 README 表格里“skill.md and agent code”的宽泛描述更具体，因此阅读当前执行合同时，应以 <a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/harness_example/spreadsheetbench/.github/prompts/harnessopt-loop.prompt.md#L8-L90">prompt 的 allowlist/denylist</a>为准。</p>
+
+            <h3>6.2 Round 0 先做架构决策，再把后续轮次收窄</h3>
+            <p>Round 0 会跑 baseline val 和完整 train，扫描失败分布，再从 memory、tool、prompt context、loop policy、codegen/executor shape 等角度提出三项决策。新的 tool、memory 或执行形状可能改变系统边界，所以 prompt 要求在应用 patch 前打印 brief 并等待用户 <code>approve</code>。Round 1 之后才进入自动化的 surgical edit、diff guard、smoke、full val 和 rollback 循环。</p>
+            <p>这套设计保护了一个重要不变量：<strong>架构性扩大权限必须有人批准，局部修补才可以交给自动 gate。</strong>但当前 Round 0 还有一个实现上的空档：bootstrap patch 会先 commit 并打上 <code>round-0-best</code> 标签，只跑 6 条 debug batch；prompt 明说这里<a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/harness_example/spreadsheetbench/.github/prompts/harnessopt-loop.prompt.md#L488-L525">不做完整 val</a>，要等 Round 1 才验证。如果后续没有产生新 best，最终恢复逻辑可能把一个只通过 smoke、没有通过完整 gate 的 bootstrap 当成 best。</p>
+
+            <h3>6.3 Checkpoint 展示了 harness 优化能改出什么</h3>
+            <p><code>harnessopt_ckpt</code> 不是抽象愿景，它保存了具体代码变化。例如 <a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/harnessopt_ckpt/spreadsheetbench/codegen_agent.py#L81-L128"><code>codegen_agent.py</code></a> 把 workbook preview 从 5×20 扩到 15×30，并加入 reasoning-effort timeout fallback；同一文件还实现了<a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/harnessopt_ckpt/spreadsheetbench/codegen_agent.py#L160-L210">不读取 gold 的输出自检</a>，识别 answer cells 中残留的 formula string。这些能力都由环境变量开关控制，默认关闭，体现了 harness 改动应可回退、可做 A/B 对照。</p>
+
+            <h2>七、读到 HEAD：方法清楚，公开主路径还没有完全闭合</h2>
+            <p>到这里可以把“设计是否合理”和“fresh clone 是否能照文档跑通”分开。前者有足够源码支撑；后者在当前快照上仍存在几个可复现的断点。按照源码审计常用的三档：有真实入口和副作用才叫 main path；只有文件但未接通叫 disconnected；文档命名的目标链没有完成则叫 target route not demonstrated。</p>
+
+            <figure class="wide-figure"><img src="../assets/source-audit.png" alt="HEAD 源码审计：.github/prompts 控制面存在；scripts/eval_only.py 在当前树缺失；LiveMath 的 2-1-7 与 2-2-6 split 口径不一致；round-0-best 早于 val 39；HarnessOpt pathspec 在当前工作目录断裂；这些引用都从 README 口径展开" /><figcaption>这些断点限制的是当前公开交付路径，不等于否定“轨迹文件 + 共性提取 + 验证门控”的方法。</figcaption></figure>
+
+            <h3>7.1 五个需要在复现前先修正的断点</h3>
+            <div class="table-wrap"><table>
+              <thead><tr><th>观察</th><th>源码证据</th><th>状态判断</th><th>实际后果</th></tr></thead>
+              <tbody>
+                <tr><td>Prompt 控制面完整可读</td><td><code>.github/prompts/*-loop.prompt.md</code> 定义 snapshot、improve、gate、rollback、test</td><td><span class="status-pill">主合同可见</span></td><td>能准确理解预期循环与权限</td></tr>
+                <tr><td>当前 HEAD 没有 <code>scripts/</code></td><td><a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/copilot_example/spreadsheetbench/run.sh#L164-L214"><code>run.sh</code> 调 <code>scripts/eval_only.py</code></a>，<a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/pyproject.toml#L56-L67"><code>pyproject.toml</code> 也注册 scripts entry point</a>；但<a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/commit/636791a4b5f949c10b4540512fd67f149a98eecc">后续提交删除了整个目录</a></td><td><span class="status-pill stop">目标路径未证明</span></td><td>按 README/run.sh 的 fresh-clone 路径会在 evaluator 入口前失败</td></tr>
+                <tr><td>LiveMath split 漂移</td><td>config 指向 <a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/configs/livemathematicianbench/default.yaml#L8-L18"><code>2-1-7_seed42</code></a>；download 与 prompt 指向 <a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/data/download.py#L30-L46"><code>2-2-6_seed42</code></a>；prompt 又同时出现 val=35 与 val=18</td><td><span class="status-pill warn">合同漂移</span></td><td>不同入口可能评估不同样本，指标不可直接横比</td></tr>
+                <tr><td>Round-0 best 未经过完整 gate</td><td><a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/harness_example/spreadsheetbench/.github/prompts/harnessopt-loop.prompt.md#L488-L543">tag、smoke 与 best 初始化顺序</a></td><td><span class="status-pill warn">bootstrap 空档</span></td><td>需要先 gate Round 0，再允许它进入 best slot</td></tr>
+                <tr><td>HarnessOpt pathspec 与 cwd 重复</td><td>prompt 先 <code>cd harness_example/spreadsheetbench</code>，随后仍把同一路径传给 <code>git status/add</code></td><td><span class="status-pill stop">命令路径断裂</span></td><td>diff guard 可能看到空集合，<code>git add</code> 直接 pathspec 失败</td></tr>
+                <tr><td>插件覆盖面仍是 roadmap</td><td>README 一边列举多个 host，一边把 <a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/README.md#L167-L177">Codex CLI 与 Claude Code plugin 标为 TODO</a></td><td><span class="status-pill warn">宿主适配未交付</span></td><td>不能把 VS Code prompt 文件等同于所有 Coding Agent 的即装即用扩展</td></tr>
+              </tbody>
+            </table></div>
+
+            <h4>为什么 pathspec 会失败</h4>
+            <pre><code class="language-text">cwd = harness_example/spreadsheetbench/
+pathspec = harness_example/spreadsheetbench/
+
+resolved intent:
+  harness_example/spreadsheetbench/
+  + harness_example/spreadsheetbench/
+
+result:
+  no tracked files for that doubled relative path</code></pre>
+            <p>这是确定性的路径解析问题，不需要推测模型行为。更稳妥的写法是在该 cwd 下使用 <code>-- .</code>，或始终在仓库根目录运行并保留完整 pathspec。另一个风险是 prompt 使用 <code>git reset --hard</code> 做回滚；若工作树包含不属于优化轮次的改动，它的影响范围大于单个 harness 目录，因此生产化实现应改成独立 worktree/branch 或精确快照。</p>
+
+            <h3>7.2 项目报告了什么，本文没有证明什么</h3>
+            <div class="table-wrap"><table>
+              <thead><tr><th>项目口径</th><th>报告值</th><th>本文的证据级别</th></tr></thead>
+              <tbody>
+                <tr><td>LiveMath · GPT-5.4-nano + SkillOpt-Lite</td><td>比 Full SkillOpt 高 25.4 points</td><td>项目报告，未复现</td></tr>
+                <tr><td>LiveMath · GPT-5.5 + SkillOpt-Lite</td><td>比 Full SkillOpt 高 8.8 points</td><td>项目报告，未复现</td></tr>
+                <tr><td>ALFWorld · GPT-5.4-nano</td><td>81.3，较 SkillOpt +9.5</td><td>项目报告，未复现</td></tr>
+                <tr><td>Spreadsheet 平均提升</td><td>+12.6 points</td><td>项目报告，未复现</td></tr>
+                <tr><td>HarnessOpt · SpreadsheetBench</td><td>nano 0.7758，对比 GPT-5.5 标准 harness + SkillOpt 0.7620</td><td>项目报告，未复现；当前复现入口还缺脚本</td></tr>
+              </tbody>
+            </table></div>
+            <p>这些结果足以说明项目值得复现，但还不能把“更少模块”直接推广成普遍定律。缺少独立重跑时，更稳妥的结论是：<strong>强 Coding Agent 可能把专用的文本优化拓扑折叠成文件调试；是否更好，仍由目标模型、benchmark、val 复用程度、token 成本与宿主工具决定。</strong></p>
+
+            <h2>八、什么场景适合借用这套设计</h2>
+            <p>SkillOpt-Lite 最值得迁移的不是 slash command，而是责任划分：把可变工件做成文件，把观察做成逐条证据，把补丁生成与接受权分开，把 test 留到搜索结束。只要这四条成立，实现可以是 Coding Agent、CI job，甚至一个更小的专用服务。</p>
+
+            <div class="rule-grid">
+              <div class="rule-card"><span>Good fit</span><strong>可编辑工件边界清楚</strong><p>Prompt、skill、policy 或 harness 文件能被精确 allowlist，且每次改动都可 diff、可回滚。</p></div>
+              <div class="rule-card"><span>Good fit</span><strong>Evaluator 能重复比较</strong><p>任务有稳定输入、确定或可校准评分、足够大的 train/val/test，rollout 成本可承担。</p></div>
+              <div class="rule-card"><span>Poor fit</span><strong>成功信号只有主观自评</strong><p>没有独立环境结果时，反思只是 hypothesis；增加轮数只会放大自洽叙事。</p></div>
+              <div class="rule-card"><span>Poor fit</span><strong>改动直接触达生产副作用</strong><p>若 candidate 能改权限、数据、账单或部署，必须先进入隔离环境和人工 adoption gate。</p></div>
+            </div>
+
+            <h3>8.1 一套可迁移的最小规则</h3>
+            <ol>
+              <li><strong>先固定比较条件：</strong>锁定目标模型、harness、数据版本、seed 策略和 scorer；一次只优化一个 owner。</li>
+              <li><strong>让每条轨迹有地址：</strong>输入、输出、trace、score、failure reason 和生成工件必须能被单独引用。</li>
+              <li><strong>只修跨任务模式：</strong>至少两个独立失败支持同一规则，并用成功样本或反例尝试推翻它。</li>
+              <li><strong>限制 patch surface：</strong>allowlist、edit budget、feature flag、snapshot 与 rollback 缺一不可。</li>
+              <li><strong>Val 决定 retention，test 只做一次：</strong>重复看 test 就把它降级成新的 val。</li>
+              <li><strong>把 adoption 再设一道门：</strong>检查 intended outcome、关键回归、成本/延迟、恢复、权限与人工责任人，不能用 benchmark best 自动替代发布决策。</li>
+            </ol>
+
+            <h3>8.2 最终判断</h3>
+            <p>SkillOpt-Lite 的核心自进化机制是成立的，而且比“让 Agent 自己反思”更严谨：它有显式触发、有固定快照、有读写边界、允许 no-op、有持久历史、有可比较 rerun，也会在最终 test 前恢复 best。它优化的是外部行为资产，不是模型权重。</p>
+            <p>当前仓库更像一份<strong>有结果、有 checkpoint、有清晰控制程序，但交付表面仍在收口的研究/工程快照</strong>。如果要直接用于现有 Agent，第一步不是复制 prompt，而是先补齐 evaluator 入口、统一 split contract、修正 HarnessOpt pathspec、让 Round 0 先过完整 gate，并把 destructive git rollback 放进隔离工作树。完成这些后，这套极简闭环才从“候选方案”进入“可验证实现”；再经过目标业务的安全、成本与回滚检查，才谈得上采用。</p>
+
+            <h2>九、延伸阅读与源码索引</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite">SkillOpt-Lite 仓库</a></li>
+              <li><a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/images/skillopt_lite.pdf">SkillOpt-Lite technical report</a></li>
+              <li><a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/copilot_example/spreadsheetbench/.github/prompts/skillopt-loop.prompt.md">SpreadsheetBench SkillOpt loop prompt</a></li>
+              <li><a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/copilot_example/spreadsheetbench/.github/prompts/skillopt-improve.prompt.md">SpreadsheetBench improve prompt</a></li>
+              <li><a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/copilot_example/make_samples.py">Trajectory-to-Markdown formatter</a></li>
+              <li><a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/skillopt/evaluation/gate.py">Validation gate</a></li>
+              <li><a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/skillopt/engine/trainer.py">Full SkillOpt trainer</a></li>
+              <li><a href="https://github.com/EvolvingLMMs-Lab/SkillOpt-Lite/blob/4cb4eeef1f95375a9179737ab94cf5e64b9647c6/harness_example/spreadsheetbench/.github/prompts/harnessopt-loop.prompt.md">HarnessOpt loop prompt</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer"><p>Rememorio Blog · SkillOpt-Lite</p><a href="#top">回到顶部</a></footer>
+    <script src="../article.js"></script>
+    <script src="../../assets/vendor/highlightjs/highlight.min.js"></script>
+    <script src="../../assets/code-highlight.js"></script>
+  </body>
+</html>
