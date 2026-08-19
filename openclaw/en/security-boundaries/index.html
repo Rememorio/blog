@@ -10,7 +10,7 @@
   <div class="article-shell"><aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
     <section class="article-hero">
       <p class="eyebrow">Reading OpenClaw · Part VI</p><h1>How tool policy, sandbox, approval, and elevated form a security boundary</h1>
-      <p class="lead">Security is not one switch. “The tool does not exist,” “the tool runs in a container,” “a human must approve this command,” and “exec may temporarily leave the sandbox” are four different gates. OpenClaw separates visible capability, execution environment, consent for a concrete operation, and host escape, then intersects them with trusted sender identity, workspace path guards, and host-local policy. Least privilege becomes real only when each gate's promise—and non-promise—is explicit.</p>
+      <p class="lead">A command executes only after four questions are answered: can the model see the tool, where will it run, does this exact command require human approval, and may sandboxed exec move to the host? OpenClaw also applies the sender identity resolved at ingress, workspace path checks, and policy from the execution machine. A denial at any layer stops the call.</p>
       <div class="meta-line"><span>Part 6 of 8</span><span>Source snapshot: c549250</span><span>Topic: policy · sandbox · approval · elevated</span><span>Prerequisite: capability assembly</span></div>
       <nav class="series-strip"><a href="../overview/"><strong>01</strong> Main path</a><a href="../gateway/"><strong>02</strong> Gateway</a><a href="../routing-sessions/"><strong>03</strong> Routing</a><a href="../context-memory/"><strong>04</strong> Context</a><a href="../capability-assembly/"><strong>05</strong> Capabilities</a><span class="series-current"><strong>06</strong> Security</span><a href="../multi-agent/"><strong>07</strong> Multi-agent</a></nav>
       <figure class="hero-image"><img src="../assets/security-four-gates.png" alt="Four OpenClaw security gates: Tool Policy decides whether a tool exists, Sandbox decides where it runs, Exec Approval decides whether a concrete command may run, and Elevated decides only whether exec may leave a sandbox; they correspond to availability, isolation, consent, and escape" /></figure>
@@ -21,7 +21,8 @@
       <div class="note"><p><strong>Reading contract.</strong>By the end, you should be able to state what tool policy, sandbox, exec approval, and elevated each control; explain why approval is not a user-authorization boundary; combine sandbox mode, scope, and workspaceAccess; explain the double allow required for plugin/MCP tools in a sandboxed turn; distinguish <code>workspaceOnly</code> from process isolation; and show how an approved node command binds argv, cwd, env, agent/session, and executable.</p></div>
       <p><strong>Evidence boundary.</strong>This chapter stays pinned to <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a>. It is not a generic security certification and does not claim a perfect sandbox. It explains the defenses verifiable in this snapshot's policy pipeline, sandbox resolver, elevated resolution, and host-exec approval code.</p>
 
-      <h2>1. Four gates answer four different questions</h2>
+      <h2>1. A tool call first establishes capability and identity</h2>
+      <h3>1.1 Four checks restrict the tool, environment, command, and host escape</h3>
       <div class="table-wrap"><table><thead><tr><th>Control</th><th>Core question</th><th>Typical stage</th><th>It cannot replace</th></tr></thead><tbody>
         <tr><td>Tool policy</td><td>May this tool exist for the turn?</td><td>Before the model request; filter schemas.</td><td>Isolation of side effects inside exec.</td></tr>
         <tr><td>Sandbox</td><td>Where does it run and what can it see?</td><td>Runtime context and tool construction.</td><td>Deciding which sender should see the tool.</td></tr>
@@ -30,64 +31,67 @@
       </tbody></table></div>
       <p>The diagram presents four serial gates for clarity, while some source checks happen earlier during construction and others repeat at call time. The invariant is that each gate may only narrow authority. No later directive should convert an earlier denial into permission.</p>
 
-      <h2>2. Identity comes from ingress, never model arguments</h2>
+      <h3>1.2 Ingress resolves sender identity; model arguments cannot change it</h3>
       <p>senderId, accountId, channel, roleIds, and <code>senderIsOwner</code> are resolved at the channel/Gateway boundary and bound to the run and tool wrapper as trusted requester context. A model can emit <code>{"target":"admin"}</code>, but cannot become an owner through a tool argument. Message actions, elevated allowlists, and owner-only control tools read host-derived identity.</p>
       <p>A missing identity field means unproven, not safe by default. A hook requiring a maintainer role should fail closed when roleIds are absent. Falling back to display name turns mutable sender-supplied text into a credential.</p>
       <p>This is also why route/session isolation precedes tool policy. If several people's DMs were already folded into one main transcript, later tool restrictions cannot remove the private context that has crossed the wrong boundary.</p>
 
-      <h2>3. Tool policy is the hard stop at capability level</h2>
+      <h3>1.3 Tool policy removes disallowed tools before the request</h3>
       <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/agent-tools.policy.ts"><code>agent-tools.policy.ts</code></a> and the pipeline apply profile, provider, global, agent, group, sender, and sandbox policy in layers. Deny wins. A non-empty allowlist treats every unlisted tool as blocked. Filtered descriptors never reach the model, and an <code>/exec</code> directive cannot override a denied exec tool.</p>
       <p>Policy matches tool names; it cannot infer every side effect inside a tool. The critical example is shell execution. Denying <code>write</code>, <code>edit</code>, and <code>apply_patch</code> does not make an allowed <code>exec</code> read-only: <code>sh -c 'echo x &gt; file'</code> still writes. A read-only agent must also deny runtime tools or enforce read-only resources through sandbox/OS permissions.</p>
       <p>Likewise, allowing a plugin group does not make every parameter safe. Trusted policy or <code>before_tool_call</code> can still reject concrete resources, params, and requesters. Build-time controls reduce model mistakes; call-time controls catch parameter-level risk.</p>
 
-      <h2>4. Sandbox controls execution location; the Gateway remains on host</h2>
+      <h2>2. How sandbox restricts processes, files, and extensions</h2>
+      <h3>2.1 Tools enter sandbox; Gateway and native plugins stay on host</h3>
       <figure class="hero-image"><img src="../assets/security-sandbox-host.png" alt="OpenClaw sandbox host cutaway: Gateway and Native Plugins remain on the host, while exec, read, write, and edit run in a sandbox with none, read-only, or read-write workspace access and separate network policy; plugin tools need normal and sandbox policy, while elevated exec uses a gated bridge to the gateway or configured node" /></figure>
       <p>The OpenClaw Gateway does not enter the container with an agent turn. A sandbox backend carries exec and filesystem tools—and optionally a browser. The Gateway control plane, session state, and native plugin runtime stay in the host process. Tool execution is isolated, not the whole control plane.</p>
       <p>Sandboxing therefore reduces the blast radius when the model makes a bad decision by limiting processes, files, network, and workspace visibility. It does not turn loaded native plugins into untrusted isolated code. Installing a plugin admits code into the Gateway trust boundary and needs review before execution.</p>
 
-      <h2>5. Mode, scope, and backend are independent dimensions</h2>
+      <h3>2.2 Mode, scope, and backend control different dimensions</h3>
       <p><code>mode</code> chooses which sessions are sandboxed: <code>off</code>, <code>non-main</code>, or <code>all</code>. Under non-main, group and channel session keys are not main and therefore enter the sandbox. “This belongs to the main agent” does not mean every session owned by that agent is the main session.</p>
       <p><code>scope</code> chooses the sharing unit: per agent, per session, or shared. Session scope isolates most and costs most. Shared scope reuses state and can let sessions influence one another through container state; it also ignores per-agent binds. Scope is an isolation-domain decision, not merely performance tuning.</p>
       <p><code>backend</code> chooses Docker/Podman, SSH, or OpenShell. Their network, browser, bind-mount, and workspace synchronization capabilities differ. Protections configured for a local container do not automatically appear on an SSH target.</p>
 
-      <h2>6. workspaceAccess and bind mounts are separate doors</h2>
+      <h3>2.3 workspaceAccess and bind mounts open paths separately</h3>
       <p><code>workspaceAccess</code> is none, ro, or rw. It controls how the agent workspace appears inside the sandbox. None typically gives the sandbox its own scratch workspace; ro suits review; rw lets tools modify the real workspace. Additional <code>docker.binds</code> are an independent entry surface.</p>
       <p>A bind with no explicit mode may be read-write and pierces the sandbox filesystem. Mounting secrets, SSH keys, or <code>/var/run/docker.sock</code> greatly expands authority; the last nearly grants host container control. OpenClaw checks both normalized sources and resolution through the deepest existing ancestor to catch symlink-parent escapes, but operators still need least-privilege mounts.</p>
       <p>Network policy is independent again. Docker's default network-none blocks most outbound traffic, but a proxy, host service, browser bridge, or mounted socket can reopen a path. Read-only files do not imply read-only network behavior, and no network does not protect writable mounts.</p>
 
-      <h2>7. Plugin and MCP tools need two allows in sandboxed sessions</h2>
+      <h3>2.4 Plugin and MCP tools need normal and sandbox policy approval</h3>
       <p>Native plugin and configured MCP tools often execute on the Gateway side. They do not move into the same container merely because the caller session is sandboxed. To stop a sandboxed turn from escaping through an extension, OpenClaw requires the ordinary effective tool policy to allow the tool and <code>tools.sandbox.tools</code> to allow the plugin group, bundle, or concrete name.</p>
       <p>The first gate says whether this agent and sender may use the tool. The second says whether a sandboxed session may reach a host-side extension. Adding a name only to normal allow may still leave it hidden; adding it only to sandbox allow cannot override a global or agent denial.</p>
 
-      <h2>8. workspaceOnly is a path guard, not process isolation</h2>
+      <h3>2.5 workspaceOnly checks paths for controlled file tools</h3>
       <p><code>tools.fs.workspaceOnly</code> gives read/write/edit/apply_patch a host-path boundary. Correct enforcement cannot use string-prefix checks alone. It resolves relative and absolute paths, symlink parents, final symlinks, and hardlink aliases so a path that looks internal cannot write externally.</p>
       <p>Even complete checks protect only the controlled filesystem tools. Host exec has its own filesystem API, and a plugin accepting paths needs its own guard. Container/OS boundaries, tool policy, and library path validation are defense in depth; none substitutes for the other two.</p>
 
-      <h2>9. Elevated is an exec-only escape hatch</h2>
+      <h2>3. How host exec gains consent and prevents plan drift</h2>
+      <h3>3.1 Elevated changes only where sandboxed exec runs</h3>
       <p><code>/elevated on</code> matters only when the session is already sandboxed. It sends later exec calls through the configured path outside the sandbox: Gateway by default, or node when the exec target is already configured as node. In an unsandboxed session, exec already runs on a host and elevated is effectively a no-op.</p>
       <p>Availability requires the global gate, per-agent gate, and sender allowlists to pass. An inline directive affects only one message; a session override comes next; the global default is last. A missing gate should report unavailable, never silently execute on host.</p>
       <p><code>full</code> skips prompts only if requested exec policy and host-local approvals are actually permissive. A host configured ask-always still asks. Elevated cannot change tool policy, add read/browser/plugin tools, or turn <code>host=auto</code> into arbitrary cross-host routing.</p>
 
-      <h2>10. Exec approval stacks on policy and elevated</h2>
+      <h3>3.2 Exec approval evaluates one concrete host command</h3>
       <figure class="hero-image"><img src="../assets/security-approval-plan.png" alt="OpenClaw host exec approval: after Tool Policy, the Elevated enabled and sender gates pass; the stricter of config and execution-host policy applies; allowlist or ask yields allow once, allow always, or deny; approval seals argv, cwd, env, agent, session, and executable, rejecting plan drift, because approval is not authorization" /></figure>
       <p>Host exec approval is an accidental-execution guardrail on the Gateway or node host. A run needs agreement from tool policy, the elevated gate when escaping a sandbox, requested exec policy, host-local approvals, the allowlist, and any human decision. Host and config resolve to the stricter result. A remote session cannot relax a machine-local denial or ask-always rule.</p>
       <p>This is not per-user authorization. An authenticated Gateway operator and paired node already establish a trust relationship; approval adds consent for one risky action. Once approved, the command can mutate anything allowed by host filesystem permissions. Real multi-user boundaries remain ingress authentication, sender policy, agent isolation, and OS/sandbox controls.</p>
 
-      <h2>11. Allowlist the executable, and preferably the arguments</h2>
+      <h3>3.3 Allowlist the executable and preferably the arguments</h3>
       <p>Exec allowlists are per agent. A bare command name matches only a PATH invocation, not <code>./rg</code> or <code>/tmp/rg</code>. A path glob can restrict the trusted binary location. Every top-level segment in a shell chain must satisfy the rule; trusting git must not implicitly trust a later curl.</p>
       <p><code>argPattern</code> narrows one executable to an argv shape, and approval-generated allow-always entries are argv-bound. Otherwise allowing <code>python3</code> permits arbitrary scripts and inline code. strictInlineEval keeps forms such as <code>python -c</code> and <code>node -e</code> approval-only even when the interpreter binary matches.</p>
       <p>Safe bins are another constrained fast path, not a claim that common commands are intrinsically safe. stdin-only behavior, argument form, path resolution, and environment all determine eligibility.</p>
 
-      <h2>12. Approval binds an execution plan that may not drift</h2>
+      <h3>3.4 Approved executable, arguments, cwd, and environment may not drift</h3>
       <p>The node-host path first constructs a canonical <code>systemRunPlan</code>. The approval record stores command, cwd, session, and related bindings. The final <code>system.run</code> forwards the stored plan rather than trusting fields supplied later. Changes to command, rawCommand, cwd, agentId, or sessionKey reject the run as a mismatch.</p>
       <p>Approval also tries to pin the resolved executable and one concrete local file operand for direct script or interpreter invocation. A changed file between approval and execution causes denial. If exactly one file cannot be identified, OpenClaw refuses to pretend it has complete approval coverage. The best-effort limit matters; one click is not proof over every runtime loader.</p>
       <p>No UI or timeout resolves through <code>askFallback</code>, which defaults to deny. Allow once applies to one plan. Allow always creates a durable matching rule. Deny terminates the command and settles the agent through session/system events so it does not wait forever for a missing result.</p>
 
-      <h2>13. Prompts and skills advise; host code enforces</h2>
+      <h2>4. How to diagnose policy and avoid common misconfiguration</h2>
+      <h3>4.1 Prompts and skills advise; host code enforces</h3>
       <p>A system prompt may say “never run destructive commands,” and a skill may require “show a diff before editing.” These instructions improve model choices but remain advisory. Prompt injection, model error, or a bad skill can still produce a dangerous call, so tool visibility, path guards, sandboxing, and approval must be enforced by host code.</p>
       <p>Third-party skills are untrusted instructions and need review. They may encourage secret reads, binary installation, or elevated mode, but the relevant tools and host gates should remain restricted. Third-party native plugins deserve even more scrutiny because their code already runs inside the Gateway trust boundary; a sandboxed agent does not isolate plugin startup side effects.</p>
 
-      <h2>14. Use explain and audit to identify the gate</h2>
+      <h3>4.2 Use explain and audit to locate the rejecting check</h3>
       <p><code>openclaw sandbox explain --session ...</code> reports effective mode, scope, workspace access, actual sandbox status, sandbox tool policy, and elevated gates. Tool-policy filtering emits <code>agents/tool-policy</code> audit entries with layer label, configuration key, and affected tools.</p>
       <pre><code class="language-bash">openclaw sandbox explain --session agent:main:main --json
 openclaw approvals get --gateway
@@ -95,7 +99,7 @@ openclaw exec-policy show
 openclaw logs</code></pre>
       <p>Do not start diagnosis by disabling the sandbox. First confirm the tool is in the effective surface. Then identify execution host or sandbox. For host exec, inspect elevated availability, effective exec mode, allowlist, and pending approval. Following the controls lets you open only the missing gate.</p>
 
-      <h2>15. Common misconfigurations and consequences</h2>
+      <h3>4.3 Six common misconfigurations and their consequences</h3>
       <div class="table-wrap"><table><thead><tr><th>Misconfiguration</th><th>Why it fails</th><th>Correct boundary</th></tr></thead><tbody>
         <tr><td>Deny write/edit, so exec is read-only.</td><td>The shell can write directly.</td><td>Restrict exec too; add sandbox/OS read-only resources.</td></tr>
         <tr><td>Docker isolates every plugin.</td><td>Native plugins remain on the Gateway host.</td><td>Review installed code and double-gate plugin tools.</td></tr>
@@ -105,7 +109,7 @@ openclaw logs</code></pre>
         <tr><td>No UI should continue to avoid a stall.</td><td>An unconfirmed action should not run implicitly.</td><td>Keep askFallback deny unless explicitly justified.</td></tr>
       </tbody></table></div>
 
-      <h2>16. Eight rules to carry from the security boundary</h2>
+      <h2>5. Eight security rules to carry forward</h2>
       <ol>
         <li><strong>Separate identity, capability, resources, and consent.</strong>One approval button cannot stand for all four.</li>
         <li><strong>Tool policy decides whether a capability exists.</strong>Remove forbidden tools from schemas first.</li>
