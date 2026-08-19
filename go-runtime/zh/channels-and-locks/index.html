@@ -7,7 +7,7 @@
     <meta name="description" content="Go 从请求到生产现场系列第四篇：沿 fetchd 的 result channel 阅读 Go 1.26.0 的 hchan、chansend、chanrecv、sudog、selectgo，以及 sync.Mutex、runtime semaphore 和饥饿交接。" />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Go 源码阅读（四）：什么时候 channel，什么时候锁" />
-    <meta property="og:description" content="channel 传递值与背压，锁保护同一份状态；源码展示了两种并发契约各自怎样等待、唤醒与建立顺序。" />
+    <meta property="og:description" content="channel 传递值并让拥塞返回发送方，锁保护同一份状态；源码展示两者各自怎样等待、唤醒与建立内存顺序。" />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/channel-or-lock-overview.png" />
     <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/zh/channels-and-locks/" />
@@ -46,15 +46,15 @@
           <p class="eyebrow">Go 从请求到生产现场 · 第四篇</p>
           <h1 class="long-title">什么时候 <code>channel</code>，什么时候锁</h1>
           <p class="lead">
-            worker 抓完网页，要把结果交给汇总者；这像交接包裹，channel 很自然。所有 worker 只想给同一个成功数加一；这像轮流修改同一本账，锁更直接。
-            本篇先用“数据要不要换主人”做选择，再解释两种工具怎样让 goroutine 等待和继续。
+            worker 抓完网页，要把结果交给汇总者；这像交接包裹，channel 很自然。所有 worker 只想给同一个成功数加一；这像轮流修改同一个计数器，锁更直接。
+            本篇先看数据是否交给另一个 goroutine、发送后还能不能修改，再解释两种工具怎样让 goroutine 等待和继续。
           </p>
           <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：chansend → sudog → selectgo / Mutex → sema</span><span>实验：concurrency_lab_test.go</span></div>
-          <figure class="hero-image"><img src="../assets/channel-or-lock-overview.png" alt="Go channel 与锁的契约对照：channel 在 worker 和聚合器之间传递 fetchResult 并提供背压；sync.Mutex 保护同一份共享 map 与临界区" /></figure>
+          <figure class="hero-image"><img src="../assets/channel-or-lock-overview.png" alt="Go channel 与锁的行为对照：channel 在 worker 和聚合器之间传递 fetchResult，并在接收方跟不上时阻塞发送；sync.Mutex 保护同一份共享 map 与临界区" /></figure>
         </section>
 
         <section class="article-body">
-          <div class="note route-note"><p><strong>阅读契约：</strong>先不讨论谁“更快”。读完前半篇，你应该能根据一句普通话做选择：数据要交给另一个 goroutine，就先想 channel；多段代码要共同保护一份状态，就先想锁。后半篇再解释它们阻塞、唤醒和建立内存顺序的源码路径。</p></div>
+          <div class="note route-note"><p><strong>阅读目标：</strong>先不讨论谁“更快”。读完前半篇，你应该能根据一句普通话做选择：数据要交给另一个 goroutine，就先想 channel；多段代码要共同修改一份状态，就先想锁。后半篇再解释它们阻塞、唤醒和建立内存顺序的源码路径。</p></div>
 
           <p>
             语言层先看 <a href="https://go.dev/ref/mem">Go Memory Model</a> 给出的同步保证；源码细节再固定到 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
@@ -71,14 +71,14 @@
             另一个需求是让所有 worker 给同一个“成功数”加一。这里没有成果转交，只有多段代码共同修改一份状态；用 <code>Mutex</code> 把“读—改—写”包起来通常更直接。
           </p>
           <p>
-            因此，不要从“channel 还是锁更快”开始，而要先问：谁拥有数据？数据是否要换主人？拥塞时谁应该等待？结束信号怎样传播？
+            因此，不要从“channel 还是锁更快”开始，而要先问：发送前后分别是谁可以修改数据？拥塞时谁应该等待？谁发结束信号？接收方怎样知道生产已经结束？
             这些问题决定并发协议，语法只是协议的实现工具。
           </p>
 
           <div class="table-wrap"><table>
-            <thead><tr><th>问题形状</th><th>优先工具</th><th>显式表达</th><th>主要失败边界</th></tr></thead>
+            <thead><tr><th>问题形状</th><th>优先工具</th><th>显式表达</th><th>常见失败方式</th></tr></thead>
             <tbody>
-              <tr><td>工作项或结果转交给另一个 goroutine</td><td><code>channel</code></td><td>所有权流向、排队、容量、关闭</td><td>阻塞发送、泄漏、关闭协议</td></tr>
+              <tr><td>工作项或结果转交给另一个 goroutine</td><td><code>channel</code></td><td>发送方与接收方、排队、容量、关闭</td><td>阻塞发送、泄漏、重复关闭</td></tr>
               <tr><td>在多个事件中选择一个并支持取消</td><td><code>select</code> + channel/context</td><td>就绪集合与退出路径</td><td>永远不就绪的 case、错误的 default</td></tr>
               <tr><td>短临界区内维护同一份 map/counter/cache</td><td><code>sync.Mutex</code></td><td>谁可访问共享状态</td><td>持锁过久、锁顺序、复制 Mutex</td></tr>
               <tr><td>无锁读取或单变量原子状态</td><td><code>sync/atomic</code></td><td>单个内存位置的原子操作</td><td>跨字段不变量被拆散</td></tr>
@@ -87,7 +87,7 @@
 
           <p>
             表格把刚才的判断扩成四种常见形状。channel 内部也有锁；Mutex 竞争时也会把 goroutine park。区别不在“一个无锁、一个阻塞”，而在业务层暴露的协议。
-            如果为了保护 map 而造一条命令 channel，还要维护专属 goroutine、请求/响应和退出协议；如果用 Mutex 模拟任务队列，又会把等待、容量与所有权藏进条件变量和字段。
+            如果为了保护 map 而造一条命令 channel，还要维护专属 goroutine、请求/响应和退出协议；如果用 Mutex 模拟任务队列，又会把何时等待、最多排多少项、谁取出后继续处理藏进条件变量和字段。
           </p>
 
           <h2>二、<code>hchan</code> 同时保存缓冲区与等待者</h2>
@@ -104,7 +104,7 @@ handler 创建容量为 N 的结果 channel
           </p>
           <p>
             可以先把字段分成四组读：buffer 里有多少格；下一次从哪里读写；谁因没有配对而等待；channel 是否关闭以及谁保护这些状态。
-            “结果换了主人”是业务协议；若结果含 slice、map 或 pointer，发送仍只复制说明卡，底层对象可能继续共享。
+            “发送完成后 worker 不再修改结果”是业务约定，不是 channel 自动施加的限制；若结果含 slice、map 或 pointer，发送仍只复制说明卡，底层对象可能继续共享。
           </p>
 
           <pre><code class="language-go">type hchan struct {
@@ -163,7 +163,7 @@ if c.qcount &lt; c.dataqsiz {
           <h4>发送复制元素值，不递归复制元素指向的对象</h4>
           <p>
             buffer 路径的 <code>typedmemmove(c.elemtype, qp, ep)</code> 与直接交付路径都复制 channel element。
-            对 <code>fetchResult</code> 这样的纯值 struct，这会得到独立字段；若元素含 slice、map 或 pointer，复制的是 descriptor/pointer，底层对象仍可能共享。这正接上第二篇的值语义边界。
+            对 <code>fetchResult</code> 这样的纯值 struct，这会得到独立字段；若元素含 slice、map 或 pointer，复制的是 descriptor/pointer，底层对象仍可能共享。这正是第二篇值语义在 channel send 上的实际结果。
           </p>
 
           <h3>2.3 满 channel 怎样把发送者变成 waiting G</h3>
@@ -204,7 +204,7 @@ c.sendx = c.recvx
 goready(sg.g, skip+1)</code></pre>
           <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L524-L685">chanrecv</a> 与 <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L688-L746">recv</a>。</span>
 
-          <h4>容量是并发协议，不是随手调大的性能旋钮</h4>
+          <h4>容量决定发送方何时等待，不是随手调大的性能旋钮</h4>
           <p>
             <code>fetchd</code> 使用 <code>make(chan fetchResult, len(targets))</code>，所以每个 worker 即使在 handler 开始收集前完成，也能放下一个结果；这避免响应取消后 worker 因无人接收而泄漏。
             代价是聚合器变慢时，最多积压一整个 batch。容量 0 强制 rendezvous；小容量早一点把压力传回生产者；大容量吸收 burst，却增加内存、排队年龄和故障时丢弃成本。
@@ -217,7 +217,7 @@ goready(sg.g, skip+1)</code></pre>
           </p>
 
           <p>
-            因此 close 的工程契约通常是“发送方/拥有方关闭”，接收方不猜测还有没有生产者。多个 sender 争着 close，需要额外的 owner、<code>sync.Once</code> 或聚合协议；recover 不是关闭协调机制。
+            因此通常应由知道“所有生产者都已结束”的那段代码关闭 channel，接收方不负责猜测还有没有生产者。多个 sender 都可能完成时，应指定一个协调者，或用 <code>sync.Once</code>、<code>WaitGroup</code> 后的汇总 goroutine 统一关闭；recover 不是关闭协调机制。
           </p>
 
           <h2 id="selectgo">三、<code>selectgo</code> 是一个三遍协议</h2>
@@ -383,24 +383,24 @@ go test -run '^$' -bench BenchmarkCoordinationContracts -benchmem</code></pre>
               <tr><td>mutex profile</td><td>哪些 unlock 路径造成了锁等待</td><td>无竞争快路径成本</td></tr>
               <tr><td>execution trace</td><td>park、unblock、runnable 与运行的时间关系</td><td>长期低开销趋势</td></tr>
               <tr><td>race detector</td><td>本次执行实际碰到的未同步访问</td><td>未覆盖路径没有 race</td></tr>
-              <tr><td>benchmark</td><td>一个固定契约在当前环境的开销</td><td>channel 与 Mutex 谁“普遍更好”</td></tr>
+              <tr><td>benchmark</td><td>一个固定工作负载在当前环境的开销</td><td>channel 与 Mutex 谁“普遍更好”</td></tr>
             </tbody>
           </table></div>
 
           <h2>七、回到 <code>fetchd</code> 的工程规则</h2>
           <ol>
-            <li><strong>用 channel 传递工作与所有权。</strong><code>fetchResult</code> 从 worker 到聚合器只有一个方向，通信本身就是完成信号。</li>
+            <li><strong>用 channel 把工作交给下一步。</strong><code>fetchResult</code> 从 worker 单向送到聚合器；发送后 worker 不再修改它，成功通信也同时表示这一份结果已完成。</li>
             <li><strong>用 Mutex 保护同一份短生命周期状态。</strong>计数器、map 或 cache 的不变量留在一个临界区里，不必为一次加法制造 actor 协议。</li>
             <li><strong>把容量当预算。</strong>写清允许积压多少项、多少字节和多老；buffer 不是修复慢消费者的无限仓库。</li>
             <li><strong>每条可能阻塞的 send 都要有退出故事。</strong>要么接收者生命周期更长，要么 select 监听 <code>ctx.Done()</code>，要么容量覆盖有界结果。</li>
-            <li><strong>close 由拥有发送生命周期的一侧负责。</strong>接收者消费到 closed，不负责猜最后一个 sender。</li>
+            <li><strong>close 由知道所有 sender 已结束的一侧负责。</strong>接收者只消费到 closed，不负责猜最后一个 sender 何时退出。</li>
             <li><strong>不要在持锁时做网络 I/O、channel send 或未知回调。</strong>它们把短临界区扩成跨组件等待，并放大锁顺序风险。</li>
             <li><strong>先用 profile 找等待，再读对应源码。</strong>优化目标应是缩短持锁、减少不必要唤醒或修正背压，而不是盲目替换同步原语。</li>
           </ol>
 
           <p>
-            这一篇的可复用结论是：<strong>channel 把值移动、排队和唤醒组合成通信协议；Mutex 把对同一状态的访问组合成临界区。两者都依赖 runtime 的 park/ready，选择依据是所有权与 happens-before，而不是一句性能口号。</strong>
-            下一篇会继续沿 <code>fetchResult</code> 的 error 与抽象边界，拆开 interface 的两个 word、typed nil、泛型字典与反射成本。
+            这一篇的可复用结论是：<strong>channel 把值复制、排队和唤醒组合成通信协议；Mutex 把对同一状态的访问放进临界区。两者都依赖 runtime 的 park/ready；选择时要看数据是否交给另一个 goroutine、谁还会修改它，以及 happens-before，而不是一句性能口号。</strong>
+            下一篇会继续沿 <code>fetchResult</code> 的 error 字段，解释 interface 的两个 word 怎样产生 typed nil，并比较泛型字典与反射各自付出的成本。
           </p>
 
           <h2 id="sources">参考源码与文档</h2>
