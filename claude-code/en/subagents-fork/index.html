@@ -3,10 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Subagents and Forks Are Context Projections | Rememorio Blog</title>
+    <title>How Claude Code isolates subagents and forked work | Rememorio Blog</title>
     <meta name="description" content="A source-reading article on Claude Code subagents, AgentTool, worker tool pools, fork path, cache-stable child queries, and context isolation." />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Subagents and Forks Are Context Projections | Rememorio Blog" />
+    <meta property="og:title" content="How Claude Code isolates subagents and forked work | Rememorio Blog" />
     <meta property="og:description" content="A source-reading article on Claude Code subagents, AgentTool, worker tool pools, fork path, cache-stable child queries, and context isolation." />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/agent-fork-cover.png" />
@@ -97,8 +97,8 @@
         <article class="article-card">
           <section class="article-hero">
             <p class="eyebrow">Claude Code Source Notes · Part VII</p>
-            <h1>Subagents and forks are context projections</h1>
-            <p class="lead">A subagent is tempting to picture as another chat window. The source points to a more precise model: the parent turn delegates part of the task into a separate context projection, with its own prompt, tool pool, memory rules, and result path.</p>
+            <h1>How Claude Code isolates subagents and forked work</h1>
+            <p class="lead">A subagent is not another chat window. Claude Code creates a separate <code>ToolUseContext</code> with its own prompt, tools, transcript, and query loop. A fork takes a different route: it deliberately copies the parent's request prefix so the child can reuse the prompt cache.</p>
             <div class="meta-line">
               <span>Project: Rememorio/claude-code</span>
               <span>Topic: subagents and fork</span>
@@ -111,7 +111,10 @@
 
           <section class="article-body">
 
-            <p>The <code>AgentTool</code> path starts when the model chooses to delegate work. That delegation is still a tool call from the parent loop's point of view. The interesting part is what happens after the tool call is accepted: Claude Code creates a worker context rather than giving the child unrestricted access to the parent's whole runtime.</p>
+            <p>The <code>AgentTool</code> path starts when the model asks to delegate work. From the parent loop's point of view, this is still a tool call. If it is accepted, Claude Code selects an agent, decides which tools that agent may use, creates separate state, and runs a child query loop.</p>
+            <div class="note route-note">
+              <p><strong>Reading goal:</strong> distinguish a normal subagent from the fork path. The normal path rebuilds a focused prompt and tool list; the fork path keeps the parent's system prompt, tools, thinking settings, and message prefix as stable as possible.</p>
+            </div>
             <figure class="shape-example">
               <pre><code class="language-text">AgentTool input
   -&gt; select agent definition
@@ -123,37 +126,56 @@
 fork path
   -&gt; reuse parent system/tools/messages prefix
   -&gt; append fork-only suffix</code></pre>
-              <figcaption>Source shape: normal subagents isolate the worker context; forked subagents preserve a parent prefix for cache discipline.</figcaption>
+              <figcaption>Source shape: normal subagents create focused child state; forked subagents preserve the parent request prefix for prompt-cache reuse.</figcaption>
             </figure>
 
-            <h2>1. Agent selection is gated</h2>
-            <p>The runtime must decide which agent definition applies, whether that agent is available, and which tools it may use. This keeps delegation explicit. The model can request an agent, but the runtime selects and constrains the child task.</p>
-            <div class="table-wrap"><table><thead><tr><th>Stage</th><th>What changes</th><th>Boundary protected</th></tr></thead><tbody>
-              <tr><td>Model proposal</td><td>The parent loop emits an <code>AgentTool</code> input such as task prompt, requested subagent type, and optional model preference.</td><td>The child does not exist yet; this is still a parent <code>tool_use</code> proposal.</td></tr>
-              <tr><td>Runtime selection</td><td>Claude Code resolves the agent definition, availability, and allowed tool scope.</td><td>The model request cannot mint an unrestricted worker by naming one.</td></tr>
-              <tr><td>Worker context</td><td>The runtime narrows tools and creates a child context with its own query loop and sidechain transcript.</td><td>The child sees a projection of parent state, not the whole parent runtime.</td></tr>
-              <tr><td>Parent result</td><td>The child loop finishes and returns a bounded result to the parent as a tool result.</td><td>The parent receives an outcome, not ownership of the child transcript internals.</td></tr>
+            <h2>1. AgentTool chooses a concrete execution path</h2>
+            <p>The input schema contains a task description and prompt, plus optional fields such as <code>subagent_type</code>, model, and background execution. When the related features are enabled, it may also accept a teammate name, team name, permission mode, isolation choice, and working directory. These fields decide how and where work runs; they do not create a free-form chat.</p>
+            <figure class="figure"><img src="../assets/agent-selection-gates.png" alt="AgentTool checks teammate and fork routes, deny rules, required MCP tools, worktree isolation, and background policy" /><figcaption><code>AgentTool.call()</code> decides which agent may start, whether required MCP tools are ready, and whether the task needs an isolated worktree.</figcaption></figure>
+
+            <p>The code first separates teammate spawning, the fork path, and a named agent definition. It then applies <code>Agent(name)</code> deny rules. An agent definition may also require MCP servers; Claude Code waits for pending servers for a limited time and stops with an actionable error if their tools never become available. The child starts only after the tools promised by its definition are actually present.</p>
+
+            <h2>2. A normal subagent gets a rebuilt tool list</h2>
+            <p>The normal path does not copy the parent's tool array verbatim. It starts from the current permission state and MCP tools, selects the agent's permission mode, and calls <code>assembleToolPool()</code>. <code>resolveAgentTools()</code> then removes tools forbidden to all agents, custom agents, or background agents, and applies the definition's <code>tools</code> and <code>disallowedTools</code> lists.</p>
+            <figure class="figure"><img src="../assets/worker-tool-scope.png" alt="Worker tools assembled from parent app state, worker permission settings, MCP tools, and agent-specific filters" /><figcaption>The child receives a newly calculated tool list that can be narrower than the parent's.</figcaption></figure>
+
+            <p>MCP tools are generally available to agents unless another rule removes them. A non-main-thread Agent tool is filtered out to prevent unbounded nesting. The normal child also receives a system prompt generated from its selected agent definition, environment details, and enabled tools rather than a copy of the parent's rendered prompt.</p>
+
+            <h2>3. The fork path preserves the parent request prefix</h2>
+            <p>The fork path makes a different tradeoff. It inherits the parent's rendered system prompt and uses <code>buildForkedMessages()</code> to clone the relevant assistant message, placeholder tool results, and a directive for the child. It also enables <code>useExactTools</code> and passes the parent's exact tool list.</p>
+            <figure class="figure"><img src="../assets/fork-cache-prefix.png" alt="Parent and forked child sharing system prompt, tools, thinking settings, and message prefix before a child-specific suffix" /><figcaption>The fork child changes the tail of the request while preserving the expensive parent prefix.</figcaption></figure>
+
+            <p>This exactness matters because tool definitions and thinking configuration contribute to the prompt-cache key. Rebuilding tools with a different permission mode could invalidate the cache at the first changed schema. Fork children therefore inherit the parent's thinking configuration as well. The Agent tool remains in the exact schema list, but a runtime check rejects another fork when the current request is already a fork child, preventing recursive branching.</p>
+
+            <h2>4. createSubagentContext isolates mutable state</h2>
+            <p><code>createSubagentContext()</code> defaults to separating mutable state unless the caller explicitly shares it. It clones file-read state, creates fresh memory and dynamic-Skill trigger sets, assigns a new agent id and tracking depth, and replaces parent UI callbacks such as <code>setToolJSX</code> and <code>addNotification</code> with no-ops.</p>
+            <figure class="figure"><img src="../assets/subagent-context-isolation.png" alt="Parent ToolUseContext creating child state with a new agent id, fresh triggers, isolated UI callbacks, and sidechain transcript" /><figcaption>A child cannot change the parent interface or mutable session state unless the caller explicitly shares that capability.</figcaption></figure>
+
+            <p>A synchronous interactive subagent may share selected callbacks, response accounting, and an abort controller with its parent. A background subagent is more isolated. When it has no shared interactive controller, its application state sets <code>shouldAvoidPermissionPrompts: true</code>, so unanswered permission requests are handled by hooks or denied instead of waiting for an unavailable dialog.</p>
+
+            <h2>5. runAgent operates a complete child query loop</h2>
+            <p><code>runAgent()</code> is an asynchronous generator, not a single provider request. It creates child state, runs <code>SubagentStart</code> hooks, registers hooks declared in the agent frontmatter, preloads Skills as messages, connects agent-specific MCP servers, and then enters <code>query()</code>. Child messages are written to a sidechain transcript as the loop continues.</p>
+
+            <p>A synchronous agent yields progress records to the parent and eventually returns a tool result. A background agent registers a task and reports completion through a notification or task result. Both paths have their own agent id, transcript, and cleanup behavior; neither is hidden code still running inside the parent turn.</p>
+
+            <h2>6. Compare normal, background, and forked work</h2>
+            <div class="table-wrap"><table><thead><tr><th>Path</th><th>System prompt</th><th>Tools</th><th>Result behavior</th></tr></thead><tbody>
+              <tr><td>Normal synchronous subagent</td><td>Generated from the selected agent definition.</td><td>Rebuilt and filtered for the worker.</td><td>Progress and the final result return to the waiting parent.</td></tr>
+              <tr><td>Normal background subagent</td><td>Generated from the selected agent definition.</td><td>Further restricted for background execution.</td><td>A task continues independently and notifies the parent when complete.</td></tr>
+              <tr><td>Fork child</td><td>Inherits the parent's rendered prompt.</td><td>Uses the exact parent tool definitions.</td><td>Runs a child-specific suffix while reusing the parent's cached prefix.</td></tr>
             </tbody></table></div>
-            <figure class="figure"><img src="../assets/agent-selection-gates.png" alt="Agent selection gates for name, definition, permission, and tool scope" /><figcaption>Subagent selection is another runtime gate, not a free-form model spawn.</figcaption></figure>
-            <h2>2. Worker tools are rebuilt</h2>
-            <p>A worker does not simply inherit the parent tool pool. The runtime builds worker tools from parent state, current permission mode, allow and deny lists, MCP tools, and agent-specific rules. This is why a subagent can be powerful while still being narrower than the parent session.</p>
-            <figure class="figure"><img src="../assets/worker-tool-scope.png" alt="Worker tool scope assembled from parent app state, permission context, MCP tools, and agent allow lists" /><figcaption>Worker tools are assembled for the child. Inheritance is a decision, not an accident.</figcaption></figure>
-            <h2>3. Normal subagents isolate context</h2>
-            <p>The normal subagent path gives the child a new prompt and a focused task. It can include selected parent facts, but it is not just the parent chat with a different name. That isolation reduces prompt pressure and keeps the result easy to route back into the parent turn.</p>
-            <figure class="figure"><img src="../assets/subagent-context-isolation.png" alt="Parent context projecting selected facts into isolated subagent context and returning a result" /><figcaption>The child receives a projection of the parent state, then returns a bounded result.</figcaption></figure>
-            <h2>4. Fork path preserves a cache-stable prefix</h2>
-            <p>The fork path is a special case. It mirrors the parent prefix more exactly so the child query can preserve cache behavior while adding a task-specific suffix. That suffix is consumed by the forked child request; it is not a new parent-conversation tail that later mainline turns should resume from. Forking reuses a request shape for economy, not because the child receives full authority over the parent runtime.</p>
-            <figure class="figure"><img src="../assets/fork-cache-prefix.png" alt="Fork path preserving parent prompt cache prefix while adding a child suffix" /><figcaption>Forking is not just another model call. It is a carefully shaped child request.</figcaption></figure>
-            <h2>5. The invariant</h2>
-            <p>A subagent is a bounded projection of work. The parent loop proposes delegation, the runtime chooses an agent, assembles a worker context, runs a child query, and returns a result. That path gives Claude Code parallel reasoning power without losing the parent session's governance boundaries.</p>
+
+            <p>A useful mental model is a child runtime with explicit inputs and outputs. Claude Code selects an agent, calculates its tools, chooses isolated or forked state, runs a separate query loop, records a transcript, and returns progress or a result to the parent.</p>
         
             <h2 id="sources">Sources</h2>
-            <p>The source-code claims in this article are based on the public mirror and the linked official documentation. Server-side behavior and private feature-gate policy are treated only as client-visible request shape.</p>
+            <p>The source-code claims in this article are based on the public mirror and the linked official documentation. Server-side scheduling is not inferred from client-side code.</p>
             <ul>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx">Agent tool source</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/Tool.ts#L158-L300">ToolUseContext</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolOrchestration.ts#L19-L82">Tool orchestration</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L81-L765">AgentTool input, routing, and launch</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/agentToolUtils.ts#L70-L225">Worker tool filtering</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/forkedAgent.ts#L253-L626">Subagent context and fork execution</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L520-L859">Child hooks, Skills, query loop, and transcript</a></li>
                 <li><a href="https://docs.anthropic.com/en/docs/claude-code/sub-agents">Claude Code subagents docs</a></li>
+                <li><a href="https://docs.anthropic.com/en/docs/claude-code/hooks">Claude Code hooks docs</a></li>
             </ul>
           </section>
         </article>

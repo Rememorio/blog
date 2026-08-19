@@ -12,7 +12,7 @@
     <meta property="og:title" content="Claude Code 源码阅读（七）：Subagent 不是另一个聊天窗口，而是隔离的工具上下文" />
     <meta
       property="og:description"
-      content="Subagent 不是多开一个聊天窗口，而是把任务投影到一份新的 ToolUseContext；fork path 则故意复制父级前缀来保 prompt cache。"
+      content="Subagent 不是多开一个聊天窗口，而是为子任务创建独立的 ToolUseContext；fork path 则故意复制父级前缀来复用 prompt cache。"
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/agent-fork-cover.png" />
@@ -108,7 +108,7 @@
             <h1>Subagent 不是另一个聊天窗口，而是隔离的工具上下文</h1>
             <p class="lead">
               前面讲完命令、Skills 和 MCP 后，很自然会问：模型如果觉得一个任务太大，能不能把一部分活交给另一个 agent？
-              Claude Code 的答案不是“开一个新聊天窗口”。源码里的 subagent，更像是把当前任务投影到一份新的
+              Claude Code 的答案不是“开一个新聊天窗口”。源码里的 subagent，会为当前子任务创建一份新的
               <code>ToolUseContext</code>：有自己的系统提示词、工具池、权限模式、transcript 和生命周期。
             </p>
             <div class="meta-line">
@@ -149,7 +149,7 @@
 
             <div class="note reading-contract">
               <p>
-                <strong>阅读契约：</strong>这篇只追本地 in-process subagent 和 fork path：
+                <strong>阅读目标：</strong>这篇只追本地 in-process subagent 和 fork path：
                 Agent 怎么被选中，工具池怎么被收窄，fork 为什么要复用父级前缀，
                 subagent context 默认隔离了哪些状态，同步和异步 agent 为什么有不同生命周期。
                 远端 CCR、tmux teammate 和 swarm 只在必要处点到为止。
@@ -184,16 +184,16 @@ fork path
               <code>AgentTool</code> 的 schema 在
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L81-L155"><code>AgentTool.tsx</code></a>。
               基础输入有 <code>description</code>、<code>prompt</code>、可选 <code>subagent_type</code>、可选模型和后台运行标记；
-              feature gate 打开时，还可能有 <code>name</code>、<code>team_name</code>、<code>mode</code>、
+              相关功能开关启用时，还可能有 <code>name</code>、<code>team_name</code>、<code>mode</code>、
               <code>isolation</code> 和 <code>cwd</code>。这些字段决定的是执行形态，不是简单的聊天窗口参数。
             </p>
 
             <figure class="figure">
               <img
                 src="../assets/agent-selection-gates.png"
-                alt="Claude Code AgentTool 选择闸门图，展示 AgentTool input 经过 teammate、fork path、deny filter、required MCP、worktree isolation 和 background policy 后选中 agent 与运行模式"
+                alt="Claude Code AgentTool 选择步骤图，展示 AgentTool input 经过 teammate、fork path、deny filter、required MCP、worktree isolation 和 background policy 后选中 agent 与运行模式"
               />
-              <figcaption><code>AgentTool.call()</code> 先过选择闸门：能不能 spawn、选哪个 agent、MCP 是否就绪、是否需要隔离工作树。</figcaption>
+              <figcaption><code>AgentTool.call()</code> 先完成几项检查：能不能 spawn、选哪个 agent、MCP 是否就绪、是否需要隔离工作树。</figcaption>
             </figure>
 
             <h3>1.1 先分 teammate、fork 和普通 agent</h3>
@@ -208,7 +208,7 @@ fork path
             <p>
               选择 agent 前还会过滤 deny rule。源码里支持 <code>Agent(name)</code> 这类权限规则：
               如果某个 agent 被 deny，调用会直接抛出错误，而不是让模型绕过去。
-              这和前面的权限篇能接上：subagent 的生成本身也是一个需要治理的能力。
+              这和前面的权限篇能接上：启动 subagent 本身也要受明确的权限规则控制。
             </p>
 
             <h3>1.2 required MCP 是启动前置条件</h3>
@@ -219,7 +219,7 @@ fork path
             </p>
 
             <p>
-              这说明 agent 不是“启动后再慢慢发现能力”。有些 agent 的能力边界必须在启动前满足，否则系统提示词、工具池和任务预期都会不一致。
+              这说明 agent 不是“启动后再慢慢发现能力”。如果 agent 声明了必需的 MCP，那么这些工具必须在启动前可用，否则系统提示词、工具池和任务预期会互相矛盾。
             </p>
 
             <h2>二、普通 subagent 会重建 worker tool pool</h2>
@@ -239,7 +239,7 @@ fork path
               <figcaption>普通 subagent 的工具池会重新组装，并按 agent definition、async 策略和 disallowedTools 收窄。</figcaption>
             </figure>
 
-            <h3>2.1 <code>resolveAgentTools()</code> 是工具收窄器</h3>
+            <h3>2.1 <code>resolveAgentTools()</code> 逐项缩小可用工具</h3>
             <p>
               工具收窄的共享逻辑在
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/agentToolUtils.ts#L70-L225"><code>resolveAgentTools()</code></a>。
@@ -358,14 +358,14 @@ fork path
 
             <p>
               这说明 agent 的上下文不是只由父级 prompt 决定。agent definition 自己可以带 hooks、skills、MCP 需求和系统提示词。
-              这些都在进入 query loop 前变成子 agent 的 model-visible view。
+              这些内容都会在进入 query loop 前写入子 agent 收到的提示词和消息。
             </p>
 
             <h3>5.2 Sidechain transcript 是子 agent 可恢复的前提</h3>
             <p>
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L732-L805"><code>runAgent()</code></a>
               会把 initial messages 写入 sidechain transcript，然后在 query loop 中继续记录 assistant、user、progress
-              和 compact boundary。这个 sidechain 不是 UI 装饰，而是后面查看、恢复和统计 subagent 的基础。
+              和压缩分界点。这个 sidechain 不是 UI 装饰，而是后面查看、恢复和统计 subagent 的基础。
             </p>
 
             <p>
@@ -416,14 +416,14 @@ fork path
 
             <p>
               到这里，Claude Code 的 subagent 就不神秘了：它不是“另一个聊天窗口”，也不是“模型自己复制自己”。
-              它是一套可组合的上下文投影：选择一个 agent，决定普通还是 fork，组装工具池，隔离 mutable state，
+              它是一套明确的执行过程：选择一个 agent，决定普通还是 fork，组装工具池，隔离 mutable state，
               跑独立 query loop，最后把结果、进度或通知回填给父级。
             </p>
 
             <p>
-              下一篇读 <a href="../hooks-lifecycle/">hooks</a> 时，会继续沿着这个边界看：
+              下一篇读 <a href="../hooks-lifecycle/">hooks</a> 时，会继续看这些执行位置：
               SessionStart、PreToolUse、PostToolUse、SubagentStart、SubagentStop 这些生命周期插槽，
-              究竟能在哪些地方改变上下文，又不能越过哪些运行时边界。
+              究竟能在哪些时刻修改输入、阻止工具或追加结果，以及哪些状态仍由运行时控制。
             </p>
 
             <h2 id="sources">参考源码与文档</h2>
@@ -484,23 +484,70 @@ fork path
         };
 
         const list = document.createElement("ol");
-        headings.forEach((heading) => {
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
           if (!heading.id) {
-            const base = slugify(heading.textContent);
-            const count = counts.get(base) || 0;
-            counts.set(base, count + 1);
-            heading.id = count ? `${base}-${count + 1}` : base;
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
           }
 
+          const level = Number(heading.tagName.slice(1));
           const item = document.createElement("li");
-          item.className = `toc-${heading.tagName.toLowerCase()}`;
           const link = document.createElement("a");
           link.href = `#${heading.id}`;
-          link.textContent = heading.textContent;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
           item.appendChild(link);
-          list.appendChild(item);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
         });
         toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
       })();
     </script>
   <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
