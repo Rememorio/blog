@@ -3,13 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Codex 源码阅读（九）：性能与 prompt cache，速度来自请求形状</title>
+    <title>Codex 源码阅读（九）：Codex 怎样构造可复用的请求前缀</title>
     <meta
       name="description"
       content="沿 OpenAI prompt caching 官方契约和 openai/codex 源码，拆解 Codex 怎样通过稳定前缀、prompt_cache_key、动态尾部、compaction 与 token usage 指标管理体感速度。"
     />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Codex 源码阅读（九）：性能与 prompt cache，速度来自请求形状" />
+    <meta property="og:title" content="Codex 源码阅读（九）：Codex 怎样构造可复用的请求前缀" />
     <meta
       property="og:description"
       content="从稳定前缀、动态尾部、prompt_cache_key、cached/non-cached token usage 和 compaction，看 Codex 为什么把性能问题落到请求形状。"
@@ -83,9 +83,9 @@
         <article class="article-card">
           <section class="article-hero">
             <p class="eyebrow">Codex 源码阅读 · 第九篇</p>
-            <h1>性能与 prompt cache，速度来自请求形状</h1>
+            <h1>Codex 怎样构造可复用的请求前缀</h1>
             <p class="lead">
-              前八篇把一次 turn 的 owner 拆开以后，性能问题终于能落到具体位置：
+              前八篇把一次 turn 的执行模块拆开以后，性能问题终于能落到具体位置：
               Codex 要反复把规则、工具、历史、上下文更新和最新输入组装成 Responses 请求。
               如果前缀稳定，OpenAI automatic prefix cache 可以复用已处理的前缀；如果动态信息太早混进来，
               同一个 thread 也会变成一轮轮重新 prefill。第九篇就看 Codex 怎样把体感速度压回请求形状。
@@ -113,7 +113,7 @@
             <p>
               OpenAI 的
               <a href="https://developers.openai.com/api/docs/guides/prompt-caching">prompt caching 文档</a>
-              把合同讲得很清楚：缓存依赖 exact prefix match；静态内容应该放在请求开头，动态内容放在尾部；
+              说明了明确条件：缓存依赖 exact prefix match；静态内容应该放在请求开头，动态内容放在尾部；
               请求可以通过 <code>prompt_cache_key</code> 影响路由；响应里的
               <code>usage.prompt_tokens_details.cached_tokens</code> 用来观察命中结果。
               对 Codex 来说，源码里真正值得看的点就变成：它怎样让请求开头足够稳定，又怎样把会变化的东西推到合适的位置。
@@ -121,17 +121,16 @@
 
             <div class="note key-point">
               <p>
-                这篇的中心判断是：<strong>Codex 的 prompt cache 纪律不是一个 cache 参数，而是一套模型视图纪律。</strong>
-                <code>prompt_cache_key</code> 只负责把相似请求带进同一个缓存域；能不能命中，还要看
+                <code>prompt_cache_key</code> 只负责帮助相似请求进入同一个缓存路由；能不能命中，还要看
                 <code>instructions</code>、<code>tools</code>、<code>input</code>、context update、tool output 和
-                compaction 共同形成的前缀是否稳定。
+                compaction 共同形成的有序前缀是否完全匹配。
               </p>
             </div>
 
             <div class="note">
               <p>
-                <strong>证据边界。</strong>
-                OpenAI 官方文档说明 prompt cache 的 provider contract：exact prefix、缓存门槛、路由、retention、
+                <strong>取材范围。</strong>
+                OpenAI 官方文档说明 prompt cache 的服务端条件：exact prefix、缓存门槛、路由、retention、
                 <code>prompt_cache_key</code> 和 <code>cached_tokens</code>。Codex 公开源码只能证明客户端如何构造请求、
                 保存历史、触发 compaction、记录 token usage。服务端如何序列化内部 token、如何放置 KV cache、
                 如何调度机器，本文不把它写成 Codex 源码事实。
@@ -148,10 +147,10 @@
               <li>Codex 用哪些指标把 cache 效果和体感速度记录下来？</li>
             </ol>
 
-            <h2>一、先定坐标：缓存命中的是模型视图，不是聊天窗口</h2>
+            <h2>一、缓存匹配 API 请求，不匹配聊天窗口</h2>
             <p>
               很多性能讨论会直接问“有没有命中缓存”。这个问法太早了。先要问：
-              哪份内容进入了这次 API request？顺序是什么？哪些字段在 provider contract 里会参与 prefix？
+              哪份内容进入了这次 API request？顺序是什么？哪些字段会参与 prefix match？
               UI 里显示的历史、磁盘里的 rollout、runtime 临时构造的 request input，这三者不总是同一份东西。
             </p>
 
@@ -160,7 +159,7 @@
                 <thead>
                   <tr>
                     <th>层</th>
-                    <th>owner</th>
+                    <th>负责实现</th>
                     <th>作用</th>
                     <th>和 prompt cache 的关系</th>
                   </tr>
@@ -168,7 +167,7 @@
                 <tbody>
                   <tr>
                     <td>可见历史</td>
-                    <td>客户端投影</td>
+                    <td>客户端事件转换</td>
                     <td>让用户看到 turn、工具、hook、事件和最终回答。</td>
                     <td>只提供观察，不等于下一轮完整发给模型。</td>
                   </tr>
@@ -339,7 +338,7 @@ Responses request
             </div>
 
             <p>
-              这也是第 8 篇 hooks 铺垫的原因。hook 如果在 prompt gate 或 post-tool gate 补上下文，
+              这也是第 8 篇 hooks 铺垫的原因。hook 如果在 prompt 提交前或工具完成后补上下文，
               它不是“免费附加信息”；它会改变后续模型视图。一个小 hook 是否影响性能，要看它把内容插到哪里、
               是否每轮变化、是否破坏早期 prefix。
             </p>
@@ -428,7 +427,7 @@ Responses request
               这套指标也解释了为什么性能文章要排在 hooks 后面。一个 post-tool hook 可以让模型看见不同反馈；
               一个 permission hook 可以减少无效审批等待；一个 stop hook 可以让 turn 多跑一次；
               它们都会影响体感速度，但不一定直接体现在 cached tokens 上。源码里的性能观测必须把 cache、
-              tool loop、事件投影和 turn lifecycle 放在一起看。
+              tool loop、客户端事件转换和 turn lifecycle 放在一起看。
             </p>
 
             <h2>七、常见误读：把 cache 当成单点开关</h2>
@@ -443,7 +442,7 @@ Responses request
                   <tr>
                     <th>误读</th>
                     <th>更准确的读法</th>
-                    <th>源码里的边界</th>
+                    <th>源码检查点</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -485,8 +484,8 @@ Responses request
 
             <p>
               所以下一篇回到持久化和恢复：Codex 怎样把一次 turn 的过程写进 rollout，怎样从
-              <code>RolloutItem</code> 重建 history，怎样处理 rollback、fork、compact boundary 和 token usage。
-              读完那一篇，性能、恢复和客户端投影才会合成同一条线：用户看到的事实、磁盘保存的事实、
+              <code>RolloutItem</code> 重建 history，怎样处理 rollback、fork、compact 前后状态和 token usage。
+              读完那一篇，性能、恢复和客户端事件转换才能互相对应：用户看到的事实、磁盘保存的事实、
               模型下一轮看到的事实，必须能互相对齐。
             </p>
 
