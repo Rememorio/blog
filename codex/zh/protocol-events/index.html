@@ -6,7 +6,7 @@
     <title>Codex 源码阅读（三）：protocol 与事件流，客户端怎样共享同一套事实</title>
     <meta
       name="description"
-      content="沿 openai/codex 源码拆解 Codex 的 protocol 与事件流：TurnStartParams、Submission、Op、EventMsg、app-server v2 投影和 rollout 恢复。"
+      content="沿 openai/codex 源码拆解 Codex 的 protocol 与事件流：TurnStartParams、Submission、Op、EventMsg、app-server v2 映射和 rollout 恢复。"
     />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Codex 源码阅读（三）：protocol 与事件流，客户端怎样共享同一套事实" />
@@ -87,8 +87,8 @@
             <p class="lead">
               第二篇讲清了 turn 内部怎样整理上下文。现在把视角挪到 turn 外面：
               当 Codex 在后台跑模型、等审批、执行命令、更新 diff 时，客户端为什么能持续看到同一件事？
-              答案藏在一条很朴素的链路里：客户端提交有类型的任务单，运行时发出有类型的事件，
-              app-server 再把这些事件投影成客户端能消费的视图。
+              答案来自一段很朴素的数据流：客户端提交有类型的任务单，运行时发出有类型的事件，
+              app-server 再把这些事件转换成客户端能消费的通知和列表项。
             </p>
             <div class="meta-line">
               <span>项目：openai/codex</span>
@@ -112,8 +112,8 @@
 
             <p>
               如果只盯着界面，会很容易把这些现象看成一堆 UI 状态：聊天消息、进度条、审批弹窗、diff 面板、token 数字。
-              源码里的边界更清楚：先有 <strong>core 的运行时事实</strong>，再有 <strong>客户端视图</strong>。
-              这一篇就沿这条边界读。
+              源码里的顺序更清楚：先有 <strong>core 的运行时事件</strong>，再由客户端决定怎样显示。
+              这一篇就沿这个顺序读。
             </p>
 
             <div class="note key-point">
@@ -127,17 +127,17 @@
 
             <div class="note">
               <p>
-                <strong>证据边界。</strong>
-                OpenAI 的 App Server 文章提供产品层边界：App Server 位在客户端和 Codex harness 之间，
+                <strong>取材范围。</strong>
+                OpenAI 的 App Server 文章说明产品关系：App Server 位在客户端和 Codex harness 之间，
                 负责接住客户端请求，并把 harness event stream 整理成客户端通知。公开源码里能直接验证的是协议类型、
-                事件类型和映射函数。源码链接固定到同一个公开快照。文中把“任务单”“事实”“客户端投影”当作阅读辅助词，
+                事件类型和映射函数。源码链接固定到同一个公开快照。文中把“任务单”“运行时事件”“客户端通知”当作阅读辅助词，
                 对应的是源码里的 <code>Submission</code>、<code>EventMsg</code>、app-server v2 notification 等结构。
               </p>
             </div>
 
             <p>这一篇只追五个问题：</p>
             <ol>
-              <li>客户端发起 turn 时，除了文本，还带了哪些运行边界？</li>
+              <li>客户端发起 turn 时，除了文本，还带了哪些运行参数？</li>
               <li>core 层为什么只暴露提交任务和接收事件两条队列？</li>
               <li><code>EventMsg</code> 里哪些是生命周期，哪些是内容、工具、审批、用量和 diff？</li>
               <li>app-server v2 为什么要把 core event 再翻译成 turn、item、delta 和 request？</li>
@@ -156,7 +156,7 @@
                   <tr>
                     <th>客户端看到</th>
                     <th>源码里要追问</th>
-                    <th>对应边界</th>
+                    <th>对应类型</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -206,7 +206,7 @@
 
             <p>
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L125"><code>TurnStartParams</code></a>
-              里最直观的是 <code>thread_id</code> 和 <code>input</code>，但它还带着很多“本轮怎么运行”的边界：
+              里最直观的是 <code>thread_id</code> 和 <code>input</code>，但它还带着很多“本轮怎么运行”的参数：
               client metadata、additional context、environment、cwd、workspace roots、approval policy、
               sandbox policy、permissions、model 和 service tier。也就是说，发起 turn 的请求不是一句话，
               更像是一张带运行约束的任务单。
@@ -238,9 +238,9 @@
               不是在旁边随手改全局变量，而是被放进同一条有序队列。
             </p>
 
-            <h2>三、core 边界：Codex 是一对队列</h2>
+            <h2>三、core 对外只暴露一对队列</h2>
             <p>
-              app-server 把请求整理成 <code>Op</code> 之后，真正进入 core 的边界非常小。
+              app-server 把请求整理成 <code>Op</code> 之后，core 的交互接口非常小。
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L380-L390"><code>Codex</code></a>
               结构体的注释说它是一个 queue pair：发送 submission，接收 event。结构体里对应两根管道：
               <code>tx_sub: Sender&lt;Submission&gt;</code> 和 <code>rx_event: Receiver&lt;Event&gt;</code>。
@@ -291,7 +291,7 @@
             </div>
 
             <p>
-              这个边界小，但后面的设计都靠它对齐：
+              接口虽小，但后面的设计都靠它对齐：
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1149-L1156"><code>Event</code></a>
               也带一个 id，注释写的是“与 submission id 关联”。这就是客户端看到“第几轮 turn 在更新”的基础。
             </p>
@@ -301,7 +301,7 @@
               接下来读
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1158-L1325"><code>EventMsg</code></a>。
               它不是一个小枚举，而是一份很长的运行时事实清单，并且用 <code>#[serde(tag = "type", rename_all = "snake_case")]</code>
-              固定 wire shape。也就是说，事件不是靠字符串约定偷偷传，而是以 tagged enum 的形式进入序列化边界。
+              固定 wire shape。也就是说，事件不是靠字符串约定偷偷传，而是以 tagged enum 的形式序列化。
             </p>
 
             <div class="table-wrap">
@@ -337,7 +337,7 @@
                   <tr>
                     <td>状态补充</td>
                     <td><code>TokenCount</code>、<code>TurnDiff</code>、<code>ContextCompacted</code>、<code>ThreadRolledBack</code></td>
-                    <td>让客户端显示用量、diff、压缩和回滚状态，也给恢复链路留下可用信息。</td>
+                    <td>让客户端显示用量、diff、压缩和回滚状态，也给后续恢复留下可用信息。</td>
                   </tr>
                 </tbody>
               </table>
@@ -347,14 +347,14 @@
               这里要注意一件事：<code>EventMsg</code> 的粒度比最终 UI 更底层。
               比如 <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L3355-L3358"><code>TurnDiffEvent</code></a>
               只关心统一 diff 文本；<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2020-L2024"><code>TokenCountEvent</code></a>
-              只携带 token usage 和 rate limit 快照。客户端要怎样排版、折叠、突出显示，留给投影层处理。
+              只携带 token usage 和 rate limit 快照。客户端再自行决定怎样排版、折叠和突出显示。
             </p>
 
             <h2>五、app-server v2：把运行时事实翻译成客户端视图</h2>
             <p>
               到 app-server 这一层，协议开始面向多客户端。OpenAI 的
               <a href="https://openai.com/index/unlocking-the-codex-harness/">App Server 文章</a>
-              给了产品层边界：client 通过 JSON-RPC 接入 Codex harness，服务端把请求转成 core operation，
+              说明了产品关系：client 通过 JSON-RPC 接入 Codex harness，服务端把请求转成 core operation，
               也把 harness event stream 整理成客户端稳定消费的通知。
               源码里，这件事首先表现为用宏生成
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1318-L1338"><code>ServerNotification</code></a>，
@@ -383,7 +383,7 @@
             <p>
               第二处是
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L35"><code>item_event_to_server_notification</code></a>。
-              这个 helper 只覆盖“单个 core event 到单个 v2 notification”的无状态投影，
+              这个 helper 只覆盖“单个 core event 到单个 v2 notification”的无状态转换，
               例如 assistant 文本 delta、plan delta、reasoning delta、item started/completed、
               exec output delta 等。需要检查状态、清理 pending request 或抑制 legacy event 的场景，
               仍然留在 bespoke handler 里。
@@ -407,7 +407,7 @@
                   <tr>
                     <td><code>AgentMessageContentDelta</code></td>
                     <td><code>AgentMessageDeltaNotification</code></td>
-                    <td>流式文本增量直接投影给客户端。</td>
+                    <td>流式文本增量直接发给客户端。</td>
                   </tr>
                   <tr>
                     <td><code>ItemStarted</code> / <code>ItemCompleted</code></td>
@@ -434,7 +434,7 @@
             </div>
 
             <p>
-              把它连成一条链路，一次需要审批的命令大致会这样穿过边界：
+              把它连成一段数据流，一次需要审批的命令大致会依次经过：
             </p>
 
             <pre><code class="language-text">turn/start request
@@ -450,7 +450,7 @@
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L901-L904"><code>ContextCompacted</code></a>
               在 v2 里被压下，因为 v2 客户端会收到 canonical 的 context compaction item；
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1081-L1093"><code>PatchApplyBegin/End</code> 和部分 exec legacy item</a>
-              也会为了避免重复渲染而被抑制。也就是说，客户端投影层不是“有事件就全发”，它会维护客户端视图的一致性。
+              也会为了避免重复渲染而被抑制。也就是说，app-server 不是“有事件就全发”，它会维护客户端视图的一致性。
             </p>
 
             <h2>六、rollout 与恢复：保存能重建的事实</h2>
@@ -521,7 +521,7 @@ ThreadHistoryBuilder:
                 <tbody>
                   <tr>
                     <td><code>TurnStartParams</code></td>
-                    <td>客户端这次 turn 带了哪些边界？</td>
+                    <td>客户端这次 turn 带了哪些运行参数？</td>
                     <td>只看成用户消息。</td>
                     <td>把 input、cwd、approval、sandbox、model、metadata 一起看。</td>
                   </tr>
@@ -539,7 +539,7 @@ ThreadHistoryBuilder:
                   </tr>
                   <tr>
                     <td><code>ServerNotification</code></td>
-                    <td>这是哪个客户端视图需要的投影？</td>
+                    <td>哪个客户端功能需要这条通知？</td>
                     <td>以为 core event 会原样发给所有客户端。</td>
                     <td>看 bespoke handler 和 event mapping 是否做了转换、抑制或拆分。</td>
                   </tr>
@@ -556,7 +556,7 @@ ThreadHistoryBuilder:
             <p>
               回到开头的问题：客户端之所以能共享同一套事实，是因为 Codex 把输入、运行、展示和恢复分成了四层。
               读工具系统时也沿这条线追问：
-              <strong>模型提出 tool call 之后，Codex 怎样把它路由到具体工具、处理并发、归档结果，并把副作用关进权限边界里？</strong>
+              <strong>模型提出 tool call 之后，Codex 怎样把它路由到具体工具、处理并发、记录结果，并在审批与 sandbox 检查后执行？</strong>
             </p>
 
             <h2 id="sources">参考源码与文档</h2>
