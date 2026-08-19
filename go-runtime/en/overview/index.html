@@ -163,13 +163,13 @@
             <p>
               We will keep one scenario throughout the chapter. A small service named <code>fetchd</code> accepts several URLs,
               fetches them concurrently under one deadline, collects status codes and response sizes, and returns JSON.
-              It is small enough to read in one sitting yet contains boundaries that appear in real services: inbound connections,
+              It is small enough to read in one sitting yet contains handoffs that appear in real services: inbound connections,
               request contexts, child goroutines, an outbound connection pool, socket waits, and response writes.
             </p>
 
             <div class="note route-note">
               <p>
-                <strong>Reading contract:</strong> you do not need runtime knowledge. After the first half, you should be able to draw this relay:
+                <strong>Reading goal:</strong> you do not need runtime knowledge. After the first half, you should be able to draw this relay:
                 the server accepts a connection → a handler processes one request → workers make outbound requests → a worker pauses
                 while the network is empty → it continues when data arrives. The second half maps those handoffs to <code>net/http</code>,
                 <code>internal/poll</code>, and runtime source.
@@ -177,8 +177,8 @@
             </div>
 
             <p>
-              First, the evidence boundary. Direct source claims are pinned to the public
-              <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>. API contracts come from the
+              First, the source scope. Direct source claims are pinned to the public
+              <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>. Documented API behavior comes from the
               <a href="https://pkg.go.dev/net/http">net/http documentation</a>,
               <a href="https://pkg.go.dev/context">context documentation</a>, and
               <a href="https://go.dev/doc/diagnostics">Go diagnostics documentation</a>.
@@ -209,8 +209,8 @@
 5. The handler gathers two results
 6. The connection writes JSON to the caller</code></pre>
             <p>
-              No single request object performs that whole story. Several owners take turns. Here, <em>owner</em> simply means the code
-              that creates some state, decides when its lifetime ends, and cleans it up. Learn the owners first; the type names in the
+              No single request object performs that whole story. Several components take turns: one creates state, another decides
+              when its lifetime ends, and another may clean it up. Learn which code is responsible at each step; the type names in the
               table are only Go 1.26.0's concrete implementation of this relay.
             </p>
             <p>
@@ -224,8 +224,8 @@
                 <thead>
                   <tr>
                     <th>Layer</th>
-                    <th>Main owner</th>
-                    <th>Owned state</th>
+                    <th>Responsible component</th>
+                    <th>State it manages</th>
                     <th>Typical end condition</th>
                   </tr>
                 </thead>
@@ -279,7 +279,7 @@ incoming request
   ├─ child goroutine: fetch go.dev
   ├─ child goroutine: fetch pkg.go.dev
   └─ JSON aggregation</code></pre>
-              <figcaption>The same example will cross the server entry, context, Transport, netpoll, and diagnostics boundaries.</figcaption>
+              <figcaption>The same example will pass through server entry, context, Transport, netpoll, and diagnosis in later chapters.</figcaption>
             </figure>
 
             <h2>2. Make <code>fetchd</code> real before reading internals</h2>
@@ -329,7 +329,7 @@ server := &amp;http.Server{
 }</code></pre>
 
             <p>
-              These are not universal production defaults. They make boundaries visible: the server limits header reads, response
+              These are not universal production defaults. They state how long each wait may last: the server limits header reads, response
               writes, and idle connections; the client limits per-host connections, idle reuse, and response-header waiting.
               Real values must follow traffic, upstream SLOs, body sizes, and retry policy.
             </p>
@@ -337,7 +337,7 @@ server := &amp;http.Server{
             <h2 id="server-serve">3. <code>Server.Serve</code> accepts connections</h2>
             <p>
               <code>ListenAndServe</code> performs two essential actions: <code>net.Listen("tcp", addr)</code>, then hands the listener
-              to <code>Server.Serve</code>. The actual concurrency boundary sits in the accept loop.
+              to <code>Server.Serve</code>. The accept loop is where connection goroutines are created.
             </p>
 
             <pre><code class="language-go">// net/http/server.go, reduced to the main route
@@ -398,12 +398,12 @@ for {
 
             <p>
               The source comment explains the choice: ordinary HTTP/1 cannot read the next request while the current response is still
-              being produced, so another handler goroutine would add ownership without useful protocol concurrency. Application code
-              may create child goroutines as <code>fetchd</code> does, but that is handler-owned concurrency; it must bound work,
+              being produced, so another handler goroutine would add bookkeeping without useful protocol concurrency. Application code
+              may create child goroutines as <code>fetchd</code> does, but the handler must limit their work,
               propagate cancellation, and collect results. HTTP/2 multiplexing follows a different path.
             </p>
 
-            <h3>The panic boundary belongs to the connection owner</h3>
+            <h3>Where the connection goroutine catches a handler panic</h3>
             <p>
               A defer at the top of <code>conn.serve</code> recovers ordinary panics, records the current goroutine stack, and closes a
               non-hijacked connection. <code>ErrAbortHandler</code> is the special no-stack signal. This protects the HTTP connection
@@ -419,13 +419,13 @@ for {
               Keep following the worker that visits <code>go.dev</code>. If the caller disconnects early, the server cancels the request
               context. The worker used that same context for its outbound request, so <code>client.Do</code> can observe the stop signal.
               Cancellation is a notification, not a runtime command that deletes a goroutine; the call must return, the response body
-              must be cleaned up, and the worker must exit under their respective owners.
+              must be cleaned up, and the worker must exit through the code that created and waits for it.
             </p>
 
             <figure class="figure">
               <img
                 src="../assets/request-context-ownership.png"
-                alt="Go HTTP context ownership: baseCtx contains connCtx, which contains a request context; readRequest stores the cancel function on response, ServeHTTP return cancels the request, connection end cancels connCtx, and I/O deadlines remain separate"
+                alt="Go HTTP context cancellation: baseCtx contains connCtx, which contains a request context; readRequest stores the cancel function on response, ServeHTTP return cancels the request, connection end cancels connCtx, and I/O deadlines separately limit reads and writes"
               />
             </figure>
 
@@ -566,7 +566,7 @@ w = &amp;response{
             </p>
 
             <p>
-              The source reveals a subtler ownership split. The dial context uses <code>context.WithoutCancel</code> to retain request
+              The source reveals two separate lifetime decisions. The dial context uses <code>context.WithoutCancel</code> to retain request
               values while temporarily detaching from that request's cancellation because another request may reuse the connection.
               <code>wantConn</code> still has its own cancel path, and the caller stops waiting on <code>treq.ctx.Done()</code>.
               “This request stopped waiting” and “this connection is no longer worth establishing” are related but separate decisions.
@@ -574,7 +574,7 @@ w = &amp;response{
 
             <p>
               Once HTTP/1 obtains a <code>persistConn</code>, <code>roundTrip</code> sends writes to <code>writech</code> and response waits
-              to <code>reqch</code>. The connection's read and write loops own the socket while the calling goroutine waits for a response
+              to <code>reqch</code>. The connection's read and write loops manage the socket while the calling goroutine waits for a response
               or cancellation. A synchronous-looking <code>client.Do</code> therefore sits above a pool, dial goroutines, and persistent
               connection loops.
             </p>
@@ -685,12 +685,12 @@ casgstatus(gp, _Gwaiting, _Grunnable)</code></pre>
             <p>
               When the goroutine resumes, <code>internal/poll.FD.Read</code> returns from <code>waitRead</code> and retries the syscall.
               Epoll readiness is not treated as a guarantee that this read must succeed; readiness can change before the G runs, so the
-              retry loop is part of the contract.
+              code retries the syscall until it reads data or receives a definite error.
             </p>
 
             <h2>7. Where scheduling and GC belong on this route</h2>
             <p>
-              This first chapter establishes owners rather than turning the scheduler and GC into encyclopedias. For our request, the
+              This first chapter states which components do what rather than turning the scheduler and GC into encyclopedias. For our request, the
               scheduler runs accept, connection, handler, and Transport goroutines; switches away when they wait on channels, mutexes,
               timers, or netpoll; then arranges ready Gs on an executable P/M combination. <code>schedule → findRunnable</code> is the
               later entry point for G-M-P, local and global run queues, work stealing, and preemption.
@@ -714,7 +714,7 @@ casgstatus(gp, _Gwaiting, _Grunnable)</code></pre>
             <h2>8. Choose production evidence by symptom</h2>
             <p>
               Source reading should not make an incident start at line one of <code>server.go</code>. Start with evidence selected for the
-              symptom, then map the observation back to the owner route.
+              symptom, then decide which component or wait phase can explain it.
             </p>
 
             <div class="table-wrap">
@@ -723,7 +723,7 @@ casgstatus(gp, _Gwaiting, _Grunnable)</code></pre>
                   <tr>
                     <th>Symptom</th>
                     <th>Inspect first</th>
-                    <th>Likely owner</th>
+                    <th>Likely cause</th>
                     <th>Premature conclusion to avoid</th>
                   </tr>
                 </thead>
@@ -760,7 +760,7 @@ casgstatus(gp, _Gwaiting, _Grunnable)</code></pre>
                   </tr>
                   <tr>
                     <td>Shared state fails intermittently</td>
-                    <td><kbd>go test -race</kbd>, minimal reproduction, owner design</td>
+                    <td><kbd>go test -race</kbd>, minimal reproduction, who reads and writes shared data</td>
                     <td>Handler children, shared caches or maps</td>
                     <td>“Adding sleep proves there is no race”</td>
                   </tr>
@@ -769,16 +769,16 @@ casgstatus(gp, _Gwaiting, _Grunnable)</code></pre>
             </div>
 
             <p>
-              Each diagnostic tool has an observation boundary. Pprof aggregates samples and answers “where are resources spent?”
+              Each diagnostic tool has limits. Pprof aggregates samples and answers “where are resources spent?”
               Trace preserves temporal relationships among goroutines, scheduling, network blocking, syscalls, and GC and answers “why
               did this work not run then?” The race detector instruments memory access for concurrency conflicts and is not a performance
-              profile. Source gives a mechanism hypothesis; tools provide runtime evidence.
+              profile. Source suggests a mechanism; tools show what happened at runtime. A diagnosis needs both to agree.
             </p>
 
-            <h2>9. Keep all eight chapters on the same request</h2>
+            <h2>9. Keep all seven later chapters on the same request</h2>
             <p>
               The series will not switch among eight unrelated demos. Later chapters keep <code>fetchd</code> and the same production
-              request, enlarge one owner at a time, and add a reproducible experiment plus verified source.
+              request, enlarge one component or problem at a time, and add a reproducible experiment plus verified source.
             </p>
 
             <div class="table-wrap">
@@ -818,27 +818,27 @@ casgstatus(gp, _Gwaiting, _Grunnable)</code></pre>
                   </tr>
                   <tr>
                     <td>V</td>
+                    <td>What do interfaces, generics, and reflection each solve?</td>
+                    <td>Interface, itab, generic shapes, reflect</td>
+                    <td>Typed nil, assertions, reflective writes</td>
+                  </tr>
+                  <tr>
+                    <td>VI</td>
                     <td>How should a request end?</td>
                     <td>Context, timers, net/http cancellation</td>
                     <td>Timeout, cancellation, goroutine leaks</td>
                   </tr>
                   <tr>
-                    <td>VI</td>
+                    <td>VII</td>
                     <td>Why does an allocation reach the heap?</td>
                     <td>Compiler escape, allocator, GC</td>
                     <td><code>-gcflags=-m</code> and alloc profiles</td>
                   </tr>
                   <tr>
-                    <td>VII</td>
-                    <td>Why is <code>net/http</code> fast, and why does it stall?</td>
-                    <td>Transport, persistConn, HTTP/2</td>
-                    <td>Connection pools and slow upstreams</td>
-                  </tr>
-                  <tr>
                     <td>VIII</td>
-                    <td>How do we diagnose Go performance with evidence?</td>
-                    <td>Pprof, trace, runtime metrics, race</td>
-                    <td>A complete performance investigation</td>
+                    <td>Why is <code>net/http</code> fast, and why does it stall?</td>
+                    <td>Transport, persistConn, HTTP/2, pprof, trace</td>
+                    <td>Connection pools, slow upstreams, and joint diagnosis</td>
                   </tr>
                 </tbody>
               </table>
@@ -846,7 +846,7 @@ casgstatus(gp, _Gwaiting, _Grunnable)</code></pre>
 
             <p>
               The first chapter should leave three reusable rules, not a pile of function names:
-              <strong>find the lifecycle owner; separate the synchronous API from the waiting mechanism underneath; validate source
+              <strong>identify which code creates, ends, and cleans up each lifetime; separate the synchronous API from the waiting mechanism underneath; validate source
               hypotheses with runtime evidence.</strong> <a href="../value-semantics/">Chapter II is now available</a>: it begins with <code>fetchd</code>'s URL slice, result channel, and
               JSON aggregation to ask which bytes Go value semantics copy and which underlying state remains shared.
             </p>
