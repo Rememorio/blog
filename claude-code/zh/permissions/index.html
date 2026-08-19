@@ -6,7 +6,7 @@
     <title>Claude Code 源码阅读（五）：权限不是弹窗，而是副作用刹车</title>
     <meta
       name="description"
-      content="沿 Claude Code 公开镜像源码拆解权限链路：ToolPermissionContext、permission mode、allow/deny/ask 规则、PreToolUse、PermissionRequest、auto classifier 和拒绝结果回填。"
+      content="沿 Claude Code 公开镜像源码拆解权限判断：ToolPermissionContext、permission mode、allow/deny/ask 规则、PreToolUse、PermissionRequest、auto classifier 和拒绝结果回填。"
     />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Claude Code 源码阅读（五）：权限不是弹窗，而是副作用刹车" />
@@ -109,7 +109,7 @@
             <p class="lead">
               读到工具调用以后，最容易把权限理解成一个弹窗：模型想跑命令，终端问你要不要允许。
               但 Claude Code 的源码里，弹窗只是其中一种出口。真正的权限系统，是挡在 <code>tool_use</code>
-              和本地副作用之间的一条刹车链路：规则先拦，工具自己再检查，安全路径可以强制 ask，
+              和本地副作用之间的一套刹车机制：规则先拦，工具自己再检查，敏感操作可以强制 ask，
               hook 和 classifier 也可能参与，最后才轮到用户交互。
             </p>
             <div class="meta-line">
@@ -150,7 +150,7 @@
 
             <div class="note reading-contract">
               <p>
-                <strong>阅读契约：</strong>这篇只追工具执行前的副作用边界：规则和 mode 负责什么，工具自己的
+                <strong>阅读目标：</strong>这篇只追工具执行前的权限判断：规则和 mode 负责什么，工具自己的
                 <code>checkPermissions()</code> 负责什么，hook / classifier / user 什么时候能改决策，deny 如何回到下一轮模型。
                 读完应该能回答：为什么 bypass 也不是无条件通行，为什么后台路径不能弹窗，以及为什么拒绝不是沉默失败。
               </p>
@@ -187,28 +187,28 @@ tool_use
               <figcaption>源码形状：权限不是一个 UI 弹窗，而是工具执行路径里的三分支决策。</figcaption>
             </figure>
 
-            <h2>一、权限上下文是一张小账本</h2>
+            <h2>一、权限上下文保存本轮规则与状态</h2>
             <p>
-              权限链路的状态入口是
+              权限判断读取的状态集中在
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/Tool.ts#L123-L148"><code>ToolPermissionContext</code></a>。
-              它不是一个布尔开关，而是一张小账本：当前 mode、allow / deny / ask 规则、额外工作目录、
+              它不是一个布尔开关，而是一组会共同影响结果的字段：当前 mode、allow / deny / ask 规则、额外工作目录、
               bypass 是否可用、auto mode 是否可用、是否避免权限弹窗、是否要先等自动检查。
             </p>
 
             <figure class="figure">
               <img
                 src="../assets/permission-context-ledger.png"
-                alt="Claude Code ToolPermissionContext 权限账本图，展示 mode、allow rules、deny rules、ask rules、directories 和 no prompts 被 canUseTool 读取"
+                alt="Claude Code ToolPermissionContext 状态图，展示 mode、allow rules、deny rules、ask rules、directories 和 no prompts 被 canUseTool 读取"
               />
-              <figcaption><code>ToolPermissionContext</code> 是副作用边界的配置账本，<code>canUseTool()</code> 每次决策都会读取它。</figcaption>
+              <figcaption><code>ToolPermissionContext</code> 保存本轮权限配置，<code>canUseTool()</code> 每次决策都会读取它。</figcaption>
             </figure>
 
             <h3>1.1 mode 不是唯一输入</h3>
             <p>
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/types/permissions.ts#L16-L38">权限模式类型</a>
               里能看到外部可用模式：<code>default</code>、<code>plan</code>、<code>acceptEdits</code>、
-              <code>bypassPermissions</code>、<code>dontAsk</code>；内部还可能有 feature gated 的 <code>auto</code>。
-              但 mode 只是账本的一列。规则、目录、安全检查、工具实现自己的判断，都会影响最后结果。
+              <code>bypassPermissions</code>、<code>dontAsk</code>；内部还可能有受功能开关控制的 <code>auto</code>。
+              但 mode 只是其中一个输入。规则、目录、安全检查、工具实现自己的判断，都会影响最后结果。
             </p>
 
             <p>
@@ -216,7 +216,7 @@ tool_use
               源码明确把 deny 规则、工具自身 deny、requiresUserInteraction、content-specific ask 和 safety check 放在 bypass 前面。
             </p>
 
-            <h3>1.2 权限更新可以改账本，也可以持久化</h3>
+            <h3>1.2 权限更新可以只影响本轮，也可以写入设置</h3>
             <p>
               权限弹窗或 hook 允许时，可能带回 permission updates。
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/PermissionUpdate.ts#L55-L205"><code>applyPermissionUpdate()</code></a>
@@ -226,10 +226,10 @@ tool_use
             </p>
 
             <p>
-              所以“本次允许”和“以后都允许”不是同一件事。前者只返回 allow；后者还会把规则写进账本，甚至写回 settings。
+              所以“本次允许”和“以后都允许”不是同一件事。前者只让当前请求继续；后者会新增权限规则，并按所选范围写回 user、project 或 local settings。
             </p>
 
-            <h2>二、真正的决策栈在 <code>hasPermissionsToUseToolInner()</code></h2>
+            <h2>二、权限判断按固定顺序执行</h2>
             <p>
               权限判断的内核是
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L1158-L1315"><code>hasPermissionsToUseToolInner()</code></a>。
@@ -239,9 +239,9 @@ tool_use
             <figure class="figure">
               <img
                 src="../assets/permission-decision-stack.png"
-                alt="Claude Code 权限决策栈图，展示 deny rule、ask rule、tool check、safety check、bypass mode、allow rule 和 final ask 的顺序"
+                alt="Claude Code 权限判断顺序图，展示 deny rule、ask rule、tool check、safety check、bypass mode、allow rule 和 final ask 的顺序"
               />
-              <figcaption>顺序就是安全边界：deny、ask 和 safety check 先于 bypass / allow，避免模式开关覆盖硬约束。</figcaption>
+              <figcaption>判断顺序很重要：deny、ask 和 safety check 先于 bypass / allow，模式开关不能覆盖这些检查。</figcaption>
             </figure>
 
             <h3>2.1 deny 和 ask 先于工具默认放行</h3>
@@ -254,7 +254,7 @@ tool_use
 
             <p>
               工具自己的检查也不是摆设。如果工具实现返回 deny，直接 deny；如果工具要求 user interaction，即使后面有 bypass 模式也会保留 ask。
-              这类检查通常承载工具本身更懂的语义，比如路径、命令、沙箱、敏感文件等。
+              工具更了解自己的输入，所以会在这里检查路径、命令、沙箱和敏感文件等具体风险。
             </p>
 
             <h3>2.2 bypass 也绕不过内容级 ask 和 safety check</h3>
@@ -265,7 +265,7 @@ tool_use
             </p>
 
             <p>
-              这背后的不变量很简单：模式可以改变默认体验，但不能覆盖已经明确配置或工具识别出的高风险边界。
+              这里遵守的规则很简单：模式可以改变默认体验，但不能覆盖已经明确配置或工具识别出的高风险操作。
               <code>bypassPermissions</code> 是“默认不问”，不是“所有安全闸都失效”。
             </p>
 
@@ -273,7 +273,7 @@ tool_use
             <p>
               走过 deny、ask、工具检查、safety、bypass、allow rule 以后，如果工具结果还是 <code>passthrough</code>，
               源码会把它转换成 ask，并生成 permission request message。
-              这就是 default mode 下最常见的用户确认来源：不是每个工具都显式说“要问”，而是没有足够理由 allow 时，runtime 兜底问。
+              这就是 default mode 下最常见的用户确认来源：不是每个工具都显式说“要问”，而是没有足够理由 allow 时，runtime 把决定交给用户。
             </p>
 
             <div class="table-wrap">
@@ -303,8 +303,8 @@ tool_use
                   </tr>
                   <tr>
                     <td>passthrough to ask</td>
-                    <td>兜底确认</td>
-                    <td>没有明确证据证明安全时，把决策还给用户或后续自动检查。</td>
+                    <td>默认确认</td>
+                    <td>没有明确规则允许时，把决定交给用户或后续自动检查。</td>
                   </tr>
                 </tbody>
               </table>
@@ -327,7 +327,7 @@ tool_use
             <h3>3.2 auto mode 先走便宜路径，再跑 classifier</h3>
             <p>
               auto mode 不是所有 ask 都丢给模型分类器。
-              源码先排除不可自动批准的 safety check 和要求用户交互的工具；PowerShell 在特定 feature gate 未开时也要求显式用户权限。
+              源码先排除不可自动批准的 safety check 和要求用户交互的工具；PowerShell 在特定功能开关未启用时也要求用户明确授权。
               然后才尝试 acceptEdits fast path、安全工具 allowlist，最后调用 <code>classifyYoloAction()</code>。
               classifier blocked、unavailable、transcript too long 都有不同 fallback 或 fail-closed 行为。
             </p>
@@ -398,7 +398,7 @@ tool_use
               所以 ask 并不天然等于“当前终端弹窗”。ask 是一个需要决策的状态，至于谁来决策，要看当前线程、worker 类型、是否有 UI、是否有 bridge 或 channel。
             </p>
 
-            <h2>五、拒绝也要回到模型视图</h2>
+            <h2>五、拒绝结果也要告诉模型</h2>
             <p>
               权限结果回到 <code>toolExecution.ts</code> 后，如果不是 allow，
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L995-L1103">客户端不会执行工具</a>。
@@ -429,13 +429,13 @@ tool_use
               这说明“拒绝”也不是一个绝对终点：它可以改变下一轮策略，但仍然不能越过当前这次副作用。
             </p>
 
-            <h2>六、把权限链路压成几条规则</h2>
+            <h2>六、把权限判断归纳成几条规则</h2>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
                     <th>看到的现象</th>
-                    <th>源码里的真实边界</th>
+                    <th>源码里的实际行为</th>
                     <th>别误读成</th>
                   </tr>
                 </thead>
@@ -475,13 +475,13 @@ tool_use
             </div>
 
             <p>
-              到这里再回头看工具调用，就能分清三件事：模型能提出什么、客户端能执行什么、用户信任边界允许什么。
-              Claude Code 的权限系统不是为了让用户多点几次按钮，而是让本地副作用始终有一个可追溯、可拒绝、可恢复的决策点。
+              到这里再回头看工具调用，就能分清三件事：模型能提出什么、客户端能执行什么、当前规则允许什么。
+              Claude Code 的权限系统不是为了让用户多点几次按钮，而是让每次本地操作都有明确结果：执行、拒绝，或等待用户决定。
             </p>
 
             <p>
-              <a href="../commands-skills-mcp/">后面读命令、skills 和 MCP</a> 时，还会遇到同一个问题：能力越多，进入模型视图的 schema 越多，权限账本就越重要。
-              因为真正危险的不是“模型知道一个工具名”，而是某个工具名背后能否改变本地状态。
+              <a href="../commands-skills-mcp/">后面读命令、skills 和 MCP</a> 时，还会遇到同一个问题：可调用的能力越多，就越需要为文件、命令和外部服务分别定义权限规则。
+              真正需要控制的不是“模型知道一个工具名”，而是这个工具被调用后能否改变本地或远端状态。
             </p>
 
             <h2 id="sources">参考源码与文档</h2>

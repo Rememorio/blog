@@ -3,10 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Permissions Are the Side-Effect Brake | Rememorio Blog</title>
+    <title>Permissions are the side-effect brake | Rememorio Blog</title>
     <meta name="description" content="A source-reading article on Claude Code permissions: permission context, allow/deny/ask decisions, hooks, permission requests, and denied tool results." />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Permissions Are the Side-Effect Brake | Rememorio Blog" />
+    <meta property="og:title" content="Permissions are the side-effect brake | Rememorio Blog" />
     <meta property="og:description" content="A source-reading article on Claude Code permissions: permission context, allow/deny/ask decisions, hooks, permission requests, and denied tool results." />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/permission-side-effect-brake.png" />
@@ -111,7 +111,10 @@
 
           <section class="article-body">
 
-            <p>A coding agent reads files, edits files, runs commands, and talks to external tools. Those actions do not have the same risk. Claude Code therefore threads permission state through the tool runtime instead of leaving it as a UI-only feature.</p>
+            <p>A coding agent reads files, edits files, runs commands, and talks to external tools. Those actions do not carry the same risk. Claude Code therefore evaluates permissions inside the tool runtime instead of treating confirmation as a UI-only feature.</p>
+            <div class="note route-note">
+              <p><strong>Reading goal:</strong> follow one tool request from its configured rules to an allow, deny, or ask result. The useful questions are which checks run first, what each mode changes, and how a refusal reaches the next model turn.</p>
+            </div>
             <figure class="shape-example">
               <pre><code class="language-text">type PermissionDecision = "allow" | "deny" | "ask"
 
@@ -123,29 +126,50 @@ tool_use
               <figcaption>Source shape: permission is a branch in the tool runtime, not merely the dialog that may appear for the ask branch.</figcaption>
             </figure>
 
-            <h2>1. Permission context travels with the tool call</h2>
-            <p><code>ToolPermissionContext</code> is part of the state used while a tool call is evaluated. It gives the permission layer access to current mode, settings, rules, and session facts. The important point is that the decision is made in the same runtime path that will execute the side effect.</p>
-            <figure class="figure"><img src="../assets/permission-context-ledger.png" alt="Permission context ledger with mode, rules, settings, hooks, and tool request" /><figcaption>Permission is not a standalone prompt; it reads the same session context that tool execution reads.</figcaption></figure>
-            <h2>2. Allow, deny, and ask are runtime branches</h2>
-            <p>The permission decision stack can produce three practical outcomes. An allowed tool can continue. A denied tool returns a model-visible denial result. An ask branch suspends progress long enough to collect a user decision. That branch point is why permission code affects both UX and model behavior.</p>
-            <figure class="figure"><img src="../assets/permission-decision-stack.png" alt="Permission decision stack with allow, deny, ask, hooks, and settings layers" /><figcaption>The decision is built from mode, rules, hooks, and tool-specific validation rather than one global switch.</figcaption></figure>
-            <h2>3. Hooks can participate before execution</h2>
-            <p>Pre-tool hooks are part of the same story. A hook can inspect the tool request before execution and influence whether the action proceeds. That makes hooks governance points, not merely shell callbacks. They sit on the side-effect boundary.</p>
-            <h2>4. Asking the user is a race-sensitive path</h2>
-            <p>When the runtime asks for confirmation, it must keep the tool call, the UI prompt, and the eventual response aligned. Background events and new user input may still exist. The command queue and permission-request handling keep that interaction from turning into an ambiguous state.</p>
-            <figure class="figure"><img src="../assets/permission-dialog-race.png" alt="Permission dialog race between pending tool request, user choice, and command queue" /><figcaption>Ask-mode is not just a modal. It is a paused runtime decision waiting for a precise answer.</figcaption></figure>
-            <h2>5. Denial still returns a result</h2>
-            <p>When a tool is denied, Claude Code still needs to close the provider protocol loop. The model requested a tool id, so the client returns a paired tool result that explains the denial. That is healthier than dropping the call, because the next model turn can adapt instead of waiting for a result that never comes.</p>
-            <figure class="figure"><img src="../assets/permission-denied-result.png" alt="Denied permission becoming a paired tool_result for the model" /><figcaption>A denied action is still a completed runtime event from the model loop's point of view.</figcaption></figure>
-            <h2>6. The invariant</h2>
-            <p>Permission is the brake between language and side effect. Any code that bypasses it turns a model proposal into local action without the runtime's policy layer. That is the line this article keeps watching.</p>
+            <h2>1. Permission context holds the current rules and state</h2>
+            <p><code>ToolPermissionContext</code> supplies the inputs used for each decision: the current mode, allow/deny/ask rules, additional working directories, prompt availability, and feature state. No single field determines the result. A mode can change the default behavior, but configured rules and checks performed by the tool still apply.</p>
+            <figure class="figure"><img src="../assets/permission-context-ledger.png" alt="Permission context with mode, rules, settings, hooks, and tool request" /><figcaption><code>canUseTool()</code> reads the current permission state whenever it evaluates a request.</figcaption></figure>
+
+            <h3>1.1 One-time approval and saved approval are different</h3>
+            <p>A permission response may allow only the current request, or it may include an update that adds a rule. <code>applyPermissionUpdate()</code> can change the in-memory mode, rules, and working directories; updates targeted at user, project, or local settings can also be persisted. “Allow once” therefore continues one call, while “always allow” changes how later matching calls are evaluated.</p>
+
+            <h2>2. Checks run in a deliberate order</h2>
+            <p><code>hasPermissionsToUseToolInner()</code> checks reasons to stop before reasons to proceed. It evaluates configured deny and ask rules, then calls the tool's own <code>checkPermissions()</code>. Content-specific prompts and safety checks are considered before bypass mode or an allow rule. A remaining <code>passthrough</code> result becomes ask.</p>
+            <figure class="figure"><img src="../assets/permission-decision-stack.png" alt="Permission check order with deny rule, ask rule, tool check, safety check, bypass mode, allow rule, and final ask" /><figcaption>The order prevents bypass and allow settings from overriding an explicit denial or a required safety check.</figcaption></figure>
+
+            <p>This ordering explains a common surprise: <code>bypassPermissions</code> means “do not ask by default,” not “ignore every safety check.” A deny rule, a tool-level denial, required user interaction, or a protected-path check can still stop the request.</p>
+
+            <h2>3. Modes transform an ask result</h2>
+            <p>The outer <code>hasPermissionsToUseTool()</code> function decides what to do after the initial result is ask. In <code>dontAsk</code> mode, ask becomes deny because no interactive confirmation is permitted. Auto mode first excludes requests that cannot be approved automatically, then tries low-cost checks and an allowlist before using <code>classifyYoloAction()</code>. The classifier can approve, reject, or fail closed; auto mode is automated decision-making, not automatic approval.</p>
+            <p>A background or headless agent cannot display a prompt. When <code>shouldAvoidPermissionPrompts</code> is true, Claude Code gives <code>PermissionRequest</code> hooks a chance to return allow or deny. If no hook decides, the request is denied instead of waiting forever for a dialog nobody can answer.</p>
+
+            <h2>4. Hooks can decide before execution</h2>
+            <p><code>PreToolUse</code> hooks run before the main permission check, and <code>PermissionRequest</code> hooks can answer a pending ask. These hooks are concrete decision points: an allow result continues the current request, while a deny result prevents the tool from changing local or remote state.</p>
+
+            <h2>5. Interactive confirmation has several possible responders</h2>
+            <p>On the interactive path, the visible <code>ToolUseConfirm</code> is only one possible source of a decision. A user choice, permission hook, Bash classifier, bridge callback, or channel callback may answer first. <code>createResolveOnce()</code> lets one responder claim and resolve the request so that later responses cannot execute the tool again or record a conflicting answer.</p>
+            <figure class="figure"><img src="../assets/permission-dialog-race.png" alt="Permission request with user choice, hook, classifier, bridge, and channel competing to resolve once" /><figcaption>Several responders may be active, but exactly one result is accepted for the tool request.</figcaption></figure>
+
+            <p>Coordinator and swarm workers adapt the same ask state to their environment. A coordinator waits for a hook and classifier before falling back to its interactive path. A swarm worker tries its classifier and can forward the request to the leader through its mailbox. Ask therefore means “a decision is still required,” not necessarily “show a dialog in this terminal.”</p>
+
+            <h2>6. Denial still returns a tool result</h2>
+            <p>When the final decision is not allow, Claude Code does not execute the tool. It returns an error-shaped <code>tool_result</code> with the original <code>toolUseID</code> and an explanation. The next model turn can see that the action did not happen and choose a safer alternative instead of waiting for a missing response.</p>
+            <figure class="figure"><img src="../assets/permission-denied-result.png" alt="Denied permission becoming a paired error tool_result for the model" /><figcaption>A denied local action is still a completed protocol event that the next model turn can inspect.</figcaption></figure>
+
+            <p>After an auto-mode classifier denial, a <code>PermissionDenied</code> hook may also return a retry hint. That hint can influence the next attempt, but it does not retroactively approve the blocked action.</p>
+
+            <h2>7. The rule to keep in mind</h2>
+            <p>Permission is the brake between a model proposal and an observable side effect. The runtime first checks explicit restrictions and tool-specific risks, then considers configured shortcuts, and finally asks an eligible responder when no earlier rule settles the request. Each outcome is visible: the tool runs, the request is refused, or execution pauses for a decision.</p>
         
             <h2 id="sources">Sources</h2>
-            <p>The source-code claims in this article are based on the public mirror and the linked official documentation. Server-side behavior and private feature-gate policy are treated only as client-visible request shape.</p>
+            <p>The source-code claims in this article are based on the public mirror and the linked official documentation. Server-side behavior and private feature policy are described only where the client exposes an observable request or result.</p>
             <ul>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L93">useCanUseTool</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L473-L525">hasPermissionsToUseTool</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L599-L752">Tool permission wrapper</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/Tool.ts#L123-L148">ToolPermissionContext</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/PermissionUpdate.ts#L55-L265">Permission updates and persistence</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L473-L1315">Permission evaluation and mode handling</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L180">Interactive permission entry point</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/handlers/interactiveHandler.ts#L92-L530">Interactive responders and resolve-once handling</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L916-L1103">Permission check and denied tool result</a></li>
                 <li><a href="https://docs.anthropic.com/en/docs/claude-code/settings#permissions">Claude Code permissions docs</a></li>
                 <li><a href="https://docs.anthropic.com/en/docs/claude-code/hooks">Claude Code hooks docs</a></li>
             </ul>
