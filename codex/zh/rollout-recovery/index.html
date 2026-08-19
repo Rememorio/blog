@@ -3,13 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Codex 源码阅读（十）：rollout 与恢复，能继续的前提是能重放</title>
+    <title>Codex 源码阅读（十）：rollout 怎样重建 resume、fork 与 rollback</title>
     <meta
       name="description"
       content="沿 openai/codex 源码拆解 Codex rollout、JSONL writer、InitialHistory、TurnContextItem、compaction replacement、rollback 与 fork 的恢复机制。"
     />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Codex 源码阅读（十）：rollout 与恢复，能继续的前提是能重放" />
+    <meta property="og:title" content="Codex 源码阅读（十）：rollout 怎样重建 resume、fork 与 rollback" />
     <meta
       property="og:description"
       content="从 append-only rollout、倒序扫描、正序 replay、TurnContext baseline、ThreadRolledBack marker 和 fork snapshot，看 Codex 怎样让一次 thread 可以继续。"
@@ -83,11 +83,11 @@
         <article class="article-card">
           <section class="article-hero">
             <p class="eyebrow">Codex 源码阅读 · 第十篇</p>
-            <h1>rollout 与恢复，能继续的前提是能重放</h1>
+            <h1>Rollout 怎样重建 resume、fork 与 rollback</h1>
             <p class="lead">
               第九篇讲 prompt cache 时，我们把速度落到了请求形状。可一条 thread 不只要跑得快，还要能在进程退出后继续、
               能从旧会话 resume、能 fork 出新分支，也能在用户撤回几轮以后恢复到合理现场。
-              这些能力的共同前提，是 Codex 把一次运行留下成可重放的证据。
+              这些能力的共同前提，是 Codex 把一次运行写成可以重新解释的记录。
             </p>
             <div class="meta-line">
               <span>项目：openai/codex</span>
@@ -112,20 +112,20 @@
             <p>
               这些看起来像“保存聊天记录”。源码读下来会发现，聊天记录只是其中一层。Codex 真正要保存的，是之后可以被 runtime
               重新解释的一串事实：哪些内容进入过模型历史，哪个 compaction 替换了历史，哪一轮的工作目录、sandbox、模型和
-              collaboration mode 是有效基线，哪些事件应该投影给客户端。
+              collaboration mode 是有效基线，哪些事件应该重新交给客户端。
             </p>
 
             <div class="note key-point">
               <p>
-                第十篇抓住一个判断：<strong>rollout 是 Codex 的可重放账本。</strong>
-                它按 JSONL 追加 <code>RolloutItem</code>，写入时保持顺序和可重试，恢复时再从这些 item
+                rollout 是一份按时间追加的 typed JSONL 记录。它追加 <code>RolloutItem</code>，
+                写入时保持顺序并允许失败后重试，恢复时再从这些 item
                 重建模型历史、上下文基线、token usage、rollback 后的可见状态，以及 fork 的起点。
               </p>
             </div>
 
             <div class="note">
               <p>
-                <strong>证据边界。</strong>
+                <strong>取材范围。</strong>
                 本文只描述 openai/codex 公开源码中的 rollout schema、writer、session 初始化、resume/fork/rollback
                 路径和相关测试。它不推断 Codex 后端私有存储，也不把本地文件系统上的具体 rollout 路径写成公共契约。
               </p>
@@ -138,10 +138,10 @@
               <li>写入路径怎样做到先排队、再落盘、失败后还能重试？</li>
               <li>resume 和 fork 为什么先进入 <code>InitialHistory</code>？</li>
               <li>重建算法为什么要倒序扫描，再正序 replay？</li>
-              <li>rollback、compaction、prompt cache 会怎样被同一套账本串起来？</li>
+              <li>rollback、compaction、prompt cache 怎样共同依赖这些记录？</li>
             </ol>
 
-            <h2>一、先把“继续”拆成三层</h2>
+            <h2>一、恢复需要四类状态，不能只保存消息</h2>
             <p>
               客户端看到的是消息列表，模型下一轮需要的是有序 input，runtime 继续工作还要知道上下文基线和权限设置。
               这三层互相关联，却不能混成一个字段。只保存 UI 文本，后面会丢失工具调用、context diff、compaction
@@ -162,8 +162,8 @@
                   <tr>
                     <td>客户端状态</td>
                     <td>用户消息、工具进度、警告、rollback 事件。</td>
-                    <td>事件顺序、turn 边界、是否是恢复或 fork。</td>
-                    <td>保存 <code>EventMsg</code>，让投影层能重放事实。</td>
+                    <td>事件顺序、turn 起止位置、是否是恢复或 fork。</td>
+                    <td>保存 <code>EventMsg</code>，让客户端转换代码能重放事件。</td>
                   </tr>
                   <tr>
                     <td>模型历史</td>
@@ -188,8 +188,8 @@
             </div>
 
             <p>
-              这个拆法能解释为什么第六篇的 client projection、第七篇的多 agent、第九篇的 prompt cache，都会在第十篇重新出现：
-              它们都依赖同一条持久证据链。恢复如果重建错了，UI 可能看起来正常，模型视图却已经偏掉；模型视图如果偏掉，
+              这个拆法能解释为什么第六篇的客户端事件转换、第七篇的多 agent、第九篇的 prompt cache，都会在第十篇重新出现：
+              它们都依赖同一组持久记录。恢复如果重建错了，UI 可能看起来正常，模型视图却已经偏掉；模型视图如果偏掉，
               后续 prompt cache 形状也会跟着变。
             </p>
 
@@ -226,7 +226,7 @@
               </p>
             </div>
 
-            <h2>三、写入路径：先排队，再兑现 durability barrier</h2>
+            <h2>三、写入先排队，flush 再等待真正落盘</h2>
             <p>
               新建 session 和恢复 session 的 recorder 初始化路径不一样。新 session 会先预计算 rollout path 和
               <code>SessionMeta</code>，但文件创建可以延后到显式 <code>persist()</code>；resume 则要立刻打开旧 rollout
@@ -340,7 +340,7 @@ forward replay
               </p>
             </div>
 
-            <h2>六、rollback：追加 marker，再让 replay 算出当前世界</h2>
+            <h2>六、rollback：追加 marker，再让 replay 重算当前 history</h2>
             <p>
               rollback 的实现很克制。它先拒绝 <code>num_turns == 0</code>，也拒绝 active turn 进行中时 rollback。
               然后它要求 thread persistence 可用，flush 当前持久化队列，读取存储里的 history，把一个
@@ -409,12 +409,12 @@ forward replay
                   <tr>
                     <td>事件追加</td>
                     <td><code>RolloutLine</code> 外层 timestamp，内部 <code>RolloutItem</code>。</td>
-                    <td>恢复、审计、rollback 都有同一条证据链。</td>
+                    <td>恢复、审计、rollback 都读取同一组记录。</td>
                   </tr>
                   <tr>
                     <td>类型分层</td>
-                    <td>history、context、session meta、event 各有 owner。</td>
-                    <td>客户端投影和模型视图可以分开重建。</td>
+                    <td>history、context、session meta、event 由不同模块解释。</td>
+                    <td>客户端状态和模型视图可以分开重建。</td>
                   </tr>
                   <tr>
                     <td>checkpoint</td>
@@ -424,7 +424,7 @@ forward replay
                   <tr>
                     <td>marker 语义</td>
                     <td>rollback 追加 <code>ThreadRolledBack</code>。</td>
-                    <td>旧事实保留，当前世界由 replay 解释出来。</td>
+                    <td>旧记录保留，replay 据此算出当前 history。</td>
                   </tr>
                   <tr>
                     <td>durability barrier</td>
@@ -436,8 +436,8 @@ forward replay
             </div>
 
             <p>
-              到这里，Codex 的内部主线已经接近闭环：请求进入 runtime，context 形成模型视图，工具和权限制造副作用，
-              events 投影给客户端，rollout 把过程留下，恢复再把它们变回下一轮可用的现场。
+              到这里，Codex 的内部执行路径已经接近完整：请求进入 runtime，context 形成模型视图，工具和权限控制副作用，
+              events 交给客户端，rollout 记录过程，恢复再把记录重建成下一轮需要的 history 和 settings。
               下一篇就适合看外部接口：SDK 和 app-server 怎样让其他调用方进入同一套 runtime。
             </p>
           </section>
