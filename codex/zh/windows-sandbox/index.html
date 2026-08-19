@@ -3,16 +3,16 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Codex 源码阅读（十三）：Windows 沙箱，权限边界怎样落到操作系统</title>
+    <title>Codex 源码阅读（十三）：Windows sandbox 怎样限制文件写入与网络访问</title>
     <meta
       name="description"
       content="沿 OpenAI 官方 Windows sandbox 工程文章和 openai/codex 源码，拆解 Codex 怎样把权限策略落到 Windows 用户身份、ACL、防火墙、command runner 和 restricted token。"
     />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Codex 源码阅读（十三）：Windows 沙箱，权限边界怎样落到操作系统" />
+    <meta property="og:title" content="Codex 源码阅读（十三）：Windows sandbox 怎样限制文件写入与网络访问" />
     <meta
       property="og:description"
-      content="Codex 的 Windows sandbox 不是一句策略开关，而是一条从 runtime 权限到操作系统执行边界的落地路径。"
+      content="Codex 怎样把 runtime 权限转换成 Windows 用户身份、文件 ACL、防火墙规则和 restricted process token。"
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/windows-sandbox-boundary.png" />
@@ -82,7 +82,7 @@
         <article class="article-card">
           <section class="article-hero">
             <p class="eyebrow">Codex 源码阅读 · 第十三篇</p>
-            <h1>Windows 沙箱，权限边界怎样落到操作系统</h1>
+            <h1>Windows sandbox 怎样限制文件写入与网络访问</h1>
             <p class="lead">
               第五篇讲到 <code>SandboxAttempt</code> 时，我们停在了 runtime 的选择：
               一次工具调用可以被批准、拒绝、降权执行，或者在失败后请求更高权限。
@@ -106,7 +106,7 @@
             <p>
               如果只看产品体验，沙箱像是一个开关：允许写工作区、禁止联网、必要时请求审批。
               但源码阅读不能停在这个说法上。模型请求执行命令以后，真正保护本机的不是一句 prompt，
-              也不是 UI 上的标签，而是操作系统愿意承认的边界。
+              也不是 UI 上的标签，而是 Windows 真正执行的 ACL、防火墙规则和进程令牌。
             </p>
 
             <p>
@@ -120,7 +120,6 @@
 
             <div class="note key-point">
               <p>
-                本篇的主线是：<strong>Windows sandbox 是权限策略的操作系统落地层。</strong>
                 Codex 先在 runtime 里决定这次工具调用能拿到什么权限，再通过 setup 准备
                 sandbox 用户、文件 ACL 和防火墙规则；真正执行命令时，command runner 以
                 sandbox 用户身份启动，再派生出受限 token 的子进程。
@@ -129,8 +128,8 @@
 
             <div class="note">
               <p>
-                <strong>阅读契约。</strong>
-                这篇只追 Windows 本地执行链路：为什么现成 Windows 方案不够用，
+                <strong>阅读目标。</strong>
+                这篇只追 Windows 本地执行流程：为什么现成 Windows 方案不够用，
                 未提权原型解决了什么、漏掉了什么，提权 setup 为什么出现，command runner
                 为什么要站到 sandbox 用户一侧，以及这些机制怎样接回第五篇的工具权限主线。
               </p>
@@ -138,7 +137,7 @@
 
             <div class="note">
               <p>
-                <strong>证据边界。</strong>
+                <strong>取材范围。</strong>
                 产品背景来自 OpenAI 官方工程文章；实现细节来自 <code>openai/codex</code>
                 公开源码。本文只讨论本地 Windows sandbox backend，不推断 OpenAI 私有服务端如何执行远程任务。
               </p>
@@ -146,7 +145,7 @@
 
             <h2>一、先接回第五篇：runtime 只决定“应该怎样执行”</h2>
             <p>
-              第五篇里，我们把副作用拆成几道关口：permission hooks 可以提前观察或拒绝，
+              第五篇里，我们把副作用拆成几项检查：permission hooks 可以提前观察或拒绝，
               approval policy 决定是否需要人类确认，<code>ToolOrchestrator</code> 把一次模型工具请求整理成
               <code>SandboxAttempt</code>，最后 exec backend 负责真正启动命令。
             </p>
@@ -222,7 +221,7 @@
                   </tr>
                   <tr>
                     <td>Windows Sandbox</td>
-                    <td>临时 VM 边界。</td>
+                    <td>临时 VM 隔离。</td>
                     <td>隔离粒度太重，启动、文件映射和交互成本不适合每次工具调用。</td>
                   </tr>
                   <tr>
@@ -235,7 +234,7 @@
             </div>
 
             <p>
-              Codex 需要的边界更贴近日常开发：命令要在原仓库里跑，能读依赖和源码，
+              Codex 需要的限制更贴近日常开发：命令要在原仓库里跑，能读依赖和源码，
               但写入要收在允许的目录里；默认不能随便联网，必要时又要支持在线模式和代理例外。
               这不是一个“把进程关进盒子里”的单点问题，而是一组要和开发工具链共存的约束。
             </p>
@@ -268,12 +267,12 @@
 
             <div class="note key-point">
               <p>
-                未提权原型已经说明一件事：<strong>文件写入可以靠 ACL 收口，网络访问必须找到更硬的身份边界。</strong>
+                未提权原型已经说明一件事：<strong>文件写入可以靠 ACL 限制；要拦住直接 socket 连接，防火墙还需要一个可识别的用户身份。</strong>
                 这就是后面两个 sandbox 用户和防火墙规则出现的根因。
               </p>
             </div>
 
-            <h2>四、提权 setup：把网络边界变成 Windows 用户身份</h2>
+            <h2>四、提权 setup：用 Windows 用户身份执行网络规则</h2>
             <p>
               重新设计后的核心变化，是先用一个提权 setup 准备本机安全材料。源码里这两个用户名写得非常直白：
             </p>
@@ -330,11 +329,11 @@ const ONLINE_USERNAME: &amp;str = "CodexSandboxOnline";</code></pre>
             </div>
 
             <p>
-              所以 setup 不是“安装一个沙箱程序”这么简单。它是在用户机器上铺好几条操作系统边界：
-              文件系统认 ACL，网络栈认用户身份，后续 runner 才能把一次工具调用放进正确边界里。
+              所以 setup 不是“安装一个沙箱程序”这么简单。它要先配置文件 ACL、网络规则和两个本地用户；
+              后续 runner 才能为每次工具调用选择对应身份。
             </p>
 
-            <h2>五、command runner：真正的子进程从 sandbox 用户一侧出生</h2>
+            <h2>五、command runner 以 sandbox 用户启动真正的命令</h2>
             <p>
               有了 sandbox 用户，还剩一个实际问题：Codex 主进程通常以真实用户身份运行，
               它怎样让最终命令在 sandbox 用户身份下启动，同时还能拿回 stdin/stdout、exit code 和 terminal 尺寸变化？
@@ -360,7 +359,7 @@ const ONLINE_USERNAME: &amp;str = "CodexSandboxOnline";</code></pre>
               这一步看起来绕，但它解决了身份和交互两个问题。身份方面，最终命令出生在
               <code>CodexSandboxOffline</code> 或 <code>CodexSandboxOnline</code> 的世界里，
               防火墙和 ACL 可以生效。交互方面，Codex 仍然保留对命令生命周期的观察：
-              可以写 stdin、读输出、处理 resize、等待退出，也能把结果投影回 protocol event 和 rollout。
+              可以写 stdin、读输出、处理 resize、等待退出，也能把结果写回 protocol event 和 rollout。
             </p>
 
             <h2>六、放回 Codex 主线：平台沙箱保护的到底是什么</h2>
@@ -413,13 +412,13 @@ const ONLINE_USERNAME: &amp;str = "CodexSandboxOnline";</code></pre>
             <p>
               这样看，Windows sandbox 不是 Codex 系列里一块孤立的安全附录。
               它是第五篇“权限与 sandbox”的平台实现篇：runtime 决定策略，setup 准备边界，
-              runner 把命令放进边界，事件和 rollout 把结果带回主线。
+              runner 以选定身份启动命令，事件和 rollout 再记录结果。
             </p>
 
             <h2>七、读源码时容易误会的几件事</h2>
             <p>
-              第一，沙箱不是 prompt 约束。prompt 可以要求模型谨慎，但模型之外的命令执行需要 OS 边界兜底。
-              第二，它也不是一台完整 VM。Codex 的目标是在当前工作区里跑开发命令，所以它更像一组贴着仓库和用户身份工作的本地边界。
+              第一，沙箱不是 prompt 约束。prompt 可以要求模型谨慎，但模型之外的命令执行需要 OS 强制限制。
+              第二，它也不是一台完整 VM。Codex 的目标是在当前工作区里跑开发命令，所以它使用仓库 ACL、本地用户和防火墙规则。
               第三，setup 成功不代表每次命令都一定成功；它只说明本机材料准备好了，后续还要看权限轮廓、路径、网络和 runner 状态。
             </p>
 
