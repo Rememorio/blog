@@ -10,7 +10,7 @@
   <div class="article-shell"><aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
     <section class="article-hero">
       <p class="eyebrow">Reading OpenClaw · Part IV</p><h1>How context, memory, and compaction work together</h1>
-      <p class="lead">An agent can retain a complete transcript and still appear to forget. A durable record is not the same as the model's view for this run. OpenClaw reconstructs a bounded runtime view from the system prompt, workspace files, session history, tool schemas, results, and attachments. Memory is yet another durable, selectively retrieved layer. Understanding who stores, injects, and shrinks each kind of state is what “remembering” really requires.</p>
+      <p class="lead">An agent can retain a complete transcript and still appear to forget because each model request sees only part of it. OpenClaw also adds the system prompt, workspace files, tool schemas, results, and attachments, while memory stores separately retrieved long-term facts. Diagnose forgetting by checking what was stored and what the model actually received.</p>
       <div class="meta-line"><span>Part 4 of 8</span><span>Source snapshot: c549250</span><span>Topic: context · memory · compaction</span><span>Prerequisite: routing and sessions</span></div>
       <nav class="series-strip"><a href="../overview/"><strong>01</strong> Main path</a><a href="../gateway/"><strong>02</strong> Gateway</a><a href="../routing-sessions/"><strong>03</strong> Routing</a><span class="series-current"><strong>04</strong> Context</span><a href="../capability-assembly/"><strong>05</strong> Capabilities</a></nav>
       <figure class="hero-image"><img src="../assets/context-assembly.png" alt="OpenClaw context assembly on every run: system prompt, Project Context, session transcript, tool schemas, results, and attachments enter the Context Engine to form bounded Model Context, while full SKILL.md instructions load on demand" /></figure>
@@ -21,7 +21,8 @@
       <div class="note"><p><strong>Reading contract.</strong>By the end, you should be able to name the workspace files injected into Project Context by default; explain why the system prompt is rebuilt on every run; account for the two token costs of tools; place ContextEngine's ingest, assemble, compact, and afterTurn phases; tell which of pruning and compaction rewrites the transcript; and explain why <code>MEMORY.md</code> is not another name for the context window.</p></div>
       <p><strong>Evidence boundary.</strong>This chapter is pinned to commit <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a> and follows the workspace/bootstrap, system-prompt, ContextEngine, and compaction implementation in that snapshot. Memory backends continue to evolve, so the focus is the verifiable runtime contract rather than treating one retrieval implementation as permanent architecture.</p>
 
-      <h2>1. Context means everything in one model request</h2>
+      <h2>1. What enters one model request</h2>
+      <h3>1.1 Context includes every input in the request</h3>
       <p>In OpenClaw, context is not merely the last few chat messages. It is everything actually sent for one model request: the system prompt, conversation messages, tool calls and results, attachments, and tool definitions. All of them compete for the same context window. There is no permanently reserved space that only conversation history may consume.</p>
       <p>This explains a familiar surprise: no extra conversation was added, but installing several verbose tools reduced the history that fit. The visible chat length is not the only input. Images, structured tool results, JSON schemas, and dynamic prompt additions all consume capacity.</p>
       <pre><code class="language-text">model context = system prompt
@@ -33,12 +34,12 @@ memory != model context
 transcript != model context</code></pre>
       <p>The two inequalities matter more than the formula. A transcript is the durable record of a session. Memory is a set of selected facts intended to survive longer and often cross session boundaries. Model context is the temporary view assembled for one run. The first two can supply the third, but neither automatically or completely becomes it.</p>
 
-      <h2>2. The workspace is a working directory, not an automatic sandbox</h2>
+      <h3>1.2 Workspace provides a directory; sandbox provides isolation</h3>
       <p>Each agent has a workspace, which becomes the default root for relative tool paths and bootstrap files. <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/workspace.ts"><code>workspace.ts</code></a> creates the directory and starter files; the runtime later reads selected files into the system prompt as Project Context.</p>
       <p>“Working directory” must not be read as “filesystem boundary.” Without a sandbox policy, a tool can still access absolute paths outside it. Real filesystem, network, and process isolation belong to sandbox and tool policy, the subject of Part VI. A workspace establishes default ownership and collaboration material, not security by itself.</p>
       <p>It is also distinct from OpenClaw's runtime state directory. The workspace contains agent-editable instructions, skills, and memory files. Runtime state contains configuration, credentials, and session storage. Mixing the session database into the workspace—or putting the user project into runtime state—makes permissions, backups, and migration unnecessarily ambiguous.</p>
 
-      <h2>3. Project Context is a selected bootstrap, not a directory snapshot</h2>
+      <h3>1.3 Project Context loads only the defined bootstrap files</h3>
       <p>The canonical bootstrap set has explicit names: <code>AGENTS.md</code> describes working conventions, <code>SOUL.md</code> carries persona and principles, <code>IDENTITY.md</code> identifies the agent, <code>USER.md</code> holds the user profile, and <code>BOOTSTRAP.md</code> participates during initial setup. Root <code>MEMORY.md</code> enters Project Context only when it already exists and the current session is not a privacy-restricted shared group or channel. The runtime does not recursively read the workspace or inject a file merely because its name looks important.</p>
       <div class="table-wrap"><table><thead><tr><th>File</th><th>Default role</th><th>Easy mistake</th></tr></thead><tbody>
         <tr><td><code>AGENTS.md</code></td><td>Repository, workflow, and behavioral conventions.</td><td>It does not bypass higher-level policy.</td></tr>
@@ -51,17 +52,18 @@ transcript != model context</code></pre>
       <p>There are per-file and total bootstrap limits. Oversized files are truncated with a visible marker in the injected content; missing files also remain observable instead of being silently indistinguishable from empty text. That makes “why did the model miss the latter half of the rule?” a context-report question rather than folklore.</p>
       <p><code>TOOLS.md</code>, <code>BOOT.md</code>, and <code>HEARTBEAT.md</code> have useful roles elsewhere, but their names do not put them into the default Project Context list. Source reading should follow the actual bootstrap resolver rather than infer injection semantics from filenames.</p>
 
-      <h2>4. The system prompt is rebuilt for every run</h2>
+      <h3>1.4 The system prompt combines stable rules and current state</h3>
       <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/system-prompt.ts#L795-L950"><code>buildAgentSystemPrompt</code></a> does not emit one installation-time template. Every run combines the current tools, skill metadata, workspace, runtime and time information, channel capabilities, sandbox state, and bootstrap content. A workspace edit therefore appears on the next construction; no old transcript entry needs to be rewritten.</p>
       <p>This also demands a stable/dynamic split. Persona and durable conventions belong in workspace files. Current time, available tools, and sandbox state must be generated at runtime. Persisting every dynamic detail into the transcript creates stale facts; rebuilding all stable rules independently in each channel creates inconsistent ingress.</p>
       <p>Slash directives are a preprocessing concern. Controls such as <code>/think</code>, <code>/model</code>, and <code>/queue</code> update runtime or session settings and are removed from the user text sent to the model. The model receives the processed request, not the entire Gateway control protocol embedded in it.</p>
 
-      <h2>5. Skills enter as a catalog; tools carry description and schema</h2>
+      <h3>1.5 Skills expand on demand; tool schemas travel with the request</h3>
       <p>To control prompt size, the system prompt normally lists only each available skill's name, summary, and location. When the model determines that a capability applies, it reads the full <code>SKILL.md</code> on demand. Injecting every installed skill in full would make adding capabilities reduce the space available for the task and history.</p>
       <p>Tool cost is less visible. The system prompt includes a human-readable name and description, while the provider request also includes the JSON schema that constrains callable parameters. The schema may not appear as ordinary chat text, but still consumes context. Tight descriptions and schemas without redundant nesting can save more than removing a few user sentences.</p>
       <div class="note"><p><strong>A useful distinction:</strong>a skill says when to load which operating manual; a tool schema says which structured call the model can make now. The former should expand on demand. The latter must be fully precise whenever the tool is callable. Hiding the parameter contract to save tokens is unsafe, while preloading every manual is wasteful.</p></div>
 
-      <h2>6. ContextEngine is a view-assembly protocol, not another session store</h2>
+      <h2>2. How ContextEngine selects model input and maintains history</h2>
+      <h3>2.1 ContextEngine assembles input without replacing the session store</h3>
       <p>The default <code>legacy</code> context engine preserves established behavior: ingest and afterTurn add little, assemble lets the existing sanitize/validate/limit pipeline shape messages, and compact delegates to built-in summarization. A plugin can occupy the single <code>plugins.slots.contextEngine</code> slot, but that gives it the context lifecycle—not automatic ownership of the canonical transcript database.</p>
       <p>The core lifecycle in <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/context-engine/types.ts"><code>ContextEngine</code></a> reads naturally in time:</p>
       <ol>
@@ -73,18 +75,19 @@ transcript != model context</code></pre>
       </ol>
       <p>The output of assemble is the input view for this run; it is not authority to delete the durable record. Transcript changes must use the safe rewrite interface provided by runtime context. The contract deliberately separates choosing what the model sees from changing historical truth.</p>
 
-      <h2>7. The hard part of pluggable assembly is the turn fence</h2>
+      <h3>2.2 The turn fence prevents duplicate writes during retries</h3>
       <p>A custom engine may mirror transcripts into a vector database and assemble a relevance-ranked view. Retry semantics are more dangerous than retrieval quality: if the first provider request fails and the same logical user turn retries, the engine must not commit it twice or alternately include and exclude it during assembly.</p>
       <p>To durably own admitted turns, an engine declares current-turn-fence and atomic-idempotent-advancement semantics, then implements atomic <code>commitTurn</code> keyed by <code>advancementKey</code>. A repeated key must return duplicate instead of appending again. Without the complete declaration, the host conservatively falls back to the legacy path for that logical turn rather than invite double-written history.</p>
       <p>This contract transfers to any “external memory plus agent” architecture. Relevance is only the read path. Idempotent commit, repeatable assembly, and a precise visibility boundary for the current turn determine whether the state can be trusted.</p>
 
-      <h2>8. Transcript, memory, and runtime view have different owners</h2>
+      <h3>2.3 Transcript, memory, and model input store different information</h3>
       <figure class="hero-image"><img src="../assets/context-state-owners.png" alt="Three OpenClaw state owners: Transcript is the durable session record, Memory contains MEMORY.md and daily memory files and is retrieved selectively, and Runtime View is temporary model context; Project Context enters separately, so context is not memory" /></figure>
       <p>The transcript records the messages, tool calls, and results that actually occurred under one sessionId. It is the causal ledger. Memory holds selected facts and decisions meant for longer reuse. Runtime View is the temporary message sequence produced by assembly for one run; the view itself does not need to become a new source of truth after the request.</p>
       <p><code>MEMORY.md</code> contains curated long-term memory, while <code>memory/YYYY-MM-DD.md</code> contains daily notes. A private main session can use long-term memory as trusted context or a retrieval source. Group and other sessions must not receive the same private profile unconditionally. Retrieval is a selective bridge with an authorization boundary, not “concatenate all memory files into the prompt.”</p>
       <p>Cross-session recall follows the same rule. It may retrieve fragments from other authorized transcripts, but it does not merge session keys or change the owner of either transcript. Otherwise “remember a relevant fact” would silently become “inherit another session's entire authority.”</p>
 
-      <h2>9. Pruning shrinks the view; compaction persists a summary</h2>
+      <h2>3. How model input shrinks as history grows</h2>
+      <h3>3.1 Pruning shrinks one request; compaction persists a summary</h3>
       <figure class="hero-image"><img src="../assets/context-compaction-pruning.png" alt="OpenClaw pruning versus compaction: pruning omits older tool results only from the runtime Model Context and leaves the transcript intact; compaction persists a summary of older messages and keeps recent messages" /></figure>
       <p>Both mechanisms reduce model input, but their durability semantics are different. Pruning omits bulky old tool results during assembly, affecting only the in-memory prompt. The full result remains in the durable transcript for audit or future assembly under another policy. It fits reproducible tool output whose immediate value has decayed.</p>
       <p>Compaction summarizes older conversation into one summary entry and persists that entry in the transcript while retaining recent messages verbatim. Future runs see the summary in place of the folded interval. It is therefore a lossy, durable state transition—not merely a cache.</p>
@@ -94,17 +97,18 @@ transcript != model context</code></pre>
       </tbody></table></div>
       <p>“The model did not see it” therefore does not imply “the data was deleted.” Assembly may not have selected it, pruning may have removed it only from the view, or compaction may have irreversibly generalized the detail.</p>
 
-      <h2>10. Memory flush rescues durable facts before lossy compression</h2>
+      <h3>3.2 Memory flush saves long-term facts before compression</h3>
       <p>Before automatic compaction, OpenClaw can run a silent memory-flush turn by default, prompting the agent to append important facts to memory files. The result is not a copy of the compaction summary. A summary exists to continue this session; memory selects information worth retaining for longer and retrieving elsewhere.</p>
       <p>The flush may use its own exact model override, which does not inherit the active session's fallback chain. Write paths are constrained so a housekeeping turn cannot modify arbitrary workspace content under the pretext of remembering. If the flush is exhausted or fails, normal reply and compaction paths can degrade; user-visible status requires notifications to be enabled.</p>
       <p>The safer practice is still to write durable decisions promptly, not bet everything on one rescue at the edge of the window. The longer organization is delayed, the easier it is for the model to miss the most important decision in the history it is about to compress.</p>
 
-      <h2>11. Overflow is not “drop the oldest message”</h2>
+      <h3>3.3 Overflow still preserves tool-call and result pairs</h3>
       <p>Before a run, OpenClaw estimates proximity to the provider's context limit; during the run, the provider may still report overflow. The legacy engine can compact and retry. A custom engine that owns compaction must honor its own compact contract. Either path must preserve system/tool pairing, the current user turn, and enough recent history to continue coherently.</p>
       <p>If compaction times out, the runtime must decide whether it can safely resume from a pre-compaction snapshot rather than continue after a half-written summary. Tool calls make this strict: an assistant tool call and its result cannot be cut into orphans, or the provider may reject the structure and the model may misunderstand whether an external action occurred.</p>
       <p>Context governance is consequently more than token arithmetic. It is also transcript-schema repair, provider compatibility, retry idempotency, and side-effect ordering.</p>
 
-      <h2>12. Inspect the built request instead of guessing from the chat page</h2>
+      <h2>4. How to diagnose why the agent forgot</h2>
+      <h3>4.1 Inspect the built request instead of guessing from the chat page</h3>
       <p><code>/context list</code> shows major contributors, <code>/context detail</code> expands the largest system-prompt and tool-schema entries, and <code>/context map</code> gives a distribution-oriented view. Reports prefer the system prompt captured from the last real embedded run; only when no run report exists do they estimate one on demand.</p>
       <p>A reliable diagnostic order is: verify route and sessionId, confirm that the raw fact exists in the transcript, inspect Project Context truncation, check memory write and retrieval, then examine pruning, compaction, and tool-schema share. That sequence prevents every apparent memory issue from becoming an indiscriminate window increase.</p>
       <pre><code class="language-text">/context list
@@ -113,7 +117,7 @@ transcript != model context</code></pre>
 /compact Focus on decisions, constraints, and unfinished work</code></pre>
       <p>The focus supplied to <code>/compact</code> should name the structure the summary must preserve, not invite new facts. Decisions, paths, constraints, and unfinished work make useful checkpoints before and after compression.</p>
 
-      <h2>13. Five kinds of forgetting need five repairs</h2>
+      <h3>4.2 Five kinds of forgetting point to five checks</h3>
       <div class="table-wrap"><table><thead><tr><th>Symptom</th><th>Likely owner</th><th>Correct move</th></tr></thead><tbody>
         <tr><td>The same chat suddenly behaves like a new one.</td><td>Route / sessionId</td><td>Inspect reset, daily/idle rollover, and key before touching memory.</td></tr>
         <tr><td>The latter half of an instruction file has no effect.</td><td>Project Context</td><td>Check bootstrap caps and truncation; shorten stable rules.</td></tr>
@@ -122,7 +126,7 @@ transcript != model context</code></pre>
         <tr><td>A cross-session fact is not recalled.</td><td>Memory / retrieval</td><td>Check write, index, authorization, and retrieval hit; do not merge transcripts.</td></tr>
       </tbody></table></div>
 
-      <h2>14. Seven rules to carry from the context system</h2>
+      <h3>4.3 Seven context rules to carry forward</h3>
       <ol>
         <li><strong>Separate durable record from model view.</strong>Successful storage does not mean complete injection on every run.</li>
         <li><strong>Give each state one source of truth.</strong>Transcript, memory, workspace, and runtime view must not impersonate one another.</li>
