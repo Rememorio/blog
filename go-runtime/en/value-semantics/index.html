@@ -63,7 +63,7 @@
           </section>
 
           <section class="article-body">
-            <div class="note route-note"><p><strong>Reading contract:</strong> you do not need to know a slice's internal layout. Whenever you see an assignment, argument, return, or channel send, learn to ask two questions: what value was copied here, and does that copy still point to the same underlying data?</p></div>
+            <div class="note route-note"><p><strong>Reading goal:</strong> you do not need to know a slice's internal layout. Whenever you see an assignment, argument, return, or channel send, learn to ask two questions: what value was copied here, and does that copy still point to the same underlying data?</p></div>
 
             <p>
               We will build intuition with runnable code, then confirm it with three evidence layers. Semantics come from the Go specification sections on
@@ -99,7 +99,7 @@ fmt.Println(b) // [99 20]</code></pre>
                 <tr><td>Array, struct</td><td>The full array/struct value</td><td>References inside fields</td><td>Recurse into fields</td></tr>
                 <tr><td><code>string</code></td><td>The string value</td><td>Immutable byte sequence</td><td>Did slicing/conversion allocate?</td></tr>
                 <tr><td><code>slice</code></td><td>Pointer, length, capacity</td><td>Backing array</td><td>Range and capacity</td></tr>
-                <tr><td><code>map</code>, <code>channel</code></td><td>A value referring to runtime state</td><td>The same map/channel</td><td>Owner and synchronization</td></tr>
+                <tr><td><code>map</code>, <code>channel</code></td><td>A value referring to runtime state</td><td>The same map/channel</td><td>Who may mutate and how access is synchronized</td></tr>
                 <tr><td><code>interface</code></td><td>Dynamic type and data</td><td>Depends on dynamic value</td><td>Inspect both parts</td></tr>
               </tbody>
             </table></div>
@@ -118,7 +118,7 @@ fmt.Println(b) // [99 20]</code></pre>
 
             <h2>2. Find Every Copy in <code>fetchd</code></h2>
             <p>
-              The handler from Chapter I is small, yet it crosses four useful boundaries: a query returns a URL slice; range gives a string value to each goroutine;
+              The handler from Chapter I is small, yet it contains four useful handoffs: a query returns a URL slice; range gives a string value to each goroutine;
               a worker sends a <code>fetchResult</code> through a channel; and the collector appends received elements to a result slice.
             </p>
 
@@ -136,7 +136,7 @@ for range targets {
 
             <p>
               This is not one reference flowing unchanged. <code>targets</code> is a slice value; each <code>target</code> is a string value; the goroutine call gets another string value;
-              the channel copies a <code>fetchResult</code>; and <code>append</code> writes the received element into the batch backing array. Values are copied at every boundary, while isolation depends on their representations.
+              the channel copies a <code>fetchResult</code>; and <code>append</code> writes the received element into the batch backing array. Values are copied at every handoff, while isolation depends on their representations.
             </p>
 
             <h2 id="slice">3. Slices: Copy the Triple, Share the Backing Array</h2>
@@ -166,7 +166,7 @@ copyOfHeader = append(copyOfHeader, "gamma")
 len(original) == 2                   // each header owns its len
 original[:3][2] == "gamma"           // append still wrote into shared storage</code></pre>
 
-            <figure class="figure"><img src="../assets/slice-append-ownership.png" alt="Slice copy and append ownership: two ptr len cap headers address one array; append keeps it when capacity is available, while growslice uses mallocgc and memmove to create a new array when capacity is exhausted" /></figure>
+            <figure class="figure"><img src="../assets/slice-append-ownership.png" alt="Slice copy and append: two ptr len cap headers address one array; append keeps using it while capacity remains, then growslice uses mallocgc and memmove to create a new array" /></figure>
 
             <h3>Why <code>append</code>'s result must be assigned</h3>
             <p>
@@ -188,16 +188,16 @@ original[:3][2] == "gamma"           // append still wrote into shared storage</
             <p>
               The real path also separates pointer-bearing elements, runs race/msan/asan hooks, applies write barriers, and rounds allocator size classes.
               <code>nextslicecap</code> tends to double small slices and transitions smoothly toward roughly 1.25× for larger ones, but element size and allocator rounding affect the result.
-              <strong>The growth formula is an implementation policy, not a language contract.</strong>
+              <strong>The growth formula is an implementation detail; the Go language does not guarantee that ratio.</strong>
             </p>
 
-            <h3>Alias bugs are ownership bugs in disguise</h3>
+            <h3>Alias bugs usually come from unclear mutation rules</h3>
             <p>
               A function receiving <code>[]T</code> gets a header copy. It can update elements in the shared range; local reslicing or appending does not update the caller's header.
-              If an API must own input, say so and clone with <code>append([]T(nil), input...)</code> or <code>slices.Clone</code>. If it borrows, define who may mutate and whether the callee may retain it.
+              If an API needs data that later caller mutations cannot change, clone with <code>append([]T(nil), input...)</code> or <code>slices.Clone</code>. If it only reads during the call, define who may mutate and whether the callee may retain the value afterward.
             </p>
 
-            <h2>4. Follow Three More Sharing Boundaries</h2>
+            <h2>4. Follow Three More Sharing Cases</h2>
             <h3 id="channel">4.1 A Channel Send Copies the Element, Not an Object Graph</h3>
             <p>
               <code>results &lt;- result</code> sends one <code>fetchResult</code> value. On the buffered fast path, <code>chansend</code> locates a ring-buffer slot and calls
@@ -234,14 +234,14 @@ fmt.Println(string(got.Body)) // "Nk"</code></pre>
             <p>
               Today's <code>fetchResult</code> contains strings and integer fields. Reassigning the sender's <code>result.Status</code> after the send cannot rewrite the buffered copy.
               If a future version adds <code>Body []byte</code>, however, the channel copies the struct and slice header; mutations to <code>Body</code> elements may race with the receiver.
-              “Transfer ownership through the channel” is a design protocol, not an automatic runtime deep copy.
+              A rule that “the sender stops mutating after send” is an agreement between both sides, not an automatic runtime deep copy.
             </p>
 
             <h3>4.2 Maps and Interfaces: Follow Dynamic State</h3>
             <h4>Map assignment shares one map</h4>
             <p>
               The specification defines a map value as a reference to an implementation-specific structure. <code>second := first</code> copies the map value, so both names address one map.
-              Updating through either is visible through the other. Copying a map variable is neither a snapshot nor synchronization; concurrent sharing still needs a mutex, a single owner, or immutable publication.
+              Updating through either is visible through the other. Copying a map variable is neither a snapshot nor synchronization; concurrent sharing still needs a mutex, one goroutine that performs all writes, or immutable publication.
             </p>
 
             <h4>An interface nil has both a type and data question</h4>
@@ -275,11 +275,11 @@ ok &amp;&amp; typed == nil            // true</code></pre>
               <code>target := target</code> patch is unnecessary here.
             </p>
 
-            <figure class="figure"><img src="../assets/range-variable-iterations.png" alt="Range variables since Go 1.22: target1, target2, and target3 belong to separate iterations and closures capture them separately; references nested inside those values remain a separate ownership question" /></figure>
+            <figure class="figure"><img src="../assets/range-variable-iterations.png" alt="Range variables since Go 1.22: target1, target2, and target3 belong to separate iterations and closures capture them separately; nested references may still reach shared data" /></figure>
 
             <p>
-              Two boundaries remain. Variables declared before the loop and assigned with <code>=</code> are reused. And a fresh iteration variable is not a deep copy:
-              ranging over <code>[][]byte</code> yields distinct slice variables that may still address overlapping arrays. The language change repairs variable capture, not ownership.
+              Two caveats remain. Variables declared before the loop and assigned with <code>=</code> are reused. And a fresh iteration variable is not a deep copy:
+              ranging over <code>[][]byte</code> yields distinct slice variables that may still address overlapping arrays. The language change repairs variable capture; it does not decide who may mutate those arrays.
             </p>
 
             <h2 id="experiments">5. Turn “Copy” into Runnable Experiments</h2>
@@ -289,7 +289,7 @@ ok &amp;&amp; typed == nil            // true</code></pre>
               <tbody>
                 <tr><td><code>TestSliceHeaderCopySharesBackingArray</code></td><td>Spare capacity</td><td>Independent headers, shared array</td><td>Every append shares</td></tr>
                 <tr><td><code>TestAppendMaySplitBackingArray</code></td><td>Capacity exhausted</td><td>Growth can separate arrays</td><td>A fixed growth ratio</td></tr>
-                <tr><td><code>TestChannelSendCopiesElementValue</code></td><td>Buffered channel</td><td>Struct copy, shallow slice field</td><td>Automatic ownership transfer</td></tr>
+                <tr><td><code>TestChannelSendCopiesElementValue</code></td><td>Buffered channel</td><td>Struct copy, shallow slice field</td><td>The sender automatically stops mutating</td></tr>
                 <tr><td><code>TestMapAssignmentSharesState</code></td><td>One map value</td><td>Updates are shared</td><td>Concurrent safety</td></tr>
                 <tr><td><code>TestInterfaceHoldingTypedNilIsNotNil</code></td><td>Typed nil pointer</td><td>Interface is non-nil with a type</td><td>Stable reflection internals</td></tr>
                 <tr><td><code>TestRangeVariablesArePerIteration</code></td><td>Go 1.26 and <code>:=</code></td><td>Distinct iteration variables</td><td>No nested aliases</td></tr>
@@ -302,14 +302,14 @@ go test -race ./...
 go vet ./...</code></pre>
 
             <p>
-              A clean race run does not make ownership automatically correct; these tests create sharing sequentially. If slice-element reads and writes move to different goroutines without a happens-before edge,
+              A clean race run does not prove that shared mutation is designed correctly; these tests create sharing sequentially. If slice-element reads and writes move to different goroutines without a happens-before edge,
               the race detector can then report the conflict. The lab's job is to separate byte copying from state sharing.
             </p>
 
             <h2>6. Derive API Rules from Value Semantics</h2>
             <ol>
-              <li><strong>State borrow or ownership for parameters.</strong> Do not retain a read-only borrow; clone data that must outlive the call and expose the cost.</li>
-              <li><strong>Document mutability of returned slices and maps.</strong> Exposing an internal collection makes the caller an alias owner; copy or offer operations when needed.</li>
+              <li><strong>State whether parameters are retained.</strong> Do not retain data promised as call-only; clone data that must outlive the call and expose the cost.</li>
+              <li><strong>Document mutability of returned slices and maps.</strong> Exposing an internal collection lets the caller modify the same data; copy or offer operations when needed.</li>
               <li><strong>Audit channel messages recursively.</strong> A struct-by-value message does not deep-copy mutable slice, map, or pointer fields.</li>
               <li><strong>Always keep the result of append.</strong> Do not depend on spare capacity or a runtime growth ratio.</li>
               <li><strong>Read range semantics with the module version.</strong> Check <code>go.mod</code> and <code>:=</code> versus <code>=</code> before diagnosing captures.</li>
