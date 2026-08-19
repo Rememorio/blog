@@ -6,7 +6,7 @@
     <title>Claude Code 源码阅读（九）：Resume 不是续聊天，而是重建运行时状态</title>
     <meta
       name="description"
-      content="沿 Claude Code 公开镜像源码拆解 transcript 写入、loadConversationForResume、deserializeMessages、SessionStart(resume)、processResumedConversation、REPL /resume 和 fork resume 边界。"
+      content="沿 Claude Code 公开镜像源码拆解 transcript 写入、loadConversationForResume、deserializeMessages、SessionStart(resume)、processResumedConversation、REPL /resume 和 fork resume 的差异。"
     />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Claude Code 源码阅读（九）：Resume 不是续聊天，而是重建运行时状态" />
@@ -119,7 +119,7 @@
             <figure class="hero-image">
               <img
                 src="../assets/resume-surfaces-cover.png"
-                alt="Claude Code 会话表面图，展示 UI、transcript、runtime projection 和 API view 四层之间的关系"
+                alt="Claude Code 会话数据图，展示 UI、transcript、runtime state 和 API request 四种形态之间的关系"
               />
             </figure>
           </section>
@@ -135,7 +135,7 @@
 
             <div class="note key-point">
               <p>
-                这篇的结论先说清：<strong>transcript 是恢复账本，不是 model-visible prompt。</strong>
+                这篇的结论先说清：<strong>transcript 是持久化的恢复记录，不是直接发给模型的 prompt。</strong>
                 Claude Code 写入 transcript 时要维护消息链和附属记录；读取 transcript 时要清洗坏尾巴和未完成 tool_use；
                 真正 resume 时，还要把 transcript 里的状态重新安装回 AppState、session pointer、worktree、
                 agent definition、content replacement state 和 context-collapse store。
@@ -144,16 +144,16 @@
 
             <div class="note reading-contract">
               <p>
-                <strong>阅读契约：</strong>本篇只追本地会话恢复主线：
-                <code>recordTranscript()</code> 怎样写账，<code>loadConversationForResume()</code>
-                怎样读账，<code>processResumedConversation()</code> 和 REPL 的 <code>/resume</code>
+                <strong>阅读目标：</strong>本篇只追本地会话恢复过程：
+                <code>recordTranscript()</code> 怎样写记录，<code>loadConversationForResume()</code>
+                怎样读取和清理记录，<code>processResumedConversation()</code> 和 REPL 的 <code>/resume</code>
                 怎样恢复运行时状态，以及 <code>--fork-session</code> 为什么不能直接接管原会话文件。
                 远端会话、分享会话和 remote agent 只在必要处点到为止。
               </p>
             </div>
 
             <p>
-              证据边界同前几篇一样：产品概念参考 Claude Code
+              产品概念参考 Claude Code
               <a href="https://docs.anthropic.com/en/docs/claude-code/overview">官方概览</a>；
               源码层来自
               <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
@@ -167,20 +167,20 @@
   -&gt; run SessionStart resume hooks
   -&gt; processResumedConversation()
   -&gt; restore AppState, session pointer, worktree, agent, replacement state</code></pre>
-              <figcaption>源码形状：resume 先读耐久账本，再把能影响下一轮工具和模型请求的运行时状态装回去。</figcaption>
+              <figcaption>源码形状：resume 先读取持久化记录，再把能影响下一轮工具和模型请求的状态装回去。</figcaption>
             </figure>
 
-            <h2>一、先分清四个表面</h2>
+            <h2>一、先分清四种数据形态</h2>
             <p>
-              继续会话为什么复杂？因为同一段工作并不只有“聊天记录”一个表面。
+              继续会话为什么复杂？因为同一段工作不只保存为一种数据。
               屏幕上看到的是 UI messages；磁盘里保存的是 transcript 和附属 entry；
-              下一轮运行时看到的是经过恢复、清洗、压缩和工具预算处理后的 runtime view；
-              真正发给模型的又是 provider API 能接收的 request shape。
+              下一轮运行时使用的是经过恢复、清洗、压缩和工具预算处理后的消息与状态；
+              真正发给模型的则要进一步转换成 provider API 能接收的 request shape。
             </p>
 
             <p>
-              这四层不能混。UI 可以隐藏进度、折叠工具输出；transcript 要能恢复链路；
-              runtime view 要保证下一轮工具调用和上下文投影合法；API view 要满足模型和工具协议。
+              这四种数据不能混。UI 可以隐藏进度、折叠工具输出；transcript 要保留消息的前后关系；
+              runtime state 要保证下一轮工具调用引用正确的文件、agent 和替换记录；API request 则必须满足模型和工具协议。
               这也是 resume 不能简单等于“把 JSONL 里的 messages 读出来”的原因。
             </p>
 
@@ -188,7 +188,7 @@
               <table>
                 <thead>
                   <tr>
-                    <th>表面</th>
+                    <th>数据形态</th>
                     <th>负责什么</th>
                     <th>resume 时的风险</th>
                   </tr>
@@ -210,8 +210,8 @@
                     <td>工具结果、文件快照、agent 定义和工作目录对不上。</td>
                   </tr>
                   <tr>
-                    <td>API view</td>
-                    <td>进入模型请求的消息、工具 schema、上下文投影和 cache 形状。</td>
+                    <td>API request</td>
+                    <td>进入模型请求的消息、工具 schema 和影响 cache 的字段顺序。</td>
                     <td>未完成 tool_use、thinking-only 消息或过大工具结果会触发协议错误。</td>
                   </tr>
                 </tbody>
@@ -232,7 +232,7 @@
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1400-L1449"><code>recordTranscript()</code></a>。
               它先用 <code>cleanMessagesForLogging()</code> 清理可记录消息，再读取当前 session 已有的 message set。
               如果一个消息已经写过，并且它还处在新消息之前的 prefix 里，源码会把它当成 parent hint；
-              如果 compaction 把新的 compact boundary 和 summary 放在前面，后面的旧 messagesToKeep 就不会被错误拿来当 parent。
+              如果 compaction 把新的压缩标记和 summary 放在前面，后面的旧 messagesToKeep 就不会被错误拿来当 parent。
             </p>
 
             <figure class="figure">
@@ -240,7 +240,7 @@
                 src="../assets/context-ledger-cover.png"
                 alt="Claude Code runtime view 图，展示 history 和 tools 进入 stable prefix、runtime view、API view、compact 与 resume"
               />
-              <figcaption>Transcript 是恢复账本；进入 API 前还会被 runtime 投影成另一种 view。</figcaption>
+              <figcaption>Transcript 保存恢复所需的记录；发起 API 请求前，runtime 还会把它转换成模型可接收的消息。</figcaption>
             </figure>
 
             <h3>2.1 附属记录也要跟着写</h3>
@@ -256,7 +256,7 @@
             <p>
               这意味着“旧工具结果被压缩或替换过”不是屏幕状态，而是恢复状态。
               resume 时如果只加载 messages，不恢复 replacement 记录，下一轮就可能把本该替换的完整工具输出重新送进请求，
-              造成上下文膨胀和 cache 形状变化。
+              造成上下文膨胀，并改变后续请求的缓存前缀。
             </p>
 
             <h2>三、读取 transcript：先清理坏尾巴，再补 resume hooks</h2>
@@ -278,7 +278,7 @@
             </p>
 
             <p>
-              这一步很像把坏掉的账本尾页修好。不是每条落盘记录都能原样喂回下一轮。
+              这一步是在修复一次被中断的会话末尾。不是每条落盘记录都能原样喂回下一轮。
               未完成工具调用、孤立 thinking block、用户刚提交但模型没响应的半截 turn，都要先归一化成可恢复形状。
             </p>
 
@@ -316,7 +316,7 @@
               <figcaption>恢复不是只读 messages。稳定信息、重新加载信息和触发式信息会以不同方式回到下一轮。</figcaption>
             </figure>
 
-            <h3>4.1 <code>adoptResumedSessionFile()</code> 解决的是文件所有权</h3>
+            <h3>4.1 <code>adoptResumedSessionFile()</code> 决定后续写入哪个文件</h3>
             <p>
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1501-L1534"><code>adoptResumedSessionFile()</code></a>
               看起来只是把 <code>project.sessionFile</code> 指向 <code>getTranscriptPath()</code>，
@@ -325,7 +325,7 @@
             </p>
 
             <p>
-              这就是“恢复文件所有权”的含义。正常 resume 是接管原 session；fork resume 则不能接管，
+              换句话说，正常 resume 后的记录继续写入原 session；fork resume 则不能这样做，
               因为 fork 应该写入新 session file。
             </p>
 
@@ -355,12 +355,12 @@
             </p>
 
             <p>
-              这解释了为什么 session 列表也要 progressive enrich。
+              这解释了为什么 session 列表也要逐步补齐信息。
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L5072-L5105"><code>enrichLogs()</code></a>
               不是为了展示漂亮列表，而是从轻量 log 扩展出可以 resume 的有效会话，同时过滤掉不该展示的记录。
             </p>
 
-            <h2>六、普通 resume 和 fork resume 的边界</h2>
+            <h2>六、普通 resume 和 fork resume 的区别</h2>
             <p>
               最后看一个很实用的分叉：普通 resume 和 fork resume。
               普通 resume 要继续原 session，所以会切到旧 session id，恢复原 metadata/worktree，并 adopt 原 transcript。
@@ -370,7 +370,7 @@
             <figure class="figure">
               <img
                 src="../assets/compact-recovery-loop.png"
-                alt="Claude Code compact 恢复循环图，展示 trigger、pre hooks、summary fork、ledger、restore files memory tools 和 next turn"
+                alt="Claude Code compact 恢复循环图，展示 trigger、pre hooks、summary fork、恢复记录、files、memory、tools 和 next turn"
               />
               <figcaption>fork 和 compact 都在提醒同一件事：恢复点不是历史本身，而是下一轮能继续的运行时起点。</figcaption>
             </figure>
@@ -415,9 +415,9 @@
             </div>
 
             <p>
-              这就是第九篇的核心：resume 不是“续聊天”，而是把旧账本重新变成可运行状态。
+              这就是第九篇的核心：resume 不是“续聊天”，而是把持久化记录重新变成可运行状态。
               消息只是其中一层，旁边还有文件历史、内容替换、collapse commit、metadata、agent、worktree、
-              hooks 和 session file ownership。少恢复任何一层，下一轮看起来也许能发出去，
+              hooks 和 session 文件写入目标。少恢复任何一层，下一轮看起来也许能发出去，
               但它已经不是原来那条会话了。
             </p>
 
