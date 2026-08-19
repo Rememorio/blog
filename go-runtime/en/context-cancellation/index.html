@@ -55,14 +55,14 @@
         </section>
 
         <section class="article-body">
-          <div class="note route-note"><p><strong>Reading contract:</strong> remember one sentence: <code>cancel()</code> sends “please stop”; it does not instantly kill a goroutine or wait for it. Learn to separate termination into four steps: publish the signal, let each worker observe it and return, clean up resources, and wait for all workers to finish.</p></div>
+          <div class="note route-note"><p><strong>Reading goal:</strong> remember one sentence: <code>cancel()</code> sends “please stop”; it does not instantly kill a goroutine or wait for it. Learn to separate termination into four steps: publish the signal, let each worker observe it and return, clean up resources, and wait for all workers to finish.</p></div>
 
           <p>
             The first half teaches the caller's termination protocol; propagation details are then pinned to the <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> in
             <a href="https://github.com/golang/go/blob/go1.26.0/src/context/context.go">context/context.go</a> and
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go">net/http/server.go</a>. Public contracts come from the
+            <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go">net/http/server.go</a>. Public guarantees come from the
             <a href="https://pkg.go.dev/context">context documentation</a> and <a href="https://pkg.go.dev/net/http#Server.Shutdown">Server.Shutdown documentation</a>.
-            Field layouts, fallback goroutines, and shutdown polling are current implementation details; Done, Err, Cause, propagation, and public shutdown semantics are the caller's contract.
+            Field layouts, fallback goroutines, and shutdown polling are current implementation details; callers may rely on the documented behavior of Done, Err, Cause, cancellation propagation, and shutdown.
           </p>
 
           <h2>1. Three More Things Must Happen after Cancel</h2>
@@ -81,14 +81,14 @@
             <tbody>
               <tr><td>Publish cancellation</td><td>Parent, deadline, or explicit cancel</td><td><code>Done()</code> closed</td><td>The worker has stopped</td></tr>
               <tr><td>Observe and stop work</td><td>Every worker or blocking API</td><td>Function or goroutine returns</td><td>Checking ctx only once outside the loop</td></tr>
-              <tr><td>Cleanup</td><td>The resource owner</td><td>Body, Conn, timer, and temporary resources released</td><td>Assuming cancel performs cleanup</td></tr>
+              <tr><td>Cleanup</td><td>The code that opened the resource</td><td>Body, Conn, timer, and temporary resources released</td><td>Assuming cancel performs cleanup</td></tr>
               <tr><td>Join</td><td>The goroutine creator</td><td><code>WaitGroup</code>, errgroup, or done channel</td><td>Treating <code>cancel()</code> as Wait</td></tr>
             </tbody>
           </table></div>
 
           <p>
-            The table maps those four steps to their owners. Context is a control plane, not a task manager. It broadcasts “do not begin or continue useless work” over a receive-only channel, but it neither knows what a goroutine is doing nor holds a goroutine handle to wait on.
-            Whoever creates a goroutine must design both its stopping point and its join point. If a <code>fetchd</code> handler returns while a worker still sends to an abandoned results channel, cancellation alone does not prevent a leak. A bounded buffer solved one specific shape in Chapter IV; the general protocol remains cancellation, interruptible blocking, and joining.
+            The table maps each step to the code responsible for it. Context broadcasts “do not begin or continue useless work” over a receive-only channel, but it neither knows what a goroutine is doing nor holds a goroutine handle to wait on.
+            Code that creates a goroutine must define both where it observes cancellation and how the caller waits for it. If a <code>fetchd</code> handler returns while a worker still sends to an abandoned results channel, cancellation alone does not prevent a leak. A bounded buffer solved one specific case in Chapter IV; the general sequence remains cancellation, interruptible blocking, and joining.
           </p>
 
           <h2>2. <code>Context</code> is a tree-shaped query interface, not a data bag</h2>
@@ -106,10 +106,10 @@
 
           <p>
             Closing a channel is a broadcast: any number of waiters observe the same event. Because the channel carries no error value, receivers ask <code>Err()</code> or <code>Cause()</code> for the reason.
-            <code>Done()</code> may return nil to mean “never canceled.” A nil channel disables its select case forever, which is the boundary for Background/TODO and <code>WithoutCancel</code>.
+            <code>Done()</code> may return nil to mean “never canceled.” A nil channel disables its select case forever; Background/TODO and <code>WithoutCancel</code> behave this way.
           </p>
 
-          <h2 id="cancelctx">3. <code>cancelCtx</code> combines publication and subtree ownership</h2>
+          <h2 id="cancelctx">3. <code>cancelCtx</code> publishes cancellation and tracks children</h2>
           <pre><code class="language-text">fetchd's 1.5-second budget expires:
 the context records Err / Cause once and closes Done
   → a worker observes the signal in a network call or select
@@ -223,7 +223,7 @@ func (c *timerCtx) cancel(removeFromParent bool, err, cause error) {
             A true stop result means f was prevented from starting. False means f has started or the association had already been stopped. The easy-to-miss API sentence is: <strong>stop does not wait for f to complete</strong>.
           </p>
 
-          <figure class="figure"><img src="../assets/timer-afterfunc-boundary.png" alt="Go timerCtx and context.AfterFunc boundaries: an earlier parent deadline avoids a new timer, manual cancel stops it, and sync.Once chooses between stop and go f; stop=false does not wait for a running callback" /></figure>
+          <figure class="figure"><img src="../assets/timer-afterfunc-boundary.png" alt="Go timerCtx and context.AfterFunc behavior: an earlier parent deadline avoids a new timer, manual cancel stops it, and sync.Once chooses between stop and go f; stop=false does not wait for a running callback" /></figure>
 
           <pre><code class="language-go">stop := context.AfterFunc(ctx, func() {
     close(started)
@@ -237,13 +237,13 @@ if !stop() {
 
           <p>
             Multiple AfterFuncs on one context are independent and have no ordering guarantee. Each f runs in its own goroutine. If it takes a lock, a caller must not hold that lock while waiting for done, or it can deadlock itself.
-            AfterFunc is useful for waking a wait wrapped by <code>sync.Cond</code> or a system call, or triggering light cleanup. A complex lifecycle still belongs to an owner goroutine and explicit join.
+            AfterFunc is useful for waking a wait wrapped by <code>sync.Cond</code> or a system call, or triggering light cleanup. A complex lifecycle still needs one coordinating goroutine and an explicit wait for completion.
           </p>
 
           <h3>3.5 <code>WithoutCancel</code> Cuts the Control Plane and the Deadline</h3>
           <p>
             <code>context.WithoutCancel(parent)</code> still delegates Value lookup, but Deadline reports none, Done returns nil, and Err and Cause return nil. It does not ignore one cancellation; it severs parent cancellation and deadline completely.
-            That can fit a short audit or delivery after a request returns, but the detached context should immediately receive a new bounded timeout and remain owned by the process. Otherwise a request leak becomes a process leak.
+            That can fit a short audit or delivery after a request returns, but the detached context should immediately receive a new bounded timeout, and process-lifecycle code must wait for the work. Otherwise a request leak becomes a process leak.
           </p>
 
           <pre><code class="language-go">detached := context.WithoutCancel(r.Context())
@@ -253,7 +253,7 @@ return writeAudit(auditCtx, event)</code></pre>
 
           <h2 id="http">4. Where an HTTP Request Context Closes</h2>
           <p>
-            The HTTP/1 server first creates a connection context. Each <code>readRequest</code> derives another <code>context.WithCancel(ctx)</code> and stores its cancel function in the response. The public contract cancels an incoming request context when the client's connection closes, an HTTP/2 request is canceled, or <code>ServeHTTP</code> returns.
+            The HTTP/1 server first creates a connection context. Each <code>readRequest</code> derives another <code>context.WithCancel(ctx)</code> and stores its cancel function in the response. The documentation guarantees cancellation of an incoming request context when the client's connection closes, an HTTP/2 request is canceled, or <code>ServeHTTP</code> returns.
             In HTTP/1, the implementation calls <code>w.cancelCtx()</code> immediately after the handler returns. A connection-reader error also cancels the connection context, which propagates into the current request.
           </p>
 
@@ -266,7 +266,7 @@ w.cancelCtx()</code></pre>
           <span class="source-caption">Request context construction: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L1038-L1067">readRequest</a>; cancellation after return: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L2055-L2081">conn.serve</a>.</span>
 
           <p>
-            Workers created inside a handler should not save the request context and continue indefinitely after return. The handler should stop admitting work, cancel children, wait for workers or its errgroup, and only then return. The request cancellation triggered by return is a backstop, not the owner's join protocol.
+            Workers created inside a handler should not save the request context and continue indefinitely after return. The handler should stop accepting work, cancel children, wait for workers or its errgroup, and only then return. The request cancellation triggered by return is a final stop signal, not proof that workers exited.
             Conversely, client disconnect may close Done early, but when the network stack observes that disconnect depends on protocol and I/O state. It is not a millisecond heartbeat.
           </p>
 
@@ -345,7 +345,7 @@ go vet ./...</code></pre>
           </ol>
 
           <p>
-            The reusable conclusion is: <strong>context propagates cancellation state and reason; correct termination also requires each owner to finish cleanup and use an independent join to prove that goroutines exited.</strong>
+            The reusable conclusion is: <strong>context only propagates cancellation state and reason; code that opens a resource must still clean it up, and code that starts a goroutine must still use a <code>WaitGroup</code>, errgroup, or done channel to prove it exited.</strong>
             The next chapter asks where those workers and request objects go: from escape analysis and size classes through mcache, GC mark assist, write barriers, and observable allocation pressure.
           </p>
 
