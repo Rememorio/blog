@@ -22,37 +22,37 @@
 <h2>二、把任务卡变成可运行的控制流程</h2>
 <h3>2.1 任务为什么要离开聊天，成为独立任务卡</h3>
 <p>聊天记录适合保留对话，却不是任务本身。任务卡最先需要的只有稳定编号、目标、完成条件、当前状态、已完成和下一步。任务规模扩大后，再逐步加入优先级、依赖、当前处理者、尝试次数和外部对象引用。Run 只是任务卡上的一次处理记录，不应取代任务卡。</p>
-<figure class="mechanism-figure"><img src="../assets/outer-loop-cover.png" alt="Outer loop 包含 trigger、select work、launch run、verify、persist、retry or next，内部有 agent loop" /><figcaption>Inner loop 消耗一个 work item；outer loop 决定何时创建、交给谁、是否接受结果以及下一步。图中的 Persist 是最终交接点，checkpoint 与 effect ledger 在运行中持续写入。</figcaption></figure>
+<figure class="mechanism-figure"><img src="../assets/outer-loop-cover.png" alt="Outer loop 包含 trigger、select work、launch run、verify、persist、retry or next，内部有 agent loop" /><figcaption>Inner loop 处理一个 work item；outer loop 决定何时创建、交给谁、是否接受结果以及下一步。图中的 Persist 是最终交接点，checkpoint 与外部动作状态会在运行中持续写入。</figcaption></figure>
 <figure class="shape-example"><pre><code class="language-text">任务：修复支付模块回归
 状态：处理中
 完成条件：支付测试通过，review 接受
 已经确认：缺少过期订单校验
 已经修改：payment.go
 下一步：运行支付测试</code></pre><figcaption><strong>最小任务卡：</strong>先让下一次运行能看懂目标、进度和下一步。并发、重试和副作用字段会在出现相应问题时再加入。</figcaption></figure>
-<p>这张任务卡的权威副本属于 Outer Loop 的持久化存储，不属于某次 Prompt 或聊天历史。启动 Run 时，系统只把当前目标、权限和进度投影给 Agent；Run 通过 checkpoint 提交新事实；verifier 通过后，Outer Loop 才把任务状态从“待验证”改为“完成”。后续 Run 和人类 reviewer 都从更新后的任务卡与 artifact 引用继续。</p>
+<p>任务卡的最新版本保存在 Outer Loop 使用的持久化存储中，而不是某次 Prompt 或聊天历史里。启动 Run 时，系统只把当前目标、权限和进度放进 Agent 的输入；Run 通过 checkpoint 写回新事实；verifier 通过后，Outer Loop 才把任务状态从“待验证”改为“完成”。后续 Run 和人类 reviewer 都从这张更新后的任务卡与 artifact 引用继续。</p>
 
 <h3>2.2 把刚才的六步变成可运行的责任</h3>
 <p>这六项不是只执行一次的直线流水线。保存进度从 run 启动前就开始，并贯穿执行与最终交接；否则进程若在验证前崩溃，系统恰好没有可恢复事实。后文会逐个解释并发领取、checkpoint 和外部动作记录，先用普通语言记住表里的责任即可。</p>
 <div class="table-wrap"><table><thead><tr><th>阶段</th><th>控制问题</th><th>必须留下的事实</th></tr></thead><tbody><tr><td>Trigger</td><td>什么事件或人工请求创建任务？</td><td>任务来源、是否重复、时间</td></tr><tr><td>Select work</td><td>现在哪项任务可以开始？</td><td>选择理由、当前处理者</td></tr><tr><td>Launch run</td><td>本次 Agent 得到什么目标、工具和进度？</td><td>运行配置、输入版本、上次进度</td></tr><tr><td>Verify</td><td>哪些独立检查可以接受结果？</td><td>检查证据、失败原因</td></tr><tr><td>Persist</td><td>哪些进度和外部变化必须保存？</td><td>恢复起点、动作记录</td></tr><tr><td>Retry / next</td><td>结束、等待、换策略还是找人？</td><td>决定理由、剩余尝试</td></tr></tbody></table></div>
 
-<h3>2.3 多个执行者同时工作时，谁拥有任务</h3>
+<h3>2.3 怎样防止两个执行者同时写同一任务</h3>
 <p>想象两名执行者同时从等待列表里拿到了同一张支付任务卡，两边都开始改代码。等待列表只能决定谁先看到任务，还需要一种“限时领取”机制：某名执行者在一段时间内取得处理权，持续证明自己还在工作；超过时间后，任务才能被别人重新领取。这种限时处理权叫 lease。</p>
-<p>真实系统里的 Webhook 可能重复，定时任务可能重叠，worker 也可能崩溃。没有这套所有权规则，同一任务会被并发修改，或在执行者死亡后永久卡住。</p>
-<figure class="mechanism-figure"><img src="../assets/outer-loop-control-plane.png" alt="Outer loop 控制面图，展示去重、队列、租约、运行、验证、重试预算和人工升级" /><figcaption>Queue 管等待顺序，lease 管当前处理权，fencing token 拒绝旧处理者的迟到写入；重复外部动作会在 3.3 节单独处理。</figcaption></figure>
-<ul><li><strong>Deduplication：</strong>相同外部事件只创建一个 work item。</li><li><strong>Lease：</strong>同一时刻只有一个 run 拥有排他写权；只读调查可另设并行策略。</li><li><strong>Heartbeat：</strong>区分长运行与已死亡 worker。</li><li><strong>Fencing token：</strong>旧 lease 即使迟到，也不能覆盖新 owner 的状态。</li><li><strong>Backpressure：</strong>根据资源、风险和人工审查容量限制启动。</li></ul>
+<p>真实系统里的 Webhook 可能重复，定时任务可能重叠，worker 也可能崩溃。没有这套领取与过期规则，同一任务会被并发修改，或在执行者死亡后永久卡住。</p>
+<figure class="mechanism-figure"><img src="../assets/outer-loop-control-plane.png" alt="Outer loop 使用去重、队列、租约、验证、重试预算和人工升级协调多次运行" /><figcaption>Queue 管等待顺序，lease 管当前处理权，fencing token 拒绝旧处理者的迟到写入；重复外部动作会在 3.3 节单独处理。</figcaption></figure>
+<ul><li><strong>Deduplication：</strong>相同外部事件只创建一个 work item。</li><li><strong>Lease：</strong>同一时刻只有一个 run 可以写任务状态；只读调查可另设并行策略。</li><li><strong>Heartbeat：</strong>区分长运行与已死亡 worker。</li><li><strong>Fencing token：</strong>旧 lease 即使迟到，也不能覆盖新 worker 写入的状态。</li><li><strong>Backpressure：</strong>根据资源、风险和人工审查容量限制启动。</li></ul>
 <figure class="shape-example"><pre><code class="language-text">queued
   -- worker-A claim, fence=1 --> running(A)
   -- lease expires -----------> claimable
   -- worker-B claim, fence=2 --> running(B)
 
-complete(worker-A, fence=1)  # rejected: stale owner
-complete(worker-B, fence=2)  # accepted</code></pre><figcaption><strong>所有权实验：</strong>Queue 只决定谁先被看见；lease 让所有权可过期；fencing token 让旧 worker 的迟到写被确定性拒绝。</figcaption></figure>
+complete(worker-A, fence=1)  # rejected: stale lease
+complete(worker-B, fence=2)  # accepted</code></pre><figcaption><strong>Lease 实验：</strong>Queue 只决定谁先被看见；lease 让处理权过期；fencing token 让旧 worker 的迟到写被确定性拒绝。</figcaption></figure>
 
 <h2>三、进阶：跨运行恢复、重试与副作用</h2>
 <h3>3.1 中断以后，下一次运行怎样接上</h3>
 <p><strong>Checkpoint 就是下一次运行可以恢复的已保存起点。</strong>回到支付故事：Run 1 在结束前写下目标、已确认原因、<code>payment.go</code> 的修改、尚未执行的测试和日志引用；Run 2 启动后先核对文件与引用是否仍然有效，再从“运行支付测试”继续，而不是重新调查。</p>
 <p>Anthropic 的 long-running harness 经验强调，让后续 agent 能从明确进展文件、git 状态和干净的任务切片继续。这样的 handoff 同时服务机器与人：结构化字段保证恢复，叙述记录决策与异常；原始 artifact 保留证据。</p>
-<figure class="mechanism-figure"><img src="../assets/cross-run-handoff.png" alt="跨运行交接图，Run N 通过 checkpoint、effect ledger 和 artifacts 把状态交给 Run N+1" /><figcaption>下一次 run 不应该重新猜上次发生了什么，也不应该盲信一段没有证据指针的摘要。</figcaption></figure>
+<figure class="mechanism-figure"><img src="../assets/cross-run-handoff.png" alt="Run N 通过 checkpoint、外部动作记录和 artifacts 把状态交给 Run N+1" /><figcaption>下一次 run 不应该重新猜上次发生了什么，也不应该盲信一段找不到原始结果的摘要。</figcaption></figure>
 <div class="table-wrap"><table><thead><tr><th>Handoff 字段</th><th>回答的问题</th><th>恢复检查</th></tr></thead><tbody><tr><td>Goal / done</td><td>要完成什么？</td><td>是否仍有效</td></tr><tr><td>Confirmed facts</td><td>已经知道什么？</td><td>来源是否可访问、新鲜</td></tr><tr><td>Effects</td><td>已经改了什么外部状态？</td><td>与真实世界对账</td></tr><tr><td>Attempts</td><td>哪些路径失败、为什么？</td><td>避免同策略重复</td></tr><tr><td>Open / next</td><td>阻塞点和最小下一步？</td><td>能力与权限是否足够</td></tr><tr><td>Artifacts</td><td>日志、diff、测试和截图在哪里？</td><td>引用是否完整</td></tr></tbody></table></div>
 
 <h3>3.2 失败后不是简单地“再试一次”</h3>
@@ -60,22 +60,22 @@ complete(worker-B, fence=2)  # accepted</code></pre><figcaption><strong>所有�
 <p>重试预算应随 work item 持久化，不能在 worker 重启后归零。可以按错误类别设置不同策略：基础设施短暂错误自动退避；权限阻塞直接等待审批；同一 invariant 连续失败转人工；高风险外部写在状态不明时先 reconcile，不能重放。</p>
 
 <h3>3.3 请求超时，不等于外部动作没有发生</h3>
-<p>“创建 PR”“退款”“发通知”都可能出现请求成功但响应丢失。Outer loop 若只看本地超时，会再次执行。每个可重试副作用应携带稳定 idempotency key，并把 proposed、started、committed、observed 状态写入 effect ledger。恢复时先查询外部世界，再决定继续、补偿或完成。</p>
+<p>“创建 PR”“退款”“发通知”都可能出现请求成功但响应丢失。Outer loop 若只看本地超时，会再次执行。每个可重试副作用应携带稳定 idempotency key，并把 proposed、started、committed、observed 状态写入动作状态日志。恢复时先查询外部系统，再决定继续、补偿或完成。</p>
 <figure class="shape-example"><pre><code class="language-text">effect_key = "issue-1842:create-pr:v3"
-ledger: proposed → started → unknown
+status log: proposed → started → unknown
 remote: PR #41 already exists
 
 reconcile(effect_key)
   → find PR #41
-  → ledger: committed → observed
+  → status log: committed → observed
   → do not create PR #42</code></pre><figcaption><strong>超时前后：</strong>天真的流程是 <code>timeout → retry → 两个 PR</code>；安全流程是 <code>timeout → reconcile → 复用已有 PR</code>。因此副作用发生前就必须持久化，不是 verify 之后才记录。</figcaption></figure>
 <ul><li>把“我调用过”与“世界已经改变”分开记录。</li><li>优先使用外部 API 的幂等键；没有时用业务唯一键和对账查询。</li><li>补偿动作也要被建模和审计，不能假设所有效果可回滚。</li><li>未知状态不是失败重试，而是 reconciliation 状态。</li></ul>
 
 <h3>3.4 什么时候必须把任务交给人</h3>
-<p>OpenAI Harness engineering 的核心约束是人类注意力稀缺。Outer loop 应把人放在高杠杆边界：目标冲突、高风险授权、无法自动判定的质量、预算继续投入。系统要给出压缩但充分的升级包：发生了什么、已验证什么、选项与影响、推荐动作、截止时间。</p>
+<p>OpenAI Harness engineering 强调人类注意力稀缺。Outer loop 应只在需要人的判断时打断：目标冲突、高风险授权、无法自动判定的质量，或是否继续投入预算。系统要给出精简但充分的说明：发生了什么、已验证什么、有哪些选项与影响、推荐动作和截止时间。</p>
 
 <h2>四、复盘：从最小版本逐步加保护</h2>
-<div class="table-wrap"><table><thead><tr><th>问题</th><th>最低机制</th><th>没有它会怎样</th></tr></thead><tbody><tr><td>重复事件会创建重复工作吗？</td><td>dedupe key</td><td>并发重复副作用</td></tr><tr><td>谁拥有当前 work item？</td><td>lease + fencing</td><td>双写或永久卡住</td></tr><tr><td>Run 结束后怎样判断完成？</td><td>独立 verifier</td><td>把 final 当结果真值</td></tr><tr><td>下一次 run 从什么继续？</td><td>checkpoint + artifacts</td><td>丢状态、重做调查</td></tr><tr><td>重试会改变什么？</td><td>error class + persistent budget</td><td>无限烧钱</td></tr><tr><td>外部效果状态不明怎么办？</td><td>idempotency + effect ledger</td><td>重复退款、PR 或通知</td></tr><tr><td>什么时候找人？</td><td>escalation policy</td><td>无人负责或人被频繁打断</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>问题</th><th>最低机制</th><th>没有它会怎样</th></tr></thead><tbody><tr><td>重复事件会创建重复工作吗？</td><td>dedupe key</td><td>并发重复副作用</td></tr><tr><td>哪个 worker 当前可以写任务？</td><td>lease + fencing</td><td>双写或永久卡住</td></tr><tr><td>Run 结束后怎样判断完成？</td><td>独立 verifier</td><td>把 final 当结果真值</td></tr><tr><td>下一次 run 从什么继续？</td><td>checkpoint + artifacts</td><td>丢状态、重做调查</td></tr><tr><td>重试会改变什么？</td><td>error class + persistent budget</td><td>无限烧钱</td></tr><tr><td>外部效果状态不明怎么办？</td><td>idempotency + action status log</td><td>重复退款、PR 或通知</td></tr><tr><td>什么时候找人？</td><td>escalation policy</td><td>任务无人处理或人被频繁打断</td></tr></tbody></table></div>
 <p>Outer loop 把 run 变成了可运营的工作系统。但它仍需要一个外部真值来判断“verify”是否可信。最后一篇进入 <strong>Evals 与反馈</strong>：怎样测结果、定位失败层，并把证据变成下一次系统改动。</p>
 <h2 id="sources">官方资料</h2><ul class="source-list"><li><a href="https://openai.com/index/open-source-codex-orchestration-symphony/">OpenAI：An open-source spec for Codex orchestration: Symphony</a></li><li><a href="https://openai.com/index/harness-engineering/">OpenAI：Harness engineering</a></li><li><a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents">Anthropic：Effective harnesses for long-running agents</a></li><li><a href="https://www.anthropic.com/engineering/managed-agents">Anthropic：Managed agents</a></li></ul>
 <h2>延伸阅读</h2><ul class="source-list"><li><a href="https://www.runoob.com/ai-agent/loop-engineering.html">菜鸟教程：Loop Engineering</a></li><li><a href="https://addyosmani.com/blog/loop-engineering/">Addy Osmani：Loop Engineering</a></li><li><a href="https://walkinglabs.github.io/learn-harness-engineering/en/lectures/lecture-13-loop-engineering/">Learn Harness Engineering：From Manual Prompting to Autonomous Loops</a></li></ul>
