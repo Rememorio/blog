@@ -7,7 +7,7 @@
     <meta name="description" content="Go 从请求到生产现场系列第八篇：沿 fetchd 阅读 Go 1.26.0 Transport 连接池、persistConn、bodyEOFSignal、HTTP/2 stream 与 flow control，并联合 httptrace、runtime metrics、pprof、trace 和 race 诊断。" />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Go 源码阅读（八）：连接复用之后，瓶颈藏在哪里" />
-    <meta property="og:description" content="HTTP/1 的复用取决于底层 body EOF；HTTP/2 把并发移进 stream 与 flow window。诊断必须把请求阶段、runtime 压力、owner 和时间线对齐。" />
+    <meta property="og:description" content="HTTP/1 的复用取决于底层 body EOF；HTTP/2 把并发移进 stream 与 flow window。诊断必须把请求阶段、runtime 压力、阻塞栈和时间线对齐。" />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/connection-diagnosis-route.png" />
     <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/zh/transport-http2-diagnostics/" />
@@ -54,14 +54,14 @@
         </section>
 
         <section class="article-body">
-          <div class="note route-note"><p><strong>阅读契约：</strong>先不背连接池字段。读完前半篇，你应该能区分三种“等”：等一条可用连接、等服务器返回数据、等 HTTP/2 连接里的 stream 名额。它们都表现为请求变慢，却需要完全不同的证据和修复。</p></div>
+          <div class="note route-note"><p><strong>阅读目标：</strong>先不背连接池字段。读完前半篇，你应该能区分三种“等”：等一条可用连接、等服务器返回数据、等 HTTP/2 连接里的 stream 名额。它们都表现为请求变慢，却需要完全不同的证据和修复。</p></div>
 
           <p>
-            本文先讲公开 <code>Transport</code> 与 <code>Response.Body</code> 契约，再用 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
+            本文先讲 <code>Transport</code> 与 <code>Response.Body</code> 文档保证的行为，再用 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
             <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go">net/http/transport.go</a>、
             <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go">h2_bundle.go</a> 与
             <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/httptrace/trace.go">httptrace/trace.go</a>。
-            诊断契约来自 <a href="https://pkg.go.dev/net/http/httptrace">httptrace</a>、
+            各诊断工具能观察什么，依据 <a href="https://pkg.go.dev/net/http/httptrace">httptrace</a>、
             <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a>、
             <a href="https://pkg.go.dev/net/http/pprof">net/http/pprof</a> 与 <a href="https://go.dev/doc/diagnostics">Diagnostics</a>。
           </p>
@@ -73,7 +73,7 @@
           </p>
           <p>
             因此看到延迟上涨时，先问请求卡在哪一段：还没拿到连接，已经发出但服务器没回，还是拿到了 HTTP/2 连接却没有可用 stream 或窗口？
-            连接池的意义，是让这些资源由一个长期存在的 owner 统一复用和限流，而不是简单保存一袋 socket。
+            连接池的意义，是让一个长期存在的 <code>Transport</code> 统一复用连接、计算每个 host 的并发数并让超额请求排队，而不是简单保存一袋 socket。
           </p>
           <pre><code class="language-text">20 个请求到同一个站点：
 先到的请求借走现有连接或 stream
@@ -126,7 +126,7 @@ case &lt;-treq.ctx.Done():
           <p>
             还有一个容易错读的细节：dial context 用 <code>context.WithoutCancel</code> 从 request context 脱离，再单独加内部 cancel。
             当前请求取消后，<code>getConn</code> 会返回取消错误，但已经开始的 dial 可以继续，因为刚建好的连接可能交付给未来请求。
-            这不是忽略 deadline；它是在 request owner 与 pool owner 之间转移连接创建的生命周期。
+            这不是忽略 deadline；请求已经不再等待这次 dial，但 <code>Transport</code> 可以保留 dial 结果供下一次请求复用。
           </p>
 
           <h3>2.2 三个限制分别控制“总量”和“留下多少”</h3>
@@ -145,7 +145,7 @@ case &lt;-treq.ctx.Done():
             <code>connsPerHostWait</code>。取消请求会让票据不再 waiting，队列清理时跳过它。这个等待时间不会在默认 metrics 中自动出现，
             需要应用通过 httptrace 的 GetConn/GotConn 差值或显式 wrapper 记录。
           </p>
-          <span class="source-caption">配置契约：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L194-L232">Transport fields</a>；排队：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1594-L1655">queueForDial</a>。</span>
+          <span class="source-caption">配置语义：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L194-L232">Transport fields</a>；排队实现：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1594-L1655">queueForDial</a>。</span>
 
           <h3 id="http1">2.3 HTTP/1 的 <code>persistConn</code> 是一读一写两条循环</h3>
           <p>
@@ -195,7 +195,7 @@ resp.Body = &amp;bodyEOFSignal{
           <span class="source-caption">完整判断：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L2291-L2468">persistConn.readLoop</a>；wrapper：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L3052-L3114">bodyEOFSignal</a>。</span>
 
           <p>
-            这正好解释 <code>fetchd</code> 的资源边界：<code>io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))</code>
+            这正好解释 <code>fetchd</code> 在 1 MiB 上限附近的行为：<code>io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))</code>
             对小于 1 MiB 的正常响应会读到真实 body EOF，连接可复用；若上游仍有数据而读取达到上限，<code>LimitReader</code> 在自己的 N 归零时返回 EOF，
             却没有让被包装的 <code>resp.Body</code> 再读到 EOF。随后 defer Close 会走 early-close 分支，HTTP/1 连接不复用。
           </p>
@@ -263,10 +263,10 @@ type http2clientStream struct {
 
           <p>
             默认 <code>StrictMaxConcurrentStreams=false</code> 时，Transport 可以新建 TCP connection，让每条连接分别服从 peer 的 per-connection stream limit；
-            strict=true 时把该 limit 视作全局限制，RoundTrip 必要时等待。前者提高并行度但增加 socket/TLS 和 upstream 压力，后者提供更硬的并发边界却可能形成 queue。
-            因此“HTTP/2 只需要一条连接”不是契约，只是低于 stream limit 且连接健康时的常见结果。
+            strict=true 时把该 limit 视作全局限制，RoundTrip 必要时等待。前者提高并行度但增加 socket/TLS 和 upstream 压力，后者限制得更严格，却可能形成 queue。
+            因此不能依赖“HTTP/2 只需要一条连接”；它只是低于 stream limit 且连接健康时的常见结果。
           </p>
-          <span class="source-caption">可用性与 slot：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L8369-L8410">isUsableLocked / availableLocked</a>；strict 契约：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L7430-L7446">StrictMaxConcurrentStreams</a>。</span>
+          <span class="source-caption">可用性与 slot：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L8369-L8410">isUsableLocked / availableLocked</a>；strict 模式语义：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/h2_bundle.go#L7430-L7446">StrictMaxConcurrentStreams</a>。</span>
 
           <h3>3.2 两级 flow control 让“没读 body”影响更大</h3>
           <p>
@@ -329,16 +329,16 @@ go vet ./...</code></pre>
           <pre><code class="language-text">一次 P99 排查：
 httptrace 发现 GetConn → GotConn 变长
   → 应用指标确认同一 host 的 in-flight 到上限
-  → goroutine profile 找到等待 getConn 的 owner
+  → goroutine profile 找到等待 getConn 的调用栈
   → execution trace 区分 runnable 排队与纯连接等待
   → 修正容量或上游延迟假设，再用同一指标验证</code></pre>
           <p>
             P99 上升时先写一个可证伪假设：在 GetConn 排队、DNS/Connect/TLS、等待 upstream headers、读取 body、runtime runnable、锁、GC assist，
             还是数据竞争？每个工具只回答一层，不能拿一张 goroutine dump 同时证明网络、池配置和 GC。
-            最小证据顺序是 request phase → 持续趋势 → owner/stack → timeline → 并发安全。
+            最小证据顺序是 request phase → 持续趋势 → 等待栈 → timeline → 并发安全。
           </p>
 
-          <figure class="figure"><img src="../assets/joint-diagnosis-evidence.png" alt="生产诊断五层证据：用 httptrace 定位请求阶段，应用指标与 runtime metrics 判断持续压力，pprof 找 owner 和阻塞，execution trace 对齐 netpoll、runnable、GC assist 和 block，race 在测试或预发验证并发访问；用 request ID、时间与版本对齐" /></figure>
+          <figure class="figure"><img src="../assets/joint-diagnosis-evidence.png" alt="生产诊断五类证据：httptrace 定位请求阶段，应用指标与 runtime metrics 判断持续压力，pprof 找到阻塞调用栈，execution trace 对齐 netpoll、runnable、GC assist 和 block，race 在测试或预发验证并发访问；用 request ID、时间与版本对齐" /></figure>
 
           <div class="table-wrap"><table>
             <thead><tr><th>现象</th><th>最小证据</th><th>优先假设</th><th>不要先做</th></tr></thead>
@@ -376,7 +376,7 @@ req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))</code></p
             server-side timing 需要 upstream 自己的 span/log，二者用 trace ID 对齐。
           </p>
 
-          <h3>5.2 metrics 看趋势，pprof 找 owner</h3>
+          <h3>5.2 metrics 看趋势，pprof 找等待发生在哪段代码</h3>
           <p>
             HTTP pool 的 in-flight、GetConn wait、reuse ratio、early-close reason 属于<strong>应用指标</strong>；标准
             <code>runtime/metrics</code> 没有 Transport pool 指标。runtime 一侧可看
@@ -427,15 +427,15 @@ trace.WithRegion(ctx, "outbound-fetch", func() {
             <li><strong>症状窗口：</strong>P50/P99、timeout reason、请求量、版本与 deploy 时间。</li>
             <li><strong>request phase：</strong>GetConn wait、reuse、DNS/Connect/TLS、first byte、body duration。</li>
             <li><strong>资源趋势：</strong>in-flight、queue、connections/streams、runnable G、mutex wait、GC assist CPU。</li>
-            <li><strong>owner 证据：</strong>同一窗口的 goroutine/CPU/heap 或 delta block/mutex profile。</li>
+            <li><strong>调用栈证据：</strong>同一窗口的 goroutine/CPU/heap 或 delta block/mutex profile。</li>
             <li><strong>时间线：</strong>5–10 秒受控 execution trace，带 task/region 与 request ID。</li>
             <li><strong>最小复现：</strong>像 transport lab 一样用 channel/barrier 证明状态，不用 sleep 猜。</li>
-            <li><strong>单变量修正：</strong>先修 body 生命周期、owner 或热点，再单独改变连接/stream 参数。</li>
+            <li><strong>单变量修正：</strong>先修 body 何时关闭、哪段代码长期保留资源或热点，再单独改变连接/stream 参数。</li>
             <li><strong>回归条件：</strong>正确性测试、race、资源上限与 tail latency 同时达标。</li>
           </ol>
 
           <p>
-            至此，一条 <code>fetchd</code> 请求完成了整个系列的闭环：从值怎样复制、goroutine 怎样调度、channel 与锁怎样协调、
+            至此可以沿一条 <code>fetchd</code> 请求回顾整个系列：从值怎样复制、goroutine 怎样调度、channel 与锁怎样协调、
             interface/泛型/反射怎样保存类型，到 context 怎样结束工作、对象怎样进入 heap、GC 怎样追上分配，最后回到连接复用与生产证据。
             可复用的总原则只有一句：<strong>先用源码建立机制模型，再用最小实验与生产证据证明当前系统真的走了那条路径。</strong>
           </p>
