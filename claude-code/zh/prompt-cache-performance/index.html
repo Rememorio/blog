@@ -126,7 +126,7 @@
           <section class="article-body">
             <p>
               <a href="../transcript-resume/">上一篇</a>讲 resume 时，我们一直在区分 UI、transcript、
-              runtime view 和 API view。到了 prompt cache，这个区分更重要。缓存命中的对象不是“聊天窗口”，
+              运行时状态和 API request。到了 prompt cache，这个区分更重要。缓存命中的对象不是“聊天窗口”，
               也不是“磁盘里的 transcript”，而是 provider 看到的一段请求前缀。
               只要这段前缀的字节形状、工具 schema、系统块、cache marker、beta headers 或模型参数变了，
               客户端本地再怎么觉得“还是同一段会话”，服务端也可能没法复用上一轮的处理结果。
@@ -134,15 +134,15 @@
 
             <div class="note key-point">
               <p>
-                这篇的结论先说清：<strong>Claude Code 的性能设计，是一套请求形状纪律。</strong>
+                这篇的结论先说清：<strong>Claude Code 能否复用缓存，取决于连续请求能否保留相同的前缀。</strong>
                 <code>cache_control</code> 只是 marker；真正让 marker 有用的，是把动态内容挪到尾部，
-                把会话级开关 latch 住，把 fork 子任务做成共享前缀加短尾巴，把 compact 和工具结果替换做成不会让旧前缀漂移的投影。
+                把会话级开关固定下来，让 fork 子任务共享前缀并只追加短尾巴，并确保 compact 和工具结果替换不会反复改写旧前缀。
               </p>
             </div>
 
             <div class="note reading-contract">
               <p>
-                <strong>阅读契约：</strong>本篇只追客户端源码可见的 cache discipline：
+                <strong>阅读目标：</strong>本篇只追客户端源码可见的缓存行为：
                 <code>getCacheControl()</code> 怎样生成 marker，<code>addCacheBreakpoints()</code>
                 怎样放置请求级 cache marker，动态工具和 beta header 怎样避免打穿前缀，
                 fork path 怎样复用父级 cache-safe params，cached microcompact 和 content replacement
@@ -151,16 +151,16 @@
             </div>
 
             <p>
-              证据边界同前几篇一样：产品和 API 契约参考 Anthropic
+              产品和 API 行为参考 Anthropic
               <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">prompt caching 文档</a>
               与 Claude Code
               <a href="https://docs.anthropic.com/en/docs/claude-code/overview">官方概览</a>；
               源码层来自
               <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
-              本文只讲客户端源码能观察到的请求形状、缓存标记、计数和恢复边界，不推断 provider 内部如何实现 KV 或缓存替换。
+              本文只讲客户端源码能观察到的请求字段、缓存标记、计数和恢复行为，不推断 provider 内部如何实现 KV 或缓存替换。
             </p>
 
-            <h2>一、先把 prompt cache 看成“前缀契约”</h2>
+            <h2>一、Prompt cache 复用的是稳定前缀</h2>
             <p>
               如果把 prompt cache 想成一个布尔开关，很快会误读源码。Claude Code 的 API 请求不是一段单纯的 text prompt；
               它至少由 system blocks、message list、tool schemas、model、thinking、extra body、beta headers
@@ -178,7 +178,7 @@
             <h3>1.1 TTL 也会影响请求形状</h3>
             <p>
               一个容易忽略的细节是 TTL。<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L376-L430"><code>should1hCacheTTL()</code></a>
-              不只是查一次 feature flag。源码注释明确说，用户资格和 allowlist 会被 latch 到 bootstrap state，
+              不只是查一次功能开关。源码注释明确说，用户资格和 allowlist 会在会话开始时固定到 bootstrap state，
               目的是避免会话中途 GrowthBook 缓存或 overage 状态变化，导致 <code>cache_control</code>
               从 5 分钟形状变成 1 小时形状，或者反过来。对 provider 来说，这不是“同一段文本只是缓存时长不同”，
               而是请求里的 cache marker 变了。
@@ -187,9 +187,9 @@
             <figure class="figure">
               <img
                 src="../assets/prompt-cache-api-view.png"
-                alt="Prompt cache API view 图，展示 UI transcript、runtime view、API view 和 provider 看到的 stable prefix"
+                alt="Prompt cache 请求图，展示 UI、transcript、运行时状态、API request 和 provider 看到的 stable prefix"
               />
-              <figcaption>Prompt cache 命中的是 API view 里的稳定前缀；transcript 和 UI 只是它的上游材料。</figcaption>
+              <figcaption>Prompt cache 命中的是 API request 里的稳定前缀；transcript 和 UI 只是生成请求时使用的材料。</figcaption>
             </figure>
 
             <h3>1.2 system 和 message 各有自己的 marker 位置</h3>
@@ -243,7 +243,7 @@ fire-and-forget fork:
               MCP 和 global cache 的关系也在请求装配处显式处理。
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1207-L1230">源码判断</a>
               全局缓存可用时，如果将要渲染的是用户级、动态的 MCP tool，就不把 marker 放在 system prompt 的全局缓存路径上。
-              这不是性能保守，而是边界正确：一个用户的动态工具段不应该被当成全局稳定材料。
+              这不是保守地牺牲性能，而是避免把某个用户的动态工具段误当成全局稳定材料。
             </p>
 
             <p>
@@ -251,9 +251,9 @@ fire-and-forget fork:
               都在提醒我们：长期材料要先看 prompt 入口，再谈 cache。<code>CLAUDE.md</code> / rules 不是 system prompt 本体，
               而是经 <code>prependUserContext()</code> 变成 meta user message，进入 API-bound messages 的前部；
               auto memory 的内容 entrypoint 可被注入 user context 或 relevant-memory attachments，写入/检索规则则来自 memory prompt section。
-              于是判断标准就很简单：投影文本稳定时，它可以和其他前缀材料一起被复用；
+              于是判断标准就很简单：最终写入请求的文本稳定时，它可以和其他前缀材料一起被复用；
               memory 文件、auto-memory index 或其他 user-context 文本在重载后不同，provider 看到的前缀也可能变化。
-              所以“memory 是动态的”不是 cache 失效的充分条件，<strong>被投影到 API view 的那段文本变了</strong>才是关键。
+              所以“memory 是动态的”不是 cache 失效的充分条件，<strong>最终写入 API request 的那段文本变了</strong>才是关键。
             </p>
 
             <div class="table-wrap">
@@ -353,7 +353,7 @@ fire-and-forget fork:
             <h2>四、Compact：缩短上下文时，也不能随手改旧前缀</h2>
             <p>
               上下文压缩看起来和 prompt cache 天然冲突：既然 compact 会改 messages，它不是必然让缓存失效吗？
-              Claude Code 的答案分两层。第一层是 full compact：它把旧会话总结成新的 compact boundary，
+              Claude Code 的答案分两层。第一层是 full compact：它把旧会话总结成新的 compact 标记与摘要，
               之后的请求自然进入一条新前缀。第二层是 microcompact / content replacement：
               它们想缩短模型可见的工具结果，但尽量不让已经缓存过的旧前缀字节突然漂移。
             </p>
@@ -385,9 +385,9 @@ fire-and-forget fork:
             <figure class="figure">
               <img
                 src="../assets/prompt-cache-microcompact.png"
-                alt="Prompt cache compact 图，展示 full compact 建新边界和 cached microcompact 通过 cache_reference、cache_edits 编辑缓存"
+                alt="Prompt cache compact 图，展示 full compact 建立新前缀，cached microcompact 通过 cache_reference、cache_edits 编辑缓存"
               />
-              <figcaption>Compact 会重写运行时边界；cached microcompact 则尽量把删除动作推到 API 层，避免本地历史直接漂移。</figcaption>
+              <figcaption>Full compact 会生成新的请求前缀；cached microcompact 则尽量把删除动作推到 API 层，避免直接修改本地历史。</figcaption>
             </figure>
 
             <h3>4.1 cache_edits 不是“本地删消息”</h3>
@@ -434,21 +434,21 @@ fire-and-forget fork:
             <figure class="figure">
               <img
                 src="../assets/prompt-cache-replacement-state.png"
-                alt="Prompt cache tool result replacement 图，展示 transcript、ContentReplacementState、runtime projection、API view、resume 和 fork"
+                alt="Prompt cache tool result replacement 图，展示 transcript、ContentReplacementState、API request、resume 和 fork"
               />
-              <figcaption>工具结果替换影响的是 runtime projection 和 API view；transcript 还要能支撑 resume 重建同一套替换状态。</figcaption>
+              <figcaption>工具结果替换会改变 API request；transcript 还要能让 resume 重建同一套替换状态。</figcaption>
             </figure>
 
             <h3>5.1 resume 和 fork 都要带上替换历史</h3>
             <p>
               这和上一篇 resume 连在一起。替换历史如果恢复错了，旧 transcript 能读回来，
-              但下一轮 API view 会变成另一条前缀。源码在 <code>ContentReplacementState</code>
+              但下一轮 API request 会变成另一条前缀。源码在 <code>ContentReplacementState</code>
               的生命周期注释里把 main thread、subagent、resumeAgentBackground 和 cache-sharing fork 都列出来；
               目的不是为了本地文件管理好看，而是让“哪些 tool result 应该还是 preview”这件事跨 turn、resume、fork 都稳定。
             </p>
 
             <p>
-              还有一个更小的并发边界：
+              并发执行时还有一个更细的时序问题：
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L802-L849">源码在 await 前后维护 <code>seenIds</code> 和 <code>replacements</code> 的原子性</a>。
               如果并发读者看到某个 id 已经 seen，但 replacement 还没写入，它可能把这个结果误判成 frozen，
               发送完整内容；而主线程发送的是 preview。两条路径对同一个历史前缀给出不同 wire content，结果就是 cache miss。
@@ -494,11 +494,11 @@ fire-and-forget fork:
               <figcaption>Cache break detection 的作用，是把“前缀为什么没活下来”从体感问题变成可归因的请求形状问题。</figcaption>
             </figure>
 
-            <h2>七、把十篇串起来：最后看的是同一条 runtime 账本</h2>
+            <h2>七、把十篇串起来：这些机制都会改变下一次请求</h2>
             <p>
-              到这里，Claude Code 系列的第一轮路线就闭合了。第一篇建立运行主线；
-              第二篇讲 Memory 怎样投影进 prompt 入口；第三篇讲上下文怎样进入 model-visible view；
-              第四、五篇讲工具和权限怎样把副作用收口；第六篇讲命令、skills、MCP 怎样把能力引入本轮；
+              到这里，Claude Code 系列的第一轮路线就完整了。第一篇建立运行主线；
+              第二篇讲 Memory 怎样进入 prompt；第三篇讲运行时上下文怎样转换成模型请求；
+              第四、五篇讲工具怎样执行、权限怎样决定是否放行；第六篇讲命令、skills、MCP 怎样把能力引入本轮；
               第七篇讲 subagent 和 fork；第八篇讲 hooks 的生命周期插槽；第九篇讲 transcript 和 resume；
               第十篇把这些都收回到性能层。
             </p>
@@ -516,7 +516,7 @@ fire-and-forget fork:
                   <tr>
                     <td>memory layer</td>
                     <td>保存长期规则。</td>
-                    <td>不是 transcript；它投影进 user context 后会成为前缀纪律的一部分。</td>
+                    <td>不是 transcript；它写入 user context 后会成为请求前缀的一部分。</td>
                   </tr>
                   <tr>
                     <td>context management</td>

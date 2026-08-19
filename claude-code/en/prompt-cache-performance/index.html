@@ -3,10 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Prompt Cache Is Request-Shape Discipline | Rememorio Blog</title>
+    <title>Prompt cache depends on a stable request prefix | Rememorio Blog</title>
     <meta name="description" content="A source-reading article on Claude Code prompt cache and performance: cache_control, stable prefixes, fork suffixes, microcompact, replacement state, and cache-break detection." />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Prompt Cache Is Request-Shape Discipline | Rememorio Blog" />
+    <meta property="og:title" content="Prompt cache depends on a stable request prefix | Rememorio Blog" />
     <meta property="og:description" content="A source-reading article on Claude Code prompt cache and performance: cache_control, stable prefixes, fork suffixes, microcompact, replacement state, and cache-break detection." />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/fork-cache-prefix.png" />
@@ -96,8 +96,8 @@
         <article class="article-card">
           <section class="article-hero">
             <p class="eyebrow">Claude Code Source Notes · Part X</p>
-            <h1>Prompt cache is request-shape discipline</h1>
-            <p class="lead">Prompt cache is not a switch you turn on at the end. It rewards request shape. Claude Code keeps trying to preserve stable prefixes, isolate changing suffixes, and detect cache-breaking blocks before they quietly slow the whole loop.</p>
+            <h1>Prompt cache depends on a stable request prefix</h1>
+            <p class="lead">Prompt caching is not just an option Claude Code enables. Reuse depends on sending the same system blocks, tools, headers, model options, and earlier messages in the same order. Much of the performance code exists to keep changing material out of that prefix.</p>
             <div class="meta-line">
               <span>Project: Rememorio/claude-code</span>
               <span>Topic: prompt cache performance</span>
@@ -110,7 +110,10 @@
 
           <section class="article-body">
 
-            <p>Prompt caching works best when the early part of the request stays byte-stable across calls. A coding agent naturally fights that requirement: tool results change, files change, memory changes, and child tasks need different instructions. Claude Code performance code is therefore mostly about preserving shape.</p>
+            <p>Prompt caching works when consecutive provider requests share a long, byte-stable prefix. A coding agent naturally challenges that requirement: tools connect, memory changes, results grow, and child tasks need different instructions. Claude Code therefore controls where changing data appears and records which request fields changed when reuse drops.</p>
+            <div class="note route-note">
+              <p><strong>Reading goal:</strong> follow cache markers from request assembly, then inspect the designs that preserve old bytes—session-fixed options, fork suffixes, cached microcompact, deterministic tool-result replacement, and cache-break detection.</p>
+            </div>
             <figure class="shape-example">
               <pre><code class="language-text">stable prefix = system + tools + headers + earlier messages
 dynamic tail = current user turn + new tool output
@@ -122,68 +125,77 @@ addCacheBreakpoints(messages)
 content replacement / cache_edits
   -&gt; shorten future provider view
   -&gt; keep local transcript and recovery state separate</code></pre>
-              <figcaption>Source shape: prompt-cache performance comes from request shape discipline, not from a single on/off switch.</figcaption>
+              <figcaption>Source shape: a marker identifies a reusable prefix, but only stable request content makes that prefix reusable.</figcaption>
             </figure>
 
-            <p>A single request goes through a small decision trace before it becomes cacheable work. The runtime starts with messages, tools, model options, beta headers, and replacement state. The provider adapter turns those into Anthropic request blocks. <code>addCacheBreakpoints()</code> then chooses where the one message-level <code>cache_control</code> marker can live, keeping volatile tool output and the current turn after the reusable prefix when possible. The provider reports cache-read and cache-write counters back in usage metadata, and cache-break detection turns those counters into a client-visible signal. This is a shape-level client contract; it does not claim how the provider internally indexes or recomputes KV-cache state.</p>
+            <h2>1. Cache markers are only part of the request</h2>
+            <p><code>getCacheControl()</code> produces an ephemeral marker and may add a one-hour TTL or global scope. <code>buildSystemPromptBlocks()</code> places a marker on the system blocks, while <code>addCacheBreakpoints()</code> adds at most one message-level marker. A normal request marks its final message. With <code>skipCacheWrite</code>, Claude Code moves the marker to the preceding message so a short-lived fork can read the shared parent prefix without writing its private suffix.</p>
 
-            <h2>1. The API sees cache markers on request blocks</h2>
-            <p>At the provider boundary, Claude Code converts runtime messages and tools into Anthropic request parameters. Cache control can be attached to selected blocks so the provider can reuse stable prompt prefixes. The important part is placement. A cache marker after a volatile block is much less valuable.</p>
-            <figure class="figure"><img src="../assets/prompt-cache-api-view.png" alt="API request view with system prompt, tools, messages, cache_control markers, and volatile suffix" /><figcaption>Prompt cache behavior emerges from the exact API view, not from the local transcript alone.</figcaption></figure>
-            <p>The memory chapter becomes important here. Long-lived material has to be classified by prompt entrance before it can be reasoned about as cache material. <code>CLAUDE.md</code> and rules are not hidden system-prompt magic in the visible source; they are projected through <code>prependUserContext()</code> into an early meta user message. Auto-memory content can enter user context or relevant-memory attachments, while write/search policy comes from the memory prompt section. If the projected text is unchanged, it can remain part of the reusable prefix. If memory files, the auto-memory index, or other user-context text is reloaded with different content, the provider-visible prefix may need to be written again.</p>
-            <table>
-              <thead>
-                <tr>
-                  <th>Dynamic material</th>
-                  <th>Source handling</th>
-                  <th>Cache consequence</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td>memory / user context</td>
-                  <td><code>prependUserContext()</code> puts it near the front of messages.</td>
-                  <td>Stable text can be reused; changed projection can break the prefix.</td>
-                </tr>
-                <tr>
-                  <td>deferred tools</td>
-                  <td>Delta attachment avoids prepending fresh tool text each turn.</td>
-                  <td>Tool discovery does not churn the message prefix.</td>
-                </tr>
-                <tr>
-                  <td>beta headers</td>
-                  <td>Session-level latch keeps request shape stable.</td>
-                  <td>Feature toggles do not quietly change cache identity mid-session.</td>
-                </tr>
-              </tbody>
-            </table>
-            <h2>2. Forking tries to keep the parent prefix stable</h2>
-            <p>The fork path described in the subagent article has a cache consequence. If the child request can reuse the parent system prompt, tools, and selected message prefix, it can add task-specific instructions near the suffix while keeping the expensive front stable.</p>
-            <figure class="figure"><img src="../assets/fork-cache-prefix.png" alt="Fork path preserving stable cached prefix and appending child task suffix" /><figcaption>Fork is useful partly because it separates stable parent context from a changing child suffix.</figcaption></figure>
-            <h2>3. Microcompact reduces volatile pressure</h2>
-            <p>Large or frequently changing blocks can break cache usefulness even when the nominal cache setting is enabled. Microcompact gives the runtime a smaller pressure valve: reduce a troublesome segment without forcing a full compact of the whole conversation.</p>
-            <figure class="figure"><img src="../assets/prompt-cache-microcompact.png" alt="Microcompact replacing high-pressure changing blocks while preserving stable prompt prefix" /><figcaption>Microcompact is a performance tool because it can keep volatile details away from stable prefixes.</figcaption></figure>
-            <h2>4. Replacement state has to be request-aware</h2>
-            <p>Content replacement helps keep long tool outputs and file-related state manageable. But replacement also changes what the provider sees. The runtime must know whether replacement preserves the facts needed by the next turn and whether it changes cache-sensitive request layout.</p>
-            <figure class="figure"><img src="../assets/prompt-cache-replacement-state.png" alt="Content replacement state shaping model-visible request blocks and cache stability" /><figcaption>Replacement is local state management and prompt-shape management at the same time.</figcaption></figure>
-            <h2>5. Cache-break detection makes performance visible</h2>
-            <p>Without explicit detection, cache misses look like the model simply got slower. Claude Code tracks cache-sensitive changes so developers can distinguish unavoidable new work from accidental prefix churn. That turns performance from folklore into a debuggable runtime property.</p>
-            <figure class="figure"><img src="../assets/prompt-cache-break-detection.png" alt="Cache break detection comparing stable prefix with changed request blocks" /><figcaption>When a prefix breaks, the useful question is which block changed and whether it had to move.</figcaption></figure>
-            <h2>6. The invariant</h2>
-            <p>Performance follows request shape. Memory projection, stable prefixes, careful fork suffixes, bounded tool results, microcompact, and replacement state are all different ways to protect that shape. Treating prompt cache as a boolean setting misses the engineering problem.</p>
+            <p>The TTL choice is itself kept stable. <code>should1hCacheTTL()</code> records user eligibility and allowlist state in bootstrap state instead of reevaluating a changing experiment or overage condition on every turn. Otherwise the marker could alternate between the default TTL and one hour even when all prompt text remained identical.</p>
+            <figure class="figure"><img src="../assets/prompt-cache-api-view.png" alt="Provider request with system blocks, tool schemas, messages, cache markers, and a changing suffix" /><figcaption>The provider receives request blocks, headers, and model options; the local transcript is only an input to that request.</figcaption></figure>
+
+            <h2>2. Dynamic material is kept out of the stable prefix when possible</h2>
+            <p>Deferred tools and late Chrome instructions illustrate the problem. Prepending a fresh meta message whenever tools appear would change every later byte. When delta attachments are enabled, Claude Code emits <code>deferred_tools_delta</code> or <code>mcp_instructions_delta</code> instead of repeatedly changing earlier messages or the system prompt.</p>
+
+            <p>Global caching is also disabled for the affected system path when user-specific dynamic MCP tools are rendered. A per-user tool list should not be treated as globally stable content. Advisor tools are appended after existing schemas so toggling the advisor disturbs the tail instead of reordering the whole tool list.</p>
+
+            <p>Memory follows the same rule. <code>CLAUDE.md</code> and rules enter an early meta user message through <code>prependUserContext()</code>; auto-memory content may enter user context or relevant-memory attachments. If the final text is unchanged, it can remain reusable. If a memory file or index changes, the provider sees different prefix bytes even though the feature is still called “memory.”</p>
+
+            <p>Beta headers can change cache identity without changing prompt text. Claude Code therefore keeps AFK, fast mode, cache editing, and thinking-clear headers sticky once first sent during a session. The header can stay present while current behavior—such as whether fast speed is active after cooldown—continues to change through another request field.</p>
+
+            <div class="table-wrap"><table><thead><tr><th>Changing input</th><th>Client handling</th><th>Result</th></tr></thead><tbody>
+              <tr><td>Deferred tools</td><td>Send a delta attachment instead of prepending a new message.</td><td>Earlier message bytes stay in place.</td></tr>
+              <tr><td>Late Chrome instructions</td><td>Move them out of the system prompt when delta support is available.</td><td>The system blocks remain stable.</td></tr>
+              <tr><td>User-specific MCP tools</td><td>Avoid global caching for the affected content.</td><td>Private dynamic schemas are not mislabeled as globally reusable.</td></tr>
+              <tr><td>Beta headers</td><td>Keep a sent header present for the rest of the session.</td><td>Mid-session feature changes do not silently change cache identity.</td></tr>
+            </tbody></table></div>
+
+            <h2>3. Fork children copy the parent prefix exactly</h2>
+            <p>A fork child inherits the parent's rendered system prompt, exact tool array, messages, non-interactive setting, and thinking configuration. <code>buildForkedMessages()</code> copies the parent assistant message and placeholder tool results, then appends a directive and task for that child.</p>
+            <figure class="figure"><img src="../assets/fork-cache-prefix.png" alt="Fork child sharing the parent system prompt, tools, thinking settings, and messages before a child-specific suffix" /><figcaption>The expensive parent prefix stays unchanged; only the task-specific tail differs.</figcaption></figure>
+
+            <p>This is why a fork is intentionally unlike a normal subagent. Rebuilding worker tools under another permission mode could change serialized tool definitions at the first schema. A new system prompt or thinking setting would do the same. <code>useExactTools: true</code> preserves those request fields instead.</p>
+
+            <h2>4. Full compact and cached microcompact take different approaches</h2>
+            <p>Full compact summarizes older work and creates a new prefix for later turns. The summary request can still reuse the current session's cached prefix through its fork-like path. Once the summary is installed, however, future requests naturally use the new compacted history.</p>
+
+            <p>Cached microcompact tries to shorten old tool results without rewriting local messages. When the service cache is likely still useful and the current model and thread support the feature, <code>cachedMicrocompactPath()</code> leaves message content untouched, queues <code>cache_edits</code>, and adds <code>cache_reference</code> blocks while converting the provider request. If the cache is probably expired, Claude Code can clear old result content directly because the full prefix will be written again anyway.</p>
+            <figure class="figure"><img src="../assets/prompt-cache-microcompact.png" alt="Full compact creating a new prefix and cached microcompact applying cache references and edits" /><figcaption>Cached microcompact edits the provider-side cached material without mutating the local transcript on every turn.</figcaption></figure>
+
+            <p>Pending edits are consumed before <code>paramsFromContext</code> can be called by logging, retry, or fallback code. Consuming the same edit twice during one turn could make retry requests differ from the original attempt.</p>
+
+            <h2>5. Tool-result replacement must repeat the same decision</h2>
+            <p>Large tool results can be stored locally and represented by a preview in the model request. The important cache rule is consistency: an old result cannot be full text on one turn and a preview on another, and a regenerated preview cannot differ by a few bytes.</p>
+
+            <p><code>ContentReplacementState</code> records ids that have already been evaluated and the exact preview used for replacements. Later turns reapply the preview through a map lookup without reading the file again. Previously seen results that were not replaced are frozen in that state; only fresh results participate in the next budget decision. Forks that share a prefix clone the replacement state so parent and child serialize the same old results.</p>
+            <figure class="figure"><img src="../assets/prompt-cache-replacement-state.png" alt="Transcript and ContentReplacementState producing the same tool-result previews after resume and fork" /><figcaption>Resume and fork must reconstruct the exact replacement history or the next request prefix changes.</figcaption></figure>
+
+            <p>The update around asynchronous file persistence is also kept atomic. If another reader observed an id in <code>seenIds</code> before its replacement appeared, it could send full content while the main thread sends the preview. The same historical result would then have two different wire representations.</p>
+
+            <h2>6. Cache-break detection compares requests with response counters</h2>
+            <p><code>PreviousState</code> records client-visible inputs that can affect reuse: hashes of system blocks, tools, and cache control; tool names; model; fast mode; global strategy; beta headers; overage; microcompact state; effort; extra body; and prior cache-read tokens. Separate tracking keys keep unrelated agents and SDK calls from being compared, while compact shares the main REPL key because its summary path reuses those parameters.</p>
+
+            <p>Before the request, <code>recordPromptState()</code> captures the final sticky headers and excludes deferred-loading tools that will not appear in the prompt. After the response, <code>checkResponseForCacheBreak()</code> compares <code>cache_read_input_tokens</code>. A small or absent drop clears pending changes; a drop expected after cached microcompact deletion is recorded as expected. Only a suspicious decrease is paired with changes in model, system, tools, cache control, headers, effort, or extra body.</p>
+            <figure class="figure"><img src="../assets/prompt-cache-break-detection.png" alt="Previous request fields and cache-read tokens compared with the next response to identify a suspected cache break" /><figcaption>When reuse falls, the client can report which observable request fields changed instead of treating slowdown as a mystery.</figcaption></figure>
+
+            <h2>7. The practical rule</h2>
+            <p>Prompt-cache performance follows the serialized provider request. Stable memory text, ordered tools, sticky headers, exact fork prefixes, deterministic replacements, and carefully placed compact edits all serve the same goal: avoid changing old request bytes unless the underlying information truly changed.</p>
         
             <h2 id="sources">Sources</h2>
-            <p>The source-code claims in this article are based on the public mirror and the linked official documentation. Server-side behavior and private feature-gate policy are treated only as client-visible request shape.</p>
+            <p>The source-code claims in this article are based on the public mirror and the linked official documentation. Provider-side KV implementation and eviction policy are not inferred from client code.</p>
             <ul>
                 <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic prompt caching docs</a></li>
                 <li><a href="../memory-layer/">Claude Code memory chapter</a></li>
                 <li><a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory docs</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L588-L674">API request conversion</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3062-L3110"><code>addCacheBreakpoints()</code></a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L360-L430">Cache control and TTL selection</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1207-L1689">Dynamic tools, global strategy, and sticky headers</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3062-L3237">Message and system cache markers</a></li>
                 <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts#L449-L474"><code>prependUserContext()</code></a></li>
                 <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/claudemd.ts#L790-L910"><code>getMemoryFiles()</code></a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L659-L708">Model call dependencies</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L365-L467">QueryLoop context projection</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L483-L633">Fork cache-prefix reuse</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L253-L390">Cached microcompact</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L367-L849">Deterministic tool-result replacement</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L28-L481">Cache-break detection</a></li>
             </ul>
           </section>
         </article>
