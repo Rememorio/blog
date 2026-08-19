@@ -12,7 +12,7 @@
     <meta property="og:title" content="Agent 框架源码阅读（三）：跟 AgentScope 的 reply_stream 走一遍" />
     <meta
       property="og:description"
-      content="AgentScope 的核心不是一个 while loop，而是一条事件化、可暂停、可治理、可服务化的 agent runtime。"
+      content="AgentScope 的核心不是一个 while loop，而是一条能报告进度、暂停工具、接收确认并接入多用户服务的 Agent Runtime。"
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/agentscope-runtime-overview.png" />
@@ -127,7 +127,7 @@
             <figure class="hero-image">
               <img
                 src="../assets/agentscope-runtime-overview.png"
-                alt="AgentScope Runtime 手绘图：reply_stream 进入 Model Input，经 API Adapter 分成 Responses Items 和 Chat Messages，再归一为 Event Stream、Tool Gate 和 Context Ledger"
+                alt="AgentScope Runtime 手绘图：reply_stream 进入模型输入，经 API Adapter 分成 Responses Items 和 Chat Messages，再统一成事件流、工具权限检查和消息记录"
               />
             </figure>
           </section>
@@ -153,7 +153,7 @@
             <p>
               上一篇的 Pi 已经把 provider adapter、agent loop、tool result、event 和 session 树放进了最小 core。
               AgentScope 不是推翻这条基线，而是在它上面继续接走产品责任：让中间过程可观察，让副作用可询问、可暂停，
-              再让同一条 reply 能被服务层和多用户应用复用。因此这一篇看的不是“另一种 loop”，而是最小 runtime 怎样长出治理边界。
+              再让同一条 Reply 能被服务层和多用户应用复用。因此这一篇看的不是“另一种 Loop”，而是最小 Runtime 怎样加入权限、暂停与服务接入。
             </p>
 
             <h2>二、先认识一次 reply 的五个要素</h2>
@@ -164,13 +164,13 @@
             <ul>
               <li><strong>Reply：</strong>从用户输入开始，到最终回答结束的一次完整处理；中间可以调用模型多次。</li>
               <li><strong>Event：</strong>回复过程对外发出的进度，例如开始、模型输出、等待确认、工具结果和结束。</li>
-              <li><strong>Msg 账本：</strong>保存用户消息、模型内容、工具调用和工具结果，让下一轮知道刚才发生了什么。</li>
+              <li><strong>Msg 记录：</strong>保存用户消息、模型内容、工具调用和工具结果，让下一轮知道刚才发生了什么。</li>
               <li><strong>模型适配：</strong>把同一份内部消息翻译成不同模型 API 要求的请求格式，再把返回值翻译回来。</li>
-              <li><strong>工具关口：</strong>在真正执行前校验参数、检查权限，并决定允许、拒绝、询问用户或交给外部系统。</li>
+              <li><strong>工具权限检查：</strong>在真正执行前校验参数、检查权限，并决定允许、拒绝、询问用户或交给外部系统。</li>
             </ul>
             <p>
-              这五个要素不是五个孤立功能。Event 报告 Reply 的进度，工具关口可以暂停 Reply，确认结果让 Reply 恢复，
-              最终所有关键步骤都写进 Msg 账本。
+              这五个要素不是五个孤立功能。Event 报告 Reply 的进度，工具权限检查可以暂停 Reply，确认结果让 Reply 恢复，
+              最终所有关键步骤都写进 Msg 记录。
             </p>
 
             <h2>三、一次 reply 怎样走完</h2>
@@ -189,8 +189,8 @@
 
             <div class="note key-point">
               <p>
-                <strong>阅读契约。</strong>
-                这篇跟一条 <code>reply_stream</code> 走到底：先看用户输入怎样变成结构化消息账本，
+                <strong>读完后你应该能回答。</strong>
+                这篇跟一条 <code>reply_stream</code> 走到底：先看用户输入怎样变成结构化消息记录，
                 再看模型输出怎样变成事件和工具调用，最后看 Responses API 与 Chat Completions 两种 provider 形状
                 怎样被翻译回同一个 AgentScope runtime。
               </p>
@@ -198,25 +198,25 @@
 
             <div class="note">
               <p>
-                <strong>证据边界。</strong>
+                <strong>本文依据。</strong>
                 源码引用固定到 AgentScope 当前公开快照
                 <code>ae9819017d6c195967a8f17b0ab4e70ff803f5a3</code>。OpenAI API 语义引用官方
                 <a href="https://developers.openai.com/api/docs/guides/migrate-to-responses">Responses 迁移指南</a>。
-                文中“账本”“权限门”“服务平面”是对公开代码的工程归纳，不推断闭源控制台或模型 provider 内部实现。
+                文中“消息记录”“权限检查”“服务接入层”用于概括公开代码的分工，不推断闭源控制台或模型 Provider 内部实现。
               </p>
             </div>
 
             <p>这一篇只回答六个问题：</p>
             <ol>
               <li><code>reply_stream</code> 到底承诺了什么，为什么它返回事件而不是最终字符串？</li>
-              <li>AgentScope 的内部账本是什么形状，<code>Msg</code> 和 content block 解决什么问题？</li>
+              <li>AgentScope 的内部消息记录是什么形状，<code>Msg</code> 和 Content Block 解决什么问题？</li>
               <li>模型调用前，system prompt、summary、context 和 tool schema 怎样进入统一输入？</li>
               <li>工具调用为什么不是普通函数调用，而是一段可暂停的 lifecycle？</li>
               <li id="responses-vs-chat">AgentScope 支持 OpenAI Responses API 与 Chat Completions API 时，差异到底在哪里？</li>
               <li>为什么一个 example service 就能看出它不是脚本框架？</li>
             </ol>
 
-            <h2>四、reply_stream 是公开事件契约</h2>
+            <h2>四、reply_stream 对外发送哪些事件</h2>
             <p>
               如果一个 agent 接口只返回最终字符串，前端在中间过程里什么都看不到：不知道模型正在思考、准备调用工具、
               等待用户确认，还是已经卡住。<code>reply_stream</code> 解决的是这个问题。它接收用户消息、确认结果或外部执行结果，
@@ -333,7 +333,7 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               <code>ReplyEndEvent</code> 只说明 reply 生命周期结束；答案是否只暴露允许字段，仍需要业务校验器或调用方验收。
             </p>
 
-            <h2>五、内部账本不是聊天字符串，而是 Msg 与 content blocks</h2>
+            <h2>五、内部记录不是聊天字符串，而是 Msg 与 Content Block</h2>
             <p>
               AgentScope 没有把历史记录存成一串聊天字符串。它用 <code>Msg</code> 保存 sender name、role、content block、
               message id、metadata、创建/完成时间和 usage。这样做看起来比 <code>{role, content}</code> 重，
@@ -399,7 +399,7 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               已经把这几个 owner 写得很直接。
             </p>
 
-            <h2>六、工具调用是一段可治理的 lifecycle</h2>
+            <h2>六、工具调用怎样暂停、确认与继续</h2>
             <p>
               在看函数前，先按 owner 把一次调用拆开。注册来源负责提供能力，Toolkit 规范化 schema，PermissionEngine
               只作 policy 决定，真正执行可以在本地或外部系统，结果最后由 Agent loop 消费。权限 owner 与执行 owner 不是同一个概念。
@@ -641,7 +641,7 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               它仍覆盖 OpenAI-compatible provider、audio-capable chat models 和传统 <code>messages</code> 生态。
             </p>
 
-            <h2>九、service example 暴露的是服务平面</h2>
+            <h2>九、Service Example 展示多用户服务怎样接入</h2>
             <p>
               如果 AgentScope 只是一个本地脚本库，这条 reply 主线到这里就可以结束。但它的 example service 直接把
               <code>create_app</code>、<code>RedisStorage</code>、<code>InMemoryMessageBus</code>、<code>LocalWorkspaceManager</code>、
@@ -668,7 +668,7 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               </table>
             </div>
 
-            <h2>十、读完 AgentScope 先记住这些 invariant</h2>
+            <h2>十、读完 AgentScope 先记住这些运行约束</h2>
             <div class="table-wrap">
               <table>
                 <thead>
