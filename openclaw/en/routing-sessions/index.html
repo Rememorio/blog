@@ -10,7 +10,7 @@
   <div class="article-shell"><aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
     <section class="article-hero">
       <p class="eyebrow">Reading OpenClaw · Part 3</p><h1>How routing, sessions, and queues assign a message</h1>
-      <p class="lead">“A message from the same person” is not a precise state address. Channel, account, direct or group peer, thread, binding, and DM isolation policy decide which agent and history own it. The queue then decides whether a new message joins the current run, waits, coalesces, or interrupts. Routing assigns space; queuing assigns time.</p>
+      <p class="lead">The same person can send messages through different channels, accounts, groups, and threads. OpenClaw first uses bindings and DM isolation policy to choose the agent and history, then lets the queue decide whether the message joins the current run, waits, coalesces, or interrupts.</p>
       <div class="meta-line"><span>Part 3 / 8</span><span>Source snapshot: c549250</span><span>Topic: routing · session · queue</span><span>Prerequisite: Gateway</span></div>
       <nav class="series-strip"><a href="../overview/"><strong>01</strong> Main path</a><a href="../gateway/"><strong>02</strong> Gateway</a><span class="series-current"><strong>03</strong> Routing and sessions</span><a href="../context-memory/"><strong>04</strong> Context</a></nav>
       <figure class="hero-image"><img src="../assets/routing-session-key.png" alt="OpenClaw route resolution: channel, accountId, peer, threadId, binding, dmScope, and optional identityLinks enter resolveAgentRoute and produce agentId, sessionKey, mainSessionKey, and matchedBy" /></figure>
@@ -22,12 +22,13 @@
       <div class="note"><p><strong>Reading contract.</strong>By the end, you should be able to distinguish binding (target agent), DM scope (how direct identities collapse), identityLinks (explicit canonical peer mapping), <code>sessionKey</code> (stable address), <code>sessionId</code> (current instance at that address), and transcript (that instance's history). You should also be able to explain the distinct effects of steer, followup, collect, and interrupt.</p></div>
       <p><strong>Evidence boundary.</strong>This chapter stays on <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a>, using <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/routing/resolve-route.ts"><code>resolve-route.ts</code></a>, auto-reply queue source, and the official <a href="https://docs.openclaw.ai/concepts/session">Session</a> and <a href="https://docs.openclaw.ai/concepts/queue">Command queue</a> contracts. Cross-session memory retrieval does not change the session key; part four handles it separately.</p>
 
-      <h2>1. Route ownership is not a reply address</h2>
+      <h2>1. How routing selects the agent and session history</h2>
+      <h3>1.1 Route chooses the handler and history; reply target chooses delivery</h3>
       <p>A channel reply target says where outbound content should be delivered. A route says who owns the run and history. They are often related but not identical. Channel docking can move a direct session's reply route to another linked channel without creating a session. Conversely, group and private work should retain different owners even when both eventually deliver through one app.</p>
       <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/routing/resolve-route.ts#L48-L70"><code>ResolvedAgentRoute</code></a> returns agentId, channel, accountId, effective dmScope, <code>sessionKey</code>, <code>mainSessionKey</code>, lastRoutePolicy, and <code>matchedBy</code>. The diagnostic <code>matchedBy</code> explains whether a peer, parent peer, wildcard, guild+roles, guild, team, account, channel, or default rule won.</p>
       <p>Logging only the final agentId is not enough to debug routing. Without the match source, an operator cannot tell whether configuration failed to match, a more specific rule won, or a thread inherited a parent binding.</p>
 
-      <h2>2. Bindings choose the agent; session policy builds the key</h2>
+      <h3>1.2 Bindings choose the agent; session policy builds the key</h3>
       <p>Bindings are configuration-level route rules. They can target a channel, account, peer, guild, roles, or team to select an agent. The source indexes bindings by channel/account and evaluates more specific peer and group constraints before account, channel, and default fallbacks. This both avoids scanning every binding per message and makes precedence testable.</p>
       <p>After agent selection, <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/routing/resolve-route.ts#L87-L109"><code>buildAgentSessionKey</code></a> passes agent, main key, channel, account, peer kind/id, dmScope, and identityLinks into the session-key builder. Model provider is deliberately absent: switching providers should not silently create another conversation.</p>
       <pre><code class="language-typescript">export function buildAgentSessionKey(params: {
@@ -40,7 +41,7 @@
 }): string</code></pre>
       <p>The general rule is to choose the logical owner first, then derive the state address under a session-isolation policy. Hiding both decisions inside string concatenation makes privacy audits and migrations nearly impossible.</p>
 
-      <h2>3. DM scope is a privacy policy</h2>
+      <h3>1.3 DM scope encodes privacy in the key</h3>
       <p>OpenClaw defaults to <code>dmScope: "main"</code>, collapsing direct messages into the agent's main session. That is convenient for a single trusted personal user: Telegram and Slack continue one conversation. On a Gateway where multiple people can DM the agent, the same default lets Alice and Bob share a transcript.</p>
       <div class="table-wrap"><table><thead><tr><th>dmScope</th><th>Collapse dimensions</th><th>Use and risk</th></tr></thead><tbody>
         <tr><td><code>main</code></td><td>All DMs → main session</td><td>Best single-user continuity; unsafe for unrelated users.</td></tr>
@@ -50,19 +51,20 @@
       </tbody></table></div>
       <p>The choice is not merely “should the agent remember me?” It is “which external identities may read the same private history?” Privacy belongs in the key, before the model sees anything.</p>
 
-      <h2>4. identityLinks solve sameness, not authority</h2>
+      <h3>1.4 identityLinks merge identity without merging authority</h3>
       <p><code>identityLinks</code> can map a Telegram identity and a Slack identity to one canonical peer so <code>per-peer</code> yields one session. It is explicit normalization, not fuzzy display-name matching. Automatic merging would turn a convenience feature into an identity-confusion vulnerability.</p>
       <p>Linked identities do not merge every conversation. Groups, rooms, and channels remain isolated. rememberAcrossConversations may retrieve relevant fragments from other private transcripts, but it neither changes keys nor combines transcripts. Identity, session, and retrieval are separate layers.</p>
 
-      <h2>5. Threads are route dimensions and inheritance boundaries</h2>
+      <h3>1.5 Threads participate in routing and binding inheritance</h3>
       <p>A thread cannot be treated as cosmetic message metadata. Different threads under one group usually represent different tasks and need separate sessions. Yet a thread may inherit its agent binding from the parent peer, which is why route input can carry both peer and parentPeer.</p>
       <p><code>matchedBy: "binding.peer.parent"</code> makes that inheritance observable. Otherwise, the same selected agent would conceal whether the thread matched directly or fell back to its parent. Inheritance rules belong in diagnostics, not only in hidden fallbacks.</p>
 
-      <h2>6. sessionKey is an address; sessionId is an instance</h2>
+      <h3>1.6 sessionKey is stable; sessionId identifies the current instance</h3>
       <p>This is the chapter's most important distinction. <code>sessionKey</code> is the stable routing, storage, and concurrency address. <code>sessionId</code> identifies the current conversation instance at that address. <code>/new</code>, <code>/reset</code>, or daily/idle policy can rotate the id while preserving the key.</p>
       <p>If reset changed the key, inbound routing would struggle to find the current conversation. If reset only erased transcript without rotating the id, delayed followups, approvals, and recovery claims could not tell whether they belonged before or after reset. The stable address preserves reachability; the rolling instance expires asynchronous work.</p>
 
-      <h2>7. Four temporal semantics: steer, followup, collect, interrupt</h2>
+      <h2>2. How queues arrange the active run and later messages</h2>
+      <h3>2.1 Four choices: steer, followup, collect, interrupt</h3>
       <figure class="hero-image"><img src="../assets/routing-queue-modes.png" alt="Four OpenClaw queue modes for a message arriving during an active run: steer injects after the current tool completes and before the next LLM call; followup schedules the next turn; collect coalesces after a quiet window; interrupt aborts the run and starts the newest message; maxConcurrent limits the global main lane" /></figure>
       <p>When no run is active, a message can start immediately. With an active run, each mode defines a different causal contract:</p>
       <ul>
@@ -73,29 +75,30 @@
       </ul>
       <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply/queue/settings.ts#L24-L58"><code>resolveQueueSettings</code></a> resolves inline choice, persisted session override, channel config, global config, then default steer. An explicit choice for this session appropriately outranks deployment defaults.</p>
 
-      <h2>8. Steer waits for a safe tool boundary</h2>
+      <h3>2.2 Steer waits for a safe tool handoff</h3>
       <p>Suppose the agent is deleting old build artifacts and the user adds “keep yesterday's archive.” Once the tool call has begun, new text cannot rewrite its submitted arguments. Arbitrary termination may leave partial side effects. OpenClaw therefore injects steering after the current assistant turn finishes its tool calls and before the next model call.</p>
       <p>The transcript can then represent reality: assistant proposed tool → tool result → user steering → next assistant. The model's view and the external world's timing agree. A truly urgent stop uses interrupt so abortion is an explicit lifecycle action.</p>
 
-      <h2>9. Session and global lanes prevent different collisions</h2>
+      <h3>2.3 Session and global lanes prevent different collisions</h3>
       <p>Each embedded run enters a <code>session:&lt;key&gt;</code> lane, allowing at most one active writer for a session. It then enters the global <code>main</code> lane, where <code>agents.defaults.maxConcurrent</code> limits runs across sessions. One global mutex would let Alice's long task block everyone; only a global cap would permit concurrent writers in one transcript.</p>
       <p>Queue mode decides what an inbound message does while its session is busy. Lanes decide which runs may execute simultaneously. Collect still needs a session lane. maxConcurrent=1 does not imply steer—it merely makes a second run wait.</p>
 
-      <h2>10. Queued turns need cancellation identity</h2>
+      <h3>2.4 Queued messages retain requester and cancellation identity</h3>
       <p>Followup and collect work cannot live in an anonymous array before activation. The Gateway retains a cancel identity for each client <code>runId</code> until the item runs, drops, or becomes part of an overflow summary. <code>chat.abort</code> can cancel a particular queued run. A session-scoped abort cancels authorized queued work before active work so queue drain cannot promote another turn while stopping.</p>
       <p><strong>Waiting is an authorization-bearing ownership state.</strong>Without requester and session identity on queued content, a multi-owner session cannot safely let one caller cancel only its own work.</p>
 
-      <h2>11. The key stays, the session rolls, stale work expires</h2>
+      <h2>3. How session rollover protects history and asynchronous work</h2>
+      <h3>3.1 The key stays; sessionId expires stale work</h3>
       <figure class="hero-image"><img src="../assets/routing-session-roll.png" alt="OpenClaw session lifecycle under one stable sessionKey: sessionId A rotates through /new, /reset, daily, or idle reset into sessionId B; the old transcript is archived and notices pinned to A are discarded; incognito is a separate in-memory, no-disk-transcript mode" /></figure>
       <p>SessionEntry timestamps own different policy. <code>sessionStartedAt</code> marks when the current sessionId began and drives daily reset. <code>lastInteractionAt</code> advances on real user/channel interaction and drives idle reset. <code>updatedAt</code> records any row mutation, including bookkeeping, heartbeat, or cron work, and must not keep a session artificially fresh.</p>
       <p>Reset archives the old transcript and gives the new id a new transcript. A system notice, approval followup, or detached completion pinned to the old sessionId must fail a rebind check if the key now points to B. Comparing only the key would deliver old-conversation work into the new conversation.</p>
       <p>Incognito is a different storage mode: session row, transcript, and compaction state stay in process memory and vanish on Gateway restart. It does not restrict tool file writes or prevent the model provider from processing messages. “No session transcript on disk” is not “no external effect” or complete privacy.</p>
 
-      <h2>12. Transcript is a causal ledger, not an editable array</h2>
+      <h3>3.2 Transcript appends messages and tool results in causal order</h3>
       <p>Routing and queues ultimately protect transcript order. User message, assistant tool call, tool result, steering input, and final reply must persist in occurrence order. Reset, compaction, and repair can rewrite structure, but the session owner serializes writes.</p>
       <p>Channel plugins should not append their own parallel JSONL truth, and two runs should not choose the same “last message” as parent. Current OpenClaw keeps runtime session rows and hot transcript in each agent's <code>openclaw-agent.sqlite</code>. Legacy JSON/JSONL is migration input or archival form, not a second live owner.</p>
 
-      <h2>13. Diagnose space, time, and instance separately</h2>
+      <h3>3.3 Diagnose routing, queues, and sessionId separately</h3>
       <div class="table-wrap"><table><thead><tr><th>Symptom</th><th>Inspect first</th><th>Do not change first</th></tr></thead><tbody>
         <tr><td>The same user “forgot”</td><td>Route inputs, matchedBy, dmScope, identityLinks, sessionKey.</td><td>Do not immediately enlarge prompt or memory.</td></tr>
         <tr><td>Different users share history</td><td>Whether multi-user DMs still collapse to main.</td><td>Do not ask the model to enforce privacy.</td></tr>
@@ -104,7 +107,7 @@
         <tr><td>All chats block one another</td><td>Global lane and maxConcurrent.</td><td>Do not remove per-session serialization.</td></tr>
       </tbody></table></div>
 
-      <h2>14. Six rules from routing and sessions</h2>
+      <h2>4. Six routing and session rules to carry forward</h2>
       <ol>
         <li><strong>Routing assigns space; queuing assigns time.</strong>Together they define transcript causality.</li>
         <li><strong>Separate agent selection from key construction.</strong>Bindings choose the logical owner; DM policy chooses isolation.</li>

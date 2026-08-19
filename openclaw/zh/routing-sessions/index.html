@@ -10,7 +10,7 @@
   <div class="article-shell"><aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
     <section class="article-hero">
       <p class="eyebrow">OpenClaw 源码阅读 · 第三篇</p><h1>路由、会话与队列怎样决定消息归属</h1>
-      <p class="lead">“同一个人发来的消息”并不是一个足够精确的状态地址。渠道、账号、私聊或群组、thread、binding 与 DM 隔离策略共同决定一条消息属于哪个 Agent 和哪段历史；随后队列还要决定它加入当前运行、等待下一轮、合并，还是打断。路由回答空间归属，队列回答时间归属。</p>
+      <p class="lead">同一个人可以从不同渠道、账号、群组和 thread 发来消息。OpenClaw 先用 binding 与 DM 隔离策略决定由哪个 Agent 处理、写入哪段历史，再由队列决定消息加入当前运行、等待下一轮、合并还是打断。</p>
       <div class="meta-line"><span>系列 3 / 8</span><span>源码快照：c549250</span><span>主题：routing · session · queue</span><span>前置：Gateway</span></div>
       <nav class="series-strip"><a href="../overview/"><strong>01</strong> 主线</a><a href="../gateway/"><strong>02</strong> Gateway</a><span class="series-current"><strong>03</strong> 路由与会话</span><a href="../context-memory/"><strong>04</strong> 上下文与记忆</a></nav>
       <figure class="hero-image"><img src="../assets/routing-session-key.png" alt="OpenClaw 消息路由：channel、accountId、peer、threadId 与 binding、dmScope、可选 identityLinks 进入 resolveAgentRoute，得到 agentId、sessionKey、mainSessionKey 和 matchedBy" /></figure>
@@ -22,12 +22,13 @@
       <div class="note"><p><strong>阅读契约。</strong>读完后你应该能区分：binding 决定目标 Agent，DM scope 决定私聊怎样折叠，identityLinks 只规范化已知同一人的 peer identity，<code>sessionKey</code> 是稳定地址，<code>sessionId</code> 是该地址下当前会话实例，transcript 是实例的历史；还应该能说清 steer、followup、collect、interrupt 对当前运行分别做了什么。</p></div>
       <p><strong>证据边界。</strong>本文固定在提交 <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a>，以 <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/routing/resolve-route.ts"><code>resolve-route.ts</code></a>、auto-reply queue 源码与官方 <a href="https://docs.openclaw.ai/concepts/session">Session</a>、<a href="https://docs.openclaw.ai/concepts/queue">Command queue</a> 文档为证。跨会话 memory 检索不改变 session key，本篇不把它当路由；第四篇再讨论。</p>
 
-      <h2>一、route 是状态归属结果，不是一次发送地址</h2>
-      <p>消息渠道里的“reply to”回答结果发回哪里，route 则回答谁拥有这次运行和历史。两者通常相关，却不能合并。Channel docking 可以把当前 direct-chat session 的回复路线移到另一个已链接渠道而不创建新 session；反过来，群组与私聊即使最终都回到同一 app，也应该保持不同 history owner。</p>
+      <h2>一、路由怎样选择 Agent 与会话历史</h2>
+      <h3>1.1 route 决定处理者与历史，reply target 决定发送位置</h3>
+      <p>消息渠道里的“reply to”回答结果发回哪里，route 则回答由哪个 Agent 处理并写入哪段历史。两者通常相关，却不能合并。Channel docking 可以把当前 direct-chat session 的回复路线移到另一个已链接渠道而不创建新 session；反过来，群组与私聊即使最终都回到同一 app，也应该保持不同历史。</p>
       <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/routing/resolve-route.ts#L48-L70"><code>ResolvedAgentRoute</code></a> 同时返回 <code>agentId</code>、channel、accountId、有效 dmScope、<code>sessionKey</code>、<code>mainSessionKey</code>、lastRoutePolicy 与 <code>matchedBy</code>。其中 <code>matchedBy</code> 是非常实用的诊断字段：它告诉你这次选择来自精确 peer、parent peer、wildcard、guild+roles、guild、team、account、channel 还是 default。</p>
       <p>因此排查“路由错了”不能只打印最终 agentId。没有 matchedBy，就无法区分配置没有匹配、被更具体 binding 抢先匹配，还是 thread 继承了 parent peer 的 binding。</p>
 
-      <h2>二、binding 先选择 Agent，session policy 再构造 key</h2>
+      <h3>1.2 binding 先选择 Agent，session policy 再构造 key</h3>
       <p>binding 是配置层的路由规则。它可以按 channel、account、peer、guild、roles 或 team 把消息送到某个 agent。源码预先把 binding 按 channel/account 建索引，再按优先级寻找 peer、guild+roles、guild、team、account、channel 与 default。这既减少每条消息全表扫描，也把“更具体规则优先”固化为可测试顺序。</p>
       <p>匹配得到 agentId 后，<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/routing/resolve-route.ts#L87-L109"><code>buildAgentSessionKey</code></a> 才把 agent、main key、channel、account、peer kind/id、dmScope 与 identityLinks 交给 session-key builder。模型 provider 不在参数里，因为切换模型不应该把同一段对话悄悄变成新会话。</p>
       <pre><code class="language-typescript">export function buildAgentSessionKey(params: {
@@ -38,9 +39,9 @@
   dmScope?: "main" | "per-peer" | "per-channel-peer" | "per-account-channel-peer";
   identityLinks?: Record&lt;string, string[]&gt;;
 }): string</code></pre>
-      <p>这条边界可以迁移到任何多入口 Agent：先用 binding 选择逻辑 owner，再用会话策略确定状态地址。把 agent selection 与 session isolation 塞进一个字符串拼接函数，会让权限审计和迁移都变得困难。</p>
+      <p>这套顺序可以迁移到任何多入口 Agent：先用 binding 选择处理消息的 Agent，再用会话策略确定历史地址。把 Agent 选择与会话隔离塞进一个字符串拼接函数，会让权限审计和迁移都变得困难。</p>
 
-      <h2>三、DM scope 是隐私策略，不只是体验设置</h2>
+      <h3>1.3 DM scope 把隐私隔离编码进 key</h3>
       <p>OpenClaw 默认 <code>dmScope: "main"</code>，让所有 DM 渠道折叠到 Agent 的 main session。这对只有一个受信用户的 personal agent 很顺滑：从 Telegram 换到 Slack 仍能接上。但在多人可私聊的 Gateway 上，这个默认会让 Alice 和 Bob 共享 transcript。</p>
       <div class="table-wrap"><table><thead><tr><th>dmScope</th><th>折叠维度</th><th>适用与风险</th></tr></thead><tbody>
         <tr><td><code>main</code></td><td>所有 DM → main session</td><td>单用户连续性最好；多用户会泄露彼此上下文。</td></tr>
@@ -50,19 +51,20 @@
       </tbody></table></div>
       <p>所以 dmScope 的选择不是“要不要记住我”这么简单，而是“哪些外部身份被允许共同读取一份私人 history”。OpenClaw 的安全审计会检查这类设置，原因就在这里。</p>
 
-      <h2>四、identityLinks 只解决同一人，不解决同一权限</h2>
+      <h3>1.4 identityLinks 合并身份，但不合并权限</h3>
       <p><code>identityLinks</code> 可以把 Telegram 的 alice 与 Slack 的 alice-work 映射到 canonical peer，从而在 <code>per-peer</code> 策略下共享 session。它是显式配置的身份规范化桥，不是模糊匹配，也不应该根据显示名自动合并。</p>
       <p>链接身份也不等于链接所有会话。群组、room、channel 仍保持隔离；跨会话 rememberAcrossConversations 只是把其他私人 transcript 的相关片段作为检索材料，不会修改 key，也不会把历史合并。身份、会话和检索是三个层级。</p>
 
-      <h2>五、thread 是路由维度，也是 binding 继承边界</h2>
+      <h3>1.5 thread 同时参与路由与 binding 继承</h3>
       <p>thread 不能只当消息 metadata。Discord、Slack 等平台里，同一群组下不同 thread 往往对应不同任务，必须有独立 session。与此同时，thread 可能需要继承 parent peer 的 Agent binding，所以 <code>ResolveAgentRouteInput</code> 同时带 peer 与 parentPeer。</p>
       <p>源码的 <code>matchedBy</code> 为 <code>binding.peer.parent</code> 保留独立结果，正是为了让这种继承可观察。否则同一个 Agent 被选中时，你无法知道是 thread 自己有规则，还是继承了父会话。继承规则应参与诊断输出，而不能只藏在 fallback 分支里。</p>
 
-      <h2>六、sessionKey 是地址，sessionId 是当前实例</h2>
+      <h3>1.6 sessionKey 保持地址稳定，sessionId 标识当前实例</h3>
       <p>这是整篇最重要的区分。<code>sessionKey</code> 是路由得到的稳定 store/concurrency address；<code>sessionId</code> 是这个 key 当前绑定的会话实例。用户执行 <code>/new</code>、<code>/reset</code>，或 daily/idle policy 到期时，key 可以保持不变，而 sessionId 滚成新值。</p>
       <p>为什么要两层？如果 reset 连 key 一起换，渠道 route 很难再找到“当前对话”；如果只清空 transcript 不换 sessionId，后台 followup、approval 或恢复 claim 又无法判断自己属于 reset 前还是 reset 后。稳定地址让新消息继续找到入口，实例 id 让异步结果钉在正确时代。</p>
 
-      <h2>七、四种时间语义：steer、followup、collect、interrupt</h2>
+      <h2>二、队列怎样安排当前运行与后续消息</h2>
+      <h3>2.1 steer、followup、collect、interrupt 的四种选择</h3>
       <figure class="hero-image"><img src="../assets/routing-queue-modes.png" alt="OpenClaw 新消息到达 active run 时的四种 queue mode：steer 等当前工具完成后在下一次 LLM 前注入，followup 排到下一 turn，collect 在 quiet window 后合并，interrupt 中止当前 run 再执行最新消息；global main lane 由 maxConcurrent 控制" /></figure>
       <p>当 session 没有 active run，新消息可以直接开始。当已有 run 时，四种 mode 不是不同性能参数，而是不同因果语义：</p>
       <ul>
@@ -73,29 +75,30 @@
       </ul>
       <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply/queue/settings.ts#L24-L58"><code>resolveQueueSettings</code></a> 的优先级也体现了 session 语义：inline → sessionEntry 持久 override → channel config → global config → 默认 steer。用户对当前 session 的明确选择高于部署默认。</p>
 
-      <h2>八、为什么 steer 必须等当前 tool boundary</h2>
+      <h3>2.2 steer 等待安全的工具交接点</h3>
       <p>假设 Agent 正在执行“删除旧构建产物”，用户补充“保留昨天的压缩包”。在 tool 已经开始后把一句新消息硬塞进同一次 tool call，模型并没有机会修改已经发出的参数；强行终止工具又可能留下半完成副作用。OpenClaw 因此在当前 assistant turn 完成工具调用后、下一次 LLM 前注入 steering。</p>
       <p>这个边界保证 transcript 仍能表示真实顺序：assistant 提议工具 → tool result → 用户 steering → 下一次 assistant。模型看到补充信息的时间点与外部世界实际接受它的时间点一致。若用户真的要立即停止，就选择 interrupt，让 abort 成为显式生命周期事件。</p>
 
-      <h2>九、session lane 与 global lane 解决不同冲突</h2>
+      <h3>2.3 session lane 与 global lane 限制不同冲突</h3>
       <p>每个 embedded run 先进入 <code>session:&lt;key&gt;</code> lane，保证同一会话最多一个 active run；随后进入 global <code>main</code> lane，用 <code>agents.defaults.maxConcurrent</code> 限制跨 session 并发。把两层合成一个全局 mutex 会让 Alice 的长任务阻塞所有人；只做全局 cap 则允许同一 transcript 的两个 writer 并发。</p>
       <p>queue mode 决定“忙碌 session 的新消息怎么办”，lane 决定“哪些 run 可以同时执行”。它们不能互相替代。collect 仍需 session lane；maxConcurrent=1 也不自动等于 steer，因为它只让第二个 run 等待，并没有把消息注入当前 runtime。</p>
 
-      <h2>十、排队中的 turn 也需要取消身份</h2>
+      <h3>2.4 排队消息也要保存请求者与取消标识</h3>
       <p>followup/collect 内容还没成为 active run 时，不能只存在一个匿名数组里。Gateway 为每个 client <code>runId</code> 保留 cancel identity，直到内容执行、丢弃或被 overflow summary 吸收。<code>chat.abort</code> 带 runId 时能取消指定 queued turn；按 session abort 时则先取消获准的 queued work，再处理 active run，避免 queue drain 在停止过程中又提升一项工作。</p>
-      <p>这揭示一条经常被忽略的规则：<strong>等待执行也是一种需要授权的所有权状态</strong>。如果 queued item 没有 requester/session identity，多用户 session 就无法安全地只取消自己的请求。</p>
+      <p>这揭示一条经常被忽略的规则：<strong>等待执行的消息也必须记录谁提交、属于哪个 session。</strong>否则多用户 session 无法安全地只取消某个请求者自己的任务。</p>
 
-      <h2>十一、key 不变，session 滚动，旧异步结果必须过期</h2>
+      <h2>三、会话滚动后怎样保护历史与异步结果</h2>
+      <h3>3.1 key 保持不变，sessionId 让旧结果过期</h3>
       <figure class="hero-image"><img src="../assets/routing-session-roll.png" alt="OpenClaw session 生命周期：稳定 sessionKey 下的 sessionId A 经 /new、/reset、daily 或 idle reset 变为 sessionId B，旧 transcript 归档，绑定 A 的 stale queued notice 被丢弃；incognito 单独只存进程内且无磁盘 transcript" /></figure>
       <p>SessionEntry 用不同时间戳服务不同策略：<code>sessionStartedAt</code> 标记当前 sessionId 何时开始，daily reset 看它；<code>lastInteractionAt</code> 只由真实 user/channel interaction 推进，idle reset 看它；<code>updatedAt</code> 表示 store row 最近一次变化，heartbeat、cron 或 bookkeeping 也可能更新，不能拿它延长会话寿命。</p>
       <p>reset 时，旧 transcript 可以归档，新 sessionId 获得新 transcript。绑定旧 sessionId 的 system notice、approval followup 或 detached completion 必须检查 rebind；若 key 已经指向 B，就丢掉属于 A 的陈旧结果。只比较 key 会把上一段对话的后台结果投进新对话。</p>
       <p>incognito 是另一种 storage mode：session row、transcript 与 compaction state 只在进程内，Gateway 重启后消失，不写磁盘 transcript。它不限制工具写文件，也不阻止 model provider 处理消息，所以“无 session 落盘”不等于“无外部副作用”或“端到端隐私模式”。</p>
 
-      <h2>十二、transcript 是因果账本，不是任意可编辑数组</h2>
-      <p>路由与队列最终保护的是 transcript 的因果顺序。用户消息、assistant tool call、tool result、steering message 和最终回答必须按发生顺序持久化；reset、compaction 和 repair 可能重写结构，但写入仍由 session owner 串行化。</p>
+      <h3>3.2 transcript 按真实顺序追加消息与工具结果</h3>
+      <p>路由与队列最终保护的是 transcript 的先后关系。用户消息、assistant tool call、tool result、steering message 和最终回答必须按发生顺序持久化；reset、compaction 和 repair 可能重写结构，但同一 session 的写入仍然串行执行。</p>
       <p>因此不要让 channel plugin 各自 append 自定义 JSONL，也不要让两个运行同时把“最后一条消息”当作自己的 parent。当前 OpenClaw 把 runtime session row 与热 transcript 存入每 Agent 的 <code>openclaw-agent.sqlite</code>，旧 JSON/JSONL 是迁移来源或归档形态，不是新运行状态的并行真相。</p>
 
-      <h2>十三、常见故障应该按空间、时间、实例三层排</h2>
+      <h3>3.3 按路由、队列和 sessionId 三层排查</h3>
       <div class="table-wrap"><table><thead><tr><th>症状</th><th>先查什么</th><th>不要先改什么</th></tr></thead><tbody>
         <tr><td>同一个用户“失忆”</td><td>route inputs、matchedBy、dmScope、identityLinks、sessionKey。</td><td>不要先加 memory 或扩大 prompt。</td></tr>
         <tr><td>不同用户看到同一历史</td><td>多人 DM 是否仍用 main，binding/identityLinks 是否误合并。</td><td>不要靠 system prompt 要模型保密。</td></tr>
@@ -104,14 +107,14 @@
         <tr><td>所有聊天互相阻塞</td><td>global maxConcurrent 与 lane 配置。</td><td>不要取消 session serialization。</td></tr>
       </tbody></table></div>
 
-      <h2>十四、从路由与会话带走六条规则</h2>
+      <h2>四、六条可以迁移的路由与会话规则</h2>
       <ol>
         <li><strong>路由决定空间归属，队列决定时间归属。</strong>二者共同定义 transcript 因果顺序。</li>
-        <li><strong>选择 Agent 与构造 session key 分层。</strong>binding 解决逻辑 owner，dmScope/identityLinks 解决会话隔离。</li>
+        <li><strong>选择 Agent 与构造 session key 分层。</strong>binding 选择处理者，dmScope/identityLinks 决定会话隔离。</li>
         <li><strong>隐私必须编码进 key。</strong>模型提示不能补救错误的多人 DM 合并。</li>
         <li><strong>稳定地址与滚动实例分开。</strong>sessionKey 便于路由，sessionId 让异步结果过期。</li>
         <li><strong>steer 在安全 runtime boundary 注入。</strong>补充消息不能重写已经发出的工具副作用。</li>
-        <li><strong>排队项也有 owner。</strong>取消、drop 与 overflow summary 都要保留 requester/run identity。</li>
+        <li><strong>排队项也要保存来源。</strong>取消、drop 与 overflow summary 都要保留 requester/run identity。</li>
       </ol>
       <p>下一篇进入 session 内部，拆开 workspace、bootstrap、system prompt、history、compaction 和 memory。那时会看到：路由保证“哪段历史属于你”，上下文引擎还要决定“这段历史里哪些材料在本轮真的给模型看”。</p>
 
