@@ -3,16 +3,16 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Codex 源码阅读（二）：上下文不是聊天记录，而是运行时账本</title>
+    <title>Codex 源码阅读（二）：会话记录怎样变成下一次模型请求</title>
     <meta
       name="description"
       content="沿 openai/codex 源码拆解 Codex 的上下文管理机制：ContextManager、TurnContext、for_prompt、reference_context_item、auto compaction 与 rollout 恢复。"
     />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Codex 源码阅读（二）：上下文不是聊天记录，而是运行时账本" />
+    <meta property="og:title" content="Codex 源码阅读（二）：会话记录怎样变成下一次模型请求" />
     <meta
       property="og:description"
-      content="从实际上下文压力出发，逐步读懂 Codex 如何把 durable history 投影成 model-visible prompt，并在压缩后恢复运行。"
+      content="从实际上下文压力出发，逐步读懂 Codex 如何把 durable history 整理成模型请求，并在压缩后恢复运行。"
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/context-ledger-cover.png" />
@@ -83,10 +83,10 @@
         <article class="article-card">
           <section class="article-hero">
             <p class="eyebrow">Codex 源码阅读 · 第二篇</p>
-            <h1>上下文不是聊天记录，而是运行时账本</h1>
+            <h1>会话记录怎样变成下一次模型请求</h1>
             <p class="lead">
               很多 coding agent 的失败，看起来像“模型忘了”。Codex 源码里的答案更具体：
-              运行时维护的是一套可投影、可压缩、可恢复的上下文账本，而不是把聊天记录原封不动塞进 context window。
+              运行时既保存可恢复的 history，也会为每一轮筛选、压缩并重新组装模型输入，而不是把聊天记录原封不动塞进 context window。
             </p>
             <div class="meta-line">
               <span>项目：openai/codex</span>
@@ -96,7 +96,7 @@
             <figure class="hero-image">
               <img
                 src="../assets/context-ledger-cover.png"
-                alt="Codex 上下文账本总览图，展示从持久 history 到模型请求和压缩恢复的路径"
+                alt="Codex 上下文管理总览图，展示从持久 history 到模型请求和压缩恢复的路径"
               />
             </figure>
           </section>
@@ -119,12 +119,12 @@
                 先不看源码，先把三个词翻译成人话：
                 <strong>thread</strong> 是一次可以恢复的工作会话；
                 <strong>context window</strong> 是本次模型请求能容纳的上下文上限；
-                <strong>compact</strong> 不是“删掉前文”，而是把旧账改写成一个可继续工作的摘要恢复点。
+                <strong>compact</strong> 不是“删掉前文”，而是把旧 history 改写成一个可继续工作的摘要恢复点。
               </p>
             </div>
 
             <p>
-              官方文档先给出外部契约：Codex 的 thread 是一次会话，包含 prompt、模型输出和工具调用；
+              官方文档先说明产品行为：Codex 的 thread 是一次会话，包含 prompt、模型输出和工具调用；
               agent 工作时会继续从文件内容、工具输出和已完成工作中收集上下文；所有信息都必须放进模型的
               context window，长任务可能自动 compact。源码要回答的是下一层问题：这些东西在运行时到底放在哪里，
               什么时候进入模型，什么时候被摘要替换，恢复时又靠什么对齐？
@@ -173,25 +173,25 @@ next inference:
             <p>
               官方文章还解释了一个性能和隐私相关的选择：Codex 为了保持 stateless / ZDR-friendly 的请求形状，
               不依赖 <code>previous_response_id</code> 把后续请求绑定到服务端状态；它每轮都会把需要的 input 组装出来。
-              这样做让客户端侧的上下文账本更重要，也解释了为什么 prompt cache 和 compact 会同时出现：
-              <strong>稳定前缀要尽量稳定，新增事实要按顺序追加，过长旧账要变成可继续工作的恢复点。</strong>
+              这样做让客户端保存并组装上下文的代码更重要，也解释了为什么 prompt cache 和 compact 会同时出现：
+              <strong>稳定前缀要尽量稳定，新增事实要按顺序追加，过长历史要变成可继续工作的恢复点。</strong>
             </p>
 
             <div class="note">
               <p>
-                <strong>证据边界。</strong>
-                本文把官方文档当作产品层契约，把 openai/codex 的公开源码当作机制证据。源码链接固定到同一公开快照。
-                当源码只暴露 remote compaction 的选择边界，而不暴露服务端摘要实现时，本文只描述可见生命周期，
+                <strong>取材范围。</strong>
+                本文用官方文档确认产品行为，用 openai/codex 的公开源码解释机制，源码链接固定到同一公开快照。
+                当源码只暴露 remote compaction 的选择条件，而不暴露服务端摘要实现时，本文只描述可见生命周期，
                 不推断服务端内部算法。
               </p>
             </div>
 
             <p>
-              这篇的阅读契约很简单：先分清 <strong>哪本账负责保存状态</strong>，
-              再分清 <strong>哪一部分会被投影给模型</strong>。只要这两件事清楚了，
-              后面的 diff、projection、compact 和 resume 都会落到同一条主线上。
-              后文只跟三次转换：运行环境怎样入账，history 怎样经过模型投影变成 prompt，
-              compact 怎样把旧账替换成新的恢复点。
+              这篇的阅读目标很简单：先分清 <strong>哪些结构负责保存状态</strong>，
+              再分清 <strong>哪些内容会进入模型请求</strong>。只要这两件事清楚了，
+              后面的 diff、compact 和 resume 都会落到同一条主线上。
+              后文只跟三次转换：运行环境怎样写入 history，history 怎样经过过滤和规整变成 prompt，
+              compact 怎样把旧 history 替换成新的恢复点。
             </p>
 
             <p>所以这篇只追六个问题：</p>
@@ -200,16 +200,16 @@ next inference:
               <li>Codex 持久保存的 history，为什么不能直接等同于模型看到的 prompt？</li>
               <li>每一轮开始前，哪些上下文会全量注入，哪些只发 diff？</li>
               <li><code>for_prompt()</code> 这一步到底规整和过滤了什么？</li>
-              <li>compact 发生时，Codex 替换的是哪本账，留下的恢复点是什么？</li>
+              <li>compact 发生时，Codex 替换的是哪段 history，留下的恢复点是什么？</li>
               <li>rollback、resume 和模型切换为什么会影响下一轮上下文注入？</li>
             </ol>
 
-            <h2>一、先把四个表面分开</h2>
+            <h2>一、先把四种数据分开</h2>
             <p>
               读 Codex 上下文源码，第一步不是找一个叫“记忆模块”的地方。
-              真正需要先分开的，是同一个工作会话里四种不同的表面：
-              session 级状态、turn 级快照、durable history，以及本次请求真正发给模型的 view。
-              它们看起来都叫“上下文”，但 owner 和生命周期完全不同。
+              真正需要先分开的，是同一个工作会话里的四种数据：
+              session 级状态、turn 级快照、durable history，以及本次真正发给模型的 request。
+              它们看起来都叫“上下文”，但保存位置、使用者和生命周期完全不同。
             </p>
 
             <p>
@@ -222,7 +222,7 @@ next inference:
 
             <p>
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/state/session.rs#L23-L42"><code>SessionState</code></a>
-              是 session 级账本，持有 <code>history: ContextManager</code>、<code>additional_context</code>、
+              保存 session 级状态，持有 <code>history: ContextManager</code>、<code>additional_context</code>、
               <code>previous_turn_settings</code> 和 <code>auto_compact_window</code>。
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L55-L108"><code>TurnContext</code></a>
               则是单轮快照：模型、cwd、日期、时区、开发者指令、用户指令、协作模式、权限、技能上下文、输出 schema 等都在这里。
@@ -233,10 +233,10 @@ next inference:
               <table>
                 <thead>
                   <tr>
-                    <th>表面</th>
-                    <th>源码 owner</th>
+                    <th>数据</th>
+                    <th>保存或生成它的结构</th>
                     <th>模型是否直接看到</th>
-                    <th>保护的不变量</th>
+                    <th>需要保证什么</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -255,7 +255,7 @@ next inference:
                   <tr>
                     <td>durable history</td>
                     <td><code>ContextManager.items</code></td>
-                    <td>经过投影后才进入模型</td>
+                    <td>经过过滤和规整后才进入模型</td>
                     <td>保留可恢复的 API 消息、工具调用和压缩替换记录。</td>
                   </tr>
                   <tr>
@@ -284,9 +284,9 @@ next inference:
 
             <div class="note key-point">
               <p>
-              这就是本文的核心模型：Codex 的上下文不是一段不断变长的聊天记录，
-              而是一个 <strong>durable ledger</strong>。每一轮请求前，运行时从账本里取一个快照，
-              整理成当前模型能接受的 prompt；当账本太大时，再用 replacement history 写入新的恢复点。
+              这就是本文的核心：Codex 的上下文不是一段不断变长的聊天记录。
+              运行时会持久保存 history；每一轮请求前，从中取出当前需要的内容，
+              整理成模型能接受的 prompt；history 太大时，再用 replacement history 写入新的恢复点。
               </p>
             </div>
 
@@ -301,13 +301,13 @@ next inference:
                 </thead>
                 <tbody>
                   <tr>
-                    <td>durable history / ledger</td>
-                    <td>本地可恢复、可重放的历史账本。</td>
+                    <td>durable history</td>
+                    <td>本地可恢复、可重放的历史记录。</td>
                     <td>模型每次完整看到的聊天记录。</td>
                   </tr>
                   <tr>
-                    <td>model-visible view / prompt</td>
-                    <td>本轮请求真正交给模型的投影视图。</td>
+                    <td>model request / prompt</td>
+                    <td>本轮请求真正交给模型的消息和工具说明。</td>
                     <td>内存里保存的全部状态。</td>
                   </tr>
                   <tr>
@@ -321,8 +321,8 @@ next inference:
                     <td>贴在旧 history 旁边的一条摘要备注。</td>
                   </tr>
                   <tr>
-                    <td>model projection / 模型投影</td>
-                    <td>从 durable history 生成 model-visible view 的过滤和规整过程。</td>
+                    <td>request preparation</td>
+                    <td>从 durable history 生成模型请求的过滤和规整过程。</td>
                     <td>简单复制消息数组。</td>
                   </tr>
                 </tbody>
@@ -332,9 +332,9 @@ next inference:
             <h2>二、一轮 turn 先整理运行环境，再进入模型</h2>
             <p>
               现在看一轮 turn。<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L137-L184"><code>run_turn</code></a>
-              进入后，第一件事不是记录新用户消息，而是先检查旧账是否已经太大。
+              进入后，第一件事不是记录新用户消息，而是先检查旧 history 是否已经太大。
               compact 的内部细节放到第四节；这里只需要抓住一个顺序：
-              <strong>压缩检查发生在本轮新消息入账之前。</strong>
+              <strong>压缩检查发生在本轮新消息写入 history 之前。</strong>
               源码旁边的备注说明：当前 pre-turn compaction 发生在 context updates 和新用户消息被记录之前，
               未来应该估算即将进入的上下文 diff 或全量重注入是否会把 thread 推过阈值。
             </p>
@@ -382,7 +382,7 @@ next inference:
               full initial context 由
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2814-L3048"><code>build_initial_context</code></a>
               合成。它把运行时环境整理成 developer 或 contextual user message。
-              这些信息不是一条用户聊天消息，而是本轮请求必须携带的边界条件。
+              这些信息不是一条用户聊天消息，而是本轮请求必须携带的运行条件。
             </p>
 
             <div class="table-wrap">
@@ -398,7 +398,7 @@ next inference:
                   <tr>
                     <td>模型、权限、cwd、日期、时区</td>
                     <td>developer 或 contextual user message，以及 request 字段。</td>
-                    <td>它们定义本轮运行边界，优先级高于用户临时描述。</td>
+                    <td>它们定义本轮模型、目录和权限，优先级高于用户临时描述。</td>
                   </tr>
                   <tr>
                     <td>开发者指令、协作模式、personality、用户指令</td>
@@ -421,7 +421,7 @@ next inference:
               里保存结构化基线。
             </p>
 
-            <h3>2.2 稳态 turn 只发 diff，但 diff 有边界</h3>
+            <h3>2.2 后续 turn 可以只发 diff，但覆盖范围有限</h3>
             <p>
               <code>record_context_updates_and_set_reference_context_item</code> 的分支很直接：
               如果 <code>reference_context_item</code> 缺失，就全量调用 <code>build_initial_context</code>；
@@ -453,19 +453,19 @@ reference_context_item = current TurnContextItem</code></pre>
               </p>
             </div>
 
-            <h2>三、history 到 prompt 中间有一次模型投影</h2>
+            <h2>三、<code>for_prompt()</code> 会过滤和规整 history</h2>
             <p>
               当 <code>run_turn</code> 准备采样请求时，它不会把 <code>ContextManager.items</code> 原封不动发出去。
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L107-L114"><code>for_prompt()</code></a>
               会先 normalize history，再返回当前模型可用的 <code>ResponseItem</code> 列表。
-              这里的 projection 指的就是这次转换：<strong>账本要完整，报表要合法。</strong>
+              这一步可以概括为：<strong>history 要可恢复，发给模型的内容要符合当前模型能力。</strong>
               <code>ResponseItem</code> 可以理解成模型请求里的消息、工具调用和工具输出单元。
             </p>
 
             <figure class="figure">
               <img
                 src="../assets/prompt-projection-boundary.png"
-                alt="Codex prompt projection 图，展示持久 history 经过过滤和规整后变成模型可见请求"
+                alt="Codex prompt 准备过程图，展示持久 history 经过过滤和规整后变成模型请求"
               />
               <figcaption>
                 durable history 是恢复和审计视角，model view 是本次请求视角；两者中间有规整、过滤和能力适配。
@@ -503,9 +503,9 @@ model-visible view for a text-only model:
               <code>Prompt</code>。工具 schema 不是聊天消息，但它们仍然是模型可见请求的一部分。
             </p>
 
-            <h3>3.1 compact 触发前，token 账也要对齐</h3>
+            <h3>3.1 compact 触发前，要合并服务端计数和本地估算</h3>
             <p>
-              模型投影解释了“给模型看什么”，还剩一个问题：旧账什么时候大到必须 compact？
+              <code>for_prompt()</code> 解释了“给模型看什么”，还剩一个问题：history 什么时候大到必须 compact？
               Codex 的 token 判断不只读服务端最后一次 usage。
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L249-L314"><code>get_total_token_usage</code></a>
               会在 last token usage 之外，加上最近一次模型生成之后本地追加的 items；如果服务端没有把历史 reasoning tokens 算入，
@@ -539,14 +539,14 @@ model-visible view for a text-only model:
             <div class="note key-point">
               <p>
                 本节最重要的一句话是：<strong>compact 改写的是 history，不是在旧 history 旁边贴一条摘要。</strong>
-                如果摘要不能成为恢复时可重放的新账本，它就只是省了一点 token，却没有解决长 thread 的继续工作问题。
+                如果摘要不能成为恢复时可重放的新 history，它就只是省了一点 token，却没有解决长 thread 的继续工作问题。
               </p>
             </div>
 
             <figure class="figure">
               <img
                 src="../assets/compaction-replacement.png"
-                alt="Codex compaction replacement 图，展示旧 history 被摘要任务替换成新 history 并写入恢复账本"
+                alt="Codex compaction replacement 图，展示旧 history 被摘要任务替换成新 history 并写入 rollout"
               />
               <figcaption>
                 compact 的结果不是一句摘要旁挂在旧 history 上，而是一段新的 replacement history，并带着不同的初始上下文注入策略。
@@ -556,7 +556,7 @@ model-visible view for a text-only model:
             <h3>4.1 触发点先分 pre-turn 和 mid-turn</h3>
             <p>
               先不要看 enum 名字，先看 compact 发生在一轮 turn 的哪个位置。
-              同样是“压缩旧账”，发生在用户新消息入账前，和发生在模型已经工作到一半时，恢复策略是不一样的。
+              同样是压缩旧 history，发生在用户新消息写入前，和发生在模型已经工作到一半时，恢复策略是不一样的。
             </p>
 
             <div class="table-wrap">
@@ -574,7 +574,7 @@ model-visible view for a text-only model:
                     <td>pre-turn / 手动 compact</td>
                     <td>还没有进入这轮 history。</td>
                     <td>不立刻注入，清空 baseline，下一轮全量重注入。</td>
-                    <td>旧账已经要被替换，新 turn 还没开始，最稳的是让下一轮重新建立环境基线。</td>
+                    <td>旧 history 已经要被替换，新 turn 还没开始，最稳的是让下一轮重新建立环境基线。</td>
                   </tr>
                   <tr>
                     <td>mid-turn compact</td>
@@ -630,14 +630,14 @@ model-visible view for a text-only model:
                   <tr>
                     <th>步骤</th>
                     <th>发生了什么</th>
-                    <th>保护的边界</th>
+                    <th>为什么要这样做</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr>
                     <td>1</td>
                     <td>克隆当前 history。</td>
-                    <td>compact 请求可以读旧账，但不先破坏主会话。</td>
+                    <td>compact 请求可以读旧 history，但不先破坏主会话。</td>
                   </tr>
                   <tr>
                     <td>2</td>
@@ -775,7 +775,7 @@ replacement history, shape-level:
 
             <h2>六、几个常见误读</h2>
             <p>
-              读完这条链路，可以把常见误读压成一张表。它比“上下文管理很复杂”更有用，因为每一行都对应一个实际会出错的地方。
+              读完这段执行顺序，可以把常见误读归纳成一张表。它比“上下文管理很复杂”更有用，因为每一行都对应一个实际会出错的地方。
             </p>
 
             <div class="table-wrap">
@@ -790,7 +790,7 @@ replacement history, shape-level:
                 <tbody>
                   <tr>
                     <td>history 就是 prompt</td>
-                    <td><code>ContextManager</code> 保存 durable items，<code>for_prompt()</code> 再投影出请求视图。</td>
+                    <td><code>ContextManager</code> 保存 durable items，<code>for_prompt()</code> 再过滤和规整出模型请求。</td>
                     <td>orphan outputs、unsupported images 或错误 call/output 对会直接污染请求。</td>
                   </tr>
                   <tr>
@@ -836,14 +836,14 @@ replacement history, shape-level:
                   <tr>
                     <td>真实对话和工具证据</td>
                     <td>durable history / rollout</td>
-                    <td>按模型能力投影，保持 call/output 成对。</td>
-                    <td>恢复和审计时有证据链。</td>
+                    <td>按模型能力过滤和规整，保持 call/output 成对。</td>
+                    <td>恢复和检查历史时有完整记录。</td>
                   </tr>
                   <tr>
                     <td>运行环境和权限</td>
                     <td>turn context + reference baseline</td>
                     <td>首次全量注入，后续只发可信 diff。</td>
-                    <td>模型知道当前边界，且不会被旧配置误导。</td>
+                    <td>模型知道当前环境和权限，且不会被旧配置误导。</td>
                   </tr>
                   <tr>
                     <td>工具能力</td>
@@ -869,8 +869,8 @@ replacement history, shape-level:
 
             <p>
               读到这里，后面的机制就有了共同入口。工具调用、权限系统、多 agent、
-              skills 和插件，都会回到同一个问题：运行时必须先决定哪本账有权保存状态，
-              再决定哪一部分应该被投影给模型。没有这层上下文纪律，agent 越强，越容易把自己之前做过的事搅成一团。
+              skills 和插件，都会回到同一个问题：运行时必须先决定状态保存在哪里，
+              再决定哪些内容应该进入模型请求。没有清晰的保存和转换规则，agent 越强，越容易把自己之前做过的事搅成一团。
             </p>
 
             <h2 id="sources">参考源码与文档</h2>

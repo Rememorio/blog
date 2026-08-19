@@ -3,16 +3,16 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Codex Source Notes II: Context Is a Runtime Ledger, Not Chat History</title>
+    <title>Codex source notes II: How session history becomes a model request</title>
     <meta
       name="description"
       content="A source-guided walkthrough of Codex context management: ContextManager, TurnContext, for_prompt, reference_context_item, auto compaction, and rollout recovery."
     />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Codex Source Notes II: Context Is a Runtime Ledger, Not Chat History" />
+    <meta property="og:title" content="Codex source notes II: How session history becomes a model request" />
     <meta
       property="og:description"
-      content="How openai/codex projects durable thread history into model-visible prompts, then compacts and recovers long-running threads."
+      content="How openai/codex filters durable thread history into model requests, then compacts and recovers long-running threads."
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/context-ledger-cover.png" />
@@ -55,11 +55,11 @@
         <article class="article-card">
           <section class="article-hero">
             <p class="eyebrow">Codex Source Notes · Part II</p>
-            <h1>Context Is a Runtime Ledger, Not Chat History</h1>
+            <h1>How session history becomes a model request</h1>
             <p class="lead">
               When a coding agent fails, the symptom often sounds like memory loss.
-              The Codex source shows a more precise mechanism: context is a
-              ledger that can be projected, compacted, and reconstructed.
+              The Codex source shows a more precise mechanism: the runtime preserves recoverable history,
+              prepares a valid request for each turn, and replaces older history when compaction is required.
             </p>
             <div class="meta-line">
               <span>Project: openai/codex</span>
@@ -69,7 +69,7 @@
             <figure class="hero-image">
               <img
                 src="../assets/context-ledger-cover.png"
-                alt="Overview of the Codex context ledger from durable history to model request and compaction recovery"
+                alt="Overview of Codex context management from durable history to model request and compaction recovery"
               />
             </figure>
           </section>
@@ -90,14 +90,14 @@
               explain this workflow. Repository instructions, working directory,
               sandbox policy, skill metadata, tool schemas, tool outputs,
               images, reasoning tokens, pending user input, compaction summaries,
-              and resume baselines have different owners. Some must be durable.
+              and resume baselines are stored and used by different components. Some must be durable.
               Some are only model-visible for one request. Some may be truncated.
               Some must be re-injected from scratch if the baseline becomes
               unreliable.
             </p>
 
             <p>
-              The official Codex docs provide the product contract: a thread is
+              The official Codex docs describe the product behavior: a thread is
               a session made from prompts, model outputs, and tool calls; as the
               agent works, it gathers context from files, tool output, and its
               running record; everything must fit in the model's context window,
@@ -155,19 +155,18 @@ next inference:
               The OpenAI article also explains the stateless request shape:
               Codex avoids relying on <code>previous_response_id</code> so the
               loop can remain ZDR-friendly and client-driven. That makes the
-              local context ledger central. Each turn must assemble the required
+              client-side context handling central. Each turn must assemble the required
               input again. Stable prefixes should stay stable for prompt cache;
-              new facts must be appended in order; old ledgers that grow too
+              new facts must be appended in order; old history that grows too
               large must become resumable recovery points.
             </p>
 
             <div class="note">
               <p>
-                <strong>Evidence boundary.</strong>
-                This article treats official documentation as the product-level
-                contract and the public openai/codex source as the implementation
-                evidence. Source links point to one fixed public snapshot. Where
-                the source exposes only the remote-compaction selection boundary,
+                <strong>Source scope.</strong>
+                This article uses official documentation for product behavior and the public openai/codex source for implementation details.
+                Source links point to one fixed public snapshot. Where
+                the source exposes only the remote-compaction selection conditions,
                 this article describes the visible lifecycle and does not infer
                 the server-side summarization algorithm.
               </p>
@@ -179,21 +178,21 @@ next inference:
               <li>Why is durable history not the same thing as the prompt?</li>
               <li>When does Codex inject full initial context, and when does it emit only a diff?</li>
               <li>What does <code>for_prompt()</code> normalize or filter?</li>
-              <li>During compaction, which ledger is replaced and what recovery record remains?</li>
+              <li>During compaction, which history is replaced and what recovery record remains?</li>
               <li>Why do rollback, resume, and model switches affect the next context injection?</li>
             </ol>
 
-            <h2>1. Separate The Four Surfaces</h2>
+            <h2>1. Separate the four kinds of data</h2>
             <p>
               The first step is to stop looking for one memory object. Codex has
-              at least four relevant surfaces: session-scoped state, per-turn
-              configuration, durable history, and the model-visible request view.
+              at least four relevant kinds of data: session-scoped state, per-turn
+              configuration, durable history, and the model request.
               They are not interchangeable.
             </p>
 
             <p>
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/state/session.rs#L23-L42"><code>SessionState</code></a>
-              owns session-level state such as <code>history: ContextManager</code>,
+              stores session-level state such as <code>history: ContextManager</code>,
               <code>additional_context</code>, <code>previous_turn_settings</code>,
               and <code>auto_compact_window</code>. A
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L55-L108"><code>TurnContext</code></a>
@@ -207,10 +206,10 @@ next inference:
               <table>
                 <thead>
                   <tr>
-                    <th>Surface</th>
-                    <th>Source owner</th>
+                    <th>Data</th>
+                    <th>Stored or generated by</th>
                     <th>Model-visible?</th>
-                    <th>Invariant protected</th>
+                    <th>What must remain true</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -229,7 +228,7 @@ next inference:
                   <tr>
                     <td>Durable history</td>
                     <td><code>ContextManager.items</code></td>
-                    <td>Only after projection</td>
+                    <td>Only after filtering and normalization</td>
                     <td>Retain recoverable API messages, tool calls, outputs, and compaction records.</td>
                   </tr>
                   <tr>
@@ -269,7 +268,7 @@ next inference:
               />
               <figcaption>
                 A turn checks compaction first, writes context updates and inputs,
-                then projects history into a model request.
+                then prepares history as a model request.
               </figcaption>
             </figure>
 
@@ -278,8 +277,8 @@ next inference:
               skill and plugin injections, runs hooks, records user input, and
               stores injection items. Only then does it prepare
               <code>sampling_request_input</code> by cloning history and calling
-              <code>for_prompt()</code>. The request is a view derived from the
-              ledger, not the ledger itself.
+              <code>for_prompt()</code>. The request is derived from stored history,
+              but is not identical to that history.
             </p>
 
             <pre><code class="language-text">turn starts
@@ -350,24 +349,22 @@ reference_context_item = current TurnContextItem</code></pre>
               reinjects full context rather than sending a bogus diff.
             </p>
 
-            <h2>3. History Becomes Prompt Through Projection</h2>
+            <h2>3. <code>for_prompt()</code> filters and normalizes history</h2>
             <p>
               Before sampling, Codex does not send raw
               <code>ContextManager.items</code>. It calls
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L107-L114"><code>for_prompt()</code></a>,
               which normalizes history and returns the items suitable for the
-              current model request. Think of this as generating a report from
-              the ledger: the ledger stays durable, the report must be valid.
+              current model request. Durable history stays recoverable, while the generated request must satisfy the current model's capabilities.
             </p>
 
             <figure class="figure">
               <img
                 src="../assets/prompt-projection-boundary.png"
-                alt="Codex prompt projection showing durable history filtered and normalized into the model-visible request"
+                alt="Codex prompt preparation showing durable history filtered and normalized into the model request"
               />
               <figcaption>
-                Durable history is the recovery surface. The model view is the
-                request surface, after normalization and capability filtering.
+                Durable history supports recovery. The model receives a normalized and capability-filtered request.
               </figcaption>
             </figure>
 
@@ -406,10 +403,10 @@ model-visible view for a text-only model:
               model-visible request.
             </p>
 
-            <h3>3.1 Before Compaction, Token Accounting Must Reconcile Ledgers</h3>
+            <h3>3.1 Before compaction, combine server counts and local estimates</h3>
             <p>
-              Projection explains what the model sees. The next question is when the
-              old ledger is large enough to compact. Token accounting is not just the
+              <code>for_prompt()</code> explains what the model sees. The next question is when the
+              stored history is large enough to compact. Token accounting is not just the
               server's last usage value.
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L249-L314"><code>get_total_token_usage</code></a>
               adds the latest server usage, local items appended after the last
@@ -441,7 +438,7 @@ model-visible view for a text-only model:
             <figure class="figure">
               <img
                 src="../assets/compaction-replacement.png"
-                alt="Codex compaction replacement showing old history summarized into replacement history and written to the recovery ledger"
+                alt="Codex compaction replacement showing old history summarized into replacement history and written to rollout"
               />
               <figcaption>
                 The compacted result is replacement history, not a summary
@@ -478,7 +475,7 @@ model-visible view for a text-only model:
               user message, preserving the model's expected continuation shape.
             </p>
 
-            <h3>4.2 The Summary Prompt Is A Handoff Contract</h3>
+            <h3>4.2 The summary prompt defines what a future turn must retain</h3>
             <p>
               Local inline compaction starts in
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact.rs#L72-L96"><code>run_inline_auto_compact_task</code></a>.
@@ -630,27 +627,27 @@ replacement history, shape-level:
                     <th>State type</th>
                     <th>Where it belongs</th>
                     <th>Before model visibility</th>
-                    <th>Invariant protected</th>
+                    <th>What must remain true</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr>
                     <td>Conversation and tool evidence</td>
                     <td>Durable history / rollout</td>
-                    <td>Project by model capability and preserve valid call/output pairs.</td>
-                    <td>Recovery and auditability keep an evidence chain.</td>
+                    <td>Filter by model capability and preserve valid call/output pairs.</td>
+                    <td>Recovery and later inspection retain complete records.</td>
                   </tr>
                   <tr>
                     <td>Runtime environment and permissions</td>
                     <td>Turn context plus reference baseline</td>
                     <td>Inject fully first, then emit trusted diffs.</td>
-                    <td>The model sees current boundaries without stale configuration.</td>
+                    <td>The model sees current settings without stale configuration.</td>
                   </tr>
                   <tr>
                     <td>Tool capability</td>
                     <td>Tool router / prompt request</td>
                     <td>Expose as model-visible specs, not as normal chat text.</td>
-                    <td>Tool schemas match the runtime execution surface.</td>
+                    <td>Tool schemas match the tools the runtime can execute.</td>
                   </tr>
                   <tr>
                     <td>Long-thread compaction</td>
@@ -662,7 +659,7 @@ replacement history, shape-level:
                     <td>Context-window accounting</td>
                     <td><code>token_info</code> plus <code>auto_compact_window</code></td>
                     <td>Combine server usage with local estimates.</td>
-                    <td>Neither side of the token ledger is trusted alone.</td>
+                    <td>Neither the server count nor the local estimate is trusted alone.</td>
                   </tr>
                 </tbody>
               </table>
@@ -672,8 +669,8 @@ replacement history, shape-level:
               That is why context management is a natural first mechanism article
               after the overview. Tool calling, permissions, multi-agent
               work, skills, and plugins all come back to the same discipline:
-              decide which ledger owns a piece of state, then decide which
-              projection of that state the model is allowed to see.
+              decide where each piece of state is stored, then decide which
+              parts belong in the next model request.
             </p>
 
             <h2 id="sources">Sources</h2>
