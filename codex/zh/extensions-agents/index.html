@@ -3,13 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Codex 源码阅读（七）：扩展与多 agent，额外能力怎样进入一次 turn</title>
+    <title>Codex 源码阅读（七）：skills、plugins、MCP 与 subagents 怎样进入一次 turn</title>
     <meta
       name="description"
       content="沿 openai/codex 源码拆解 Codex 的扩展与多 agent 机制：skills、plugins、MCP tool exposure、tool_search、dynamic tools、subagents 和 AgentControl。"
     />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Codex 源码阅读（七）：扩展与多 agent，额外能力怎样进入一次 turn" />
+    <meta property="og:title" content="Codex 源码阅读（七）：skills、plugins、MCP 与 subagents 怎样进入一次 turn" />
     <meta
       property="og:description"
       content="从一次 turn 的能力入口出发，读懂 Codex 怎样把 skills、plugins、MCP 工具和 subagents 接进同一条运行主线。"
@@ -83,10 +83,10 @@
         <article class="article-card">
           <section class="article-hero">
             <p class="eyebrow">Codex 源码阅读 · 第七篇</p>
-            <h1>扩展与多 agent，额外能力怎样进入一次 turn</h1>
+            <h1>Skills、plugins、MCP 与 subagents 怎样进入一次 turn</h1>
             <p class="lead">
-              前面几篇已经把一次 Codex 请求的主线走完：上下文怎样整理，工具怎样暴露，权限怎样收口，
-              客户端怎样看到同一套事实。现在问题换成另一种：当用户点名一个 skill、安装一个 plugin、
+              前面几篇已经把一次 Codex 请求的主要步骤走完：上下文怎样整理，工具怎样提供给模型，权限怎样限制执行，
+              客户端怎样转换运行时事件。现在问题换成另一种：当用户点名一个 skill、安装一个 plugin、
               启用一批 MCP 工具，或者让子 agent 并行工作时，这些额外能力怎样进入这一次 turn？
             </p>
             <div class="meta-line">
@@ -118,17 +118,16 @@
 
             <div class="note key-point">
               <p>
-                这篇可以抓住一句话：<strong>扩展会以不同形状投到这一次 turn 里，继续受 turn runtime 管理。</strong>
-                <code>skills</code> 进入上下文，<code>plugins</code> 提供能力根目录和包边界，
-                <code>MCP</code> 进入工具暴露计划，<code>subagents</code> 进入线程控制面。
+                先记住四个具体动作：<code>skills</code> 把说明加入上下文，<code>plugins</code> 声明一组资源，
+                <code>MCP</code> 把工具规格加入本轮工具列表，<code>subagents</code> 创建由父任务管理的子线程。
               </p>
             </div>
 
             <div class="note">
               <p>
-                <strong>证据边界。</strong>
+                <strong>取材范围。</strong>
                 本文只描述 openai/codex 公开源码里可验证的 skill 发现与注入、plugin manifest 与
-                load outcome、MCP tool exposure、tool_search、dynamic tools、multi-agent tool surface
+                load outcome、MCP tool exposure、tool_search、dynamic tools、multi-agent tool list
                 和 <code>AgentControl</code> 行为。文中提到 app、plugin、subagent 时，指这些公开代码里的运行时结构。
               </p>
             </div>
@@ -140,13 +139,13 @@
               <li>skill 从“可用目录”到“完整 SKILL.md 注入”经历了什么？</li>
               <li>plugin 作为能力包，怎样同时贡献 skills、MCP、apps 和 hooks？</li>
               <li>MCP 工具什么时候直接给模型，什么时候交给 <code>tool_search</code>？</li>
-              <li>subagent 为什么是线程控制面，而不是普通工具输出？</li>
+              <li>subagent 为什么会创建子线程，而不是只返回一段工具输出？</li>
             </ol>
 
-            <h2>一、先把四种能力形状分开</h2>
+            <h2>一、四种扩展走四条不同入口</h2>
             <p>
               读扩展代码最容易卡住的地方，是几个词都会被泛泛地叫成“能力”。但在 Codex 里，
-              它们落到模型面前的形状不一样，也由不同 owner 管。
+              它们交给模型或运行时的数据不同，也由不同模块处理。
             </p>
 
             <div class="table-wrap">
@@ -156,7 +155,7 @@
                     <th>能力形状</th>
                     <th>用户看到的入口</th>
                     <th>进入 runtime 的方式</th>
-                    <th>源码里要跟的 owner</th>
+                    <th>对应源码入口</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -181,7 +180,7 @@
                   <tr>
                     <td>并行工作单元</td>
                     <td><code>spawn_agent</code>、<code>send_message</code>、<code>wait_agent</code>。</td>
-                    <td>创建或恢复子线程，复制本轮运行配置和权限边界，通过 inter-agent communication 回到父线程。</td>
+                    <td>创建或恢复子线程，复制本轮运行配置和权限设置，通过 inter-agent communication 回到父线程。</td>
                     <td><code>AgentControl</code>、multi-agent handlers、<code>SessionSource::SubAgent</code>。</td>
                   </tr>
                 </tbody>
@@ -246,8 +245,8 @@
             </div>
 
             <p>
-              这条小链路比术语表更重要。一次用户请求里可以同时出现 skill、plugin、MCP 和 subagent，
-              但它们不会在同一层生效。先分清“进入上下文”“暴露工具”“启动另一条线程”，后面的源码就能顺着 owner 读。
+              这段流程比术语表更重要。一次用户请求里可以同时出现 skill、plugin、MCP 和 subagent，
+              但它们不会在同一层生效。先分清“进入上下文”“提供工具”“启动另一条线程”，再沿表中的函数读源码。
             </p>
 
             <h2>二、TurnContext 先把入口留出来</h2>
@@ -263,14 +262,14 @@
               extension data 和 skills outcome 放进同一个结构里。这里有两个细节很关键。
               第一，<code>HostLoadedSkills</code> 被插入 <code>extension_data</code>，让 host extension
               也能看到已加载的 skill 集合。第二，<code>dynamic_tools</code> 来自 session configuration，
-              后面工具规划阶段会把它们追加到工具 surface。
+              后面工具规划阶段会把它们追加到本轮工具列表。
             </p>
 
             <div class="note key-point">
               <p>
                 所以扩展入口并不是散落在各处临时读取。Codex 会在 turn 开始时先形成一个能力快照：
                 当前配置允许什么、已加载哪些 skill、有哪些 extension data、是否启用多 agent、
-                本轮权限边界是什么。后续注入和工具规划都围绕这份快照展开。
+                本轮权限设置是什么。后续注入和工具规划都读取这组字段。
               </p>
             </div>
 
@@ -319,7 +318,7 @@
 
             <p>
               这也解释了为什么一个 skill 写得好不好，会直接影响文章或图的质量。runtime 只负责把它放到正确位置，
-              至于模型读到后如何执行，取决于 skill 里面是否把工作流、边界、验收方式写清楚。
+              至于模型读到后如何执行，取决于 skill 里面是否把步骤、限制和验收方式写清楚。
             </p>
 
             <h2>四、plugins：把一组能力打成包</h2>
@@ -342,7 +341,7 @@
             <p>
               这几行很适合作为插件心智模型：plugin manifest 只是把一组资源挂到同一个包名下面。
               它没有把 skill、MCP、app 和 hook 合成一种新能力；相反，它保留了四条入口的差异，
-              后续加载器再分别把它们送到上下文、工具、app connector 或生命周期边界。
+              后续加载器再分别把它们送到上下文、工具、app connector 或对应的 hook 执行点。
             </p>
 
             <p>
@@ -353,7 +352,7 @@
 
             <div class="note">
               <p>
-                这里有个很容易忽略的边界：plugin 自己不是一个万能工具。源码给模型的 plugin 使用说明里明确强调，
+                这里有个很容易忽略的区别：plugin 自己不是一个万能工具。源码给模型的 plugin 使用说明里明确强调，
                 plugin 是 skills、MCP servers 和 apps 的本地 bundle。要解决任务，仍然使用它贡献出来的
                 skill、MCP 工具或 app tool。
               </p>
@@ -430,7 +429,7 @@
               <code>handle_spawn_agent</code> 会解析 <code>task_name</code>、<code>agent_type</code>、
               <code>model</code>、<code>reasoning_effort</code>、<code>fork_turns</code> 等参数。
               之后它会从父 turn 构建子 agent 配置：复制必要的 runtime 字段，应用模型或 role 覆盖，
-              再把本轮权限 profile、sandbox、cwd、environment selection 等运行时边界带过去。
+              再把本轮权限 profile、sandbox、cwd、environment selection 等运行设置带过去。
             </p>
 
             <p>
@@ -453,7 +452,7 @@
             <p>
               到这里可以把第七篇合回前六篇的路线图：用户输入进入 turn；<code>TurnContext</code> 固定本轮快照；
               skill 和 plugin guidance 先形成上下文注入；MCP、dynamic tools 和 collaboration tools
-              进入工具规划；工具执行、agent 活动和普通模型输出再继续变成事件，交给客户端投影。
+              进入工具规划；工具执行、agent 活动和普通模型输出再继续变成事件，交给客户端转换代码。
             </p>
 
             <div class="table-wrap">
@@ -474,7 +473,7 @@
                   <tr>
                     <td>“启用 Browser / GitHub plugin”</td>
                     <td>先看 manifest 和 load outcome，再看它贡献的 skill roots、MCP、apps。</td>
-                    <td>本篇的 plugin 包边界，第四篇的工具系统。</td>
+                    <td>本篇的 plugin 打包方式，第四篇的工具系统。</td>
                   </tr>
                   <tr>
                     <td>“工具很多，先搜索工具”</td>
@@ -484,7 +483,7 @@
                   <tr>
                     <td>“开一个 subagent 审稿”</td>
                     <td>看 multi-agent handlers、<code>AgentControl</code>、<code>SessionSource::SubAgent</code>。</td>
-                    <td>第三篇的事件流，第六篇的客户端投影。</td>
+                    <td>第三篇的事件流，第六篇的客户端事件转换。</td>
                   </tr>
                 </tbody>
               </table>
@@ -535,7 +534,7 @@
               <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs#L39-L133">handle_spawn_agent 构建子 agent</a></li>
               <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs#L185-L233">SpawnAgentArgs 与 fork_turns</a></li>
               <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_common.rs#L197-L278">build_agent_spawn_config 与 runtime overrides</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/agent/control.rs#L84-L190">AgentControl 控制面与 inter-agent communication</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/agent/control.rs#L84-L190">AgentControl 子线程管理与 inter-agent communication</a></li>
               <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/agent/control.rs#L396-L515">subagent completion watcher 与 ThreadSpawn metadata</a></li>
             </ul>
           </section>
