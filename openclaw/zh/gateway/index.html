@@ -19,7 +19,7 @@
     <div class="article-shell"><aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
       <section class="article-hero">
         <p class="eyebrow">OpenClaw 源码阅读 · 第二篇</p><h1>Gateway 为什么是控制平面</h1>
-        <p class="lead">第一篇追完了一条消息，但还留下一个更大的“谁”：CLI、Web UI、桌面应用、手机节点和聊天渠道都在操作同一个 OpenClaw，它们凭什么看见一致状态，又凭什么不能越过彼此的权限？答案不只是 WebSocket，而是 Gateway 对协议、身份、方法、事件和运行状态的集中所有权。</p>
+        <p class="lead">第一篇追完了一条消息，这一篇把视角拉到所有客户端：CLI、Web UI、桌面应用、手机节点和聊天渠道怎样读取同一份状态，又怎样被各自的权限限制？答案在 Gateway：它保持渠道连接、验证客户端身份、分发方法，并按权限推送运行事件。</p>
         <div class="meta-line"><span>系列 2 / 8</span><span>源码快照：c549250</span><span>主题：Gateway control plane</span><span>前置：消息主线</span></div>
         <nav class="series-strip"><a href="../overview/"><strong>01</strong> 消息主线</a><span class="series-current"><strong>02</strong> Gateway：协议、身份与控制</span><a href="../routing-sessions/"><strong>03</strong> 路由与会话</a></nav>
         <figure class="hero-image"><img src="../assets/gateway-control-plane.png" alt="OpenClaw Gateway 控制平面：operator 与 node 通过 WebSocket 进入同一 Gateway，Gateway 管理 methods、events、schemas，并连接 ChannelPlugin、Agent Runtime 和持久状态" /></figure>
@@ -27,26 +27,28 @@
       <section class="article-body">
         <p>设想一个很普通的操作现场。你在 macOS 菜单栏里看到 Gateway 在线，随后用 CLI 发起一次 <code>agent</code> 请求；Web UI 同时显示运行中的工具事件；手机节点提供相机能力；Telegram 连接仍在收消息。它们看起来像四个产品，实际上都围绕同一份运行状态工作。</p>
         <p>如果每个客户端都直接打开 Telegram、直接读写 session 数据库、直接启动 Agent，那么“多客户端”很快会变成“多个互相竞争的主人”：两个进程抢同一个 provider connection，配置更新只影响其中一个，手机节点把任意本地命令暴露给所有人，Web UI 断线后也不知道哪些事件已经错过。</p>
-        <p>OpenClaw 的 Gateway 正是用来消除这种多主人状态。它是一个长时间运行的进程，拥有消息 surface 的连接、方法分发、连接身份、事件 fanout 和大量运行期协调；客户端拿到的是受协议和 scope 约束的控制权，而不是对内部对象的直接引用。</p>
+        <p>OpenClaw 让一个长期运行的 Gateway 统一保持消息渠道连接、验证连接身份、分发方法并推送事件。客户端只能通过协议和 scope 操作这些资源，不能直接拿到内部对象，也不会各自维护一份真假难辨的状态副本。</p>
         <div class="note"><p><strong>阅读契约。</strong>读完后你应该能解释：为什么“共用一个 WebSocket server”还不足以成为控制平面；首帧为什么必须是 <code>connect</code>；<code>hello-ok</code> 为什么既是欢迎包也是协商结果；operator、node 与 worker 为什么不是三个 UI 名称；请求、响应和事件如何分工；以及事件断档后为什么要重新读取状态，而不是要求 Gateway 重播所有事件。</p></div>
         <p><strong>证据边界。</strong>本文沿用固定提交 <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a>。协议形状以 <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/packages/gateway-protocol/src/schema/frames.ts">TypeBox frame schemas</a> 为准，连接与广播行为以 Gateway 源码为准；官方 <a href="https://docs.openclaw.ai/concepts/architecture">Gateway architecture</a> 和 <a href="https://docs.openclaw.ai/gateway/protocol">Gateway protocol</a> 用来确认产品契约。安全篇会再深入 auth、pairing、sandbox 与 elevated，这一篇只讲控制平面如何承载授权结果。</p>
 
-        <h2>一、控制平面不是“有一个中心服务器”</h2>
-        <p>一个 HTTP/WebSocket server 只说明客户端能把字节发到同一个端口。控制平面还必须回答四类问题：谁有资格连接；连接后能调用什么；一项操作改变了哪份权威状态；变化怎样通知其他观察者。只有这四个答案都集中在同一个 owner，客户端才不会各自维护半真半假的副本。</p>
-        <p>官方架构给出一个强约束：一台 host 上运行一个长寿命 Gateway，它是唯一打开 WhatsApp/Baileys session 的位置，并维护其他消息 provider 连接。控制客户端和 nodes 都通过同一 WS server 进入，但声明不同 role 与能力。也就是说，Gateway 的中心性首先来自<strong>资源所有权</strong>，其次才是网络拓扑。</p>
-        <div class="table-wrap"><table><thead><tr><th>表面</th><th>Gateway 拥有什么</th><th>客户端拥有什么</th></tr></thead><tbody>
+        <h2>一、Gateway 集中管理哪些状态与入口</h2>
+        <h3>1.1 控制平面需要回答四个具体问题</h3>
+        <p>一个 HTTP/WebSocket server 只说明客户端能把字节发到同一个端口。控制平面还必须回答四类问题：谁有资格连接；连接后能调用什么；一项操作改变哪份权威状态；变化怎样通知其他观察者。这四类判断集中在 Gateway，客户端才不会各自维护半真半假的副本。</p>
+        <p>官方架构给出一个强约束：一台 host 上运行一个长寿命 Gateway，它是唯一打开 WhatsApp/Baileys session 的位置，并维护其他消息 provider 连接。控制客户端和 nodes 都通过同一 WS server 进入，但声明不同 role 与能力。Gateway 的中心性因此先来自它独占的连接和运行状态，其次才是网络拓扑。</p>
+        <div class="table-wrap"><table><thead><tr><th>领域</th><th>Gateway 保存或执行什么</th><th>客户端可以做什么</th></tr></thead><tbody>
           <tr><td>消息渠道</td><td>provider connection、入站接纳、出站发送与状态。</td><td>发出受约束的发送/运行请求，观察结果。</td></tr>
           <tr><td>Agent 运行</td><td>run 注册、session 归属、事件 fanout、等待与终态。</td><td>用 idempotency key 发起任务，用 runId 关联事件。</td></tr>
           <tr><td>配置与运营</td><td>当前运行配置、reload/restart 计划、持久写入与审计。</td><td>根据 scope 读取或提交有冲突保护的变更。</td></tr>
           <tr><td>设备节点</td><td>pairing、device identity、连接状态和命令路由。</td><td>声明 caps/commands/permissions，执行获准命令。</td></tr>
         </tbody></table></div>
 
-        <h2>二、operator 和 node 共用传输，不共用权限模型</h2>
+        <h3>1.2 operator、node 与 worker 使用不同权限</h3>
         <p>图左边的 operator 包括 CLI、Web UI 与 macOS app。它们主要调用 Gateway 方法、读取状态、发起 Agent 运行和处理审批。node 则是 iOS、Android、macOS 或 headless 设备端执行面，它向 Gateway 声明能提供哪些命令，例如相机、屏幕录制、位置或 canvas。</p>
         <p>两者都用 WebSocket，并不意味着 node 可以调用任意 operator RPC，也不意味着 operator 可以绕过 node pairing 直接执行设备能力。角色是连接协商的一部分，scope 是方法级授权输入，caps/commands/permissions 则描述 node 公开的能力面。传输复用降低协议数量，role separation 保留信任边界。</p>
         <p>源码还有更窄的 worker role。官方协议把它描述为闭合 allowlist：通过 Gateway 所有的 loopback/SSH ingress，只允许 worker heartbeat、transcript commit、live event 与 inference start/cancel 等有限 RPC，不进入通用 operator、node 或 plugin 分发。它说明一个成熟控制平面可以共用入口基础设施，同时对不同身份建立完全不同的协议宇宙。</p>
 
-        <h2>三、第一帧必须是 connect：先建立连接身份，再接受命令</h2>
+        <h2>二、连接怎样获得身份与可调用方法</h2>
+        <h3>2.1 第一帧 connect 先证明客户端身份</h3>
         <figure class="hero-image"><img src="../assets/gateway-handshake.png" alt="OpenClaw Gateway 握手：Gateway 发送 connect.challenge，客户端用 req connect 回应，检查 protocol、auth、device 和 scopes，成功返回 hello-ok，失败 error 并关闭；之后才使用 req、res、event 三类 frame" /></figure>
         <p>WebSocket upgrade 成功只表示 TCP/HTTP 层建立了双向通道。Gateway 还没有理由相信对方是谁。连接建立后，server 先发送 <code>event: connect.challenge</code>，其中的 nonce 与 timestamp 进入设备签名；客户端必须把普通 request frame 的 method 设为 <code>connect</code>，并携带 protocol range、client metadata、role、scopes、auth 和 device proof。</p>
         <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server/ws-connection/message-handler.ts#L283-L300">message handler 的 pre-auth 分支</a> 明确验证：第一帧必须先满足 request frame schema，再满足 <code>method === "connect"</code>，最后通过 connect params schema。普通 <code>health</code> 请求即使结构正确，也不能抢在身份协商之前。</p>
@@ -59,7 +61,7 @@
 }</code></pre>
         <p>这个顺序避免了一类危险设计：先让未认证连接进入通用 method router，再要求每个 handler 自己记得做 auth。OpenClaw 把“是否已经成为 client”作为 dispatcher 之前的硬门槛；方法 scope 仍会做第二层授权，但它面对的是已协商身份，而不是匿名 socket。</p>
 
-        <h2>四、hello-ok 是一次连接级快照与能力协商</h2>
+        <h3>2.2 hello-ok 返回连接基线与协商结果</h3>
         <p>握手成功后，<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server/ws-connection/connect-hello.ts#L75-L133"><code>sendGatewayHello</code></a> 组装 <code>hello-ok</code>。它不只回一句“连接成功”，而是给客户端一份开始正确工作的基线：</p>
         <ul>
           <li><code>server</code> 提供 version 和连接级 <code>connId</code>；</li>
@@ -71,7 +73,7 @@
         <p><code>policy</code> 不是静态 SDK 常量。例如附件上限受 Gateway 当前配置影响，客户端应该每次重连重新读取，而不是把 20 MB 写死。<code>features</code> 也不是把进程里所有 helper 自动导出；它是有意公开的协议面。控制平面的可发现性必须和授权、版本、启动可用性一致。</p>
         <p>同样，snapshot 是“连接完成这一刻”的起点，不是永久真相。后续变化通过 events 到达；客户端发现间断或重连时，再用读取 RPC 获取新的权威状态。</p>
 
-        <h2>五、方法描述表把调用、scope 与写策略绑在一起</h2>
+        <h3>2.3 方法描述表同时声明调用、scope 与写策略</h3>
         <p>一个常见实现会维护三张容易漂移的表：路由器知道 handler，权限模块知道 scope，文档生成器知道可公开方法。OpenClaw 把核心方法的 name、family、scope、since、startup availability 与 control-plane write 标记集中在 <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/methods/core-descriptors.ts#L11-L36"><code>CORE_GATEWAY_METHOD_SPECS</code></a>。</p>
         <pre><code class="language-typescript">const CORE_GATEWAY_METHOD_SPECS = [
   ["health", "health", "operator.read", "&lt;=2026.7"],
@@ -82,7 +84,7 @@
 ] as const;</code></pre>
         <p>注册表创建时会验证每个 core handler 都有 descriptor，避免一个新 handler 因漏填 scope 而绕过统一授权。plugin methods 也会转成 scoped descriptors；旧式只有 handler 的 plugin registry 被保守地默认到 admin，而不是默认公开。这是一条重要的兼容性原则：对老扩展保持可调用，不等于把未知权限降到最低门槛。</p>
 
-        <h2>六、req、res、event 是三种不同关系</h2>
+        <h3>2.4 req、res、event 分别表达请求、响应与通知</h3>
         <p>握手以后，wire protocol 只有三种顶层 frame。<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/packages/gateway-protocol/src/schema/frames.ts#L166-L199">schema</a> 用 <code>type</code> discriminator 区分它们：</p>
         <div class="table-wrap"><table><thead><tr><th>Frame</th><th>关联方式</th><th>语义</th></tr></thead><tbody>
           <tr><td><code>req</code></td><td><code>id</code> + <code>method</code></td><td>客户端要求 Gateway 执行或读取一项操作。</td></tr>
@@ -92,42 +94,44 @@
         <p>这里还要避免把“RPC 响应”与“任务完成”混为一谈。<code>agent</code> 方法可以先返回 accepted 与 <code>runId</code>，让调用方知道请求已经进入运行系统；assistant/tool/lifecycle 进度随后走 <code>agent</code> events。若客户端需要等待终态，再调用相应 wait 方法或根据 lifecycle 协议跟踪，而不是让一个 RPC socket handler 持有整个长任务。</p>
         <p>这种拆分让请求超时、WebSocket 断线与 Agent 是否继续运行成为三个可独立处理的问题。HTTP handler 或 CLI 退出不应该自动取消已经被 Gateway 接纳的 root work。</p>
 
-        <h2>七、广播不是 socket.send 循环：每个接收者都要重新过边界</h2>
+        <h2>三、事件怎样到达客户端并在断线后恢复</h2>
+        <h3>3.1 每次广播都按接收者重新检查权限</h3>
         <p>Gateway 知道一个事件，并不代表所有连接都能看到它。<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server-broadcast.ts#L32-L88"><code>EVENT_SCOPE_GUARDS</code></a> 为 agent、chat、cron、approval、pairing、terminal 等事件声明 scope。broadcast 还会按 role、session subscription、target connIds 和 agent/session visibility 过滤。</p>
         <p>这很关键，因为事件内容往往比方法返回更容易被忽略授权。一个只有 pairing scope 的客户端可以参与设备配对，不代表它能被动收听 chat transcript；node role 也不应该收到 operator 的 session 广播。授权必须同时覆盖“主动读取”和“被动推送”。</p>
         <p>广播器还为每个 client 维护独立 <code>seq</code>。这是因为过滤后，不同客户端实际收到的事件集合不同；用一个全局序号会让权限过滤看起来像丢包。targeted event 则可以不带常规广播 seq。序号属于具体接收关系，而不是业务事件的宇宙编号。</p>
 
-        <h2>八、事件是实时通知，不是持久日志</h2>
+        <h3>3.2 事件通知发生了变化，读取 RPC 返回当前状态</h3>
         <figure class="hero-image"><img src="../assets/gateway-live-events.png" alt="OpenClaw Gateway 实时事件与持久状态：客户端发现 seq 41、42、44 中缺少 43 后，不要求重播，而是发送 status 请求并用 snapshot 刷新；stateVersion 帮助识别状态版本" /></figure>
         <p>官方架构明确写着：events are not replayed，客户端遇到 gap 必须 refresh。图里 seq 43 缺失后，客户端用真实的读取方法 <code>status</code> 示意重新获取快照；具体事件域也可能需要 <code>health</code>、<code>config.get</code> 或 session 查询。重点不是某个万能 state API，而是恢复方式：<strong>事件告诉你“变了”，读取 RPC 告诉你“现在是什么”。</strong></p>
-        <p><code>stateVersion</code> 让客户端比较 presence/health 等有版本状态，但它仍不是通用 event store offset。若需要完全审计或恢复 Agent transcript，应该读取相应持久 owner，而不是依赖 WS 事件缓存。控制平面把 live observation 与 durable truth 分开，反而使断线语义更清楚。</p>
+        <p><code>stateVersion</code> 让客户端比较 presence/health 等有版本状态，但它仍不是通用 event store offset。若需要完整审计或恢复 Agent transcript，应该读取保存该记录的持久存储，而不是依赖 WS 事件缓存。实时通知与持久记录分开以后，断线时该去哪里恢复也更清楚。</p>
 
-        <h2>九、慢消费者会被丢事件或断开，不能拖住 Gateway</h2>
+        <h3>3.3 慢消费者丢事件或断开后通过序号发现缺口</h3>
         <p>WebSocket 的危险不只在握手，也在发送缓冲。某个后台 tab 停止读取时，继续无限排队会让一个客户端耗尽 Gateway 内存。<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/gateway/server-broadcast.ts#L292-L327">broadcast loop</a> 检查每个 socket 的 <code>bufferedAmount</code>：低价值、标记 <code>dropIfSlow</code> 的事件可以跳过；否则关闭 slow consumer。</p>
         <p>值得注意的是，被 drop 的普通广播仍推进该 client 的 seq。这样客户端能发现 gap 并刷新，而不是误以为自己拥有连续事实。背压策略、序号协议和状态刷新三者是成套设计；只做其中一个，会把资源保护变成静默数据损失。</p>
 
-        <h2>十、同一端口上的 HTTP surface 不自动等于同一权限</h2>
-        <p>Gateway HTTP server 还承载 Control UI、canvas/A2UI、webhooks、OpenAI-compatible endpoints 和其他插件 surface。它们与 WS 共用进程乃至端口，是为了共享 owner 与配置，不代表所有 HTTP route 都能绕过认证。源码为不同 surface 分别解析 auth、origin、host、plugin descriptor 与内容安全策略。</p>
-        <p>这一点也解释了 Gateway scoped <code>AGENTS.md</code> 的性能约束：仅为了回答静态 plugin descriptor，不应 materialize 整个 bundled plugin runtime。控制平面会频繁处理连接、探针和 UI 资源；如果每个轻量请求都拉起庞大能力注册表，它会把“集中所有权”变成“集中冷启动”。owner 集中，不等于所有依赖都必须 eager load。</p>
+        <h2>四、HTTP 入口与失败恢复仍各有判断</h2>
+        <h3>4.1 共用端口的 HTTP 路由分别验证权限</h3>
+        <p>Gateway HTTP server 还提供 Control UI、canvas/A2UI、webhooks、OpenAI-compatible endpoints 和插件路由。它们与 WS 共用进程乃至端口，是为了复用配置和运行状态，不代表所有 HTTP route 都能绕过认证。源码会为不同路由分别解析 auth、origin、host、plugin descriptor 与内容安全策略。</p>
+        <p>这一点也解释了 Gateway scoped <code>AGENTS.md</code> 的性能约束：仅为了回答静态 plugin descriptor，不应 materialize 整个 bundled plugin runtime。Gateway 会频繁处理连接、探针和 UI 资源；如果每个轻量请求都拉起庞大能力注册表，统一入口就会变成统一冷启动。状态集中管理，不要求所有依赖都提前加载。</p>
 
-        <h2>十一、失败边界：连接失败、RPC 失败、运行失败不是一回事</h2>
+        <h3>4.2 先区分连接、RPC、运行与状态恢复</h3>
         <ul>
           <li><strong>握手失败：</strong>protocol/auth/device/scopes 无法协商，连接收到结构化错误后关闭，通用 handler 不应被调用。</li>
           <li><strong>RPC 授权或校验失败：</strong>连接仍可能有效；响应以 <code>FORBIDDEN</code>、<code>MISSING_SCOPE</code> 或参数错误结束。</li>
           <li><strong>启动期不可用：</strong>Gateway sidecars 尚未完成时可返回 retryable <code>UNAVAILABLE</code> 与 <code>retryAfterMs</code>，客户端应在连接预算内重试。</li>
           <li><strong>Agent 运行失败：</strong>最初的 <code>agent</code> RPC 可能已经 accepted；终态通过运行协议观察，而非倒推握手或 socket 状态。</li>
           <li><strong>慢消费者：</strong>某一连接被 drop/close，不等于 Gateway 的持久状态回滚。</li>
-          <li><strong>Gateway 重启：</strong>live events 消失；客户端重连、重新握手并读取 snapshot，运行恢复由第八篇的 durable ownership 处理。</li>
+          <li><strong>Gateway 重启：</strong>live events 消失；客户端重连、重新握手并读取 snapshot，运行恢复由第八篇介绍的持久记录处理。</li>
         </ul>
         <p>把这些失败压成“Gateway offline”会导致糟糕的自动恢复：认证错误被无限重试，accepted run 因客户端超时而重复提交，断线后又拿旧 UI state 继续写。正确恢复必须先识别失败属于连接、RPC、运行还是状态投影。</p>
 
-        <h2>十二、从 Gateway 带走六条控制平面规则</h2>
+        <h2>五、六条可以迁移的控制平面规则</h2>
         <ol>
-          <li><strong>中心化的是所有权，不只是端口。</strong>权威 provider connections、state mutation 和 run admission 必须有唯一 owner。</li>
+          <li><strong>关键资源只能由一处修改。</strong>provider connections、状态写入和 run admission 必须有唯一执行位置。</li>
           <li><strong>连接身份先于方法分发。</strong>首帧握手建立 role、scopes、device 与协议版本，handler 再做方法级授权。</li>
           <li><strong>能力发现与授权表共源。</strong>methods、scope、startup 和 write policy 不应维护成互相漂移的列表。</li>
           <li><strong>RPC 接受与异步完成分开。</strong>用 request id 关联响应，用 runId/event 关联长任务。</li>
-          <li><strong>事件是提示，持久 owner 才是真相。</strong>发现 gap 就 refresh，而不是假设 live stream 是 event store。</li>
+          <li><strong>事件提示变化，持久记录保存事实。</strong>发现 gap 就 refresh，而不是假设 live stream 是 event store。</li>
           <li><strong>背压必须可观察。</strong>drop 推进 seq、slow close 有原因，客户端才能把资源保护转化成状态恢复。</li>
         </ol>
         <p>下一篇会沿 Gateway 已经确定的 route 继续向内：binding、peer、thread 如何组成 <code>sessionKey</code>，队列怎样决定消息加入当前 run 还是成为下一轮，session entry 与 transcript 又为什么不能由渠道插件随意改写。</p>
