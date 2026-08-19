@@ -6,13 +6,13 @@
     <title>Claude Code 源码阅读（二）：Memory 不是聊天记录，而是长期指令层</title>
     <meta
       name="description"
-      content="沿 Claude Code 公开镜像源码拆解 Memory：CLAUDE.md、auto memory、session memory、agent memory、auto dream 怎样写入账本、投影到 user context，并影响 prompt cache 前缀。"
+      content="沿 Claude Code 公开镜像源码拆解 Memory：CLAUDE.md、auto memory、session memory、agent memory、auto dream 怎样写入文件、进入 user context，并影响 prompt cache 前缀。"
     />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Claude Code 源码阅读（二）：Memory 不是聊天记录，而是长期指令层" />
     <meta
       property="og:description"
-      content="Memory 不是 transcript，也不是模型权重里的记忆。它先落到不同账本，再在每轮请求里被投影成模型可见上下文。"
+      content="Memory 不是 transcript，也不是模型权重里的记忆。长期规则先写入不同文件，再在每轮请求前被读取并插入模型上下文。"
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/memory-layer-cover.png" />
@@ -112,7 +112,7 @@
             <p class="lead">
               上一篇我们沿一次任务走完整条 runtime 主线。现在回到一个更日常的问题：为什么你在一个项目里告诉 Claude Code
               “测试用这个命令”“不要改生成文件”“这个目录有特殊约定”，它下一次还能照着做？答案不是模型突然长了记忆，
-              而是 Claude Code 把长期规则、偏好和经验放进几本不同的账本，再在每轮请求前投影给模型。
+              而是 Claude Code 把长期规则、偏好和经验写进不同文件，再在每轮请求前读取并放进模型看到的内容。
             </p>
             <div class="meta-line">
               <span>项目：Claude Code</span>
@@ -122,7 +122,7 @@
             <figure class="hero-image">
               <img
                 src="../assets/memory-layer-cover.png"
-                alt="Claude Code Memory 分层图，展示 CLAUDE.md、auto memory、agent memory 这些长期材料的不同存储与投影边界"
+                alt="Claude Code Memory 分层图，展示 CLAUDE.md、auto memory、agent memory 这些长期材料分别存在哪里，又怎样进入模型请求"
               />
             </figure>
           </section>
@@ -131,13 +131,13 @@
             <p>
               先把容易混的几句话拆开。你在终端里看到的聊天滚动历史叫会话过程；写在磁盘里的 transcript 是证据记录；
               <code>CLAUDE.md</code>、auto memory、agent memory 这类长期材料才更接近 Claude Code 说的 memory。
-              它们都可能影响下一轮模型，但影响方式不一样：有的进入每轮 user context，有的先进入 memory prompt 或后台账本，
+              它们都可能影响下一轮模型，但影响方式不一样：有的进入每轮 user context，有的先进入 memory prompt 或后台文件，
               有的只属于某个 agent 的 system prompt。
             </p>
 
             <div class="note key-point">
               <p>
-                本篇先给结论：<strong>Memory 不是聊天记录的别名，而是 runtime 在请求前可投影的一组长期账本。</strong>
+                本篇先给结论：<strong>Memory 不是聊天记录的别名，而是一组会在未来请求中重新读取的长期文件。</strong>
                 它能影响 prompt cache，因为一旦进入 model-visible request prefix，文本变化就可能改变缓存前缀；但 memory
                 “动态”不等于每轮必变，也不等于所有记忆都会直接塞进 system prompt。
               </p>
@@ -145,20 +145,20 @@
 
             <div class="note reading-contract">
               <p>
-                <strong>阅读契约：</strong>这篇追踪一个代表性规则“这个项目测试必须跑 <code>pnpm test</code>”：
+                <strong>阅读目标：</strong>这篇追踪一个代表性规则“这个项目测试必须跑 <code>pnpm test</code>”：
               它可以被人写进 <code>CLAUDE.md</code>，也可能被 auto memory 记录，或被某个 agent 作为 scoped memory 使用；
-              源码怎样发现它、缓存它、投影到对应 prompt 入口、什么时候后台更新、哪里会影响 prompt cache。
+              源码怎样发现它、缓存它、插入对应 prompt、什么时候后台更新、哪里会影响 prompt cache。
                 读完应该能回答：Memory 存在哪里，谁能写，哪一轮模型能看见，和 transcript、context、prompt cache 分别是什么关系。
               </p>
             </div>
 
             <p>
-              证据边界先摆出来。产品层说法参考
+              取材范围先摆出来。产品层说法参考
               <a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory 文档</a>、
               <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic prompt caching 文档</a>；
               源码层说法来自
               <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
-              公开镜像不是 Anthropic 官方源码仓库，所以本文只把可见客户端代码写成事实；feature gate、服务端缓存和模型内部行为只按可见请求形状做边界化推断。
+              公开镜像不是 Anthropic 官方源码仓库，所以本文只把可见客户端代码写成事实；功能开关、服务端缓存和模型内部行为只根据客户端实际发送和接收的内容谨慎推断。
               文末也放了一篇小林 Coding 的参考阅读，但正文不会把外部讲法当成源码证据。
             </p>
 
@@ -190,12 +190,12 @@ possible stores:
   auto memory file      -> learned note for future turns
   agent memory          -> scoped to one agent's future work
 
-	later projection:
+	later insertion:
 	  CLAUDE.md / rules -> user context -> model-visible request
 	  auto MEMORY.md    -> user context or relevant-memory attachments
 	  auto policy text  -> memory prompt section
 	  agent memory      -> selected agent system prompt</code></pre>
-	              <figcaption>先别把所有账本画成一根管子。关键是同一条规则会经历“写入账本”和“投影给模型”两个阶段，中间隔着 owner、入口和可见时机。</figcaption>
+	              <figcaption>先别把所有文件画成一根管子。关键是同一条规则会经历“写入文件”和“插入模型请求”两个阶段，中间还要明确由哪段程序读取、插到哪里、从哪一轮开始可见。</figcaption>
 	            </figure>
 
             <h3>1.1 <code>CLAUDE.md</code> 是人写的长期规则</h3>
@@ -247,7 +247,7 @@ possible stores:
 
 	            <h3>1.4 三类 memory 不是同一个 prompt 入口</h3>
 	            <p>
-	              到这里要收一次边界。封面图是概念库存：它把长期材料放在一张桌面上，方便看清 owner；
+	              到这里需要区分概念图和实际执行。封面图把长期材料放在一张桌面上，方便看清各自由哪段程序处理；
 	              但源码执行时并不会把所有 memory 都合流到同一个入口。真正会直接走
 	              <code>getUserContext()</code>、再被 <code>prependUserContext()</code> 包成 meta user message 的，不只是
 	              <code>CLAUDE.md</code>、<code>.claude/rules</code> 这类 claudemd 规则；auto memory 的 <code>MEMORY.md</code>
@@ -290,7 +290,7 @@ possible stores:
 	            <h2>二、Memory 怎样进入下一轮请求</h2>
 	            <p>
 	              现在来看你最关心的那句话：“它是不是包到 system reminder 里，然后塞到 system prompt？”
-	              如果这里的“它”指 <code>CLAUDE.md</code> / rules 这条 user context 路径，方向接近，但源码边界不严谨。
+	              如果这里的“它”指 <code>CLAUDE.md</code> / rules 这条 user context 路径，方向接近，但和源码实际做法仍有差别。
 	              它确实被包进 <code>&lt;system-reminder&gt;</code>；但在可见源码里，这不是追加到
 	              <code>systemPrompt</code> 字符串，而是被构造成一个 meta user message，prepend 到 messages 前面。
             </p>
@@ -320,7 +320,7 @@ messages:
     &lt;/system-reminder&gt;
 
   ...projected conversation messages...</code></pre>
-              <figcaption>它叫 system-reminder，但源码 owner 是 user message。这个细节会影响我们判断 prompt cache 的位置。</figcaption>
+              <figcaption>标签叫 system-reminder，但源码把它构造成 user message。这个细节会影响我们判断 prompt cache 的位置。</figcaption>
             </figure>
 
             <h3>2.1 进入 model-visible view，不等于变成 transcript</h3>
@@ -331,8 +331,8 @@ messages:
             </p>
 
             <p>
-              这个边界能解释 compact 后为什么 <code>CLAUDE.md</code> 还会回来：compact 改写的是旧 conversation view；
-              memory 文件仍在文件系统里。compact 后只要重新加载 user context，项目规则就会重新投影进下一轮。
+              这种分工能解释 compact 后为什么 <code>CLAUDE.md</code> 还会回来：compact 改写的是旧 conversation view；
+              memory 文件仍在文件系统里。compact 后只要重新加载 user context，项目规则就会重新插入下一轮请求。
               这不是 summary “完美保存了记忆”，而是 runtime 重新读了一份长期规则。
             </p>
 
@@ -347,7 +347,7 @@ messages:
             <figure class="figure">
               <img
                 src="../assets/memory-cache-boundary.png"
-                alt="Claude Code Memory 与 Prompt Cache 边界图，展示 memory unchanged 时前缀稳定，memory changed 时 prefix break 需要重写"
+                alt="Claude Code Memory 与 Prompt Cache 关系图，展示 memory 不变时前缀稳定，memory 改变时旧前缀可能无法复用"
               />
               <figcaption>关键不是 memory 是否叫动态，而是它在本轮 API view 里是否改变了可缓存前缀。</figcaption>
             </figure>
@@ -372,7 +372,7 @@ messages:
             <h2>三、为什么不把所有东西都写进 Memory</h2>
             <p>
               如果 memory 能跨轮次影响模型，那是不是所有读过的文件、踩过的坑、跑过的命令都应该写进去？源码给出的答案其实很克制。
-              auto memory fork 写入有权限边界；session memory 有阈值；auto dream 有时间、session 数量和锁。它们都在避免一件事：
+              auto memory fork 只能写指定目录；session memory 有阈值；auto dream 有时间、session 数量和锁。它们都在避免一件事：
               把临时证据误升级成长期规则。
             </p>
 
@@ -411,19 +411,19 @@ messages:
             <p>
               这也是为什么 Memory 章应该放在上下文管理之前。Memory 先回答“长期材料从哪里来、谁能写、什么时候可见”；
               下一篇再回答“这些材料和聊天历史、工具结果、compact summary 一起进入请求时，runtime 怎样减压”。
-              到最后的 Prompt Cache 章，我们再把这条线收回来：稳定前缀不是天生的，是这些 owner 边界共同维护出来的。
+              到最后的 Prompt Cache 章，我们再回到这条线：稳定前缀不是天生的，而是读取时机、插入位置和更新规则共同维护出来的。
             </p>
 
             <h2>四、把误读压成四条规则</h2>
             <ol>
               <li><strong>Memory 不是 transcript。</strong>transcript 记录发生过什么；memory 保存以后还会反复影响决策的规则和经验。</li>
               <li><strong><code>&lt;system-reminder&gt;</code> 不是 system prompt。</strong>源码里它由 <code>prependUserContext()</code> 生成，是 meta user message。</li>
-              <li><strong>动态 memory 不等于每轮变。</strong>只有当被投影进 API view 的 memory 文本或请求形状变化时，才可能影响旧缓存前缀。</li>
-              <li><strong>后台学习不是当前回答的魔法。</strong>extract memories、session memory、auto dream 都是有触发门槛、权限边界和存储位置的 side path。</li>
+              <li><strong>动态 memory 不等于每轮变。</strong>只有当插入 API 请求的 memory 文本或请求内容变化时，才可能影响旧缓存前缀。</li>
+              <li><strong>后台学习不是当前回答的魔法。</strong>extract memories、session memory、auto dream 都有明确触发条件、写入限制和存储位置。</li>
             </ol>
 
             <p>
-              所以我们可以用一句话收束：Claude Code 的 Memory 是“长期账本 + 轮次投影”，不是“更长的聊天记录”。
+              所以我们可以用一句话概括：Claude Code 的 Memory 是“长期文件 + 每轮重新读取”，不是“更长的聊天记录”。
               一旦接受这个模型，后面的上下文管理就顺了：compact 处理旧 view，transcript 保留证据，memory 重新加载规则，
               prompt cache 则奖励那些在 API view 里保持稳定的前缀。
             </p>
@@ -453,6 +453,14 @@ messages:
       (() => {
         const toc = document.getElementById("toc");
         const headings = [...document.querySelectorAll(".article-body h2, .article-body h3, .article-body h4")];
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = [...table.querySelectorAll("thead th")].map((th) => th.textContent.trim());
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            [...row.children].forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
         if (!toc || headings.length === 0) return;
 
         const counts = new Map();
