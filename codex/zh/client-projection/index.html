@@ -3,16 +3,16 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Codex 源码阅读（六）：客户端投影，同一套事实怎样变成可见状态</title>
+    <title>Codex 源码阅读（六）：运行时事件怎样变成客户端界面</title>
     <meta
       name="description"
-      content="沿 openai/codex 源码拆解 Codex 的客户端投影机制：EventMsg、TurnItem、ThreadItem、ServerNotification、TUI history cell、rollout 与 resume。"
+      content="沿 openai/codex 源码拆解运行时事件怎样变成客户端状态：EventMsg、TurnItem、ThreadItem、ServerNotification、TUI history cell、rollout 与 resume。"
     />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Codex 源码阅读（六）：客户端投影，同一套事实怎样变成可见状态" />
+    <meta property="og:title" content="Codex 源码阅读（六）：运行时事件怎样变成客户端界面" />
     <meta
       property="og:description"
-      content="从一次 turn 的事件流出发，读懂 Codex 怎样把 core 事实投影到 app-server、TUI、rollout 和恢复路径。"
+      content="从一次 turn 的事件流出发，读懂 Codex 怎样把 core 事件转换成 app-server 通知、TUI 状态和可恢复历史。"
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/client-projection-fanout.png" />
@@ -83,21 +83,21 @@
         <article class="article-card">
           <section class="article-hero">
             <p class="eyebrow">Codex 源码阅读 · 第六篇</p>
-            <h1>客户端投影，同一套事实怎样变成可见状态</h1>
+            <h1>运行时事件怎样变成客户端界面</h1>
             <p class="lead">
               前五篇一直站在 core runtime 里看：请求怎样进入 turn，上下文怎样整理，工具怎样执行，
-              权限怎样收口。现在换一个角度。用户看到的 streaming 文本、命令卡片、审批弹窗、
-              最终状态和可恢复历史，来自同一条事件流；不同客户端只是按自己的职责，把这些事实投影成不同界面。
+              权限怎样限制实际执行。现在换一个角度。用户看到的 streaming 文本、命令卡片、审批弹窗、
+              最终状态和可恢复历史，来自同一条事件流；app-server、TUI 和 rollout 分别把事件转换成自己需要的数据。
             </p>
             <div class="meta-line">
               <span>项目：openai/codex</span>
-              <span>主题：client projection</span>
+              <span>主题：event-to-client mapping</span>
               <span>范围：公开源码</span>
             </div>
             <figure class="hero-image">
               <img
                 src="../assets/client-projection-fanout.png"
-                alt="Codex 客户端投影图，展示 EventMsg 分叉到 app-server ServerNotification、TUI history cells 与 rollout resume"
+                alt="Codex 客户端转换图，展示 EventMsg 分叉到 app-server ServerNotification、TUI history cells 与 rollout resume"
               />
             </figure>
           </section>
@@ -113,21 +113,21 @@
               如果只盯着 UI，很容易以为这些都是各自实现的小功能。源码给出的答案更克制：
               <strong>core 负责产生和持久化事实，app-server 把事实变成 JSON-RPC 通知，
               TUI 把通知变成 history cell 和状态行，rollout 保留 resume 所需的可恢复记录。</strong>
-              这篇要讲的“客户端投影”，就是这几层之间的转换边界。
+              这一篇就沿着这些转换函数，说明同一个事件怎样抵达不同客户端。
             </p>
 
             <div class="note key-point">
               <p>
-                本文里的“投影”指一件具体的事：同一个 runtime 事实，在不同 owner 手里变成不同形状。
+                本文里的“转换”指一件具体的事：同一个 runtime 事件，经过不同模块后变成不同数据结构。
                 它可能是 <code>EventMsg</code>，也可能是 <code>ServerNotification</code>、
                 <code>ThreadItem</code>、TUI 的 history cell，或者 rollout 里的可恢复记录。
-                读源码时先问 owner，再问形状，最后再问 UI。
+                读源码时先找哪个模块执行转换，再看输入输出类型，最后看 UI 怎样使用结果。
               </p>
             </div>
 
             <div class="note">
               <p>
-                <strong>证据边界。</strong>
+                <strong>取材范围。</strong>
                 本文只描述 openai/codex 公开源码里可验证的事件类型、转换函数、通知结构、
                 TUI 处理分支和 rollout 恢复逻辑。文中提到“客户端”“界面”“状态”时，指这些公开代码暴露的
                 app-server 协议和 TUI 渲染路径，不推断私有产品客户端的页面实现。
@@ -138,7 +138,7 @@
             <ol>
               <li>哪些词必须先分开，才不会把事实、通知、UI 和持久化混在一起？</li>
               <li>core 什么时候把 provider response 变成可展示的 turn item？</li>
-              <li>app-server 怎样把 <code>EventMsg</code> 投影成 <code>ServerNotification</code>？</li>
+              <li>app-server 怎样把 <code>EventMsg</code> 转成 <code>ServerNotification</code>？</li>
               <li>TUI 怎样把通知变成 streaming、history cell、status 和 replay？</li>
               <li>rollout 里保留的记录，怎样服务 resume，而不是复刻每一次 UI 变化？</li>
             </ol>
@@ -147,7 +147,7 @@
             <p>
               第三篇讲 protocol 时已经见过 <code>EventMsg</code>。这一篇往客户端走，会再碰到
               <code>TurnItem</code>、<code>ThreadItem</code>、<code>ServerNotification</code>、
-              history cell 和 rollout record。它们名字都像“历史”或“事件”，实际 owner 不一样。
+              history cell 和 rollout record。它们名字都像“历史”或“事件”，实际由不同模块负责。
             </p>
 
             <div class="table-wrap">
@@ -155,7 +155,7 @@
                 <thead>
                   <tr>
                     <th>形状</th>
-                    <th>owner</th>
+                    <th>负责模块</th>
                     <th>它回答的问题</th>
                   </tr>
                 </thead>
@@ -195,10 +195,10 @@
             </div>
 
             <p>
-              这张表是后面阅读的护栏。<code>EventMsg::AgentMessageContentDelta</code>
+              这张表是后面阅读的参照。<code>EventMsg::AgentMessageContentDelta</code>
               可以让 TUI 立刻追加一段流式文本；等最终的 assistant message 完成后，
               同一段内容又会以 <code>ThreadItem::AgentMessage</code> 的形式进入稳定历史。
-              这两个动作服务的是不同 owner：前者服务“正在发生”，后者服务“已经完成且可重放”。
+              这两个动作解决的是不同问题：前者及时显示“正在发生”，后者保存“已经完成且可重放”。
             </p>
 
             <h2>二、core 先确定哪些内容能成为 turn item</h2>
@@ -234,7 +234,7 @@
 
             <p>
               这段源码的教学价值不在函数名，而在顺序：<strong>先把 provider response 作为
-              conversation item 记账，再决定它能不能成为客户端可见的 turn item</strong>。
+              conversation item 写入历史，再决定它能不能成为客户端可见的 turn item</strong>。
               所以 app-server 和 TUI 后面看到的是已经被 core 窄化过的事实，不是随手从 provider
               原始返回里挑字段。
             </p>
@@ -243,7 +243,7 @@
               而 <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2647-L2660"><code>record_conversation_items</code></a>
               自身还做了三件事：更新内存里的 history，把 response item 写入 rollout，并发送
               <code>RawResponseItem</code> 事件。这个顺序说明了一件事：raw item、turn item、UI item
-              是不同层面的投影。raw item 可以服务内部观察和云端处理；turn item 服务可展示的对话条目；
+              是连续三个阶段使用的数据类型。raw item 可以服务内部观察和云端处理；turn item 服务可展示的对话条目；
               UI 最终怎么呈现，还要看后面的客户端。
             </p>
 
@@ -274,7 +274,7 @@
               还会告诉客户端：这次 payload 里的 items 是完整、摘要，还是根本没加载。
             </p>
 
-            <h3>3.1 turn 状态是投影出来的</h3>
+            <h3>3.1 app-server 根据事件生成 turn 状态</h3>
             <p>
               <code>TurnStarted</code> 发出的 turn 不是完整历史，只是一个当前状态快照。
               源码里它会构造 <code>TurnStatus::InProgress</code>，并把 <code>items_view</code> 设成
@@ -287,7 +287,7 @@
             </p>
 
             <p>
-              这里真正要看的，是 owner 的变化：core 说“turn complete 事件发生了”，
+              这里真正要看的，是转换发生在哪一层：core 说“turn complete 事件发生了”，
               app-server 结合自己的 turn summary，给客户端一个“这个 turn 已完成或失败”的状态。
               这个状态来自客户端协议视角，而非 provider 原始 payload 的字段。
             </p>
@@ -305,12 +305,12 @@
               另一类需要 app-server 加一点状态。命令开始时，
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1085-L1144">源码会用 <code>command_execution_started</code> 去重</a>，
               并且对 unified exec interaction 抑制旧的 command item，避免客户端渲染两份等待状态。
-              这说明 projection 还承担客户端兼容和展示去重，并不只是在替换 JSON 字段名。
+              这说明转换代码还要处理客户端兼容和展示去重，并不只是在替换 JSON 字段名。
             </p>
 
             <h3>3.3 审批请求走 request 通道</h3>
             <p>
-              权限篇讲过审批。到客户端投影这一层，<code>ExecApprovalRequest</code> 和
+              权限篇讲过审批。转换到客户端协议时，<code>ExecApprovalRequest</code> 和
               <code>ApplyPatchApprovalRequest</code> 会通过 app-server 的 server request 发给客户端，
               因为这里需要客户端给出回答。
               <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L511-L538"><code>ApplyPatchApprovalRequest</code></a>
@@ -355,7 +355,7 @@
 
             <p>
               所以屏幕上的“正在打字”和 transcript 里的“最终消息”不是两份事实。
-              它们是同一条 assistant 内容在不同生命周期里的两个投影：一个追求即时反馈，一个追求稳定重绘。
+              它们是同一条 assistant 内容在不同生命周期里的两种表示：一个追求即时反馈，一个追求稳定重绘。
             </p>
 
             <h3>4.2 item 类型决定 history cell</h3>
@@ -431,9 +431,9 @@
               也遵循这个原则：恢复时只渲染安全可重放的 items，并用 replay 标记避免触发 live-only 副作用。
             </p>
 
-            <h2>六、读客户端投影时的四条规则</h2>
+            <h2>六、读这些客户端转换时的四条规则</h2>
             <p>
-              这一篇把链路拉通之后，可以用四条规则收尾。
+              沿完整条路径读过一遍后，可以用四条规则收尾。
             </p>
 
             <div class="table-wrap">
@@ -471,8 +471,8 @@
             </div>
 
             <p>
-              所以，客户端投影这一层真正保护的是可理解性和可恢复性：core 只产生事实；
-              app-server 负责协议边界；TUI 负责即时体验和稳定 transcript；rollout 负责 resume。
+              所以，这些客户端转换保证了界面可理解、历史可恢复：core 产生事件；
+              app-server 生成 JSON-RPC 通知；TUI 负责即时体验和稳定 transcript；rollout 负责 resume。
               这些层都在讲同一轮工作，但每一层只保存自己需要承担的那一份形状。
             </p>
 
@@ -491,7 +491,7 @@
               <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2647-L2660">record_conversation_items 更新 history、rollout 与 RawResponseItem</a></li>
               <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L3296-L3309">record_response_item_and_emit_turn_item</a></li>
               <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L137-L199">app-server apply_bespoke_event_handling turn 分支</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L511-L575">approval request 投影成 server request</a></li>
+              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L511-L575">approval request 转成 server request</a></li>
               <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1085-L1144">command execution notification 去重与 unified exec 抑制</a></li>
               <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1324-L1345">emit_turn_completed_with_status</a></li>
               <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1502-L1528">handle_turn_complete</a></li>
