@@ -3,16 +3,16 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Claude Code 源码阅读（四）：工具调用不是执行命令，而是运行时合约</title>
+    <title>Claude Code 源码阅读（四）：工具调用先检查，再执行</title>
     <meta
       name="description"
-      content="沿 Claude Code 公开镜像源码拆解工具调用：REPL 怎样装配工具上下文，query() 怎样收集 tool_use，runTools() 怎样分批，runToolUse() 怎样把模型提案变成经过校验、权限、hook 和结果回填的运行时合约。"
+      content="沿 Claude Code 公开镜像源码拆解工具调用：REPL 怎样装配工具上下文，query() 怎样收集 tool_use，runTools() 怎样分批，runToolUse() 怎样校验参数、检查权限、执行动作并回填结果。"
     />
     <meta name="theme-color" content="#f5f1e8" />
-    <meta property="og:title" content="Claude Code 源码阅读（四）：工具调用不是执行命令，而是运行时合约" />
+    <meta property="og:title" content="Claude Code 源码阅读（四）：工具调用先检查，再执行" />
     <meta
       property="og:description"
-      content="模型吐出 tool_use，只是提出一个动作请求；真正的本地副作用，要经过 Claude Code runtime 的工具合约。"
+      content="模型吐出 tool_use，只是提出一个动作请求；Claude Code runtime 检查工具、参数和权限后，才会产生本地副作用。"
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/tool-runtime-bridge.png" />
@@ -105,7 +105,7 @@
         <article class="article-card">
           <section class="article-hero">
             <p class="eyebrow">Claude Code 源码阅读 · 第四篇</p>
-            <h1>工具调用不是执行命令，而是运行时合约</h1>
+            <h1>工具调用先检查，再执行</h1>
             <p class="lead">
               看 coding agent 的工具调用，很容易把它想成“模型决定跑一个命令”。但在 Claude Code 里，
               模型吐出的 <code>tool_use</code> 只是一张申请单。真正能不能读文件、改文件、跑 shell、访问 MCP，
@@ -119,7 +119,7 @@
             <figure class="hero-image">
               <img
                 src="../assets/tool-runtime-bridge.png"
-                alt="Claude Code 工具运行时桥接图，展示 assistant 的 tool_use 经过 schema、permission、hooks 和 orchestration 后变成本地副作用，再以 tool_result 回到下一轮"
+                alt="Claude Code 工具执行过程图，展示 assistant 的 tool_use 经过 schema、permission、hooks 和调度后变成本地动作，再以 tool_result 回到下一轮"
               />
             </figure>
           </section>
@@ -128,19 +128,19 @@
             <p>
               <a href="../context-management/">上一篇</a>讲上下文时，我们反复说“模型下一轮看见什么”。
               工具调用就是最容易改变这件事的地方。模型先说“我想读这个文件”或者“我想执行这条命令”，
-              但它并不直接碰本地文件系统。Claude Code 会把这次提案交给一条运行时链路：
+              但它并不直接碰本地文件系统。Claude Code 会把这次提案交给一组运行时步骤：
               先验明工具和输入，再经过 hook、权限、并发策略和结果包装，最后把事实写成下一轮模型能理解的
               <code>tool_result</code>。
             </p>
 
             <p>
-              这就是这一篇的核心：<strong>工具不是模型的手脚，而是 runtime 暴露给模型的一组受控合约。</strong>
-              模型只拥有“提出调用”的能力；本地副作用的所有权在 Claude Code 客户端。
+              这就是这一篇的核心：<strong>模型只负责提出工具调用，runtime 负责检查并执行。</strong>
+              模型只拥有“提出调用”的能力；是否产生本地副作用由 Claude Code 客户端决定。
             </p>
 
             <div class="note key-point">
               <p>
-                先把结论放在前面：Claude Code 的工具链路可以分成四层。
+                先把结论放在前面：Claude Code 的工具执行可以分成四层。
                 REPL 装配可见工具和 <code>ToolUseContext</code>；<code>query()</code> 在模型流里收集
                 <code>tool_use</code>；<code>runTools()</code> 负责并发/串行调度；<code>runToolUse()</code>
                 负责单个工具的查找、校验、权限、hook、执行和 <code>tool_result</code> 包装。
@@ -149,14 +149,14 @@
 
             <div class="note reading-contract">
               <p>
-                <strong>阅读契约：</strong>这篇只追三组边界：模型提出的 <code>tool_use</code> 和客户端实际副作用的边界；
-                多个工具调用之间的并发/串行边界；UI 进度消息、transcript 记录和 API-bound <code>tool_result</code> 的边界。
+                <strong>阅读目标：</strong>这篇只追三组问题：模型提出 <code>tool_use</code> 后，客户端什么时候真的产生副作用；
+                多个工具调用什么时候并发、什么时候串行；UI 进度消息、transcript 记录和 API-bound <code>tool_result</code> 分别写到哪里。
                 读完应该能回答：为什么模型不能“直接执行命令”，为什么读操作可以并发而编辑类动作要串行，以及为什么工具失败也要回填成一条可见结果。
               </p>
             </div>
 
             <p>
-              证据边界也先说清楚。产品层的工具调用契约来自
+              取材范围也先说清楚。产品层的工具调用格式来自
               <a href="https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview">Anthropic tool use 文档</a>
               和 <a href="https://docs.anthropic.com/en/api/messages">Messages API</a>；
               源码层来自
@@ -242,7 +242,7 @@ runtime-only state =
 
             <p>
               这一步看起来小，其实很关键。Claude Code 没有只看 stop reason，也没有把工具调用散落在 UI 组件里处理；
-              它把“模型刚才提出了哪些工具申请”集中收在 <code>query()</code> 的局部账本里。
+              它把“模型刚才提出了哪些工具申请”集中收在 <code>query()</code> 的局部变量里。
             </p>
 
             <h3>2.2 执行阶段：streaming executor 或 <code>runTools()</code></h3>
@@ -279,7 +279,7 @@ runtime update:
 next API view:
   assistant(tool_use A)
   user(tool_result A)</code></pre>
-              <figcaption>工具结果以 user message 回到下一轮，这是 provider tool-use 契约的一部分，不是 UI 随便打印一行日志。</figcaption>
+              <figcaption>工具结果以 user message 回到下一轮，这是 provider 要求的消息格式，不是 UI 随便打印一行日志。</figcaption>
             </figure>
 
             <h2>三、<code>runTools()</code> 先判断能不能并发</h2>
@@ -355,23 +355,23 @@ next API view:
                   <tr>
                     <td>unknown / invalid</td>
                     <td>不执行本地动作，直接生成 error <code>tool_result</code>。</td>
-                    <td>让模型知道失败原因，同时避免越过客户端工具边界。</td>
+                    <td>让模型知道失败原因，同时避免客户端执行不存在或无效的工具。</td>
                   </tr>
                 </tbody>
               </table>
             </div>
 
-            <h2>四、单个工具调用要过六道闸</h2>
+            <h2>四、单个工具调用要经过六项检查</h2>
             <p>
               真正执行单个工具的是
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L337-L490"><code>runToolUse()</code></a>。
-              这段代码很适合作为“工具是 runtime 合约”的证据：它做的第一件事不是调用工具，而是用工具名在当前可见工具池里找工具。
+              这段代码很适合说明“模型提出，runtime 决定”：它做的第一件事不是调用工具，而是用工具名在当前可见工具池里找工具。
             </p>
 
             <figure class="figure">
               <img
                 src="../assets/tool-call-gates.png"
-                alt="Claude Code 单个工具调用闸门图，展示 find tool、schema、PreToolUse、permission、tool.call、wrap 到 success 或 is_error tool_result"
+                alt="Claude Code 单个工具调用检查图，展示 find tool、schema、PreToolUse、permission、tool.call、wrap 到 success 或 is_error tool_result"
               />
               <figcaption>单个 <code>tool_use</code> 只有穿过查找、schema、hook、权限和执行包装，才会成为真实本地动作。</figcaption>
             </figure>
@@ -401,7 +401,7 @@ next API view:
             <p>
               schema 通过之后，工具自己的
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L682-L733"><code>validateInput()</code></a>
-              还能继续做语义级校验。也就是说，工具输入有两层门：通用结构先过，工具自己的业务规则再过。
+              还能继续做语义级校验。也就是说，工具输入要检查两次：先检查通用结构，再检查工具自己的业务规则。
             </p>
 
             <h3>4.3 PreToolUse hook 在权限之前改变或阻断调用</h3>
@@ -413,18 +413,18 @@ next API view:
             </p>
 
             <p>
-              这解释了为什么 hook 不是“执行后的通知”。在工具调用这条链路里，PreToolUse 是副作用真正发生前的拦截点，
+              这解释了为什么 hook 不是“执行后的通知”。在工具调用过程中，PreToolUse 是副作用真正发生前的拦截点，
               它站在权限判断之前，能影响后续权限和执行输入。
             </p>
 
-            <h3>4.4 权限决定是执行前最后的用户信任边界</h3>
+            <h3>4.4 权限是执行本地动作前的最后决定</h3>
             <p>
-              权限判断本身留到下一篇细拆，这里先看它在工具链路里的位置。
+              权限判断本身留到下一篇细拆，这里先看它在工具执行过程里的位置。
               <code>checkPermissionsAndCallTool()</code> 在 hook 之后调用
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L916-L946"><code>resolveHookPermissionDecision(...)</code></a>，
               最终得到 <code>allow</code>、<code>deny</code> 或 <code>ask</code> 的结果。
               REPL 侧的 <a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L93"><code>useCanUseTool()</code></a>
-              会把配置规则、自动模式、交互弹窗和权限队列收在一个函数边界里。
+              会在同一个函数里处理配置规则、自动模式、交互弹窗和权限队列。
             </p>
 
             <p>
@@ -455,7 +455,7 @@ next API view:
             </p>
 
             <p>
-              <code>query()</code> 在收 tool update 时也做了同样的边界处理：
+              <code>query()</code> 在接收 tool update 时也把 UI 更新和 API 消息分开处理：
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L1384-L1408">先 yield update.message 给 UI，再 normalize 进 <code>toolResults</code></a>。
               所以别把屏幕上看到的每一条进度都理解成模型下一轮能看到的内容。UI view 和 API view 仍然分层。
             </p>
@@ -476,14 +476,14 @@ next API view:
             <p>
               工具 batch 完成后，<code>query()</code> 还有一段可选的
               <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L1411-L1457">tool use summary</a> 逻辑。
-              它会在 feature gate、非 abort、非 subagent 等条件满足时，提取工具 id 和工具信息，生成给 UI 或后续链路使用的摘要。
-              但摘要不是 provider tool-use 契约本身。真正让下一轮模型知道工具发生了什么的，仍然是与
+              它会在功能开关启用、未 abort、非 subagent 等条件满足时，提取工具 id 和工具信息，生成给 UI 或后续处理使用的摘要。
+              但摘要不是 provider 要求的工具结果。真正让下一轮模型知道工具发生了什么的，仍然是与
               <code>tool_use_id</code> 配对的 <code>tool_result</code>。
             </p>
 
             <h2>六、几个常见误读</h2>
             <p>
-              工具链路看完以后，可以把几个容易混淆的说法压成一张表。
+              工具执行过程看完以后，可以把几个容易混淆的说法压成一张表。
             </p>
 
             <div class="table-wrap">
@@ -513,7 +513,7 @@ next API view:
                   </tr>
                   <tr>
                     <td>权限只是 UI 弹窗</td>
-                    <td>权限是执行前的信任边界，hook 也可能先给出或改变权限结果。</td>
+                    <td>权限决定本地动作能否执行，hook 也可能先给出或改变权限结果。</td>
                     <td><code>runPreToolUseHooks()</code> 在 <code>resolveHookPermissionDecision()</code> 之前。</td>
                   </tr>
                   <tr>
@@ -532,8 +532,8 @@ next API view:
             </p>
 
             <p>
-              下一篇就沿这里的权限闸继续往下看：同样一个 <code>Bash</code> 或 <code>Edit</code>，
-              <a href="../permissions/">为什么有时直接 allow，有时直接 deny，有时要把用户拉回到决策链路里</a>。
+              下一篇就沿这里的权限检查继续往下看：同样一个 <code>Bash</code> 或 <code>Edit</code>，
+              <a href="../permissions/">为什么有时直接 allow，有时直接 deny，有时必须让用户决定</a>。
             </p>
 
             <h2 id="sources">参考源码与文档</h2>
@@ -553,8 +553,8 @@ next API view:
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L337-L490">toolExecution.ts：runToolUse</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L492-L570">toolExecution.ts：streamed tool execution</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L599-L733">toolExecution.ts：schema and input validation</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L795-L946">toolExecution.ts：PreToolUse and permission boundary</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L93">useCanUseTool.tsx：permission function boundary</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L795-L946">toolExecution.ts：PreToolUse 和权限决定</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L93">useCanUseTool.tsx：权限处理函数</a></li>
               <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L473-L525">permissions.ts：permission mode transformation</a></li>
             </ul>
           </section>
