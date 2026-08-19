@@ -10,40 +10,41 @@
   <div class="article-shell"><aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
     <section class="article-hero">
       <p class="eyebrow">OpenClaw 源码阅读 · 第八篇</p><h1>Heartbeat、Automation 与重启恢复怎样让 Agent 常驻</h1>
-      <p class="lead">“常驻”不是让一个模型调用永远不结束，也不是每隔几分钟把旧对话再问一遍。OpenClaw 把时间触发、执行记录、完成投递与重启恢复拆成不同 owner：heartbeat 做近似周期的主会话巡检，automations 保存精确 schedule，background task ledger 记录脱离主对话的活动，restart recovery 再从持久 claim、transcript 与 delivery receipt 判断该续跑、告知重发，还是停止重试。系统之所以能长期运行，靠的是可恢复状态和有界重放，而不是一个永不退出的进程。</p>
+      <p class="lead">OpenClaw 让短暂的模型调用也能跨时间工作：Heartbeat 做近似周期的主会话巡检，Automation 保存精确定时，Task 表记录脱离主对话的运行，Gateway 重启后再读取执行声明、对话记录与投递回执，决定续跑、提示重发或停止重试。长期运行依赖这些可恢复记录和明确的重试上限，而不是一个永不退出的进程。</p>
       <div class="meta-line"><span>系列 8 / 8</span><span>源码快照：c549250</span><span>主题：heartbeat · automation · durability · recovery</span><span>前置：多 Agent</span></div>
       <nav class="series-strip"><a href="../overview/"><strong>01</strong> 主线</a><a href="../gateway/"><strong>02</strong> Gateway</a><a href="../routing-sessions/"><strong>03</strong> 路由</a><a href="../context-memory/"><strong>04</strong> 上下文</a><a href="../capability-assembly/"><strong>05</strong> 能力</a><a href="../security-boundaries/"><strong>06</strong> 安全</a><a href="../multi-agent/"><strong>07</strong> 多 Agent</a><span class="series-current"><strong>08</strong> 常驻恢复</span></nav>
-      <figure class="hero-image"><img src="../assets/always-on-time-sources.png" alt="OpenClaw 常驻运行的三个 owner：heartbeat 在 main session 做周期巡检；Automations 用 at、every、cron 的持久 schedule 触发 run；Tasks 用 task_runs 记录 queued、running、terminal，完成后可 wake 主会话；schedule、run、record、wake 分层" /></figure>
+      <figure class="hero-image"><img src="../assets/always-on-time-sources.png" alt="OpenClaw 常驻运行的三类组件：Heartbeat 在主会话做周期巡检；Automations 用 at、every、cron 的持久定时规则触发运行；Tasks 用 task_runs 记录 queued、running、terminal，完成后可唤醒主会话；定时、运行、记录和唤醒彼此分开" /></figure>
     </section>
     <section class="article-body">
       <p>想象一个值班 Agent：每半小时看一次有没有值得提醒的事；工作日上午七点生成日报；收到构建事件时启动隔离分析；长任务完成后马上通知；Gateway 升级重启时继续未完成对话。把这些需求都塞进一个“while true + sleep”，会立刻碰到四个问题：错过的 tick 是否补跑，运行记录放哪里，外部消息是否重复发送，进程中断后谁判断上一次做到哪一步。</p>
-      <p>OpenClaw 的答案是分开 clock、work、ledger、delivery。scheduler 决定何时触发；session/agent runtime 执行一次 turn；task/cron history 记录发生过什么；channel delivery 持有外部副作用的 receipt；recovery 只从这些 durable facts 恢复。内存对象可以丢，所有权证据不能靠猜。</p>
-      <div class="note"><p><strong>阅读契约。</strong>读完后你应该能回答：heartbeat、automation 与 task 的 owner 分别是谁；为什么关闭 automations 后 scheduled heartbeat 也停；heartbeat 的 run session 与 delivery target 为何独立；cron 重启后怎样处理逾期 job；为什么 task 不是 scheduler；execution success 与 delivery success 怎样分离；Gateway 如何发现被中断的主会话；何时 resume、何时给 resend notice；以及 tombstone、lost、autoDisabled、crash-loop breaker 分别阻止哪种无限循环。</p></div>
-      <p><strong>证据边界。</strong>本文仍固定在 <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a>。文中的默认值、重试次数与保留时间属于该快照；更值得长期记住的是状态所有权、幂等 fencing 与 fail-closed 结构。</p>
+      <p>OpenClaw 把这几件事交给不同模块：Scheduler 决定何时触发；Session 与 Agent Runtime 执行一次 turn；Task 和 Cron History 记录运行结果；Channel Delivery 保存外部发送回执；Recovery 只根据这些持久记录作决定。进程内的 Promise、连接和模型流可以消失，但新进程必须能从数据库判断工作是否开始、是否完成、是否已经发给用户。</p>
+      <div class="note"><p><strong>读完后你应该能回答。</strong>Heartbeat、Automation 与 Task 分别保存什么；为什么关闭 Automations 后定时 Heartbeat 也会停止；Heartbeat 的运行会话与投递目标为什么互不决定；Cron 重启后怎样处理逾期 Job；Task 为什么不能代替 Scheduler；执行成功与发送成功怎样分开记录；Gateway 如何发现被中断的主会话；何时续跑、何时提示重发；以及 tombstone、lost、autoDisabled、crash-loop breaker 各自终止哪一种重复失败。</p></div>
+      <p><strong>本文依据。</strong>源码仍固定在 <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a>。默认值、重试次数与保留时间只描述这个快照；更稳定的结论是：运行状态要持久化，外部发送要可去重，无法证明安全时就停止自动恢复。</p>
 
-      <h2>一、“常驻”需要四个独立问题</h2>
-      <div class="table-wrap"><table><thead><tr><th>问题</th><th>主要 owner</th><th>持久事实</th><th>不能替代</th></tr></thead><tbody>
+      <h2>一、时间触发怎样唤醒 Agent</h2>
+      <h3>1.1 “常驻”要拆成触发、执行、记录与投递</h3>
+      <div class="table-wrap"><table><thead><tr><th>问题</th><th>由谁处理</th><th>持久记录</th><th>不能证明什么</th></tr></thead><tbody>
         <tr><td>什么时候醒</td><td>Heartbeat monitor / Automations scheduler / hook</td><td>job、schedule、next run、trigger state</td><td>不能证明工作已经完成</td></tr>
-        <tr><td>谁在执行</td><td>Session lane / agent run / child runtime</td><td>sessionKey、runId、runtime ownership</td><td>不能证明结果已对外发送</td></tr>
+        <tr><td>谁在执行</td><td>Session Lane / Agent Run / Child Runtime</td><td>sessionKey、runId、对应的 Session 或进程</td><td>不能证明结果已对外发送</td></tr>
         <tr><td>发生了什么</td><td>Task registry / cron run history / transcript</td><td>queued、running、terminal、result</td><td>不是下一次调度器</td></tr>
         <tr><td>用户是否收到</td><td>Delivery queue / receipt / requester session</td><td>delivery claim、idempotency key、provider receipt</td><td>不能把不安全执行自动重放</td></tr>
       </tbody></table></div>
       <p>很多“偶尔重复提醒”或“重启后任务消失”的根因，就是把其中两列合并。一个 task row 仍是 running，不一定进程还活着；一个 agent run succeeded，不一定消息已 delivered；一个 cron job 还 enabled，也不代表 Gateway 停机期间应该把每个错过的 occurrence 全部补跑。</p>
 
-      <h2>二、时间来源不只有定时器</h2>
+      <h3>1.2 时间来源不只有定时器</h3>
       <p>OpenClaw 能被多种事件唤醒：用户/ChannelPlugin 的外部消息、heartbeat cadence、<code>at</code>/<code>every</code>/<code>cron</code> schedule、authenticated webhook、Gmail PubSub、受监督 stream、background task completion、restart sentinel continuation。它们最终可能都启动一个 Agent turn，但入场前的身份与重复语义不同。</p>
-      <p>一个外部 webhook 需要认证与 idempotency key；一个 cron occurrence 由 jobId 与 run identity 约束；一次 child completion 已经有 task/run identity；heartbeat 则是一种 system-owned monitor tick。统一成“塞一条 user message”会丢掉这些 provenance。</p>
+      <p>外部 Webhook 需要认证与幂等键；每次 Cron 触发都有 jobId 和 runId；子任务完成事件已经关联 Task 与 Run；Heartbeat Tick 则由系统内部生成。如果把它们都改成“塞一条用户消息”，后续就无法判断事件来自哪里，也无法可靠去重。</p>
 
-      <h2>三、Heartbeat 是主会话巡检，不是后台任务</h2>
-      <p>Heartbeat 是周期性的 Agent turn，默认运行在 Agent main session。它可以看 monitor scratch、当前 session context 与配置允许的 bootstrap，然后回答“无事”或给出提醒。它不会创建 background task record；普通 interactive turn 也不会。只有 ACP、subagent、automation、Gateway-backed CLI 等 detached activity 进入 task ledger。</p>
+      <h3>1.3 Heartbeat 是主会话巡检，不是后台任务</h3>
+      <p>Heartbeat 是周期性的 Agent Turn，默认运行在 Agent 的主会话。它可以读取巡检便笺、当前会话信息与配置允许的启动文件，然后回答“无事”或给出提醒。它不会创建后台 Task 记录，普通交互 Turn 也不会；只有 ACP、Subagent、Automation、Gateway CLI 等脱离主对话运行的活动才写入 Task 表。</p>
       <p>这条界线很实用：<code>/tasks</code> 没有 heartbeat row，不代表 heartbeat 没跑；task registry 也不该拿来保存“下次半小时后执行”的 schedule。要查 heartbeat，看 monitor job、last heartbeat 与 heartbeat logs；要查 detached run，才看 task board。</p>
 
-      <h2>四、Heartbeat 的 Tick 实际由 Automation 持有</h2>
+      <h3>1.4 Automation 保存 Heartbeat 的 Tick</h3>
       <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/cron/heartbeat-monitor.ts"><code>cron/heartbeat-monitor.ts</code></a> 把每个启用 heartbeat 的 Agent 收敛成一个 system-owned automation job，declaration key 形如 <code>heartbeat:&lt;agentId&gt;</code>，payload kind 是 <code>heartbeat</code>，sessionTarget 是 <code>main</code>。配置是 desired state，持久 monitor row 才拥有实际 tick 与 anchor。</p>
       <p>因此 <code>cron.enabled=false</code> 或 <code>OPENCLAW_SKIP_CRON=1</code> 会停止 scheduled heartbeat；没有另一套隐藏 timer 兜底。config reload 和 Gateway startup 会把 heartbeat config 写回 monitor job，<code>doctor --fix</code> 可补齐缺失或陈旧的声明。禁用 cadence 时 row 可保留为 disabled，scratch 也保留，之后重新启用还能继续使用。</p>
       <p>默认 cadence 通常是 30 分钟；某些 Anthropic OAuth/token 默认会在未显式设置时调整为 1 小时。它表达的是巡检频率，不是精确 SLA。需要“每个工作日 09:00 准时”时，用 cron schedule。</p>
 
-      <h2>五、Heartbeat 用安静协议避免刷屏</h2>
+      <h3>1.5 Heartbeat 用安静协议避免刷屏</h3>
       <p>默认 prompt 明确要求只跟随 heartbeat monitor scratch，不从旧聊天臆测 recurring task；没有需要关注的内容就返回 <code>HEARTBEAT_OK</code>。结构化路径可调用 <code>heartbeat_respond</code>，用 <code>notify=false</code> 表示静默，用 <code>notify=true</code> 加 notificationText 表示提醒；结构化结果优先于文本 fallback。</p>
       <p><code>HEARTBEAT_OK</code> 位于回复开头或结尾时会被识别，token 被去掉，剩余内容很短则整条 suppress。它出现在正文中间不会被当作 ack。alert 不应再附带 OK token。这个协议的目的不是省几个字符，而是让“定期检查成功且无变化”成为可审计、却默认不产生外部噪声的 terminal outcome。</p>
       <pre><code class="language-javascript">{
@@ -60,20 +61,21 @@
   }
 }</code></pre>
 
-      <h2>六、Run Session 与 Delivery Target 是两条轴</h2>
+      <h3>1.6 运行会话与投递目标互不决定</h3>
       <p><code>heartbeat.session</code> 决定模型在哪段 session context 里运行，默认 main；<code>target</code>/<code>to</code>/<code>accountId</code> 决定外部提醒送到哪里。<code>target="none"</code> 时 turn 仍会执行，只是不对外发送；<code>target="last"</code> 才解析最近可投递 channel。把 session 指到某个 thread，也不会自动把 output 投回那个 thread。</p>
       <p><code>isolatedSession=true</code> 为每次巡检创建新 transcript，避免携带整段对话；delivery routing 仍可使用 main session 的上下文。<code>lightContext=true</code> 再跳过 workspace bootstrap，只注入 monitor scratch。二者适合纯状态检查，但如果巡检需要长期 conversation decision 或 workspace instructions，就要显式承担更多 context。</p>
 
-      <h2>七、Heartbeat 会让路，不与活跃工作争抢</h2>
+      <h3>1.7 Heartbeat 会让路，不与活跃工作争抢</h3>
       <p>scheduled heartbeat 在 main lane、automation lane、同 Agent active reply/embedded run 或目标 session 有 active/queued work时会 defer。manual/immediate wake 可以绕过较宽的 same-agent precheck，但仍尊重 main、automation 与 target-session busy guard。不同 Agent 不会因为兄弟 Agent 忙就互相暂停。</p>
       <p>activeHours 再按显式 IANA timezone、user timezone 或 host timezone 判断。窗口外不是“稍后补这一 tick”，而是跳过直到下一个窗口内 tick。同一个 start/end 表示零宽窗口，会永远跳过。对业务语义敏感的时间点，必须把 timezone 与 missed-run policy 写进 automation，而不是依赖近似 heartbeat。</p>
 
-      <h2>八、Automation 才是持久 Scheduler</h2>
+      <h2>二、Automation、Task 与完成投递怎样配合</h2>
+      <h3>2.1 Automation 保存定时规则</h3>
       <p>Automations 在 Gateway 进程内调度，job definition、runtime state 与 run history 存在共享 SQLite。支持一次性 <code>at</code>、固定间隔 <code>every</code>、带 timezone 的 <code>cron</code>，以及 on-exit、stream 等事件源。Gateway 必须在运行才能真正 fire，但 restart 不会丢 schedule。</p>
       <p>每次 automation run 都创建 task record，即使是 main-session job；notify policy 默认 silent，因为 scheduler 自己拥有 delivery。一次性 job 成功后默认删除，除非显式 keep。recurring top-of-hour cron 默认可 stagger，降低整点惊群；需要严格时刻时再用 exact。</p>
-      <p>启动时，逾期 isolated agent-turn job 会被 reschedule，而不是立刻在 channel connect 窗口补跑。这是重要的反直觉边界：持久 schedule 不等于“停机期间每个 tick 至少执行一次”。如果业务需要补账，payload 应读取外部 durable watermark，计算尚未处理的区间，并以业务 idempotency key 执行。</p>
+      <p>启动时，逾期的 Isolated Agent Turn Job 会重新安排下一次运行，而不是在 Channel 刚连接时立刻补跑。持久化定时规则并不保证“停机期间每个 Tick 都至少执行一次”。如果业务必须补跑，Payload 应读取外部系统保存的处理水位，算出尚未处理的时间段，再用业务幂等键执行。</p>
 
-      <h2>九、同一个 Job 有四种 Session 形态</h2>
+      <h3>2.2 同一个 Job 有四种 Session 形态</h3>
       <div class="table-wrap"><table><thead><tr><th>sessionTarget</th><th>上下文</th><th>适合</th><th>主要风险</th></tr></thead><tbody>
         <tr><td><code>main</code></td><td>向 scheduler lane 注入 self-contained system event</td><td>提醒、唤醒、轻量主会话动作</td><td>不要假设自动带 heartbeat scratch</td></tr>
         <tr><td><code>isolated</code></td><td>每次新 <code>cron:&lt;jobId&gt;</code> transcript</td><td>日报、后台 chores、一次性分析</td><td>必须给完整 prompt 与 delivery</td></tr>
@@ -82,55 +84,57 @@
       </tbody></table></div>
       <p>main automation event 不会自动继承默认 heartbeat prompt 或 monitor scratch；需要读取时应在 event 中明说。isolated run 会保留安全的模型/思考偏好，却不继承旧 row 的 channel、elevated、origin 或 ACP binding。所谓 fresh session 必须包括副作用路由也重新解析，不能只换 transcript id。</p>
 
-      <h2>十、无人值守任务必须在创建时封住权限</h2>
+      <h3>2.3 无人值守任务在创建时固定权限</h3>
       <p>automation 运行时没有人在旁边回答澄清或点击临时 approval。它的最终回复应是 deliverable 或明确失败，而不是“我准备开始”。需要交互审批的动作不适合无人值守 schedule；更稳妥的是只读巡检后通知人，由前台 turn 执行高风险变更。</p>
       <p>Agent 创建的 automation 会保存显式 tool policy，并被创建 turn 的有效工具面封顶；后续不能扩到创建者当时没有的工具。authenticated operator 创建 job 且未传 <code>--tools</code> 时则会保存显式 <code>*</code>，这是管理员授权语义，不应与模型侧的默认最小权限混淆。</p>
-      <p>command payload 更是 operator-admin Gateway automation surface：它在 Gateway host 上执行 argv，不走模型可见 exec tool 的 approval/policy。谁能创建或编辑这类 job，必须由 operator role 与配置审计保护。</p>
+      <p>Command Payload 的权限更高：它直接在 Gateway 主机上执行 argv，不经过模型可见 Exec Tool 的审批和 Policy。只有经过授权的 Operator 才能创建或编辑这类 Job，相关配置也应进入审计。</p>
 
-      <h2>十一、Task 是活动账本，不是调度器</h2>
+      <h3>2.4 Task 记录运行，不负责下一次触发</h3>
       <p>Task registry 记录 ACP、subagent、所有 automation run、Gateway-backed CLI 与部分后台 exec/media work。状态沿 <code>queued → running → terminal</code>，terminal 可为 succeeded、failed、timed_out、cancelled 或 lost。agent run lifecycle 自动推进这些状态；用户不需要手写状态转换。</p>
-      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/tasks/task-registry.store.sqlite.ts"><code>task-registry.store.sqlite.ts</code></a> 把 <code>task_runs</code> 与 <code>task_delivery_state</code> 写入共享 state database。task 关联 requesterSessionKey、childSessionKey、agentId、runId、ownerKey 与 deliveryStatus，因此它能回答“谁启动、在哪里跑、谁拥有、结果去哪”，但它没有 nextRunAt，也不会代替 cron。</p>
+      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/tasks/task-registry.store.sqlite.ts"><code>task-registry.store.sqlite.ts</code></a> 把 <code>task_runs</code> 与 <code>task_delivery_state</code> 写入共享状态数据库。每条 Task 可关联 requesterSessionKey、childSessionKey、agentId、runId、ownerKey 与 deliveryStatus，因此能够回答“谁启动、在哪里运行、由哪个 Runtime 处理、结果发到哪里”。但它没有 nextRunAt，不能代替 Cron 决定下一次触发。</p>
       <pre><code class="language-text">queued → running → succeeded | failed | timed_out | cancelled | lost
 
 executionStatus: succeeded
 deliveryStatus:  session_queued | delivered | failed
 terminalOutcome: succeeded | blocked</code></pre>
 
-      <h2>十二、完成会 Push，必要时借 Heartbeat 唤醒</h2>
+      <h3>2.5 完成事件会主动推送，必要时唤醒 Heartbeat</h3>
       <p>detached task terminal 后有两条主要 delivery：若有合法 requesterOrigin，可直接去 channel；group/channel 的 subagent completion 通常先回 requester session，让父 Agent 生成可见回复。若 direct delivery 失败或没有 origin，完成事件进入 requester session queue，并触发 immediate heartbeat wake，不必等下一个 scheduled tick。</p>
       <p>这解释了为什么轮询通常是错误形状。启动一次任务后，runtime 已经知道 requester 与 completion identity；不断查询只会增加模型 turn 和 race。只有排障、人工干预或审计才需要 <code>tasks list/show/audit</code>。</p>
       <p>execution 与 delivery 继续分开：child succeeded 而 result queue 超时，task 可以保持 execution succeeded，同时 terminalOutcome 是 blocked。canonical result 会保留供 retry/dismiss；不能为了让 dashboard “红起来”就篡改真实执行结果。</p>
 
-      <h2>十三、重启时真正幸存的是哪些状态</h2>
+      <h2>三、Gateway 重启后怎样决定续跑或停止</h2>
+      <h3>3.1 重启后仍然存在的是数据库记录</h3>
       <figure class="hero-image"><img src="../assets/always-on-restart-recovery.png" alt="OpenClaw mainRestartRecovery：运行中的 session 把 transcript、delivery claim 与 dispatch id 保存在 SQLite；Gateway restart 后 startup scan 读取持久状态，安全时 resume，尾部不安全时给 resend notice，重试耗尽则 tombstone；最终 delivery receipt 防止重复外发" /></figure>
-      <p>conversation transcript 与 session row 存在 per-agent SQLite；subagent/task/flow registry、cron jobs 与 delivery queue 存在共享 state database；agent-requested restart 另有 restart sentinel。JavaScript promise、socket、provider stream 与 in-process owner 会消失。recovery 的工作不是让后者魔法复活，而是拿 durable row 与新进程的 live owner 对账。</p>
+      <p>对话记录与 Session Row 存在每个 Agent 各自的 SQLite 中；Subagent、Task、Flow Registry、Cron Job 与投递队列存在共享状态数据库中；Agent 主动请求的重启另有 Restart Sentinel。JavaScript Promise、Socket、Provider Stream 与原进程中的执行对象都会消失。恢复流程不会让它们重新出现，而是把数据库记录与新进程中实际运行的工作逐项核对。</p>
       <p>优雅 restart 会先停止接新工作，然后给 active turn/background task 一个 drain budget，默认最长五分钟。大多数更新因此不需要 resume。超过预算或 crash 导致中断时，session 才进入 recovery path；drain 窗口中新工作明确拒绝，不会悄悄塞进即将退出的进程。</p>
 
-      <h2>十四、主会话在执行前就写 Recovery Claim</h2>
-      <p>普通 text turn 在既有 main session 上 admission 时，会把 user message、running 状态与 recovery delivery claim 放进同一个 SQLite transaction，再进入模型或 hook。shutdown 还会标记仍 active 的 session；hard crash 后，startup scan 则寻找“仍声称 running、但新进程没有 live owner”的 row，并清理 stale transcript lock。</p>
-      <p>这三条检测路径互补：admission transaction 覆盖启动后立刻 crash，shutdown marker 覆盖有序中断，startup orphan scan 覆盖没有机会执行清理的 kill。仅凭 transcript 最后一条是 user message 进行猜测，会把已经完成但还没投递与从未正式入场混在一起。</p>
+      <h3>3.2 主会话在执行前就写入恢复声明</h3>
+      <p>普通文本 Turn 进入已有主会话时，会在同一个 SQLite 事务里写入用户消息、running 状态与恢复投递声明，然后才调用模型或 Hook。关闭进程时还会标记仍在运行的 Session；硬崩溃之后，启动扫描会寻找“数据库仍写着 running、但新进程中没有对应工作”的 Row，并清理过期的对话锁。</p>
+      <p>三条路径互相补充：入库事务覆盖刚接收请求就崩溃的情况，关闭标记覆盖有序中断，启动扫描覆盖来不及清理的强制终止。只看对话记录的最后一条是不是用户消息，会把“回复已经生成但还没发出”和“请求从未正式开始执行”混为一谈。</p>
 
-      <h2>十五、恢复复用同一个 Dispatch Identity</h2>
+      <h3>3.3 每次恢复复用同一个 Dispatch ID</h3>
       <p>Gateway 启动几秒后，为符合条件的 session 注入 synthetic system continuation，告诉 Agent 上次 turn 被 restart 打断，并从现有 transcript 继续。如果 final reply 已经生成但未投递，恢复上下文会带上它，优先完成 delivery，而不是重新调用工具做一遍。</p>
-      <p>每次 retry 复用一个 durable dispatch identifier；连接结果不确定时不会因此启动两个 recovery。启动协调有短期 transient retry，单个 interrupted cycle 另有跨 restart 保存的三次 charged dispatch budget：dispatch 前先计费，明确未 accepted 可退，结果不确定则保留 charge，宁可停下来也不冒险重放外部副作用。</p>
+      <p>每次重试都复用同一个持久 Dispatch ID，因此连接结果不确定时不会启动两份恢复。启动协调可以做短期网络重试；同一轮被中断的主会话另有最多三次的恢复预算，并跨重启保存。系统在 Dispatch 前先消耗一次额度，只有明确得知请求未被接收时才退回；结果不确定时保留计数，宁可停止也不冒险重复执行外部操作。</p>
       <p>同一 session 若已经被 foreground work 占有，recovery 等其 settle，不争抢 lane。预算耗尽后写 tombstone；operator 检查后用 <code>/new</code> 或 <code>/reset</code> 建 replacement。<code>doctor --fix</code> 能修矛盾 flag，却不会偷偷重开已经 tombstoned 的 cycle。</p>
 
-      <h2>十六、Transcript 可继续不等于 Tool 可重放</h2>
+      <h3>3.4 对话可续写，不代表工具可重放</h3>
       <p>partial streamed text 可留在 transcript，continuation 从其下方继续；dangling tool call 会从下一次 provider payload 删除，并把恢复 turn 限制到 restart-safe tool。若 tail 是 provider failure、stale pending approval 或无法证明安全的 side-effecting state，OpenClaw 不盲跑，而是给一次 resend notice。</p>
-      <p>message-tool-only reply 有更严格的 durable correlation：terminal send 前先记录 delivery intent，provider 确认后写 receipt。已确认 delivered 的恢复只完成账本，不再调用 message；明确失败可以清理；provider outcome unknown 时 fail closed，避免同一外部消息发两次。原 requester identity、channel/thread restriction 与 source delivery mode 也随 claim 保留，重启不能借机改投递目标。</p>
+      <p>只通过 Message Tool 发送的回复会保存更严格的关联记录：最终发送前先写投递意图，Provider 确认后再写回执。恢复时，已经确认 delivered 的消息只补齐状态，不再次调用 Message；明确失败可以清理；Provider 结果未知时则停止自动发送，避免同一条外部消息出现两次。原请求者身份、Channel 或 Thread 限制与来源投递模式也随恢复声明保存，重启不能借机改变目标。</p>
       <p>read-only Code Mode 是受审计的特例：只有被标成 restart-safe 且工具目录通过只读过滤的工作，才允许重建；任何 side-effecting catalog/namespace tool 仍走 resend notice。恢复能力不是给所有工具加一个通用 retry wrapper。</p>
 
-      <h2>十七、Subagent、Task 与 Cron 各自恢复</h2>
-      <p>main-session scanner 会排除已有专属 owner 的 subagent、cron 与 ACP session。subagent registry 从 SQLite 恢复，并尝试续跑原 task context；中断超过两小时的 run 不会在隔夜后复活，重复失败的 child 会 wedged/tombstone。ACP 的实际 turn 由外部 runtime/connected client 拥有，OpenClaw 只对账其 managed task 与 session binding。</p>
-      <p>task registry 启动时加载，之后 sweeper 周期性检查 live runtime backing：ACP 要有进程内 turn，subagent 要有 child session，automation 先看 scheduler active ownership，再看 durable run history。backing 消失超过 grace 才标 lost，避免 restart 瞬间把所有尚未恢复的工作误判死亡。terminal task 默认保留七天，lost 较短保留，再按 cleanupAfter prune。</p>
+      <h3>3.5 Subagent、Task 与 Cron 分别恢复</h3>
+      <p>主会话扫描器会排除由专门模块处理的 Subagent、Cron 与 ACP Session。Subagent Registry 从 SQLite 恢复，并尝试继续原 Task；中断超过两小时的 Run 不会隔夜复活，重复失败的 Child 会标记为 wedged 或 tombstone。ACP 的实际 Turn 由外部 Runtime 或已连接客户端执行，OpenClaw 只核对其 Managed Task 与 Session Binding。</p>
+      <p>Task Registry 在启动时加载，之后由 Sweeper 周期检查实际运行状态：ACP 要有进程内 Turn，Subagent 要有 Child Session，Automation 则先看 Scheduler 中的活动记录，再看持久化的 Run History。对应工作消失并超过宽限期后才标为 lost，避免重启瞬间把所有尚未恢复的任务误判为死亡。Terminal Task 默认保留七天，lost 记录保留时间更短，随后按 cleanupAfter 清理。</p>
       <p>cron job definition 与 run history 会恢复，scheduler re-arm；但 missed occurrence 的处理服从各 schedule/run 类型，而不是统一 replay。持久化提供可判断的事实，不自动提供业务 exactly-once。需要外部副作用 exactly-once 时，job 自己还要使用业务键、watermark 或目标系统的幂等 API。</p>
 
-      <h2>十八、有界失败让“常驻”不会变成“永远重试”</h2>
+      <h2>四、怎样限制重复失败并排查系统</h2>
+      <h3>4.1 达到上限后停止自动重试</h3>
       <figure class="hero-image"><img src="../assets/always-on-safety-valves.png" alt="OpenClaw 常驻安全阀：主会话 recovery 三次 attempt 后 tombstone；失去 runtime backing 的 task 经过 grace 标为 lost；recurring automation 连续十次执行失败后 autoDisabled；五分钟内三次 unclean boot 进入 safe mode；task_runs、deliveryStatus、cleanupAfter 保留可审计结果" /></figure>
-      <p>主会话 recovery 有三次 durable budget；普通 task 失去 authoritative backing 经 grace 后变 lost；recurring automation 连续十次 execution failure 会 autoDisabled，schedule computation 连续三次错误也会停用；五分钟内三次 unclean boot 会触发 crash-loop breaker，控制平面仍启动，但 channel 等 side services 暂缓 auto-start。</p>
-      <p>这些状态不是“系统认输”，而是把自动化停在可审计边界。tombstone 防同一 session 重复 side effect，lost 暴露 orphan，autoDisabled 防定时错误持续烧资源，safe mode 让 operator 还能进入控制平面修配置。修好根因后由 operator 显式 enable、reset、retry 或启动 channel，权限与意图都更清楚。</p>
+      <p>主会话恢复最多尝试三次；普通 Task 失去对应进程并超过宽限期后变为 lost；Recurring Automation 连续十次执行失败会 autoDisabled，定时计算连续三次出错也会停用；五分钟内出现三次非正常启动会触发 crash-loop breaker。此时 Gateway 的管理接口仍然可用，但 Channel 等附属服务不会自动启动。</p>
+      <p>这些状态让自动化停在可检查的位置。tombstone 防止同一 Session 重复外部操作，lost 暴露失去对应进程的任务，autoDisabled 防止错误定时持续消耗资源，Safe Mode 则让 Operator 仍能进入 Gateway 修复配置。解决根因后，再由 Operator 明确执行 enable、reset、retry 或启动 Channel。</p>
 
-      <h2>十九、用三张表排查常驻系统</h2>
+      <h3>4.2 按定时、执行、投递三类记录排查</h3>
       <pre><code class="language-bash">openclaw automations list --all
 openclaw automations runs --id &lt;jobId&gt; --limit 20
 openclaw tasks list
@@ -139,20 +143,20 @@ openclaw sessions --json
 openclaw channels status
 openclaw gateway status
 openclaw logs</code></pre>
-      <p>第一张表是 schedule：job 是否 enabled、nextRunAt、timezone、lastRunStatus。第二张表是 execution：task/runtime 是否 queued/running/terminal、live owner 是否仍存在。第三张表是 delivery/recovery：deliveryStatus、pending queue、session recovery claim、tombstone 与 receipt。若 schedule 没 fire，查 Gateway/cron/activeHours/busy guard；run 没结束，查 runtime owner 与 timeout；run succeeded 但没消息，查 delivery route 与 blocked completion；restart 后重复，则查 dispatch/idempotency/receipt，而不是先加更多 retry。</p>
+      <p>第一类记录看定时：Job 是否启用、nextRunAt、时区与 lastRunStatus。第二类记录看执行：Task 或 Runtime 处于 queued、running 还是 terminal，以及对应进程是否仍在运行。第三类记录看投递与恢复：deliveryStatus、待发队列、Session 恢复声明、tombstone 与回执。定时没有触发时，查 Gateway、Cron 开关、activeHours 与忙碌保护；运行没有结束时，查对应进程与超时；执行成功却没有消息时，查投递路由与被阻塞的完成事件；重启后重复发送时，查 dispatch ID、幂等键与回执，不要先增加重试次数。</p>
 
-      <h2>二十、把八篇收束成一个 Runtime 模型</h2>
+      <h3>4.3 用八条规则串起整个 Runtime</h3>
       <ol>
-        <li><strong>消息先经过 Gateway 与 routing。</strong>身份、binding 与 sessionKey 决定所有者。</li>
-        <li><strong>Session lane 决定时间顺序。</strong>steer、followup、interrupt 与 child tree 都不能跳过 ownership。</li>
-        <li><strong>Context 是本轮投影。</strong>workspace、transcript、memory 与 compaction 各有持久边界。</li>
-        <li><strong>能力按 turn 装配。</strong>skill 是指导，tool/plugin/hook 才进入可执行面。</li>
+        <li><strong>消息先经过 Gateway 与 Routing。</strong>身份、Binding 与 sessionKey 决定消息进入哪段会话。</li>
+        <li><strong>Session Lane 决定执行顺序。</strong>Steer、Followup、Interrupt 与子任务都要排进对应队列。</li>
+        <li><strong>每轮 Context 都重新组装。</strong>Workspace、Transcript、Memory 与 Compaction 分别提供不同信息。</li>
+        <li><strong>能力按 Turn 装配。</strong>Skill 提供指导，Tool、Plugin 与 Hook 才能直接参与执行。</li>
         <li><strong>安全来自多层交集。</strong>policy、sandbox、approval、elevated 分别回答不同问题。</li>
-        <li><strong>委派只向下收窄。</strong>child 获得任务契约，parent 保留最终交付。</li>
-        <li><strong>常驻靠 durable owner。</strong>schedule、run、task、delivery 与 recovery claim 各自持有事实。</li>
-        <li><strong>恢复必须有界。</strong>安全可续才 resume，结果不明就 fail closed，重复失败就 tombstone/disable。</li>
+        <li><strong>委派只向下收窄。</strong>Child 获得明确任务与较少权限，Parent 仍负责最终交付。</li>
+        <li><strong>跨时间工作依赖持久记录。</strong>Schedule、Run、Task、Delivery 与 Recovery Claim 分别记录触发、执行和发送状态。</li>
+        <li><strong>恢复必须有上限。</strong>能证明安全才续跑，结果不明就停止自动重放，重复失败则 tombstone 或 disable。</li>
       </ol>
-      <p>至此，OpenClaw 不再只是“Channel → Model → Reply”的聊天壳。它是一套以 Gateway 为控制平面、以 session 为会话所有权、以 policy 为权限上界、以 SQLite 状态和幂等 receipt 穿越时间的 Agent runtime。阅读任何新功能时，都可以继续问同一组问题：谁拥有入口，谁拥有状态，谁能产生副作用，谁证明完成，进程消失后又凭什么继续。</p>
+      <p>至此，OpenClaw 不再只是“Channel → Model → Reply”的聊天壳。Gateway 接收并路由消息，Session 保存对话，Policy 限制权限，SQLite 状态与可去重的发送回执让工作穿越重启。阅读任何新功能时，都可以继续问同一组问题：入口由谁处理，状态写在哪里，哪个动作会影响外部系统，完成由什么记录证明，进程消失后又根据什么继续。</p>
 
       <h2 id="sources">参考源码与文档</h2>
       <ul>
