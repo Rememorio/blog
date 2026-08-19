@@ -42,6 +42,47 @@ Rememorio articles.
 An article must be self-contained. A reader should not need any prior chat,
 private notes, or hidden prompt context to understand the argument.
 
+### Reader-Facing Language Gate
+
+Use compact engineering labels to reason, but translate them before they reach
+public prose. For every important sentence, make sure a reader can identify:
+
+1. who or which component acts;
+2. what it reads, changes, stores, sends, or rejects;
+3. the condition that makes the action happen;
+4. the observable effect on data, state, latency, cost, or the user;
+5. whether the statement comes from official documentation, verified source,
+   an experiment, or bounded inference.
+
+Terms such as `owner`, `boundary`, `contract`, `surface`, `projection`,
+`model view`, `gate`, `admission`, `ledger`, and Chinese shorthand such as
+`治理`, `链路`, `闭环`, `沉淀`, `收口`, `承载`, `证据链`, `抓手`, or `兜底`
+are rewrite triggers, not forbidden words. Keep them when they are exact source
+identifiers, provider terms, or the clearest stable concept. Otherwise name the
+concrete actor and action. For example, prefer “the session store writes the
+user message before the model call” over “the runtime closes the persistence
+loop,” and prefer “the client rereads current state after an event gap” over
+“the control plane restores the projection boundary.”
+
+Do not invent an intermediate vocabulary merely to avoid English. A precise
+source term is better than a vague Chinese abstraction, but a plain sentence is
+better than either when it can describe the behavior exactly. At first use,
+teach the behavior before attaching the formal name.
+
+Use contrast deliberately. A heading shaped as “X is not Y” is useful when it
+corrects a real, likely misreading; repeated contrast headings make an article
+read like a list of rebuttals. Prefer headings that state the action, decision,
+or reader question directly. Avoid repeated “not ... but ...” sentences,
+scripted questions followed by corrections, and three-part strings of abstract
+nouns.
+
+A paragraph should usually complete one small explanation: carry forward the
+current question, state the mechanism, show a concrete behavior or consequence,
+then establish the limit or transition. Separate the normal path, the condition
+that changes it, and production observation when they answer different reader
+questions. Lists and tables compress strict parallel relationships; they should
+not replace explanatory prose.
+
 Preferred flow:
 
 1. Start with the practical problem and why it matters.
@@ -159,7 +200,7 @@ self-evolution, maintenance jobs, or any other side path, make the flow
 complete enough for a new reader to replay:
 
 - why the foreground path cannot do this work inline;
-- who triggers the side path and which gate or counter must fire;
+- who triggers the side path and which condition or counter starts it;
 - what input snapshot the side path sees;
 - what it is allowed to read, write, or call;
 - what it is explicitly not allowed to touch;
@@ -167,8 +208,9 @@ complete enough for a new reader to replay:
 - where successful output is stored;
 - when later turns can observe the result.
 
-Define stage names by owner, visibility, and time instead of assuming the
-domain vocabulary is self-explanatory. This applies to labels such as
+Define stage names by who may read or change the unit, when that happens, and
+what advances it instead of assuming the domain vocabulary is
+self-explanatory. This applies to labels such as
 `train / validation / holdout`, `draft / staged / committed`, or
 `active / stale / archived`. State what each stage may read, change, or decide
 and what event advances the unit. When the mechanism claims a fair comparison
@@ -181,20 +223,20 @@ source names. The table should explain the product-level event first, then link
 the source mechanism that implements it.
 
 For multi-mechanism sections, do not leave the reader with only a taxonomy.
-Convert mechanism lists into pressure-and-invariant tables when useful:
+Convert mechanism lists into pressure-and-decision tables when useful:
 
 ```text
 pressure source
 -> why the simpler approach fails
 -> chosen mechanism
--> invariant protected
--> failure boundary
+-> property the mechanism must preserve
+-> condition where the claim stops
 ```
 
 For framework overviews and framework source readings, a requested focus
 changes depth, not the reader's need for a system map. Before the focused deep
-dive, follow one representative run across the major owners that actually
-exist: entry and run loop, model/provider adapter, tools and side effects,
+dive, follow one representative run across the major runtime components that
+actually act: entry and run loop, model/provider adapter, tools and side effects,
 graph/delegation, session/context/memory/artifacts, streaming/UI/remote
 protocols, and recovery/observability/evolution. Do not force absent layers or
 turn this map into a feature brochure. Select the mechanisms that materially
@@ -214,7 +256,7 @@ as a closed evidence loop:
 execute
 -> observe a concrete result or trace
 -> explain the failure or pressure
--> change a named owner or component
+-> change a named component or stored record
 -> rerun under comparable conditions
 -> retain only verified improvement
 ```
@@ -224,8 +266,8 @@ An explanation without the rerun is a hypothesis, not a demonstrated change.
 Treat dense identifier runs as a comprehension failure, not as proof of source
 depth. A paragraph that introduces roughly five or more fields, functions,
 types, or modules in sequence should trigger a rewrite: group them under `3` to
-`5` reader questions, owners, or lifecycle steps; explain the group through a
-small scenario or shape; move exhaustive names to a compact table or
+`5` reader questions, responsibilities, or lifecycle steps; explain the group
+through a small scenario or shape; move exhaustive names to a compact table or
 `details`; and place source links after the reader understands why the names
 matter.
 
@@ -235,11 +277,12 @@ that would fail, the cost of the chosen approach, and the boundary where the
 claim stops. Integrate this reasoning into the prose; never announce process
 phrases such as "using critical thinking" or explain the editorial intent.
 
-For source-heavy runtime articles, keep a small invariant ledger in the
-writer's head and let it shape the text:
+For source-heavy runtime articles, keep a private fact checklist and let it
+shape the text without copying its shorthand into public prose:
 
-- What is the owner of this state: model view, UI, durable storage, telemetry,
-  provider cache, or resume reconstruction?
+- Which component creates, reads, changes, persists, or reconstructs this
+  state: the UI, request builder, durable store, telemetry path, provider cache,
+  or recovery code?
 - What must remain stable for caching, recovery, or user trust?
 - What is allowed to be lossy, summarized, truncated, projected, or regenerated?
 - What breaks if the mechanism is removed or moved later in the pipeline?
@@ -257,10 +300,11 @@ final caveats section to connect the cases.
 
 For long source articles, prefer ending with a transferable decision table or
 rule set. It should map content state to runtime handling and the invariant
-protected, so readers can apply the article beyond the named products.
+that must remain true, so readers can apply the article beyond the named
+products.
 
 When a system claims an output is better or ready for use, end with an
-acceptance gate rather than the system's preferred success signal alone.
+acceptance decision rather than the system's preferred success signal alone.
 Check the intended outcome, critical regressions, cost and latency, replay or
 recovery, rollback, and the human or automated authority that may adopt the
 change. Keep "output produced," "output validated," and "output adopted" as
@@ -268,7 +312,7 @@ separate states throughout the article.
 
 For a new source-reading series, the first public chapter should normally build
 the technical route before drilling into a single mechanism. Follow one
-representative request, turn, job, or runtime cycle across the major owners:
+representative request, turn, job, or runtime cycle across the major actors:
 entry point, request or queue boundary, model-visible view, tool or side-effect
 gate, durable record, recovery path, and the later chapters each layer will
 own. A narrow mechanism such as context management, prompt caching, tools, or
@@ -305,6 +349,13 @@ For multi-stage sections, also ask whether the reader can state what one
 representative unit contains, where it came from, which owners can see or
 change it, what advances it between stages, and which observable output is
 different at the end.
+Classify findings by consequence: `P0` for factual, evidence, rendering, or
+publication failures; `P1` for missing definitions, broken sequence, ambiguous
+state changes, or other obstacles that prevent a reader from replaying the
+mechanism; and `P2` for optional rhythm, wording, or layout polish. For each
+finding, name the location, explain the reader consequence, and propose a
+direct repair. Do not manufacture findings to fill every level.
+
 Prioritize gaps that block this replay over sentence-level polish. If the user
 explicitly authorizes a subagent or outside reader, use it only for this bounded
 feedback. The subagent should not edit files; it should return prioritized
@@ -344,8 +395,8 @@ owns compatibility.
   JSON fragments before adding a new diagram. Add a figure only when the
   ownership boundary, lifecycle, or recovery path remains hard to see.
 - For source walkthroughs, include short source-shaped snippets when the prose
-  depends on a state transition. Prefer excerpts that show the owner, key
-  fields, and handoff point, such as `namespace + key + value`,
+  depends on a state transition. Prefer excerpts that show the acting
+  component, key fields, and handoff point, such as `namespace + key + value`,
   `tool_call_id + result_ref`, `resolved / invalidated / new`, or
   `static profile + dynamic search results`. Link the full source, show only
   fields that carry the mechanism, and explain immediately what changed. Do not
@@ -400,8 +451,8 @@ add a compact reading contract before changing deep prose:
   tells readers which system layers to visit first.
 - Chapters and reference pages should include a brief "Reading Contract" or
   "阅读契约" near the top, after the title and any hero visual.
-- The contract should name the page's main question, the owners or boundaries
-  to track, and the check a reader should be able to answer afterward.
+- The contract should name the page's main question, the actors, records, or
+  limits to track, and the check a reader should be able to answer afterward.
 - Keep these contracts local to the page, source-safe, and localized; do not
   include editing process notes or private rationale.
 
@@ -422,8 +473,8 @@ Use the exemplar as a practical bar for new or revised articles:
   verified source, and bounded inference should be visibly separated without
   exposing process notes.
 - It introduces provider or platform contracts before interpreting source code.
-- It separates UI view, durable storage, and model-visible/runtime view when
-  those surfaces diverge.
+- It separates what the UI shows, what durable storage keeps, and what the
+  model receives when those representations diverge.
 - It uses h2 sections as major argument turns, h3 sections as mechanisms, and
   h4 sections for local implementation steps.
 - It renders a nested sticky table of contents from h2/h3/h4 headings so the
@@ -434,8 +485,8 @@ Use the exemplar as a practical bar for new or revised articles:
   paths, usernames, private branches, private transcript details, hidden
   prompts, or editing instructions.
 - It uses figures as mechanism explanations, not decoration. A good figure
-  teaches one ownership boundary, lifecycle, request shape, recovery path, or
-  comparison.
+  teaches who may change a record, a lifecycle, request shape, recovery path,
+  or comparison.
 - It closes by compressing the system into transferable rules and common
   misreadings.
 
@@ -577,8 +628,9 @@ When explaining source code:
   imply sequencing or integration that the verified call path does not perform.
 - If a mechanism exists only through surrounding contracts, say so in prose and
   keep the figure abstract.
-- Prefer "model-visible view" and "runtime projection" language when UI,
-  storage, and API request history diverge.
+- When UI, storage, and API request history diverge, first state concretely what
+  each one contains. A stable term such as "model-visible view" may then name
+  the exact request representation without repeating the full explanation.
 
 Classify every source-level claim before making it sound certain:
 
@@ -816,10 +868,12 @@ The linked target must be at the same abstraction level as the linked words.
   by the products or docs, use the English term directly in a Chinese article.
   Add a Chinese gloss only when it improves comprehension, and do not repeat the
   gloss after the first mention.
-- Do not mechanically add Chinese parenthetical glosses for mature technical
-  terms such as `runtime`, `provider contract`, `owner`, `projection`, or
-  `ledger`. Use the English term directly when it is clearer and already
-  carries the engineering meaning.
+- Do not mechanically add Chinese parenthetical glosses for established source
+  or industry terms. Keep `runtime`, API field names, protocol names, and exact
+  source identifiers when translation would be less precise. Do not treat
+  writer shorthand such as `owner`, `surface`, `projection`, `gate`, or `ledger`
+  as automatically reader-facing: use it only after the article has shown the
+  component, action, record, and lifetime it names.
 - Keep reader-facing terminology consistent across title, guiding questions,
   headings, alt text, captions, and conclusion. If the article chooses a local
   Chinese term such as `自进化`, use it consistently for the concept; reserve
