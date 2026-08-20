@@ -1021,8 +1021,19 @@ sample. Choose one exposure mode per series and keep it consistent:
   reading order; follow the established home chronology, usually newest first.
 - In series-level mode, expose one landing card and no stray individual chapter
   card. Do not silently mix series-level and chapter-level modes.
-- Treat topic shortcuts as navigation only. A shortcut to the series index does
-  not prove that the article-card inventory is complete.
+- Treat topic shortcuts as navigation only. Every shortcut in a series or topic
+  shelf must open a dedicated landing page that explains the route and lists
+  the published chapters; it must not open a chapter or long-form article
+  directly. A shortcut to the series index does not prove that the article-card
+  inventory is complete.
+- Reserve each series language root for that landing role. If the first chapter
+  currently occupies the language root, preserve the article under an explicit
+  chapter slug and replace the root with the route page. Update canonicals,
+  language siblings, home cards, series cards, previous/next links, assets, and
+  route-map references as one navigation graph.
+- Keep standalone articles in the post inventory rather than the series shortcut
+  shelf. Add them to a shortcut shelf only after a real topic landing page
+  exists for that destination.
 - When the home hero represents the newest chapter, update its visible cover
   and `og:image` together. If it deliberately represents the stable series
   overview instead, keep both surfaces aligned to that identity.

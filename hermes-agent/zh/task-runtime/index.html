@@ -1,0 +1,634 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hermes Agent：一轮任务如何运行，并把经验留给以后</title>
+    <meta
+      name="description"
+      content="从长时间运行 agent 的上下文压力出发，解释 Hermes Agent 如何组织一轮任务、模型材料、真实历史、长期状态与多个任务入口。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Hermes Agent：一轮任务如何运行，并把经验留给以后" />
+    <meta
+      property="og:description"
+      content="从一个 agent 为什么会越跑越乱开始，逐步读懂 Hermes Agent 如何运行一轮任务、保存真实历史、筛选长期经验并处理不同入口。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/hermes-banner.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/hermes-agent/zh/task-runtime/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/hermes-agent/zh/task-runtime/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/hermes-agent/en/task-runtime/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/hermes-agent/" />
+    <link rel="stylesheet" href="../../styles.css?v=hermes-series-4" />
+  <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Hermes Agent</a>
+        <a href="../instruction-state/">下一篇</a>
+        <a href="../../../zh/#posts">文章目录</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/task-runtime/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">源码阅读</p>
+            <h1>Hermes Agent：一轮任务如何运行，并把经验留给以后</h1>
+            <p class="lead">
+              一个 agent 真正难的不是回答第一句话，而是在几十轮工具调用、失败重试、历史搜索、记忆更新和后台维护之后，
+              仍然知道什么该给模型看、什么该落盘、什么值得保留成长期能力。Hermes Agent 的源码正好把整个过程摊开了。
+            </p>
+            <div class="meta-line">
+              <span>系列 1 / 7</span>
+              <span>源码快照：fa1a5c0</span>
+              <span>主题：agent runtime</span>
+              <span>范围：公开源码可见行为</span>
+            </div>
+            <nav class="series-strip" aria-label="Hermes Agent 系列">
+              <span class="series-current"><strong>01</strong> 任务运行：一轮任务如何完成，并把经验留给以后</span>
+              <a href="../instruction-state/"><strong>02</strong> 信息放置：一条信息究竟该放在哪</a>
+              <a href="../runtime-learning/"><strong>03</strong> 后台学习：为什么交付以后才开始自进化</a>
+              <a href="../learn-journey/"><strong>04</strong> 技能生成：一条 /learn 请求怎样变成 Skill</a>
+              <a href="../evaluation-dataset/"><strong>05</strong> 数据分工：训练、验证与留出怎样配合</a>
+              <a href="../self-evolution/"><strong>06</strong> 技能改写：DSPy 与 GEPA 怎样更新 Skill</a>
+              <a href="../verification-adoption/"><strong>07</strong> 完成交付：代码改完之后还要检查什么</a>
+            </nav>
+            <figure class="hero-image">
+              <img
+                src="../assets/hermes-banner.png"
+                alt="Hermes Agent 运行过程总览图，展示 AIAgent 核心、任务入口、状态存储和后台学习路径"
+              />
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <p>
+              先从一个很普通的使用场景开始。你让一个 agent 在仓库里改一个功能：它先读 README 和项目规则，
+              然后搜代码、改文件、跑测试。测试失败后，它查看日志、补一个极端情况的测试，又跑了一轮。中途你告诉它，
+              “以后这个项目里不要直接改生成文件”；过了一会儿，你又问它能不能把刚才失败的命令找回来。
+            </p>
+
+            <p>
+              如果这只是一个短聊天，最简单的做法是把所有消息都追加到 history，再把整段 history 送给模型。
+              但一个会长期运行的 agent 很快会撞上四个问题：history 会膨胀，工具输出会淹没真正的任务，
+              用户偏好和一次性失败会混在一起，多入口运行时还会出现“CLI 里记得，网关里忘了，cron 里又不能问人”的断裂。
+            </p>
+
+            <p>
+              可以先把 Hermes Agent 理解成<strong>包在模型外面的一套任务运行系统</strong>。模型负责判断下一步该做什么；工具负责真正读取文件、修改代码、运行命令；
+              Hermes 负责把用户要求、项目规则和工具结果组织成一轮可以继续、可以恢复、也可以追溯的工作。这里说的“运行时”，就是这层负责协调模型、工具和状态的程序。
+            </p>
+
+            <p>
+              Hermes Agent 在
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/README.md#L18-L29">README 的功能地图</a>
+              里把自己描述成 self-improving agent：它既能在终端和消息入口里工作，也能执行定时任务、把工作交给子任务，并从完成的任务里保留经验。
+              这些能力都在回答同一个更朴素的问题：一个 agent 该怎样让“当前任务”“真实历史”“长期知识”和“后台学习”各自待在正确的位置？
+            </p>
+
+            <div class="note">
+              <p>
+                <strong>阅读目标。</strong>
+                全文只跟踪同一个“修复失败测试”的任务。读完后，你应该能用自己的话复述：一轮从哪里开始、在哪里结束；模型与工具怎样来回接力；
+                为什么原始记录和本轮工作副本必须分开；以及后续六篇会沿着哪些交接点继续深挖。
+              </p>
+            </div>
+
+            <p>
+              <strong>取材范围。</strong>本文只使用公开 README、配置文件和固定源码快照。直接事实来自文中的源码链接；设计意图只在实际调用、
+              数据形状和源码注释能够支撑的范围内推断。README 是功能地图，具体机制以源码为准。例如 <code>session_search</code> 在当前快照中走
+              SQLite/FTS5 并返回真实消息，工具内部没有再调用一次模型。
+            </p>
+
+            <p>
+              接下来先不急着讨论“自进化”。这一篇只负责看清一句用户要求经过哪些位置，再完整走完一轮任务；长期规则、历史和后台学习会在后续篇章分别展开。
+              当这条主线连起来，Hermes 的“自进化”就不再像一个抽象口号，而是一套信息管理规则：先交付当前任务，
+              再把可复用的东西写进合适的存储；下一轮需要时再按来源、寿命和风险拿回来。
+            </p>
+
+            <h2>一、同一句话为什么要经过四个位置</h2>
+            <p>
+              继续沿用开头那句话：“以后这个项目里不要直接改生成文件。”它看起来只是一条用户消息，但 agent 要把它用好，
+              至少要让它经过四个位置。先别记源码名，我们只看这句话在每个位置承担什么职责。
+            </p>
+
+            <p>
+              第一站是<strong>门口</strong>。这句话可能来自终端，也可能来自网关或定时任务。门口只负责接住任务，并把它交给同一套回合流程；
+              如果每个入口都自己拼规则、自己保存历史，那么同一个 agent 很快就会在不同入口表现得像几个互不认识的助手。
+            </p>
+
+            <p>
+              第二站是<strong>本轮工作台</strong>。真正调用模型前，runtime 会把用户原话和项目规则、可用工具、这次临时召回的材料放在一起，
+              形成一份只服务当前推理的工作副本。模型需要看见“不要改生成文件”，也可能需要看见“哪些文件由生成器产出”；
+              但后者是 runtime 临时补充的材料，不能伪装成用户亲口说过的话。
+            </p>
+
+            <p>
+              第三站是<strong>档案</strong>。用户原话、agent 的回答、真实工具调用和结果都要按发生顺序保存。以后用户问“我当时到底怎么说的”，
+              系统应该能找到原始证据，而不是只剩一句模型总结。档案还必须尽早写入，不能等任务完全成功后才补记。
+            </p>
+
+            <p>
+              第四站才是<strong>以后还会用到的经验</strong>。当前任务交付后，后台流程可以判断这句话是不是稳定偏好，是否值得写入长期状态；
+              如果它只是本次任务的临时要求，就什么也不写。换句话说，收到一句话、让模型本轮看见它、保存它真实发生过、决定以后是否沿用，
+              是四个先后相连但不能合并的动作。
+            </p>
+
+            <p>
+              现在再给这四个位置加上源码里的名字：门口在源码中叫 <strong>entry surface</strong>，也就是任务入口；本轮工作台是<strong>模型 view</strong>，
+              档案是<strong>真实 transcript</strong>，交付后提炼经验的动作是<strong>后台 review</strong>，结果才可能进入长期状态。<code>AIAgent</code> 站在中间，
+              是因为不同入口最终都要回到同一条回合生命周期，而不是各自维护一套大脑。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>位置</th>
+                    <th>刚才例子里的职责</th>
+                    <th>典型失败</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>任务入口</td>
+                    <td>从终端、网关、定时任务或子任务接住用户要求。</td>
+                    <td>每个入口自己拼上下文，行为很快分叉。</td>
+                  </tr>
+                  <tr>
+                    <td>模型 view</td>
+                    <td>把用户原话和本轮需要的规则、工具、临时材料组装成工作副本。</td>
+                    <td>把临时召回、时间、工具输出塞进稳定前缀，缓存和判断都会抖。</td>
+                  </tr>
+                  <tr>
+                    <td>真实 transcript</td>
+                    <td>按发生顺序保存用户原话、回答、工具调用和工具结果。</td>
+                    <td>只靠摘要恢复，丢掉以后排查需要的原始证据。</td>
+                  </tr>
+                  <tr>
+                    <td>后台 review</td>
+                    <td>交付后再决定哪些小事实或流程值得在未来继续使用。</td>
+                    <td>把一次性任务状态硬化成长期规则，下一次反而误导模型。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+
+            <p>
+              这张表只是把刚才的流程压缩成速查。这里先按职责拆开“保存原始证据”和“交付后提炼经验”；下一篇再把它们分别放回
+              SessionDB、Memory 和 Skills。开头总览图里最重要的也不是节点数量，而是方向：入口不直接写长期知识，后台 review 不抢前台回答。
+            </p>
+
+            <h2>二、跟着一次修复任务走完一轮</h2>
+            <p>
+              现在把开头的任务真正跑一次。你说“修复这个失败测试”，Hermes 最终回答“已修改两个文件，测试通过”。从收到这条用户消息到交付这段回答，
+              叫作一个 <strong>turn</strong>，也就是一轮。<strong>一轮不等于一次模型调用</strong>：为了完成任务，模型可能先要求读文件，看到结果后再要求改代码，
+              跑完测试后还可能根据错误继续修改。Hermes 要负责的是整段生命周期，而不是其中某一次思考。
+            </p>
+
+            <p>
+              最简单的实现会等一切成功后再保存历史，但模型报错、工具卡住或进程退出都可能让整轮消失。因此 Hermes 把一轮拆成四个容易检查的阶段：
+              先接住并保存任务，再准备模型本轮看到的材料，然后让模型和工具接力，最后交付回答并分发状态。下面逐段走。
+            </p>
+
+            <h3>2.1 接住任务：先建立本轮工作台，再保存用户原话</h3>
+            <p>
+              用户消息到达后，Hermes 先建立一份“本轮工作台”。它找回之前的会话、确定当前项目规则和可用工具、给这一轮分配标识，
+              同时把用户刚说的原话尽早写入持久化记录。这样即使后面的模型调用失败，系统仍然知道用户要求过什么，也能从这里恢复。
+            </p>
+
+            <p>
+              概念清楚后再看源码名：前台入口是
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/conversation_loop.py#L1358-L1435"><code>run_conversation</code></a>，
+              每轮准备工作集中在 <code>build_turn_context</code>。它返回的
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_context.py#L315-L382"><code>TurnContext</code></a>
+              装着这一轮后续要用的消息、system prompt、任务标识和预取材料；
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/run_agent.py#L1896-L1980"><code>_persist_session</code></a>
+              则让“回答成功”不再是保存用户原话的前提。
+            </p>
+
+            <h3>2.2 准备第一次模型调用：从档案复制出工作副本</h3>
+            <p>
+              真实档案不能直接等同于模型这一次要看的材料。修测试时，档案里保存用户原话和已经发生的操作；但模型做当前判断时，还可能临时需要
+              “这个仓库的生成文件清单”或插件补充的项目提示。Hermes 因此从真实消息复制出一份本轮工作副本，再把这些临时材料贴到副本上。
+            </p>
+
+            <p>
+              这份工作副本就是<strong>模型 view</strong>，真实档案就是 <strong>transcript</strong>。Hermes 在进入 provider 前复制 messages，
+              把外部 memory 预取和插件上下文只加到当前用户消息的 API 副本，不改原始列表。对应过程见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_context.py#L53-L88"><code>compose_user_api_content</code></a>。
+              如果省掉这次复制，下一轮就无法分清哪些话来自用户，哪些只是 runtime 为上一次判断临时补充的材料。
+            </p>
+
+            <h3>2.3 模型和工具怎样来回接力</h3>
+            <p>
+              准备好第一次请求后，Hermes 才调用模型。模型本身不会直接打开文件或运行测试；它返回的是“请调用哪个工具、传入什么参数”。
+              Hermes 检查并执行这个请求，把成功结果或错误结果按原顺序追加到本轮消息里，再把更新后的工作副本交给模型。模型据此决定下一步：
+              继续调用工具，或者材料已经足够，给出最终回答。
+            </p>
+
+            <p>
+              因此，一轮内部其实是一个可能重复多次的小循环。源码里的主循环从
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/conversation_loop.py#L1540-L1555"><code>while</code> 回合预算</a>
+              开始；工具执行层负责真正运行调用，并把结果按模型请求的顺序放回 messages，这个顺序保证可从
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/tool_executor.py#L751-L820"><code>tool_executor.py</code></a>
+              看到。把它翻译成开头那个任务，就是：
+            </p>
+
+            <pre><code class="language-text">用户：修复这个失败测试
+Hermes：保存原话，准备项目规则和可用工具
+模型：请读取测试文件和相关实现
+Hermes：执行读取，把结果记回本轮
+模型：请修改实现并运行测试
+Hermes：执行修改和测试，把成功或错误记回本轮
+模型：材料足够，给出最终回答</code></pre>
+
+            <figure class="figure">
+              <img
+                src="../assets/turn-loop.png"
+                alt="Hermes 前台回合图，展示用户消息先建立上下文并持久化，再由模型和工具循环接力，最后完成回答、同步状态并按条件触发 review"
+              />
+              <figcaption>
+                图里的 Model 与 Tools 之间可以往返多次；整条从用户输入到最终回答的可恢复流程，才是一轮。
+              </figcaption>
+            </figure>
+
+            <h3>2.4 回答交付后：finalizer 才开始分发状态</h3>
+            <p>
+              当模型返回最终回答，前台任务可以交付，但 Hermes 还要收尾：确认返回给用户的内容，整理这一轮的真实消息，
+              同步外部状态，并检查是否达到后台 review 的触发条件。这个收尾者叫作
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_finalizer.py#L69-L130">finalizer</a>。
+              review 即使触发，也拿消息快照在回答之后运行；它不回头改变用户已经收到的结果。
+            </p>
+
+            <p>
+              这里还要分清最后两个动作。“同步状态”是把已经完成的回合送到会话存储或外部 memory provider，保证以后能恢复和检索；
+              “启动 review”才是另开一条后台路径，判断其中有没有值得长期保留的经验，而且允许最后什么也不写。前者保存发生过的事，后者筛选未来可能复用的东西。
+            </p>
+
+            <p>
+              现在可以完整复述一轮了：<strong>接住并保存用户消息 → 组装模型工作副本 → 模型与工具反复接力 → 交付最终回答 → 同步状态并按条件复盘</strong>。
+              后面六篇都只是把这条路线上的一个交接点放大：下一篇先拆开 system prompt、Context、Memory、SessionDB 与 Skill；
+              第三篇再追踪交付后的 review、nudge 与 Curator；第四篇看 <code>/learn</code> 怎样主动生成 Skill；最后三篇才进入评测集、GEPA 和采用门。
+              先有整轮路线，后面的源码名才不会突然从半空落下来。
+            </p>
+
+            <h2>三、工具调用不是模型的私事</h2>
+            <p>
+              一个 agent 能调用工具之后，风险也会跟着上来。读文件、写文件、跑命令、查 session、改 memory、spawn 子任务，
+              看起来都是 tool call，但它们的 owner 不一样。有些只是普通函数；有些必须由 runtime 持有状态；有些还会带来副作用和恢复问题。
+            </p>
+
+            <p>
+              Hermes 的工具执行器先区分并发和顺序路径。
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/tool_executor.py#L751-L900"><code>execute_tool_calls_concurrent</code></a>
+              支持多个工具并发执行并保持原始 tool-call 顺序追加结果；
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/tool_executor.py#L1596-L1705">顺序路径</a>
+              则处理交互类或需要更严格控制的工具。
+            </p>
+
+            <p>
+              更关键的是 runtime-owned 工具的分派：<code>session_search</code> 要拿 session DB，<code>memory</code> 要调用内置 memory store 并通知外部 provider，
+              <code>delegate_task</code> 要交给 agent 自己的 delegation dispatcher。这些分派在
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/tool_executor.py#L1742-L1911"><code>tool_executor.py</code></a>。
+              也就是说，模型可以请求工具，但工具使用哪份状态、怎样审计、出错后怎样恢复，仍然由 runtime 决定。
+            </p>
+
+            <p>
+              把 middleware、计时和展示代码拿掉，三个分支的差别会更直观：
+            </p>
+
+            <pre><code class="language-python">if function_name == "session_search":
+    db = agent._get_session_db_for_recall()
+    result = session_search(..., db=db)
+elif function_name == "memory":
+    result = memory_tool(..., store=agent._memory_store)
+elif function_name == "delegate_task":
+    result = agent._dispatch_delegate_task(function_args)</code></pre>
+
+            <p>
+              模型给出的只有 <code>function_name</code> 和参数；当前 session 的数据库、真正的 memory store、父任务的 delegation dispatcher，
+              都是在执行层才绑定进去。这样一来，即使模型发出了格式正确的调用，也不能自行决定“读哪份历史”或“把经验写进哪个用户的长期状态”。
+            </p>
+
+            <p>
+              这一步和前面的存储选择是连在一起的：如果 memory 只是普通工具，模型可能把临时观察写成长期事实；
+              如果 session_search 不知道 session DB，模型就只能靠摘要猜过去发生了什么；如果 delegation 不是 runtime-owned，父子上下文很容易互相污染。
+            </p>
+
+            <h2>四、多入口共享核心，但不能共享所有权限</h2>
+            <p>
+              到这里，我们已经能理解单个前台回合。接下来要看多入口运行。Hermes 不只是一个 CLI；README 和源码里还有 gateway、cron、delegation。
+              如果每个入口都自己实现一套 agent loop，信息管理很快会崩掉：gateway 里的平台上下文、cron 的非交互限制、子 agent 的隔离规则，
+              都会变成互相不一致的特殊逻辑。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../assets/runtime-surfaces.png"
+                alt="Hermes 多入口运行面图，展示 CLI/TUI、Gateway、Cron、Subagents、Curator 共同连接 AIAgent core 和 SessionDB、Memory/Skills"
+              />
+              <figcaption>
+                多入口不是多套 agent。入口只改变上下文、可用工具和交付方式，核心回合循环保持一致。
+              </figcaption>
+            </figure>
+
+            <h3>4.1 Gateway：把平台信息放进 prompt 的固定位置</h3>
+            <p>
+              gateway 的任务不是简单把 Slack 或其他平台消息转发给模型。它要告诉 agent 消息来自哪里、有哪些 connected platforms、
+              home channels 和 delivery targets。数据结构在
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/gateway/session.py#L314-L380"><code>SessionContext</code></a>，
+              渲染成 system prompt 段的逻辑在
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/gateway/session.py#L479-L560"><code>build_session_context_prompt</code></a>。
+            </p>
+
+            <p>
+              前台消息处理时，gateway 会按 session key 复用或新建 AIAgent，构造参数里包含 model、runtime、toolsets、platform、user/chat/thread 信息和 session DB；见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/gateway/run.py#L19756-L19787">agent 构造段</a>。
+              最终仍然调用
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/gateway/run.py#L19788-L19810"><code>agent.run_conversation</code></a>。
+            </p>
+
+            <h3>4.2 Cron：非交互入口必须更窄</h3>
+            <p>
+              cron 的压力不同：它在没有用户实时互动的情况下运行。它不能随便澄清问题，也不能打开 messaging 或再次创建 cronjob。
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/cron/scheduler.py#L165-L210"><code>_resolve_cron_disabled_toolsets</code></a>
+              明确让 cron-spawned agent 禁用 <code>cronjob</code>、<code>messaging</code>、<code>clarify</code> 三类 toolset，再叠加用户配置的 disabled toolsets。
+            </p>
+
+            <p>
+              cron 还有一个 <code>no_agent</code> 路径：如果 job 不需要 agent，它完全不构造 AIAgent，只执行脚本并交付 stdout 或错误；见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/cron/scheduler.py#L3119-L3200"><code>run_job</code></a>。
+              如果走 agent，prompt 会在组装后再次扫描注入风险，尤其覆盖 runtime-loaded skill content 和脚本输出；见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/cron/scheduler.py#L2792-L2860"><code>_scan_assembled_cron_prompt</code></a>。
+            </p>
+
+            <h3>4.3 Delegation：子任务隔离，父任务只拿结果</h3>
+            <p>
+              delegation 解决的是另一种压力：父 agent 不应该把所有探索细节都塞进自己的上下文。<code>delegate_task</code> 的模块说明写明，
+              子 agent 有隔离上下文、受限 toolsets 和自己的 terminal session；父 agent 阻塞直到子任务完成，但父上下文只看到 delegation call
+              和摘要结果，不看到子 agent 的中间工具调用和 reasoning。见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/delegate_tool.py#L3-L17"><code>delegate_tool.py</code></a>。
+            </p>
+
+            <p>
+              子 agent 默认不能使用 <code>delegate_task</code>、<code>clarify</code>、<code>memory</code>、<code>send_message</code>、<code>execute_code</code>，
+              这在
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/delegate_tool.py#L49-L70"><code>DELEGATE_BLOCKED_TOOLS</code></a>
+              中定义。构造子 agent 时，还会 <code>skip_context_files=True</code>、<code>skip_memory=True</code>，并有独立 iteration budget；见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/delegate_tool.py#L1500-L1665">子 agent 角色、工具集与 AIAgent 构造段</a>。
+            </p>
+
+            <h2>五、最后回到那个问题：信息到底该放哪里？</h2>
+            <p>
+              读完这些机制，再回到一开始的使用场景：用户偏好、测试失败、工具输出、可复用流程、一次性任务进度，
+              都不是“随便记一下”。Hermes 的源码给出的真正答案，是先判断信息类型，再决定它写进哪种存储，以及什么时候让模型重新看到它。
+            </p>
+
+            <figure class="figure">
+              <img
+                src="../assets/decision-map.png"
+                alt="Hermes 信息放置决策图，展示 Fact、Past turn、Workflow 和 Task state 分别进入 Memory、SessionDB、Skill 或 Transcript"
+              />
+              <figcaption>
+                先判断信息的寿命和用途，再决定它进入 Memory、SessionDB、Skill 或只留在 transcript。
+              </figcaption>
+            </figure>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>看到的信息</th>
+                    <th>放哪里</th>
+                    <th>为什么</th>
+                    <th>放错会怎样</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>用户长期偏好、小型环境事实</td>
+                    <td>Memory</td>
+                    <td>小、稳定、可审计，适合作为会话快照进入 prompt。</td>
+                    <td>如果只留在 transcript，下次需要时可能找不到。</td>
+                  </tr>
+                  <tr>
+                    <td>过去某次工具输出、完整对话证据</td>
+                    <td>SessionDB / session_search</td>
+                    <td>需要保留真实消息窗口，而不是改写成总结。</td>
+                    <td>如果写进 memory，会把一次证据伪装成长期规则。</td>
+                  </tr>
+                  <tr>
+                    <td>以后同类任务可复用的方法</td>
+                    <td>Skills</td>
+                    <td>它是程序性记忆，需要索引、正文和 patch 语义。</td>
+                    <td>如果写成 memory，模型只知道结论，不知道流程。</td>
+                  </tr>
+                  <tr>
+                    <td>当前任务进度、临时失败、探索过程</td>
+                    <td>Transcript only</td>
+                    <td>它对恢复有用，但不应硬化成长期事实。</td>
+                    <td>如果过早保存成长期状态，下一次会被错误约束。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>5.1 四个常见误读</h3>
+            <p>
+              第一种误读，是把 memory 当成所有历史的归宿。Hermes 源码不是这么做的。Memory 有预算、扫描、冻结 snapshot 和手动语义；
+              session_search 才是查真实历史的工具。
+            </p>
+
+            <p>
+              第二种误读，是把 skills 当成“每次任务都创建一个经验条目”。技能系统强调 class-level、patch existing skill 和支持文件，
+              不是一轮一个窄技能。
+            </p>
+
+            <p>
+              第三种误读，是把 background review 想成主回答的一部分。finalizer 的触发位置说明它发生在 final response 之后；
+              gateway 也会排队 review summary，主响应交付后再释放。
+            </p>
+
+            <p>
+              第四种误读，是把 cron 当成普通聊天自动化。cron 禁用交互类工具、扫描组装 prompt，并且支持 no-agent 脚本路径。
+              非交互入口的默认假设必须更窄。
+            </p>
+
+            <h2>六、结论：自进化靠状态纪律，不靠“反思”这个词</h2>
+            <p>
+              Hermes Agent 的源码价值，不在于它给“自进化”起了多少功能名，而在于它把长期运行 agent 最容易混淆的几类状态拆开了：
+              当前 turn、模型 view、真实 transcript、小型 facts、可搜索历史、程序性 skills、后台 review、空闲 curator、多入口策略。
+            </p>
+
+            <p>
+              一个完全不懂 Hermes 的读者，读到这里只需要抓住一句话：agent 的长期能力不是把所有东西都记住，
+              而是知道每种信息什么时候该出现、该出现在模型看到的哪份材料里、结束后要不要长期保存。
+            </p>
+
+            <pre><code class="language-text">事实要小而可审计；
+证据留在 transcript；
+流程变成 skill；
+当前 turn 的 recall
+不污染稳定 prompt；
+后台学习发生在响应交付之后。</code></pre>
+
+            <p>
+              这也是 Hermes 最值得借鉴的地方：它没有把所有能力堆进一个越来越大的 prompt，而是明确哪段程序负责每种状态、状态保留多久，以及以后怎样恢复。
+              一个可长期运行的 agent，真正难的是让这些不同寿命的信息互不混淆。
+            </p>
+
+            <p>
+              不过，在讨论“怎样改进 Skill”以前，还要先回答一个更基础的问题：用户偏好、项目规则、历史证据和可复用流程为什么不能都写成 memory。
+              <a href="../instruction-state/">下一篇</a>继续沿用这个修复任务，把 system prompt、Context、Memory、SessionDB 与 Skill
+              一层一层放回负责它们的组件；只有知道改动落在哪里，后面的“进化”才知道自己究竟在改变什么。
+            </p>
+
+            <h2 id="sources">参考源码</h2>
+            <ul class="source-list">
+              <li><a href="https://github.com/NousResearch/hermes-agent/tree/fa1a5c0485a6a912517ef2ded76e39907aa26087">NousResearch/hermes-agent 固定源码快照</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/README.md#L18-L29">README 功能地图</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/conversation_loop.py#L1358-L1435">run_conversation 入口</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_context.py#L315-L382">TurnContext 与回合准备</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/tool_executor.py#L751-L900">并发工具执行与有序回填</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/tool_executor.py#L1742-L1911">runtime-owned 工具分派</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_finalizer.py#L707-L732">finalizer 的状态同步与 review 触发</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/gateway/session.py#L314-L380">gateway SessionContext</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/cron/scheduler.py#L165-L210">cron 禁用的工具集</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/delegate_tool.py#L3-L17">delegation 架构说明</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <p>Rememorio Blog</p>
+      <a href="#top">回到顶部</a>
+    </footer>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map((th) =>
+            th.textContent.trim()
+          );
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            Array.from(row.children).forEach((cell, index) => {
+              if (headers[index]) cell.dataset.label = headers[index];
+            });
+          });
+        });
+
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4"));
+        if (!headings.length) return;
+
+        const counts = new Map();
+        const slugify = (text) => {
+          const base = text
+            .toLowerCase()
+            .trim()
+            .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          return base || "section";
+        };
+
+        const list = document.createElement("ol");
+        list.className = "toc-list";
+        const links = [];
+        const lastItems = new Map();
+
+        const childListFor = (item) => {
+          let child = item.querySelector(":scope > ol");
+          if (!child) {
+            child = document.createElement("ol");
+            child.className = "toc-sublist";
+            item.appendChild(child);
+          }
+          return child;
+        };
+
+        const parentListFor = (level) => {
+          if (level === 2) return list;
+          if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3));
+          if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2));
+          return list;
+        };
+
+        headings.forEach((heading, index) => {
+          if (!heading.id) {
+            const text = heading.textContent.trim();
+            const base = slugify(text);
+            const seen = counts.get(base) || 0;
+            counts.set(base, seen + 1);
+            heading.id = seen === 0 ? base : `${base}-${seen + 1}`;
+          }
+
+          const level = Number(heading.tagName.slice(1));
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${heading.id}`;
+          link.textContent = heading.textContent.trim();
+          link.className = `toc-link toc-level-${level}`;
+          if (index === 0) link.classList.add("active");
+          item.appendChild(link);
+          parentListFor(level).appendChild(item);
+          lastItems.set(level, item);
+          if (level <= 2) lastItems.delete(3);
+          if (level <= 3) lastItems.delete(4);
+          links.push(link);
+        });
+
+        toc.appendChild(list);
+
+        const activate = (id) => {
+          links.forEach((link) => {
+            link.classList.toggle("active", link.getAttribute("href") === `#${id}`);
+          });
+        };
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+            if (visible[0]) activate(visible[0].target.id);
+          },
+          { rootMargin: "-20% 0px -72% 0px", threshold: 0 }
+        );
+
+        headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+  <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>
