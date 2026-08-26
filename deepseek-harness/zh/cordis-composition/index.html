@@ -1,0 +1,101 @@
+<!doctype html><html lang="zh-CN"><head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DeepSeek Harness 源码笔记（二）：Everything is a Plugin 怎样落到 Cordis</title>
+  <meta name="description" content="从 patch 合成、Context、Service、isolate、Fiber 生命周期与 HMR，读懂 DeepSeek Harness 怎样用 Cordis 组成可替换的运行时。" />
+  <meta property="og:title" content="DeepSeek Harness 源码笔记（二）：Everything is a Plugin 怎样落到 Cordis" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/cordis-composition-route.png" />
+  <link rel="canonical" href="https://rememorio.github.io/blog/deepseek-harness/zh/cordis-composition/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/deepseek-harness/zh/cordis-composition/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/deepseek-harness/en/cordis-composition/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/deepseek-harness/" />
+  <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+</head><body id="top">
+  <header class="site-header"><a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">DSH 系列</a><a href="../runtime-route/">上一篇</a><a href="#sources">参考源码</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./" lang="zh-CN">中文</a><a href="../../en/cordis-composition/" lang="en">English</a></span></nav></header>
+  <div class="article-shell"><aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
+    <section class="article-hero"><p class="eyebrow">DeepSeek Harness 源码笔记 · 第二篇</p><h1>“Everything is a Plugin” 怎样落到 Cordis</h1>
+      <p class="lead">插件化最难的不是动态 import，而是配置覆盖不漂移、依赖就绪才激活、局部替换不污染全局，以及卸载时不留下资源。DSH 把这四个问题压进 patch、Context、Service 与 Fiber。</p>
+      <div class="meta-line"><span>系列 2 / 7</span><span>源码快照：b150a55</span><span>主题：组合与生命周期</span><span>内核：vendored Cordis</span></div>
+      <nav class="series-strip"><a href="../runtime-route/"><strong>01</strong> 运行主线</a><span class="series-current"><strong>02</strong> Cordis 装配</span><a href="../"><strong>路线图</strong> 完整七篇</a></nav>
+      <figure class="hero-image"><img src="../../assets/cordis-composition-route.png" alt="DeepSeek Harness Cordis 组合路线：Bundle、profile、home 与命令行 patch 经 applyEntryPatches 合成 EntryOptions，再挂载成具有生命周期的 Context 树" /></figure>
+    </section><section class="article-body">
+      <p>上一篇跟着一次 turn 经过了十几种插件：模型适配器装请求，prompt 与 tools 在 step 前汇合，持久化订阅 SessionEvent，approval 和 sandbox 截住副作用，Web 再观察同一运行。问题是：这些模块凭什么可以替换，却不会在启动顺序、依赖或清理上彼此踩踏？</p>
+      <p>答案不是某个“插件管理器”对象，而是两层互补协议。启动前，<code>applyEntryPatches()</code> 把多个来源合成一棵确定配置树；启动后，Cordis 的 <code>Context</code>、<code>Service</code> 和 <code>Fiber</code> 决定能力在哪个作用域可见、何时激活、由谁释放。</p>
+      <div class="note"><p><strong>阅读契约。</strong>读完以后，你应该能判断：一个 profile 覆盖为什么要重述完整 config；<code>!!js</code> 为什么不能在 config dump 阶段求值；<code>extend()</code> 与 <code>isolate()</code> 怎样产生不同的 service 解析；缺少 injection 时插件为什么停在 PENDING；以及 HMR 为什么要先让新 generation 结算再退休旧 generation。</p></div>
+      <p><strong>证据边界。</strong>本文仍固定在 <a href="https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"><code>b150a55</code></a>。DSH 把带补丁的 Cordis fork 放在 <code>vendor/</code>，因此 Context、Service 与 Fiber 的结论直接来自同一仓库快照；它证明的是组合和清理语义，不等于任意第三方插件都安全或兼容。</p>
+
+      <h2>一、启动前先把多层配置压成一棵树</h2>
+      <h3>1.1 同一个算法同时服务 boot 和 dump</h3>
+      <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/vendor/include/src/index.ts#L18-L144"><code>vendor/include</code></a> 导出纯函数 <code>applyEntryPatches(data, patches, warn)</code>。<code>composeEntries()</code>、实际 boot include 与 <code>dsh --dump-config</code> 都调用它，而不是各自实现一套近似合并。于是诊断输出与真正挂载的树共享相同的 id 索引、插入顺序和警告规则。</p>
+      <p>这个约束很重要。若 dump 使用深合并、boot 使用整对象替换，一份看似正确的诊断配置仍可能启动成另一棵树。DSH 宁愿让错误尽早暴露，也不接受“显示值”和“运行值”分叉。</p>
+
+      <h3>1.2 patch 是有顺序的操作，不是 YAML 深合并</h3>
+      <figure class="hero-image"><img src="../../assets/cordis-patch-semantics.png" alt="Cordis patch 语义：id 定位后 config 整体替换，insert 增加新条目，双感叹号 js 在挂载时求值，dump config 保留表达式，未匹配 id 进入 warning" /></figure>
+      <p>PatchOptions 只有两类核心动作：按 <code>id</code> 找到条目并替换字段，或用 <code>insert</code> 添加条目。对 DSH 用户最容易踩的坑是：<strong>id-targeted patch 会替换整个 <code>config</code>，不会逐字段深合并</strong>。要保留的 bundle 字段必须重新写出。</p>
+      <pre><code class="language-yaml">- id: llm-deepseek
+  config:
+    model: deepseek-chat
+    apiKey: !!js process.env.DEEPSEEK_API_KEY
+- insert:
+    - id: local-plugin
+      name: ./local-plugin.mjs</code></pre>
+      <p><code>!!js</code> 也不是 YAML 解析时立即执行的任意代码。Parser 把它保存成 expression node；Loader 等条目声明的 injections 可用以后，才在该条目自己的 context 中通过 <code>internal/config</code> 解析。<code>--dump-config</code> 则原样打印表达式，避免诊断命令因环境或副作用改变配置。</p>
+      <p>同一列表中，较早 <code>insert</code> 的条目会立刻进入 id 索引，后续 patch 可以继续配置或禁用它。未匹配的 id 不会静默吞掉，而是连同 layer label 交给 <code>warn()</code>。这让拼错插件 id 变成可见错误信号。</p>
+
+      <h2>二、Context 决定服务在哪个局部世界可见</h2>
+      <h3>2.1 根 Context 先安装四个内建服务</h3>
+      <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/vendor/cordis/src/context.ts"><code>Context</code></a> 构造时创建根 Fiber，并安装 reflect、registry、events 与 logger。Context 本身是 Proxy：普通属性读取经过 service resolver，<code>ctx.plugin()</code>、<code>ctx.inject()</code>、<code>ctx.on()</code> 等方法则由内建服务混入。</p>
+      <p>所以插件拿到的 <code>ctx</code> 不是全局 service bag。它是一份带父链、isolation map、intercept map 与当前 Fiber 的作用域视图。两个插件即使都读取 <code>ctx.llm</code>，也可能因 scope label 不同而得到不同 provider。</p>
+
+      <h3>2.2 extend 继承，isolate 改写某个 service 的解析域</h3>
+      <figure class="hero-image"><img src="../../assets/cordis-service-scope.png" alt="Cordis service 作用域：Context extend 子上下文解析到同一 Service，isolate 子上下文为同名 Service 使用独立实现，每个 Fiber 拥有自己的 dispose 清理" /></figure>
+      <p><code>extend(meta)</code> 创建原型继承的 child context，父对象不被修改；没有 isolation 变化时，服务读取沿用同一 label。<code>isolate(name, label)</code> 则复制 isolation map，只为指定 service 写入新 label。下游对这个名字的 provide/get 都进入新的解析域，其他服务仍继承父 scope。</p>
+      <p>这正适合 Agent runtime：可以为一段 subtree 替换 LLM、session store 或 approval provider，而不必复制整个应用。相同 label 还可以让两条分支显式加入同一隔离域。<code>intercept(name, config)</code> 则不换实现，只把祖先到当前 scope 的 service config 按顺序合并。</p>
+      <div class="table-wrap"><table><thead><tr><th>操作</th><th>改变什么</th><th>不改变什么</th></tr></thead><tbody>
+        <tr><td><code>extend()</code></td><td>给 child context 增加 metadata。</td><td>不改 service label，不修改父 context。</td></tr>
+        <tr><td><code>isolate()</code></td><td>为一个 service name 改写解析 label。</td><td>其他服务继续沿父 scope 解析。</td></tr>
+        <tr><td><code>intercept()</code></td><td>给某个 service 的插件配置增加局部覆盖。</td><td>不替换 service provider。</td></tr>
+        <tr><td><code>provide()</code></td><td>在当前 label 注册实现。</td><td>实现随 owning Fiber 卸载，不变成永久全局。</td></tr>
+      </tbody></table></div>
+
+      <h2>三、Service 把能力注册和所有权绑在一起</h2>
+      <h3>3.1 构造 Service 就登记 provider</h3>
+      <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/vendor/cordis/src/service.ts"><code>Service</code></a> 基类在构造函数里调用 <code>ctx.reflect.provide(name, this, check)</code>。这个 provide 不是裸写 Map：注册动作成为 owning Fiber 的 effect，Fiber 卸载时 provider 自动移除。</p>
+      <pre><code class="language-typescript">export class SessionStore extends Service {
+  constructor(ctx: Context) {
+    super(ctx, 'sessions')
+  }
+}
+
+ctx.plugin(SessionStore)
+const store = ctx.get('sessions')</code></pre>
+      <p>这消除了“插件卸载了但 service 还指向旧实例”的悬挂状态。可调用 service、Config schema 与 intercept config 也继续绑定在同一对象契约上。消费者只声明注入名字，不直接 import 具体 provider。</p>
+
+      <h3>3.2 injection 是激活条件，不是启动后的空值检查</h3>
+      <p>Plugin runtime 声明需要的 service 后，Registry 创建 Fiber。依赖未满足时 Fiber 保持 <code>PENDING</code>；provider 出现后保存一份实现快照，校验配置并进入 <code>LOADING</code>；回调与 init hooks 完成才变成 <code>ACTIVE</code>。provider 被替换或消失时，旧 Fiber 会卸载或回到等待路径，而不是让业务代码在任意位置撞上 undefined。</p>
+      <p>这让“启动顺序”从手工排序变成依赖图。配置文件的行顺序仍会影响 tree 与 hook 顺序，但 capability 未就绪不会被伪装成已激活插件。</p>
+
+      <h2>四、Fiber 让插件生命周期成为结构化所有权</h2>
+      <h3>4.1 每个 effect 都归当前 Fiber 负责</h3>
+      <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/vendor/cordis/src/fiber.ts"><code>Fiber</code></a> 跟踪 validated config、required service snapshot、effects、disposers、错误和状态迁移。插件通过 <code>ctx.on()</code>、<code>ctx.provide()</code> 或 <code>ctx.effect()</code> 建立的资源都会进入当前 Fiber；卸载时按逆注册顺序等待 disposer。</p>
+      <p>逆序不是细节。若插件先创建 worker，再注册事件监听，清理时应该先停止监听、再终止 worker，避免 teardown 期间继续接收新工作。异步 disposer 也会被 join，同一清理不会被并发执行两遍。</p>
+
+      <h3>4.2 HMR 是 generation 交换，不是改一个对象</h3>
+      <figure class="hero-image"><img src="../../assets/cordis-lifecycle-hmr.png" alt="Cordis Fiber 从 PENDING、LOADING、ACTIVE 到 UNLOADING、DISPOSED；injection 控制激活，internal config 延迟解析，watchUserPatches 让新 generation 结算后再卸载旧 generation" /></figure>
+      <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/boot/app-boot/src/index.ts#L209-L264"><code>watchUserPatches()</code></a> 把 profile 和 home patch 的变化交给 Cordis HMR。刷新时重新读取 include options，重组整套 patch 列表并提交新 generation。Loader 的 lazy config 会在 declared injections 活跃以后重新解析，因此 provider replacement 可以改变表达式结果。</p>
+      <p>正确的热替换需要两份所有权短暂并存：新 generation 成功挂载并 settle，才允许旧 generation 进入 UNLOADING；若新树导入、校验或激活失败，启动/刷新路径明确报错，而不是留下半棵“看起来更新了”的树。对长时间运行的 Agent，这比“修改 config 对象并发个 changed 事件”更接近事务。</p>
+
+      <h2>五、用四个问题定位 Cordis 装配故障</h2>
+      <ol>
+        <li><strong>树是否合对：</strong>先用 <code>--dump-config</code> 看 id、插入位置和 layer 来源，确认 patch 是否整 config 替换。</li>
+        <li><strong>模块是否解析：</strong>检查 bare specifier 的安装/profile 双锚点和 entry 自己的 base URL。</li>
+        <li><strong>依赖是否满足：</strong>查看 Fiber 是否停在 PENDING，以及 service name 的 isolation label 是否一致。</li>
+        <li><strong>生命周期是否收口：</strong>检查失败 generation、provider replacement 和 dispose 是否完成，而不是只看插件 callback 是否执行过。</li>
+      </ol>
+      <p>这四层分别对应 composition、resolution、injection 与 ownership。把它们都叫“插件没加载”，排障就会在 YAML、import、service 和资源泄漏之间来回猜。</p>
+      <p>下一篇会把镜头从插件树切到 <code>SessionEvent</code>：当 loop、工具和 UI 都是可替换插件时，什么才是跨插件共享的运行事实？DSH 的回答是——模型能看见的内容必须先进入可投影的事件日志。</p>
+
+      <h2 id="sources">参考源码</h2><ul>
+        <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/apps/cli/src/profile-boot.ts">profile-boot.ts</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/boot/app-boot/src/profile.ts">profile.ts</a>：bundle/profile/home/CLI patch 层次。</li>
+        <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/vendor/include/src/index.ts">vendor/include</a>：PatchOptions、expression dialect 与 applyEntryPatches。</li>
+        <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/vendor/cordis/src/context.ts">Context</a>、<a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/vendor/cordis/src/service.ts">Service</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/vendor/cordis/src/fiber.ts">Fiber</a>：作用域、能力和生命周期。</li>
+        <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/boot/app-boot/README.md">app-boot README</a>：mount、config dump、用户 patch 与热更新契约。</li>
+      </ul>
+    </section></article></main></div>
+  <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../../openclaw/article.js?v=1"></script>
+</body></html>
