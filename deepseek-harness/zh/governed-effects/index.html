@@ -1,0 +1,98 @@
+<!doctype html><html lang="zh-CN"><head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>DeepSeek Harness 源码笔记（四）：副作用不是一次函数调用</title>
+  <meta name="description" content="沿 DeepSeek Harness 的 tool/call、flush checkpoint、approval、sandbox、JSONL 与 crash repair，拆开副作用的意图、持久化、授权、约束和未知结果。" />
+  <meta property="og:title" content="DeepSeek Harness 源码笔记（四）：副作用不是一次函数调用" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/effects-governed-route.png" />
+  <link rel="canonical" href="https://rememorio.github.io/blog/deepseek-harness/zh/governed-effects/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/deepseek-harness/zh/governed-effects/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/deepseek-harness/en/governed-effects/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/deepseek-harness/" />
+  <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+</head><body id="top"><header class="site-header"><a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">DSH 系列</a><a href="../event-sourced-session/">上一篇</a><a href="#sources">参考源码</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./">中文</a><a href="../../en/governed-effects/">English</a></span></nav></header>
+<div class="article-shell"><aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
+<section class="article-hero"><p class="eyebrow">DeepSeek Harness 源码笔记 · 第四篇</p><h1>副作用不是一次函数调用：从 flush 到可恢复执行</h1>
+  <p class="lead">模型只能提出动作。运行时必须先记录意图、把它推过持久化边界，再决定是否允许、怎样隔离、何时真正 dispatch，并在 crash 后诚实区分“没有开始”和“结果未知”。</p>
+  <div class="meta-line"><span>系列 4 / 7</span><span>源码快照：b150a55</span><span>主题：副作用治理</span><span>核心：Intent → Checkpoint → Effect → Repair</span></div>
+  <nav class="series-strip"><a href="../runtime-route/"><strong>01</strong> 运行主线</a><a href="../cordis-composition/"><strong>02</strong> Cordis</a><a href="../event-sourced-session/"><strong>03</strong> 事件会话</a><span class="series-current"><strong>04</strong> 副作用</span><a href="../"><strong>路线图</strong></a></nav>
+  <figure class="hero-image"><img src="../../assets/effects-governed-route.png" alt="DeepSeek Harness 副作用治理主线：模型提出 tool call，Session 记录意图并 flush，ApprovalPolicy 决策，sandbox 约束执行，最终记录 tool result 或进入 crash repair" /></figure>
+</section><section class="article-body">
+  <p>工具调用最危险的错觉，是把 <code>await tool.execute()</code> 当作唯一事实。一条付款、发信或改文件操作至少有四个时刻：模型产生调用；runtime 持久化“准备调用”；外部世界接收动作；runtime 持久化结果。进程可以在任意相邻时刻之间退出，这些空隙决定了恢复时能不能自动重试。</p>
+  <p>DSH 没有承诺 exactly-once。它做的事情更诚实：用 SessionEvent 保存意图和结果，用 checkpoint policy 在副作用前强制 durability，用 approval 与 sandbox 分别管理授权和执行边界，再用 repair 把崩溃尾部分类为“未开始”或“结果未知”。</p>
+  <div class="note"><p><strong>阅读契约。</strong>读完以后，你应该能回答：为什么 durable <code>tool/call</code> 必须早于工具体；为什么 <code>append()</code> 不等于落盘；<code>ask</code>、<code>never</code> 和 <code>allowed-once</code> 分别在哪里生效；approval 为什么不能代替 sandbox；以及为什么看到 <code>TOOL_OUTCOME_UNKNOWN</code> 时绝不能盲目重放副作用。</p></div>
+  <p><strong>证据边界。</strong>本文固定在提交 <a href="https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"><code>b150a55</code></a>。第一方 JSONL persistence 和 checkpoint policy 可以组成本文的 durability 路径；自定义 backend、answerer、sandbox provider 与第三方工具仍须各自兑现接口。源码没有把它们自动变成事务系统。</p>
+
+  <h2>一、先记录调用，再允许执行</h2>
+  <h3>1.1 assistant message 和 tool/call 是两份不同证据</h3>
+  <p>Agent loop 先把含有 tool calls 的 assistant message 追加到 Session。随后 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/tool-calls.ts"><code>executeToolCalls()</code></a> 为每一项追加 <code>tool/call</code> 事件，再进入 prepare 与 guard；真正的工具体拿到控制权前，<code>tools/execute</code> checkpoint 才把这段前缀变成 durable。settlement 完成后，结果再作为 <code>tool/result</code> 进入同一个事件源。</p>
+  <p>这个拆分很关键：assistant message 证明模型提出了什么，<code>tool/call</code> 证明 runtime 已准备把哪个规范化调用送进执行管线。两者不能合并，否则 crash repair 无法判断动作是否已经越过 dispatch checkpoint。</p>
+  <figure class="hero-image"><img src="../../assets/checkpoint-three-barriers.png" alt="DeepSeek Harness 三个 durability checkpoint：agent pre-step、首次 llm stream，以及最外层 tools execute；每个 checkpoint 在继续下游前调用 session flush" /></figure>
+
+  <h3>1.2 工具管线保留一个不可绕过的顺序</h3>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/tools/src/index.ts"><code>tools</code> runtime</a> 先运行 <code>tools/pre-execute</code> waterfall。gate 可以返回 allow、deny 或 ask；approval seam 把交互结果收敛为 <code>allowed-once</code>、rejected、cancelled 或 unavailable。pre-execute 之后还有 monotonic guard，确保较弱的后续决策不能把已关闭的门重新打开。只有通过后才进入 <code>tools/execute</code>，最后运行 post hook。</p>
+  <p>Checkpoint policy 只拦最外层调用：<code>exec.agent</code> 已定义且 <code>exec.parent</code> 未定义。嵌套 dispatch 复用外层已经建立的 checkpoint，避免每一层都重复 flush，也避免子工具绕开最外层的事实边界。</p>
+  <pre><code class="language-typescript">ctx.on('tools/execute', async (exec, next) =&gt; {
+  if (exec.agent === undefined || exec.parent !== undefined) return next()
+  await ctx.sessions.flush(exec.agent.session)
+  if (exec.signal.aborted) return abortedBeforeDispatchResult()
+  return next()
+})</code></pre>
+
+  <h2>二、append 不等于 durable</h2>
+  <h3>2.1 Persistence backend 和 checkpoint policy 是两层能力</h3>
+  <p>Session 的 <code>append()</code> 建立内存中的原子事件提交；persistence plugin 可以 write-behind。两者解耦让不同 backend 自由批处理，但也意味着“日志数组里已经看见”并不代表 crash 后还能读到。<a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-checkpoint-policy/README.md">session-checkpoint-policy</a> 单独定义语义 checkpoint：继续下游之前，哪些先前事件必须跨过存储边界。</p>
+
+  <h3>2.2 三个 barrier 分别保护三种不可逆前进</h3>
+  <ol>
+    <li><code>agent/pre-step</code>：开始下一推理 step 之前，上一阶段事实先 durable。</li>
+    <li>第一次 <code>llm/stream</code>：真正向 provider 发请求前才 lazy flush，避免没有网络动作时的无谓同步。</li>
+    <li>最外层 <code>tools/execute</code>：工具体看到控制权前，含 <code>tool/call</code> 的前缀必须 durable。</li>
+  </ol>
+  <p><code>session/flush</code> 在下游 adapter 或工具体之前完成；失败时 fail closed。若等待 flush 时取消，policy 返回 <code>ABORTED_BEFORE_DISPATCH</code>，而不是假装工具已经运行。这个顺序使“durable call 但无 result”具有稳定含义。</p>
+
+  <h2>三、Approval 和 sandbox 解决不同问题</h2>
+  <h3>3.1 Approval 决定“这一次是否允许”</h3>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/interaction/user-approval/README.md">user-approval</a> 提供 channel-neutral 的一次性请求 <code>ctx.approval.request(req)</code>。<code>ApprovalPolicy</code> 只有 <code>ask</code> 与 <code>never</code>：ask 才会派发 <code>approval/request</code>；never 在交互前直接拒绝。当前 turn 内会成对记录 <code>approval/asked</code> 与 <code>approval/decided</code> 供审计，但模型只看最终工具结果。</p>
+  <p>缺少 answerer、answerer 抛错、请求被取消都 fail closed。策略也可由日志中的 <code>approval/policy</code> 覆盖，最后一条事件胜出。这个 seam 没有内置 answerer、没有“永久允许”，请求也不携带完整工具参数；它刻意保持窄而可审计。</p>
+
+  <h3>3.2 Sandbox 决定“即使允许，也只能怎样执行”</h3>
+  <figure class="hero-image"><img src="../../assets/approval-sandbox-boundaries.png" alt="ApprovalPolicy 与 sandbox 是两道独立边界：ask 经过 approval request 获得 allowed-once，never 直接关闭；SandboxExecutionPolicy 经 ctx.sandbox.confine 和 LocalSandboxProvider 包装命令，不可用时返回 SANDBOX_UNAVAILABLE" /></figure>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/sandbox/sandbox/README.md">SandboxProvider</a> 接收 <code>read-only</code>、<code>workspace-write</code> 或 <code>danger-full-access</code> 策略，<code>ctx.sandbox.confine(argv, policy)</code> 返回被包装的 argv。没有合适 provider 时返回 <code>SANDBOX_UNAVAILABLE</code>，不会静默降级成裸执行。</p>
+  <p>本地 provider 在 Linux 优先 bubblewrap、再尝试 Landlock；macOS 使用 Seatbelt；Windows 使用 ACL/restricted-token 路径，Windows 与 Landlock 可能报告 partial。它限制的是同一宿主世界中的文件副作用，不是 container 或 microVM。用户点了允许，不代表命令获得无限系统权限；命令被 sandbox 包住，也不代表用户已经授权。</p>
+
+  <h2>四、JSONL 怎样把 checkpoint 变成可恢复前缀</h2>
+  <h3>4.1 一帧 header，一帧 durable batch</h3>
+  <figure class="hero-image"><img src="../../assets/jsonl-durability.png" alt="DeepSeek Harness JSONL persistence：session.jsonl.zstd 由独立校验的 zstd header frame 和多个 batch frame 构成，write-behind 合并后由 flush 排空，fsync 失败回滚到原字节长度，撕裂尾帧只保留完整记录" /></figure>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-persistence-jsonl/README.md">JSONL backend</a> 默认写 <code>session.jsonl.zstd</code>：一个独立 checksummed zstd frame 保存 header，之后每个 durable batch 各占一帧；也可选 raw JSONL。<code>writeBatchMaxDelayMs</code> 默认 200ms，固定窗口合并 append，而 <code>session/flush</code> 会取消等待并排空当前队列。</p>
+
+  <h3>4.2 首次发布、追加失败和 torn tail 都有明确边界</h3>
+  <p>第一次 append 会把 header 与首批事件写进临时文件并 fsync；POSIX 用 hard-link publish 再 fsync 父目录，Windows 走 write-through rename。后续追加完成后 fsync。若写入或同步错误被捕获，文件会 truncate 回原字节长度，避免半批次成为已提交前缀。</p>
+  <p>读取时，撕裂的最后一帧只保留能完整解码的 records，截断 torn tail，并在需要时补合成 closers；完整区域的校验损坏则拒绝恢复。实现只允许每个 session 一个 live writer，也不负责删除日志。这些约束让 flush 表示“当前批次已经跨过后端承诺的 durability 边界”，而不是泛化的数据库事务。</p>
+
+  <h2>五、Crash repair 必须区分未开始与结果未知</h2>
+  <h3>5.1 日志前缀决定允许哪一种恢复动作</h3>
+  <figure class="hero-image"><img src="../../assets/crash-outcome-matrix.png" alt="DeepSeek Harness crash outcome matrix：assistant 有调用但无 durable tool call 为 TOOL_NOT_STARTED，可按需重试；durable tool call 无 result 为 TOOL_OUTCOME_UNKNOWN，必须停下核验；已有 durable result 则正常 resume" /></figure>
+  <table><thead><tr><th>崩溃前 durable 前缀</th><th>修复结果</th><th>安全动作</th></tr></thead><tbody>
+    <tr><td>assistant 含 tool call；没有 <code>tool/call</code></td><td><code>TOOL_NOT_STARTED</code></td><td>确认仍有需要后可重新 dispatch</td></tr>
+    <tr><td>有 <code>tool/call</code>；没有 <code>tool/result</code></td><td><code>TOOL_OUTCOME_UNKNOWN</code></td><td>停止；查询外部状态或询问用户</td></tr>
+    <tr><td><code>tool/call</code> 与 <code>tool/result</code> 都在</td><td>正常完成前缀</td><td>从下一步 resume</td></tr>
+  </tbody></table>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/repair.ts"><code>repair.ts</code></a> 会合成必要的 tool result、step/end 与 interrupted turn/end，并保持 seq 连续。关键不是把日志“补得好看”，而是让模型和 runtime 都看见不确定性。</p>
+
+  <h3>5.2 callId 是幂等支点，不是 exactly-once 魔法</h3>
+  <p>对有副作用的工具，DSH 建议把 <code>exec.callId</code> 传给支持幂等键的外部系统。这样一次未知结果可以通过查询或同键重试收敛。但如果目标系统不支持幂等、查询或事务，runtime 不能凭本地日志证明动作只发生一次。read-only 或天然幂等的调用可以更积极地恢复；付款、发信和删除必须保守。</p>
+
+  <h2>六、这条执行路径带来的工程判断</h2>
+  <ol>
+    <li><strong>第一方 durability 要同时装 backend 与 policy。</strong>只有 persistence 没有 checkpoint，副作用可能领先 durable 日志；只有 policy 没有兑现 flush 的 backend，也没有实际保护。</li>
+    <li><strong>Approval 不是 sandbox。</strong>前者回答“是否同意”，后者限制“能碰什么”；两道门缺一不可。</li>
+    <li><strong>Fail closed 是明确的可用性取舍。</strong>answerer、sandbox 或 flush 不可用时停止，会丢掉一次机会，却不会偷偷扩大权限或制造不可解释的动作。</li>
+    <li><strong>Unknown outcome 先核验外部世界。</strong>恢复逻辑不能用“本地没结果”推断“外部没发生”。</li>
+    <li><strong>自定义工具要传播 callId。</strong>能把本地调用身份接到外部幂等键，才有机会把 at-least-once 风险收敛成可验证结果。</li>
+  </ol>
+  <p>下一篇会处理另一个看似无害的 mutation：compaction 怎样替换模型可见 surface、裁剪旧 tool result，却仍让原始事件日志和 request header 足以重建一次请求。</p>
+
+  <h2 id="sources">参考源码</h2><ul>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-checkpoint-policy/README.md">session-checkpoint-policy README</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-checkpoint-policy/src/index.ts">实现</a>：三个 durability checkpoint、top-level 工具边界与取消语义。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/tool-calls.ts">tool-calls.ts</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/tools/src/index.ts">tools runtime</a>：调用事件、gate、execute 和 result 顺序。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/interaction/user-approval/README.md">user-approval README</a>：一次性决策、审计事件与 fail-closed 结果。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/sandbox/sandbox/README.md">sandbox contract</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/sandbox/sandbox-local/README.md">local provider</a>：策略模式、平台 backend 与限制。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-persistence-jsonl/README.md">session-persistence-jsonl README</a>：frame、batch、fsync、发布与 torn-tail 恢复。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/repair.ts">repair.ts</a>：未闭合 tool、step 与 turn 的保守修复。</li>
+  </ul>
+</section></article></main></div><script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../../openclaw/article.js?v=1"></script></body></html>

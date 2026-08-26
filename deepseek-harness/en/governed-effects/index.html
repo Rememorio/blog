@@ -1,0 +1,98 @@
+<!doctype html><html lang="en"><head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>DeepSeek Harness Source Notes IV: a side effect is not just a function call</title>
+  <meta name="description" content="Trace DeepSeek Harness tool/call, flush checkpoints, approval, sandboxing, JSONL, and crash repair to separate side-effect intent, durability, permission, confinement, and unknown outcomes." />
+  <meta property="og:title" content="DeepSeek Harness Source Notes IV: a side effect is not just a function call" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/effects-governed-route.png" />
+  <link rel="canonical" href="https://rememorio.github.io/blog/deepseek-harness/en/governed-effects/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/deepseek-harness/zh/governed-effects/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/deepseek-harness/en/governed-effects/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/deepseek-harness/" />
+  <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+</head><body id="top"><header class="site-header"><a class="brand" href="../../../en/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">DSH series</a><a href="../event-sourced-session/">Previous</a><a href="#sources">Source references</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a href="../../zh/governed-effects/">中文</a><a class="active" href="./">English</a></span></nav></header>
+<div class="article-shell"><aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
+<section class="article-hero"><p class="eyebrow">DeepSeek Harness source notes · Part IV</p><h1>A side effect is not just a function call</h1>
+  <p class="lead">The model can only propose an action. The runtime must record intent, carry it across a durability boundary, decide whether it is allowed and how it is confined, dispatch it, and then distinguish “not started” from “outcome unknown” after a crash.</p>
+  <div class="meta-line"><span>Part 4 / 7</span><span>Snapshot: b150a55</span><span>Topic: governed effects</span><span>Core: Intent → Checkpoint → Effect → Repair</span></div>
+  <nav class="series-strip"><a href="../runtime-route/"><strong>01</strong> Runtime</a><a href="../cordis-composition/"><strong>02</strong> Cordis</a><a href="../event-sourced-session/"><strong>03</strong> Session events</a><span class="series-current"><strong>04</strong> Effects</span><a href="../"><strong>Route map</strong></a></nav>
+  <figure class="hero-image"><img src="../../assets/effects-governed-route.png" alt="DeepSeek Harness governed effect route: the model proposes a tool call, Session records and flushes intent, ApprovalPolicy decides, sandboxing confines execution, and the runtime records a tool result or enters crash repair" /></figure>
+</section><section class="article-body">
+  <p>The most dangerous tool-call illusion is treating <code>await tool.execute()</code> as the only fact. A payment, message, or file mutation has at least four moments: the model emits a call; the runtime durably records that it is preparing the call; the external world receives the action; and the runtime durably records the result. A process can exit between any two.</p>
+  <p>DSH does not promise exactly-once effects. It does something more honest: SessionEvents retain intent and outcome, a checkpoint policy forces durability before side effects, approval and sandboxing govern separate boundaries, and repair classifies a crash tail as either “not started” or “outcome unknown.”</p>
+  <div class="note"><p><strong>Reading contract.</strong>After this chapter, you should be able to explain why durable <code>tool/call</code> precedes the tool body; why <code>append()</code> is not a disk guarantee; where <code>ask</code>, <code>never</code>, and <code>allowed-once</code> take effect; why approval cannot replace sandboxing; and why <code>TOOL_OUTCOME_UNKNOWN</code> must never trigger a blind side-effect replay.</p></div>
+  <p><strong>Evidence boundary.</strong>This chapter is pinned to <a href="https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"><code>b150a55</code></a>. The first-party JSONL backend and checkpoint policy compose the durability route described here. Custom backends, answerers, sandbox providers, and third-party tools still have to honor their interfaces; source composition does not turn them into one transaction system.</p>
+
+  <h2>1. Record the call before allowing execution</h2>
+  <h3>1.1 The assistant message and tool/call prove different things</h3>
+  <p>The agent loop first appends the assistant message that contains tool calls. Then <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/tool-calls.ts"><code>executeToolCalls()</code></a> appends a <code>tool/call</code> event for each item before prepare and guard. Immediately before the actual tool body receives control, the <code>tools/execute</code> checkpoint makes that prefix durable. Once execution settles, <code>tool/result</code> enters the same event source.</p>
+  <p>The distinction matters: the assistant message proves what the model proposed; <code>tool/call</code> proves the runtime prepared a normalized call for the execution pipeline. Combining them would prevent crash repair from identifying whether an action crossed the dispatch checkpoint.</p>
+  <figure class="hero-image"><img src="../../assets/checkpoint-three-barriers.png" alt="Three DeepSeek Harness durability checkpoints at agent pre-step, the first LLM stream, and the outermost tools execute; each flushes the Session before downstream work continues" /></figure>
+
+  <h3>1.2 The tool pipeline preserves a non-bypassable order</h3>
+  <p>The <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/tools/src/index.ts">tools runtime</a> runs the <code>tools/pre-execute</code> waterfall first. A gate may allow, deny, or ask; the approval seam maps interaction into <code>allowed-once</code>, rejected, cancelled, or unavailable. A monotonic guard follows pre-execute so a weaker later decision cannot reopen a closed gate. Only then does <code>tools/execute</code> run, followed by the post hook.</p>
+  <p>The checkpoint policy intercepts only a top-level call: <code>exec.agent</code> is present while <code>exec.parent</code> is absent. Nested dispatch shares the outer checkpoint, avoiding repeated flushes without giving child tools a way around the top-level fact boundary.</p>
+  <pre><code class="language-typescript">ctx.on('tools/execute', async (exec, next) =&gt; {
+  if (exec.agent === undefined || exec.parent !== undefined) return next()
+  await ctx.sessions.flush(exec.agent.session)
+  if (exec.signal.aborted) return abortedBeforeDispatchResult()
+  return next()
+})</code></pre>
+
+  <h2>2. append is not durable</h2>
+  <h3>2.1 The persistence backend and checkpoint policy are separate capabilities</h3>
+  <p>Session <code>append()</code> creates an atomic in-memory event commit; a persistence plugin may write behind. That separation allows backends to batch efficiently, but “visible in the log array” does not imply “readable after a crash.” <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-checkpoint-policy/README.md">session-checkpoint-policy</a> independently defines semantic checkpoints: which prior events must cross storage before downstream work proceeds.</p>
+
+  <h3>2.2 Three barriers protect three irreversible advances</h3>
+  <ol>
+    <li><code>agent/pre-step</code>: the preceding facts become durable before another reasoning step starts.</li>
+    <li>The first <code>llm/stream</code>: a lazy flush occurs immediately before the actual provider request, avoiding synchronization when no network action occurs.</li>
+    <li>The outermost <code>tools/execute</code>: the prefix containing <code>tool/call</code> is durable before the tool body sees control.</li>
+  </ol>
+  <p><code>session/flush</code> finishes before the downstream adapter or tool body; failure is fail-closed. Cancellation while a flush is pending returns <code>ABORTED_BEFORE_DISPATCH</code> instead of pretending the tool ran. That order gives “durable call, no result” a stable meaning.</p>
+
+  <h2>3. Approval and sandboxing solve different problems</h2>
+  <h3>3.1 Approval decides whether this occurrence is allowed</h3>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/interaction/user-approval/README.md">user-approval</a> exposes the channel-neutral one-shot request <code>ctx.approval.request(req)</code>. <code>ApprovalPolicy</code> has <code>ask</code> and <code>never</code>: ask dispatches <code>approval/request</code>, while never rejects before interactive dispatch. An open turn records paired <code>approval/asked</code> and <code>approval/decided</code> audit events; the model sees only the resulting tool outcome.</p>
+  <p>A missing answerer, answerer failure, or cancellation fails closed. A logged <code>approval/policy</code> can override configuration, with the last event winning. The seam intentionally ships no built-in answerer, no “allow always,” and no full tool arguments in the request. It remains narrow and auditable.</p>
+
+  <h3>3.2 Sandboxing decides how an allowed action may run</h3>
+  <figure class="hero-image"><img src="../../assets/approval-sandbox-boundaries.png" alt="ApprovalPolicy and sandboxing are independent boundaries: ask reaches approval request and allowed-once while never closes directly; SandboxExecutionPolicy passes through ctx.sandbox.confine and LocalSandboxProvider, returning SANDBOX_UNAVAILABLE when confinement cannot be provided" /></figure>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/sandbox/sandbox/README.md"><code>SandboxProvider</code></a> accepts <code>read-only</code>, <code>workspace-write</code>, or <code>danger-full-access</code>; <code>ctx.sandbox.confine(argv, policy)</code> returns wrapped argv. If no provider can enforce the request, it returns <code>SANDBOX_UNAVAILABLE</code> instead of silently falling back to bare execution.</p>
+  <p>The local provider prefers bubblewrap and then Landlock on Linux, Seatbelt on macOS, and an ACL/restricted-token path on Windows; Windows and Landlock may report partial coverage. This is same-host filesystem-effect confinement, not a container or microVM. User approval does not grant unlimited system access, and sandboxing does not imply that a user authorized the command.</p>
+
+  <h2>4. JSONL turns a checkpoint into a recoverable prefix</h2>
+  <h3>4.1 One header frame, then one frame per durable batch</h3>
+  <figure class="hero-image"><img src="../../assets/jsonl-durability.png" alt="DeepSeek Harness JSONL persistence: session.jsonl.zstd contains an independently checksummed header frame and batch frames; write-behind coalesces appends, flush drains them, failed fsync rolls back byte length, and torn final frames preserve only complete records" /></figure>
+  <p>The <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-persistence-jsonl/README.md">JSONL backend</a> writes <code>session.jsonl.zstd</code> by default: one independent checksummed zstd frame for the header, then one frame for each durable batch. Raw JSONL is optional. <code>writeBatchMaxDelayMs</code> defaults to 200ms and coalesces appends in a fixed window; <code>session/flush</code> cancels the wait and drains the current queue.</p>
+
+  <h3>4.2 Initial publication, append failure, and a torn tail have explicit boundaries</h3>
+  <p>The first append writes the header and first batch to a temporary file and fsyncs it. POSIX uses hard-link publication followed by parent-directory fsync; Windows uses write-through rename. Later appends fsync after writing. A caught write or sync failure truncates to the previous byte length so a partial batch never becomes the committed prefix.</p>
+  <p>On read, a torn final frame retains completely decoded records, discards the torn tail, and re-encodes with synthetic closers when required. Corruption in a complete region refuses restoration. The implementation permits one live writer per session and does not own deletion. Flush therefore means “this batch crossed the backend's stated durability boundary,” not a generalized database transaction.</p>
+
+  <h2>5. Crash repair must distinguish not-started from outcome-unknown</h2>
+  <h3>5.1 The durable prefix determines the permitted recovery action</h3>
+  <figure class="hero-image"><img src="../../assets/crash-outcome-matrix.png" alt="DeepSeek Harness crash outcome matrix: an assistant call without durable tool call becomes TOOL_NOT_STARTED and may be retried; a durable tool call without result becomes TOOL_OUTCOME_UNKNOWN and requires verification; a durable result resumes normally" /></figure>
+  <table><thead><tr><th>Durable prefix before crash</th><th>Repair result</th><th>Safe action</th></tr></thead><tbody>
+    <tr><td>Assistant contains a call; no <code>tool/call</code></td><td><code>TOOL_NOT_STARTED</code></td><td>Dispatch again if the action is still needed</td></tr>
+    <tr><td><code>tool/call</code> exists; no <code>tool/result</code></td><td><code>TOOL_OUTCOME_UNKNOWN</code></td><td>Stop; query external state or ask the user</td></tr>
+    <tr><td>Both <code>tool/call</code> and <code>tool/result</code> exist</td><td>Completed prefix</td><td>Resume from the next step</td></tr>
+  </tbody></table>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/repair.ts"><code>repair.ts</code></a> synthesizes the necessary tool result, step/end, and interrupted turn/end while preserving continuous sequence numbers. The goal is not a cosmetically complete log. It is to expose uncertainty to both model and runtime.</p>
+
+  <h3>5.2 callId is an idempotency hinge, not exactly-once magic</h3>
+  <p>For side-effecting tools, DSH recommends forwarding <code>exec.callId</code> as an idempotency key when the external system supports one. An unknown outcome can then converge through lookup or same-key retry. When the target offers no idempotency, query, or transaction semantics, the local log cannot prove an action occurred once. Read-only or naturally idempotent calls can recover more aggressively; payment, messaging, and deletion must remain conservative.</p>
+
+  <h2>6. Engineering consequences of this route</h2>
+  <ol>
+    <li><strong>First-party durability needs both backend and policy.</strong>Persistence without checkpoints may lag the effect; a policy backed by a fake flush protects nothing.</li>
+    <li><strong>Approval is not sandboxing.</strong>One answers “did the user agree?” and the other “what can the process touch?” Both boundaries matter.</li>
+    <li><strong>Fail-closed is an availability tradeoff.</strong>A missing answerer, sandbox, or flush loses an opportunity instead of silently widening authority or creating an inexplicable action.</li>
+    <li><strong>Verify the external world after an unknown outcome.</strong>“No local result” never implies “nothing happened remotely.”</li>
+    <li><strong>Custom tools should propagate callId.</strong>Connecting local identity to an external idempotency key is what makes at-least-once risk verifiable.</li>
+  </ol>
+  <p>Part V examines another apparently harmless mutation: how compaction replaces the model-visible surface and prunes old tool results while the raw log and request header still reconstruct a request.</p>
+
+  <h2 id="sources">Source references</h2><ul>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-checkpoint-policy/README.md">session-checkpoint-policy README</a> and <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-checkpoint-policy/src/index.ts">implementation</a>: three durability checkpoints, the top-level tool boundary, and cancellation semantics.</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/tool-calls.ts">tool-calls.ts</a> and the <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/tools/src/index.ts">tools runtime</a>: call-event, gate, execute, and result ordering.</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/interaction/user-approval/README.md">user-approval README</a>: one-shot decisions, audit events, and fail-closed outcomes.</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/sandbox/sandbox/README.md">sandbox contract</a> and <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/sandbox/sandbox-local/README.md">local provider</a>: policy modes, platform backends, and limits.</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-persistence-jsonl/README.md">session-persistence-jsonl README</a>: frames, batches, fsync, publication, and torn-tail recovery.</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/repair.ts">repair.ts</a>: conservative repair of open tools, steps, and turns.</li>
+  </ul>
+</section></article></main></div><script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../../openclaw/article.js?v=1"></script></body></html>
