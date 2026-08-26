@@ -1,0 +1,89 @@
+<!doctype html><html lang="en"><head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>DeepSeek Harness Source Notes V: compaction does not delete history</title>
+  <meta name="description" content="Follow token pressure, tool-result pruning, summary replacement, KV cache, and request/header reconstruction to see how DeepSeek Harness shrinks model history without deleting event facts." />
+  <meta property="og:title" content="DeepSeek Harness Source Notes V: compaction does not delete history" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/compaction-control-loop.png" />
+  <link rel="canonical" href="https://rememorio.github.io/blog/deepseek-harness/en/compaction-reconstruction/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/deepseek-harness/zh/compaction-reconstruction/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/deepseek-harness/en/compaction-reconstruction/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/deepseek-harness/" />
+  <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+</head><body id="top"><header class="site-header"><a class="brand" href="../../../en/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">DSH series</a><a href="../governed-effects/">Previous</a><a href="#sources">Source references</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a href="../../zh/compaction-reconstruction/">中文</a><a class="active" href="./">English</a></span></nav></header>
+<div class="article-shell"><aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
+<section class="article-hero"><p class="eyebrow">DeepSeek Harness source notes · Part V</p><h1>Compaction does not delete history</h1>
+  <p class="lead">DSH compaction never edits old events. It prices a real request, optionally prunes oversized tool results without a model call, and replaces the oldest balanced surface range with a sourced checkpoint. The model sees less; the event log can still explain where the change came from.</p>
+  <div class="meta-line"><span>Part 5 / 7</span><span>Snapshot: b150a55</span><span>Topic: compaction and reconstruction</span><span>Core: Measure → Prune → Replace → Reconstruct</span></div>
+  <nav class="series-strip"><a href="../runtime-route/"><strong>01</strong> Runtime</a><a href="../cordis-composition/"><strong>02</strong> Cordis</a><a href="../event-sourced-session/"><strong>03</strong> Session events</a><a href="../governed-effects/"><strong>04</strong> Effects</a><span class="series-current"><strong>05</strong> Compaction</span><a href="../"><strong>Route map</strong></a></nav>
+  <figure class="hero-image"><img src="../../assets/compaction-control-loop.png" alt="DeepSeek Harness compaction route: context pressure crosses thresholdRatio 0.8, toolResultPruner runs, whole surface units reach llm stream, one replacement checkpoint lands, retainRatio 0.16 preserves the recent tail, and deriveMessages projects history" /></figure>
+</section><section class="article-body">
+  <p>“Summarize when context gets long” hides four separate problems: which request gets priced; where a range can be cut without splitting tool call/result pairs; whether a summary appends or replaces; and how system text, tools, provider config, and session prefix return after restoration. Solving only the first yields a prompt trick, not a runtime protocol.</p>
+  <p>DSH makes compaction an auditable state transition. <code>ctx.tokenMeter</code> prices the actual request envelope and current surface. A pruner may address pure bulk first. The compaction backend opens a bracket in the log, and exactly one sourced <code>user/message</code> replacement performs the surface mutation.</p>
+  <div class="note"><p><strong>Reading contract.</strong>After this chapter, you should be able to explain what 0.8 and 0.16 control; why a below-pressure step must not opportunistically prune; why ranges use surface position rather than numeric seq; how the summary request reuses old KV cache while a future request invalidates it; and which reconstruction job belongs to raw log, current surface, and request/header.</p></div>
+  <p><strong>Evidence boundary.</strong>This chapter is pinned to <a href="https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"><code>b150a55</code></a>. The defaults belong to <code>compaction-basic</code>, not the permanent seam contract. Provider capacity, usage, and KV-cache billing remain adapter reports. Source relationships can validate a replacement; they cannot prove that a generated summary retained every business fact.</p>
+
+  <h2>1. Price the complete request before deciding to compact</h2>
+  <h3>1.1 Pressure is not messages.length</h3>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/compaction/compaction-basic/README.md"><code>BasicCompactionEngine</code></a> reads the latest canonical logged envelope and current surface at the same consumed-log revision. Measurement therefore covers system prompt, tool schemas, routing, assistant completion, tool results, buffered context, and steering—not just conversation strings.</p>
+  <p>Capacity comes from the adapter that owns the latest durable provider/model route. The default trigger is <code>thresholdRatio: 0.8</code>, with <code>retainRatio: 0.16</code> preserving the recent surface; exact provider/model entries may override policy. When an adapter cannot expose capacity, ordinary pressure reports a target-specific configuration problem, while provider-confirmed canonical overflow may still force a reduction attempt.</p>
+
+  <h3>1.2 Select only whole, balanced, replaceable surface units</h3>
+  <p>Range selection starts at the oldest nodes, reserves a recent tail, and uses the <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/compaction/compaction/README.md#tool-pairing-boundaries">tool-pairing boundary helpers</a> so no unanswered call crosses a cut. Turn boundaries do not protect old steps in one runaway turn. An open indivisible tail instead makes compaction decline until it closes.</p>
+  <p>A range is a surface-position span, not a numeric seq interval. After replacement, the new high-seq event occupies the shadowed range's old position. Later compaction must read current membership, not infer it from <code>start &lt;= seq &lt;= end</code>.</p>
+
+  <h2>2. Apply model-free pruning before paying for summarization</h2>
+  <h3>2.1 The tool-result pruner changes only the model surface</h3>
+  <figure class="hero-image"><img src="../../assets/tool-result-pruning.png" alt="Tool-result pruning: ctx.toolResultPruner turns a complete result into head, fixed omission marker, and tail on current surface, citing originalSeq through surfaceOp replace and sourceEventSeqs while the append-only log retains the complete original event" /></figure>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/compaction/compaction-tool-result-pruner/README.md"><code>ctx.toolResultPruner</code></a> acts when text blocks exceed 8192 Unicode code points by default, retaining 4096 at the head, a fixed marker, and 1024 at the tail. Non-text blocks keep relative order. Slicing never splits a UTF-16 surrogate pair, though it may split a grapheme cluster.</p>
+  <p>The new <code>tool/result</code> copies all original data except content and carries <code>surfaceOp: replace</code> with <code>sourceEventSeqs: [originalSeq]</code>. The original remains in the append-only log. The result is strictly smaller and within threshold, so another pass emits no replacement.</p>
+
+  <h3>2.2 Pruning is pressure-qualified, not background housekeeping</h3>
+  <p>A below-pressure step check never prunes. Once pressure or canonical overflow qualifies, the basic backend invokes the optional pruner and remeasures through the token meter. If the request is now safe, it skips summarization. Cheap deterministic shrink comes first without invalidating a reusable prefix merely because a result “looks large.”</p>
+  <p>A character budget is not a token budget. Surface compaction cannot fix a tool unit whose non-text or non-prunable remainder is still too large, or an envelope where system and tools alone approach the window.</p>
+
+  <h2>3. Successful compaction performs one surface mutation</h2>
+  <h3>3.1 A five-step bracket ties source, replacement, and lock together</h3>
+  <figure class="hero-image"><img src="../../assets/compaction-two-ledgers.png" alt="Two ledgers: append-only SessionEvent history retains old user, assistant, and tool events plus compaction start, summary, replacement, and end; current surface shadows the old range, places the high-seq replacement at the old position, and keeps the recent tail" /></figure>
+  <ol>
+    <li><code>compaction/start</code> appends synchronously and acquires the log-recorded lock.</li>
+    <li>The backend creates a summary and revalidates that the selected span has not drifted.</li>
+    <li><code>compaction/summary</code> records raw summary, range, shadowed seqs, token measurement, and call envelope; it is log-only.</li>
+    <li>One <code>user/message</code> carries checkpoint content, <code>compactCheckpointSource(compactionId)</code>, and <code>surfaceOp: replace</code>. Its <code>sourceEventSeqs</code> cite start, summary, and every shadowed seq in that order. This is the only surface mutation.</li>
+    <li><code>compaction/end</code> releases the lock last.</li>
+  </ol>
+  <p>The next model request sees one <code>&lt;compacted-summary&gt;</code> checkpoint followed by the recent tail. Human transcript and exact audit still read old append-origin events. The summary is not appended as a second history copy, and <code>compaction/*</code> never enters the model surface.</p>
+
+  <h3>3.2 Convergence and changed spans fail explicitly</h3>
+  <p>The basic backend rejects a summary that is not smaller than its source and retries according to <code>compactionRetries</code>. Failure to return below threshold eventually throws. If the selected span changes while summarization is in flight, the stale summary never lands over new history: a changed/summary failure closes the bracket and preserves the surface. If even the close append fails, the unmatched start intentionally remains a blocking orphan.</p>
+
+  <h2>4. Summarization and future requests move cache in opposite directions</h2>
+  <h3>4.1 The summarizer replays the old prefix; only its final instruction is new</h3>
+  <figure class="hero-image"><img src="../../assets/compaction-kv-cache.png" alt="Two KV-cache effects: the summarizer replays system, tools, and shadowed messages to reuse the warm prefix while only the compaction instruction is uncached; a future conversation request reuses content before the first replaced token and recomputes the checkpoint and retained tail after it" /></figure>
+  <p>The default summarizer is not an isolated “please summarize” prompt. It calls <code>ctx.llm.stream()</code> directly, replaying the conversation's system, tools, and shadowed-region messages verbatim, then appending the fixed compaction instruction. On the same provider/model, warm cache remains reusable up to that final instruction. A different route or non-head range gives up that advantage.</p>
+  <p>The call sets <code>purpose: 'compaction'</code> without changing the model-visible body. Only returned text enters the checkpoint. Reasoning and tool calls are excluded, while image output fails with <code>UNSUPPORTED_CONTENT</code> instead of producing an orphan or disappearing silently.</p>
+
+  <h3>4.2 Replacement invalidates future requests from the first changed token</h3>
+  <p>A future conversation request may reuse system, tools, and unchanged history before the replacement. From the first shadowed token onward, the old cache no longer matches, so checkpoint and recent tail are recomputed. An append-only audit log does not imply unchanged request bytes; KV cache follows the model surface.</p>
+
+  <h2>5. Request headers reconstruct the non-history envelope</h2>
+  <h3>5.1 deriveMessages owns history only</h3>
+  <figure class="hero-image"><img src="../../assets/compaction-lock-reconstruction.png" alt="Above, the compaction durable lock and session end seed distinguish newer unmatched starts as busy from older starts as stale; below, foldRequestHeader selects the latest request-header envelope while current surface passes through deriveMessages, and both inputs converge into llm stream" /></figure>
+  <p><code>deriveMessages()</code> projects user, assistant, and tool history from current surface. It does not invent system text, tool schemas, call config, or session prefix. Those live in full canonical <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/request-header.ts"><code>request/header</code></a> snapshots whose reason is <code>initial</code>, <code>resume</code>, or <code>change</code>.</p>
+  <p><code>foldRequestHeader()</code> skips ordinary events and selects the last snapshot. Empty system/tools canonicalize to absence, and tool schemas compare in order. Logging adds no duplicate history tokens, yet anyone holding a log prefix can recombine “the envelope actually sent then” with derived messages.</p>
+
+  <h3>5.2 end-seed distinguishes a live lock from old crash evidence</h3>
+  <p>The latest unmatched <code>compaction/start</code> after the newest <code>session/end-seed</code> belongs to this lifecycle and returns <code>busy</code>. A start before that boundary is stale evidence from a prior process and does not block. Because the lock lives in the log rather than a WeakSet, restoration has evidence for this decision.</p>
+
+  <h2>6. Engineering consequences of the protocol</h2>
+  <ol>
+    <li><strong>Do not implement compaction as deletion.</strong>Shadow model surface; audit, recovery, and human history still need old facts.</li>
+    <li><strong>Measure the envelope before history.</strong>No number of summaries fixes a system prompt or schema set that already fills the window.</li>
+    <li><strong>Prefer deterministic pruning first.</strong>It may avoid a model call, but should run only after pressure qualifies and must be remeasured.</li>
+    <li><strong>Require provenance on replacement.</strong>A checkpoint without compactionId and sourceEventSeqs cannot prove what it displaced.</li>
+    <li><strong>Judge cache by request bytes.</strong>Append-only logging does not mean model cache remains valid forever.</li>
+    <li><strong>Summaries are lossy.</strong>Relations can be valid while semantics are incomplete; critical workflows should rely on structured state and external facts.</li>
+  </ol>
+  <p>Part VI turns to multiple agents: how spawn, fork, workflows, and the Ralph loop share one SubagentRuntime while bounding session lineage, tool scope, concurrency, and delegation depth.</p>
+
+  <h2 id="sources">Source references</h2><ul>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/compaction/compaction-basic/README.md">compaction-basic README</a> and <a href="https://github.com/deepseek-ai/deepseek-harness/tree/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/compaction/compaction-basic/src">source</a>: pressure, retention, summary replay, transaction, and overflow recovery.</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/compaction/compaction/README.md">compaction seam README</a>: service boundary, tool pairing, surface contract, and durable bracket.</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/compaction/compaction-tool-result-pruner/README.md">tool-result-pruner README</a>: code-point budgets, content-only replacement, and limitations.</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/request-header.ts">request-header.ts</a> and the <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/README.md">Session README</a>: envelope reconstruction, surface replacement, and KV-cache semantics.</li>
+  </ul>
+</section></article></main></div><script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../../openclaw/article.js?v=1"></script></body></html>
