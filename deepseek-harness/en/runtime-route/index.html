@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeepSeek Harness Source Notes I: from dsh web to one turn/end</title>
+    <meta name="description" content="Follow a fixed DeepSeek Harness source snapshot through dsh profiles, bundles, the Cordis plugin tree, ReactLoopAgent, SessionEvent, and Web/ACP." />
+    <meta name="theme-color" content="#fffaf0" />
+    <meta property="og:title" content="DeepSeek Harness Source Notes I: from dsh web to one turn/end" />
+    <meta property="og:description" content="Establish the full runtime route before opening composition, state, effects, compaction, and delegation." />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/runtime-route.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/deepseek-harness/en/runtime-route/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/deepseek-harness/zh/runtime-route/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/deepseek-harness/en/runtime-route/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/deepseek-harness/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="Article shortcuts"><a href="../">DSH series</a><a href="#route">Reading route</a><a href="#sources">Source references</a></nav>
+      <nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a href="../../zh/runtime-route/" lang="zh-CN">中文</a><a class="active" href="./" lang="en" aria-current="page">English</a></span></nav>
+    </header>
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">DeepSeek Harness source notes · Part I</p>
+            <h1>From <code>dsh web</code> to one <code>turn/end</code></h1>
+            <p class="lead">The interesting part of DeepSeek Harness is not another list of supported models and tools. It turns the glue that normally leaks into application code into a composable, observable, recoverable runtime. We begin by following one request end to end.</p>
+            <div class="meta-line"><span>Part 1 / 7</span><span>Snapshot: b150a55</span><span>Version: dsh-v0.1.1-rc.2</span><span>Topic: end-to-end runtime route</span></div>
+            <nav class="series-strip" aria-label="DeepSeek Harness series"><span class="series-current"><strong>01</strong> From dsh web to turn/end</span><a href="../"><strong>Route map</strong> All seven parts</a></nav>
+            <figure class="hero-image"><img src="../../assets/runtime-route.png" alt="DeepSeek Harness runtime route from dsh through Profile, Bundle, Cordis, ReactLoopAgent, and SessionEvent to Web and ACP, with model and tool feedback inside the agent loop" /></figure>
+          </section>
+          <section class="article-body">
+            <p>Consider one task: a user opens <code>dsh web</code> and asks the agent to inspect failing tests, repair them, and report the result. The launcher must select a product composition; the runtime must create or restore a session; the model may request several tools; and the interface must expose both progress and the terminal answer.</p>
+            <p>Reducing this to “browser → LLM → tool → answer” removes the ownership boundaries that make it reliable. Who assembles system instructions, history, and tools before the provider request? Who ensures the durable record crosses a checkpoint before a side effect? After a crash, which events may be replayed, and which effects must remain explicitly uncertain? A harness that cannot answer those questions is only a successful demo path.</p>
+
+            <div class="note"><p><strong>Reading contract.</strong>After this chapter, you should be able to explain how <code>dsh web</code> selects a profile; how bundle patches become a Cordis plugin tree; how <code>ReactLoopAgent</code> separates turns from steps; why <code>SessionEvent[]</code>, <code>surface.nodes</code>, and <code>deriveMessages()</code> are not one chat transcript; and why a tool effect crosses logging, policy, and sandbox boundaries.</p></div>
+            <p><strong>Evidence boundary.</strong>This chapter is pinned to DeepSeek Harness commit <a href="https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"><code>b150a551b8d465e31e418e1b2eaf5e79bbb7d28e</code></a>, tagged <code>dsh-v0.1.1-rc.2</code>. Types, event ordering, and the base composition come from that snapshot. The repository also calls the project a developer preview, so the evidence supports source contracts—not a claim of production maturity, performance, or certified security.</p>
+
+            <h2>1. <code>dsh web</code> boots a composition, not a single app</h2>
+            <h3>1.1 The CLI selects a profile, then yields the remaining arguments</h3>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/apps/cli/src/args.ts"><code>apps/cli/src/args.ts</code></a> defines <code>web</code> as a hard-coded alias for <code>--profile web</code>. The launcher parses only the profile, patch, and config-dump flags it owns. Remaining argv becomes an immutable <code>cmdlineArgs</code> snapshot interpreted by application plugins inside the mounted composition.</p>
+            <p>This apparently small CLI boundary removes a large coupling: the top-level launcher does not need to learn every future Web, TUI, or headless flag. It chooses the plugin tree; plugins define product behavior.</p>
+            <pre><code class="language-bash">dsh web --no-open
+dsh --profile headless "run the tests"
+dsh --profile tui --patch ./extra.yml --resume &lt;session&gt;</code></pre>
+
+            <h3>1.2 A Profile is a mutable instance; a Bundle is a reusable layer</h3>
+            <figure class="hero-image"><img src="../../assets/profile-bundle-tree.png" alt="DeepSeek Harness configuration assembly: Profile, Bundle, cordis.patch.yml, and a command-line patch merge into a Cordis plugin tree and then boot dsh" /></figure>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/apps/cli/src/profile-boot.ts"><code>profile-boot.ts</code></a> makes the precedence explicit: bundle patches in <code>dsh.profile.bundles</code> order, the profile's own <code>cordis.patch.yml</code>, the home patch, command-line <code>--patch</code> overlays, and finally the telemetry switch. These are successive patches over one configuration tree, not unrelated configuration files.</p>
+            <p>A Bundle therefore represents a reusable, publishable product layer such as base or web-app. A Profile is the instance that will actually boot in one user environment. It may install more bundles and override their defaults. <code>dsh plugin</code> updates the on-disk manifest and bundle list; it does not silently replace the tree already running in memory.</p>
+            <div class="table-wrap"><table><thead><tr><th>Layer</th><th>Fact it owns</th><th>What a change affects</th></tr></thead><tbody>
+              <tr><td>Bundle</td><td>A reusable Cordis patch and its dependencies.</td><td>The product's default services and plugins.</td></tr>
+              <tr><td>Profile manifest</td><td>Which bundles this instance applies and in what order.</td><td>The composition on the next boot.</td></tr>
+              <tr><td><code>cordis.patch.yml</code></td><td>Instance-level plugin configuration and overrides.</td><td>Service parameters, mount points, and local capabilities.</td></tr>
+              <tr><td><code>--patch</code></td><td>A temporary overlay for this invocation.</td><td>Diagnostics and one-off compositions without rewriting the base.</td></tr>
+            </tbody></table></div>
+
+            <h3>1.3 “Everything is a plugin” means capability seams are replaceable</h3>
+            <p>The repository's <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/docs/architecture.md">architecture document</a> lists model adapters, tools, the session log, and the agent loop as plugins. <code>packages/core/*</code> keeps a small set of kernel contracts: LLM requests and stream chunks, tool schemas and execution, SessionEvent, Agent handles, and scoped plugin context. Providers implement capabilities through Cordis services and events.</p>
+            <p>The important point is not the number of npm packages. Consumers depend on a capability; a provider supplies it within a scope. The plugin tree determines visibility, disposal, and interception order. A model adapter, persistence layer, or agent loop can change without teaching every upper layer a new implementation type.</p>
+
+            <h2>2. A turn enters ReactLoopAgent through a Session</h2>
+            <h3>2.1 Session becomes the container for runtime facts</h3>
+            <p>A Web or ACP surface does not call <code>llm.stream()</code> directly. It obtains an Agent handle from a registry, associated with a <code>Session</code>. The Session owns append-only <code>SessionEvent[]</code>, the active surface, request headers, and scoped context. Persistence plugins subscribe to <code>session/event</code> and are awaited at the <code>session/flush</code> observation barrier.</p>
+            <p>This gives “model-visible” a strict foundation. A fact that should participate in recovery, projection, or a future request must first become a session event. State that exists only in a local variable, a console line, or a UI store is not recoverable agent history.</p>
+
+            <h3>2.2 A turn contains steps; a step advances one model interaction</h3>
+            <figure class="hero-image"><img src="../../assets/turn-step-lifecycle.png" alt="DeepSeek Harness turn and step lifecycle: turn/start encloses repeatable step/start, user/message, agent/request, llm/stream, and tool loops before turn/end" /></figure>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/agent.ts#L247-L322"><code>ReactLoopAgent.run()</code></a> appends <code>turn/start</code> after claiming an inbox item. Each advance appends <code>step/start</code>; the first step turns the input into <code>user/message</code>. Tool results can drive later steps. Only when a stopping policy supplies a reason does the loop append <code>turn/end</code>.</p>
+            <p>A turn is therefore not one HTTP request or one provider call. Repairing tests may require four model–tool exchanges and still remain one turn. A step is the observable unit of advancement inside it.</p>
+            <pre><code class="language-typescript">session.append('turn/start', { turn })
+
+while (!turnEnds) {
+  session.append('step/start', { turn, step })
+  const prepared = await preStep(target, { turn, step })
+  await step(prepared, { turn, step }, signal)
+  session.append('step/end', { turn, step, reason })
+}
+
+session.append('turn/end', { turn, reason: turnEnds })</code></pre>
+
+            <h3>2.3 <code>preStep()</code> claims input and assembles capabilities</h3>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/agent.ts#L225-L245"><code>preStep()</code></a> claims the current inbox target, runs prompt and tool assembly, merges runtime context, and executes the <code>agent/pre-step</code> waterfall. The claim prevents concurrent loops from treating the same item as their next user message.</p>
+            <p>System instructions and tools are not necessarily frozen when the Agent object is constructed. Plugins can supply or filter them by session, turn, step, and runtime scope. That flexibility makes assembly order part of product semantics; Part II will read how Cordis patches establish the order.</p>
+
+            <h2>3. The model sees an event projection, not the raw log</h2>
+            <h3>3.1 <code>buildRequest()</code> fixes the request envelope before dispatch</h3>
+            <p>Inside a step, the loop emits <code>agent/request</code>, calls <code>Session.deriveMessages()</code>, and asks the LLM service to prepare a provider call. The <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/agent.ts#L340-L352">dispatch path</a> then consumes <code>llm.stream()</code> and appends every chunk as <code>assistant/chunk</code>.</p>
+            <p><code>buildRequest()</code> also logs the non-history request envelope as <code>request/header</code>: provider, model, system text, tools, and adapter defaults have a canonical recovery snapshot. Conversation messages alone cannot prove which tool set and model configuration produced an in-flight request.</p>
+
+            <h3>3.2 One Session maintains three distinct views</h3>
+            <figure class="hero-image"><img src="../../assets/session-three-views.png" alt="Three DeepSeek Harness Session views: the append-only SessionEvent log projects into surface.nodes, which derives model messages for llm.stream and a richer Web timeline; raw assistant chunks may remain only in the log" /></figure>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/index.ts#L425-L746"><code>Session</code></a> maintains three related forms:</p>
+            <ul>
+              <li><strong>Raw event log:</strong>ordered <code>SessionEvent[]</code> retains turn, step, chunk, tool, header, and compaction facts.</li>
+              <li><strong>Surface projection:</strong><code>surface.nodes</code> expresses the active conversation surface. Compaction can replace an old surface range with a new generation without deleting the raw events.</li>
+              <li><strong>Model messages:</strong><code>deriveMessages()</code> converts only eligible surface nodes into <code>Message[]</code>. Boundaries such as <code>turn/start</code> and raw <code>assistant/chunk</code> are not copied directly into provider history.</li>
+            </ul>
+            <p>The Web UI may consume more events for progress, tokens, tool state, and diagnostics. “Visible to the user,” “visible to the model,” and “available for recovery” are therefore separate properties derived from one source—not interchangeable transcripts.</p>
+
+            <h2>4. Tool calls cross durability and governance boundaries</h2>
+            <h3>4.1 The model proposes an action; the runtime owns the effect</h3>
+            <figure class="hero-image"><img src="../../assets/tool-side-effect-gates.png" alt="DeepSeek Harness tool-effect gates: a tool call crosses session flush, pre-execute policy, approval request, and sandbox wrapping before tools execute and return a result" /></figure>
+            <p>When the LLM stream emits a structured tool call, the loop records it before handing it to the tool service. The base bundle also mounts checkpoint policy, approval, sandbox, and result-pruning plugins. They answer different questions: is the call durably recorded; does policy permit it; has a user approved it; where can the code execute; and how should the result re-enter the model surface?</p>
+            <p>These cannot collapse into one “security check.” Approval is an interactive decision, not filesystem isolation. A sandbox restricts an environment but does not know the user's intent. <code>session/flush</code> proves that the log crossed a durability barrier; it does not make an action authorized. Separate owners let failure resolve to rejection, waiting, retry, or deliberate stop.</p>
+
+            <h3>4.2 Recovery is safe only if uncertainty can be represented</h3>
+            <figure class="hero-image"><img src="../../assets/recovery-route.png" alt="DeepSeek Harness restores a compressed JSONL session through Session.fromRestore, deriveMessages, and request header reconstruction; a tool whose outcome cannot be proven remains quarantined as TOOL_OUTCOME_UNKNOWN" /></figure>
+            <p>The default JSONL persistence appends events and can use zstd compression. On resume, <code>Session.fromRestore()</code> validates seed events, reconstructs the surface and request header, and lets the Agent continue from durable state. The dangerous crash falls after an external side effect but before a durable <code>tool/result</code>.</p>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/repair.ts"><code>repair.ts</code></a> distinguishes <code>TOOL_NOT_STARTED</code> from <code>TOOL_OUTCOME_UNKNOWN</code>. The first proves execution never crossed the durable call boundary; the second says it may have started but its outcome is unavailable. The runtime must not blindly replay the latter: a file write, message send, or deployment trigger may already have succeeded.</p>
+
+            <h2>5. Web and ACP are surfaces over the same runtime kernel</h2>
+            <h3>5.1 Product interfaces consume handles and events; they do not own the loop</h3>
+            <p>The architecture document places Web, TUI, headless, and the ACP demo in profile and bundle layers. They choose input, presentation, and delivery protocols while sharing the core Agent, Session, LLM, and tool capability seams. The browser is not the Agent's owner; it is a consumer that can create, restore, send to, and observe an Agent handle.</p>
+            <p>This is why DSH deserves a source series of its own. Its central question is not how one agent product accumulates features, but <strong>how several product surfaces reuse one set of runtime semantics</strong>. If Web owned one authoritative history and ACP another, recovery and tool governance would drift by entry point. The event-sourced Session forces them back onto one fact stream.</p>
+
+            <h3>5.2 The complete path has seven handoff points</h3>
+            <ol>
+              <li><code>dsh</code> parses launcher options and selects a Profile.</li>
+              <li>The Profile combines Bundles, instance patches, and invocation overlays into a Cordis tree.</li>
+              <li>A product surface creates or restores an Agent handle and Session through the registry.</li>
+              <li><code>ReactLoopAgent</code> claims inbox input, records turn/step boundaries, and assembles prompts and tools.</li>
+              <li><code>deriveMessages()</code> projects history; the LLM service streams assistant and tool events.</li>
+              <li>Tool calls cross durability, policy, approval, and sandbox boundaries before results return to Session.</li>
+              <li>A stopping policy appends <code>turn/end</code>; Web or ACP observes and delivers from the same event source.</li>
+            </ol>
+
+            <h2 id="route">6. The six boundaries opened by the remaining chapters</h2>
+            <figure class="hero-image"><img src="../../assets/series-layer-map.png" alt="Seven-part DeepSeek Harness source route from the ReactLoopAgent mainline through Cordis, SessionEvent, tool effects, compaction, SubagentRuntime, and the cordis self-referential runtime" /></figure>
+            <p>Part I establishes the coordinate system. The next six chapters follow the same commit in dependency order:</p>
+            <ol>
+              <li><strong>Cordis composition:</strong>how patches, services, scopes, and lifecycle create a replaceable but ordered product tree.</li>
+              <li><strong>Event-sourced sessions:</strong>how “Model-visible means logged” becomes surface projection and recovery invariants.</li>
+              <li><strong>Governed effects:</strong>how checkpoints, approval, sandboxing, pruning, and crash repair form an execution protocol.</li>
+              <li><strong>Compaction:</strong>why it replaces a surface rather than deleting raw events, and how request headers support cache-friendly reconstruction.</li>
+              <li><strong>Multi-agent work:</strong>how spawn, fork, workflow, Ralph, and experimental teams differ in session ownership and delivery.</li>
+              <li><strong>Self-referential runtime:</strong>how <code>cordis_inspect</code>, <code>cordis_define</code>, <code>cordis_run</code>, and <code>cordis_stop</code> let an agent change the live process—and why that is not a security boundary.</li>
+            </ol>
+            <p>Seen from this route, “everything is a plugin” is no longer marketing shorthand. Model adapters, tools, state, the loop, and interfaces are replaceable, but only while they obey shared event, scope, and side-effect contracts. That is what keeps composability from erasing explainability.</p>
+
+            <h2 id="sources">Source references</h2>
+            <ul>
+              <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/README.md">Project README</a> and <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/docs/architecture.md">Architecture</a>: product positioning, plugin tree, and turn flow.</li>
+              <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/apps/cli/src/profile-boot.ts">profile-boot.ts</a> and the <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/apps/cli/README.md">CLI README</a>: Profile, Bundle, and patch precedence.</li>
+              <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/agent.ts">agent.ts</a>: the ReactLoopAgent turn/step, request, and stream path.</li>
+              <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/index.ts">Session implementation</a> and <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/README.md">Session contract</a>: events, surface, message projection, and recovery.</li>
+              <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/bundle/base/cordis.patch.yml">Base bundle composition</a>: default persistence, approval, sandbox, compaction, subagent, and agent-loop plugins.</li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+    <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+    <script defer src="../../../assets/code-highlight.js?v=1"></script>
+    <script defer src="../../../openclaw/article.js?v=1"></script>
+  </body>
+</html>

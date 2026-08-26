@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeepSeek Harness 源码笔记（一）：从 dsh web 到一次 turn/end</title>
+    <meta name="description" content="沿 DeepSeek Harness 固定源码快照，追踪 dsh profile、bundle、Cordis 插件树、ReactLoopAgent、SessionEvent 与 Web/ACP 的完整运行主线。" />
+    <meta name="theme-color" content="#fffaf0" />
+    <meta property="og:title" content="DeepSeek Harness 源码笔记（一）：从 dsh web 到一次 turn/end" />
+    <meta property="og:description" content="先跑通最长主线，再理解插件、状态、副作用、压缩与委派。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../../assets/runtime-route.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/deepseek-harness/zh/runtime-route/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/deepseek-harness/zh/runtime-route/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/deepseek-harness/en/runtime-route/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/deepseek-harness/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="文章快捷入口"><a href="../">DSH 系列</a><a href="#route">后续路线</a><a href="#sources">参考源码</a></nav>
+      <nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/runtime-route/" lang="en">English</a></span></nav>
+    </header>
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero">
+            <p class="eyebrow">DeepSeek Harness 源码笔记 · 第一篇</p>
+            <h1>从 <code>dsh web</code> 到一次 <code>turn/end</code></h1>
+            <p class="lead">DeepSeek Harness 最值得读的，不是它又接了哪些模型和工具，而是它把通常散落在应用代码里的“胶水”变成了可组合、可观察、可恢复的运行时。第一篇先跟一条请求走完整条路。</p>
+            <div class="meta-line"><span>系列 1 / 7</span><span>源码快照：b150a55</span><span>版本：dsh-v0.1.1-rc.2</span><span>主题：端到端运行主线</span></div>
+            <nav class="series-strip" aria-label="DeepSeek Harness 系列"><span class="series-current"><strong>01</strong> 从 dsh web 到 turn/end</span><a href="../"><strong>路线图</strong> 完整七篇</a></nav>
+            <figure class="hero-image"><img src="../../assets/runtime-route.png" alt="DeepSeek Harness 运行主线，从 dsh 经 Profile、Bundle、Cordis、ReactLoopAgent、SessionEvent 到 Web 与 ACP，模型和工具在 Agent loop 中往返" /></figure>
+          </section>
+          <section class="article-body">
+            <p>先设定一个贯穿全文的任务：用户打开 <code>dsh web</code>，要求“检查仓库里失败的测试，修好后给出结果”。这句话会触发至少四类工作：启动器要知道加载哪套产品；运行时要创建或恢复一段 session；模型可能多次请求工具；界面还要把正在发生的事件和最终结果显示出来。</p>
+            <p>把它缩成“浏览器请求 → LLM → 工具 → 回答”会漏掉真正决定正确性的部分。模型请求前，谁拼出 system、history 与 tools？工具执行前，谁确保持久记录已经落地？进程崩溃后，哪些事件可以重放，哪些副作用必须标成结果未知？如果这些问题没有明确所有者，harness 就只是一次能跑通的 demo。</p>
+
+            <div class="note"><p><strong>阅读契约。</strong>读完本文，你应该能复述：<code>dsh web</code> 怎样选中 profile；bundle patch 怎样变成 Cordis 插件树；<code>ReactLoopAgent</code> 如何划分 turn 与 step；为什么 <code>SessionEvent[]</code>、<code>surface.nodes</code> 与 <code>deriveMessages()</code> 不是同一份“聊天记录”；以及一次工具副作用为什么必须先穿过日志、策略和 sandbox 边界。</p></div>
+            <p><strong>证据边界。</strong>本文固定在 DeepSeek Harness 提交 <a href="https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"><code>b150a551b8d465e31e418e1b2eaf5e79bbb7d28e</code></a>，对应 <code>dsh-v0.1.1-rc.2</code>。类型、事件顺序与默认组合来自这个快照。仓库同时把项目标为 developer preview，因此本文描述的是源码契约，不把它外推成生产可用性、性能或安全认证。</p>
+
+            <h2>一、<code>dsh web</code> 启动的不是单个应用</h2>
+            <h3>1.1 CLI 先选择 profile，再把剩余参数交给产品</h3>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/apps/cli/src/args.ts"><code>apps/cli/src/args.ts</code></a> 把 <code>web</code> 定义成 <code>--profile web</code> 的硬编码别名。启动器只解析自己拥有的 profile、patch 和 config dump 参数；遇到产品参数以后，余下的 argv 会成为一份共享、不可变的 <code>cmdlineArgs</code> 快照，由已装入的应用插件解释。</p>
+            <p>这条边界看似只是 CLI 设计，实际上避免了一个常见耦合：顶层启动器不需要知道 Web、TUI 或 headless 将来新增哪些 flag。它只负责决定“装哪棵插件树”，产品行为由树里的插件声明。</p>
+            <pre><code class="language-bash">dsh web --no-open
+dsh --profile headless "run the tests"
+dsh --profile tui --patch ./extra.yml --resume &lt;session&gt;</code></pre>
+
+            <h3>1.2 Profile 是可修改实例，Bundle 是可复用层</h3>
+            <figure class="hero-image"><img src="../../assets/profile-bundle-tree.png" alt="DeepSeek Harness 配置装配：Profile、Bundle、cordis.patch.yml 与命令行 patch 合并为 Cordis 插件树，再启动 dsh" /></figure>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/apps/cli/src/profile-boot.ts"><code>profile-boot.ts</code></a> 明确了层叠顺序：先按 <code>dsh.profile.bundles</code> 的顺序应用 bundle patch，再叠 profile 自己的 <code>cordis.patch.yml</code>、home 级 patch、命令行 <code>--patch</code>，最后加 telemetry switch。每一层都是对同一棵配置树的 patch，不是多个互不相干的配置文件。</p>
+            <p>因此 profile 与 bundle 不只是“用户配置”和“默认配置”的别名。Bundle 表达可以复用、可以依赖的产品层，例如 base 与 web-app；Profile 则是某个用户环境中真正会启动的实例，可以安装额外 bundle，也可以覆盖默认参数。<code>dsh plugin</code> 修改的是磁盘上的 profile manifest 与 bundle 列表；已运行的进程不会神奇地热切换成另一棵树。</p>
+            <div class="table-wrap"><table><thead><tr><th>层</th><th>拥有的事实</th><th>改变它会影响什么</th></tr></thead><tbody>
+              <tr><td>Bundle</td><td>一组可发布、可复用的 Cordis patch 与依赖。</td><td>决定产品默认拥有哪些服务和插件。</td></tr>
+              <tr><td>Profile manifest</td><td>这个实例按什么顺序采用哪些 bundle。</td><td>改变下一次启动的产品组成。</td></tr>
+              <tr><td><code>cordis.patch.yml</code></td><td>实例级插件配置和覆盖。</td><td>修改服务参数、挂载位置或局部能力。</td></tr>
+              <tr><td><code>--patch</code></td><td>本次调用的临时覆盖层。</td><td>适合诊断或一次性组合，不改写基础层。</td></tr>
+            </tbody></table></div>
+
+            <h3>1.3 “Everything is a plugin” 的含义是能力缝隙可替换</h3>
+            <p>项目的 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/docs/architecture.md">Architecture</a> 文档把 model adapter、tools、session log、agent loop 都列为插件。<code>packages/core/*</code> 只保留少量内核契约：LLM 请求/流式块、工具 schema/执行、SessionEvent、Agent handle 与插件作用域。具体实现通过 Cordis service 和事件 seam 接入。</p>
+            <p>关键不是“代码拆成很多 npm 包”，而是消费者依赖一个 capability，provider 在作用域内提供它。插件树又决定 provider 在哪里可见、何时卸载、能拦截哪些事件。替换模型适配器、持久化或 agent loop 因而不需要让所有上层都识别新实现。</p>
+
+            <h2>二、一次 turn 怎样进入 ReactLoopAgent</h2>
+            <h3>2.1 Session 先成为运行事实的容器</h3>
+            <p>Web 或 ACP 入口最终不会直接调用 <code>llm.stream()</code>。它先通过 agent registry 获取一个 handle，handle 关联一份 <code>Session</code>。这个对象维护追加式 <code>SessionEvent[]</code>、当前 surface、header 与 scoped context；持久化插件则订阅 <code>session/event</code>，在 <code>session/flush</code> 观测屏障被等待。</p>
+            <p>这使“模型可见”有了严格定义：想让某个事实参与恢复、投影或下一次请求，必须先把它写成 session event。只存在于局部变量、console 或 UI store 里的状态，不属于 Agent 的可恢复历史。</p>
+
+            <h3>2.2 Turn 包住多个 step，step 包住一次模型推进</h3>
+            <figure class="hero-image"><img src="../../assets/turn-step-lifecycle.png" alt="DeepSeek Harness turn 与 step 生命周期：turn/start 包住可重复的 step/start、user/message、agent/request、llm/stream 与工具循环，最后写入 turn/end" /></figure>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/agent.ts#L247-L322"><code>ReactLoopAgent.run()</code></a> 在接纳 inbox item 后写入 <code>turn/start</code>。每次推进写 <code>step/start</code>，首个 step 把用户输入变成 <code>user/message</code>；模型产生工具调用时，工具结果会让循环进入后续 step。只有停止策略给出理由，才追加 <code>turn/end</code>。</p>
+            <p>所以 turn 不是一次 HTTP 请求，也不是一次 provider call。我们的“修测试”任务可能包含读取日志、搜索源码、修改文件和运行测试四轮模型—工具往返，但它仍属于同一个 turn。step 才是本轮中一次可观测的推进单位。</p>
+            <pre><code class="language-typescript">session.append('turn/start', { turn })
+
+while (!turnEnds) {
+  session.append('step/start', { turn, step })
+  const prepared = await preStep(target, { turn, step })
+  await step(prepared, { turn, step }, signal)
+  session.append('step/end', { turn, step, reason })
+}
+
+session.append('turn/end', { turn, reason: turnEnds })</code></pre>
+
+            <h3>2.3 <code>preStep()</code> 负责一次性声称输入和装配能力</h3>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/agent.ts#L225-L245"><code>preStep()</code></a> 先从 inbox claim 当前目标，再执行 prompt assembly、tool assembly、runtime context merge 与 <code>agent/pre-step</code> waterfall。这里的 claim 很重要：并发循环不能同时把同一条输入当成自己的下一条用户消息。</p>
+            <p>系统提示词和工具也不是构造 Agent 时冻结的一份数组。插件可以按 session、turn、step 和 runtime scope 提供或裁剪能力。这样做的代价是装配顺序本身成为产品语义；第二篇会专门读 Cordis patch 怎样确定顺序与作用域。</p>
+
+            <h2>三、模型看到的是事件投影，不是原始日志</h2>
+            <h3>3.1 <code>buildRequest()</code> 在模型调用前固定请求封装</h3>
+            <p>进入 step 后，loop 先触发 <code>agent/request</code>，再调用 <code>Session.deriveMessages()</code> 得到模型历史，并通过 LLM service 准备 provider call。<a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/agent.ts#L340-L352">对应源码</a> 随后逐块消费 <code>llm.stream()</code>，把每个块追加为 <code>assistant/chunk</code>。</p>
+            <p><code>buildRequest()</code> 还会把非历史请求封装写成 <code>request/header</code>：provider、model、system、tools 与适配器默认值有了可恢复的规范快照。否则恢复时即使有对话，也无法证明当时到底用哪组工具和模型配置发出了请求。</p>
+
+            <h3>3.2 一份 Session 同时维护三种视图</h3>
+            <figure class="hero-image"><img src="../../assets/session-three-views.png" alt="DeepSeek Harness Session 的三种视图：SessionEvent 追加日志投影成 surface.nodes，再分别派生成 llm.stream 使用的消息历史与 Web 时间线；assistant chunk 可以保留在原始日志中" /></figure>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/index.ts#L425-L746"><code>Session</code></a> 同时维护三类信息：</p>
+            <ul>
+              <li><strong>原始事件日志：</strong><code>SessionEvent[]</code> 按 seq 追加，保留 turn、step、chunk、tool、header、compaction 等事实；</li>
+              <li><strong>surface projection：</strong><code>surface.nodes</code> 表示当前有效的会话表面，压缩可以用新 generation 替换一段旧表面，但不抹掉原始事件；</li>
+              <li><strong>模型消息：</strong><code>deriveMessages()</code> 只把表面节点中满足模型消息契约的事件转成 <code>Message[]</code>，<code>turn/start</code> 和原始 <code>assistant/chunk</code> 不会直接塞进 provider history。</li>
+            </ul>
+            <p>Web UI 可以读取比模型更多的事件，用来显示进度、token、工具状态和诊断信息。于是“用户能看见”“模型能看见”“恢复能重建”是三种不同的可见性；都从同一事件源派生，却不能互相替代。</p>
+
+            <h2>四、工具调用为什么先经过持久化和治理</h2>
+            <h3>4.1 模型只提出动作，runtime 才拥有副作用</h3>
+            <figure class="hero-image"><img src="../../assets/tool-side-effect-gates.png" alt="DeepSeek Harness 工具副作用闸门：tool call 先经过 session flush、pre-execute、approval request 与 sandbox wrap，才由 tools execute 产生 tool result" /></figure>
+            <p>LLM stream 产出结构化 tool call 后，loop 会把调用写入 session，再交给工具服务。默认 bundle 还装入 checkpoint policy、approval、sandbox 与 result pruning 等插件。它们分别回答不同问题：调用事实是否已持久；策略是否允许；用户是否同意；代码在哪个隔离边界里执行；结果怎样回到模型表面。</p>
+            <p>这些门不能合成一个“安全检查”。Approval 是交互决策，不提供文件系统隔离；sandbox 限制运行环境，却不知道用户是否希望执行；<code>session/flush</code> 只证明日志越过耐久屏障，也不说明动作本身合法。把责任拆开，失败时才知道应该拒绝、等待、重试还是停止。</p>
+
+            <h3>4.2 崩溃恢复的关键是“不确定”可以被表达</h3>
+            <figure class="hero-image"><img src="../../assets/recovery-route.png" alt="DeepSeek Harness 从压缩 JSONL session 日志恢复：Session.fromRestore、deriveMessages 与 request header 重建 ReactLoopAgent；无法确认结果的工具调用被隔离为 TOOL_OUTCOME_UNKNOWN" /></figure>
+            <p>默认 JSONL persistence 用追加式日志保存事件，并可使用 zstd 压缩。恢复时，<code>Session.fromRestore()</code> 校验种子事件、重建 surface 与 request header，再让 Agent 从持久状态继续。真正危险的是进程恰好在工具副作用发生以后、<code>tool/result</code> 持久以前崩溃。</p>
+            <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/repair.ts"><code>repair.ts</code></a> 区分 <code>TOOL_NOT_STARTED</code> 与 <code>TOOL_OUTCOME_UNKNOWN</code>：前者可以证明没有越过 durable <code>tool/call</code> 边界，后者表示调用已经开始但结果无法确认。后者不应该被 runtime 擅自重放，因为写文件、发消息或触发部署可能已经成功。</p>
+
+            <h2>五、Web 与 ACP 只是同一运行内核的两种表面</h2>
+            <h3>5.1 产品界面消费 handle 与事件，不接管 loop</h3>
+            <p>Architecture 文档把 Web、TUI、headless 与 ACP demo 放在 profile/bundle 层。它们可以选择输入方式、事件展示和投递协议，却共享 core agent、session、LLM 与 tools 的能力 seam。换句话说，浏览器不是 Agent 的所有者；它是一个能够创建、恢复、发送和观察 handle 的消费者。</p>
+            <p>这也是 DSH 适合单开一个系列的原因：它研究的不是某一个 Agent 产品怎样堆功能，而是<strong>不同产品表面怎样复用同一组运行语义</strong>。如果 Web 自己维护一份“真实历史”、ACP 又维护另一份，恢复和工具治理就会随入口漂移；事件化 session 把它们重新压到同一事实源上。</p>
+
+            <h3>5.2 一次完整路线可以压成七个交接点</h3>
+            <ol>
+              <li><code>dsh</code> 解析 launcher 参数并选中 Profile；</li>
+              <li>Profile 按 Bundle、实例 patch 与命令行覆盖合成 Cordis 树；</li>
+              <li>产品入口通过 registry 创建或恢复 Agent handle 与 Session；</li>
+              <li><code>ReactLoopAgent</code> claim inbox，写入 turn/step 边界并装配 prompt/tools；</li>
+              <li><code>deriveMessages()</code> 从 surface 派生 history，LLM service 流式返回 assistant/tool 事件；</li>
+              <li>工具调用穿过持久化、策略、approval 与 sandbox，再把 result 写回 session；</li>
+              <li>停止策略写入 <code>turn/end</code>，Web/ACP 从同一事件源观察并交付结果。</li>
+            </ol>
+
+            <h2 id="route">六、后续六篇要打开哪些边界</h2>
+            <figure class="hero-image"><img src="../../assets/series-layer-map.png" alt="DeepSeek Harness 七篇源码路线，从 ReactLoopAgent 主线进入 Cordis、SessionEvent、工具副作用、压缩、SubagentRuntime 与 cordis 自指运行时" /></figure>
+            <p>第一篇建立的是坐标系。后续六篇会沿同一提交按依赖顺序深入：</p>
+            <ol>
+              <li><strong>Cordis 装配：</strong>patch、service、scope 与 lifecycle 怎样让一棵产品树可替换又不失序；</li>
+              <li><strong>事件会话：</strong>“Model-visible means logged”怎样落实到 surface、projection 与恢复不变量；</li>
+              <li><strong>副作用治理：</strong>checkpoint、approval、sandbox、pruner 与 crash repair 怎样组成一条执行协议；</li>
+              <li><strong>压缩：</strong>compaction 为什么替换 surface 而不删除原始事件，以及 request header 如何支持 cache-friendly reconstruction；</li>
+              <li><strong>多 Agent：</strong>spawn、fork、workflow、Ralph 与 experimental teams 分别拥有怎样的 session 和交付边界；</li>
+              <li><strong>自指运行时：</strong><code>cordis_inspect</code>、<code>cordis_define</code>、<code>cordis_run</code>、<code>cordis_stop</code> 如何让 Agent 改写当前进程，以及为什么它不是安全边界。</li>
+            </ol>
+            <p>从这条主线再回看“everything is a plugin”，它不再是一句包装语。模型适配、工具、状态、循环和界面确实都能被替换；但它们必须服从同一套事件、作用域与副作用契约，系统才不会在灵活性中失去可解释性。</p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul>
+              <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/README.md">项目 README</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/docs/architecture.md">Architecture</a>：产品定位、插件树与 turn flow。</li>
+              <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/apps/cli/src/profile-boot.ts">profile-boot.ts</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/apps/cli/README.md">CLI README</a>：Profile、Bundle 和 patch 层叠。</li>
+              <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/agent.ts">agent.ts</a>：ReactLoopAgent 的 turn/step、request 与 stream 主线。</li>
+              <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/index.ts">Session 实现</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/README.md">Session 契约</a>：事件、surface、消息投影与恢复。</li>
+              <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/bundle/base/cordis.patch.yml">base bundle</a>：默认持久化、approval、sandbox、compaction、subagent 与 agent-loop 装配。</li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+    <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+    <script defer src="../../../assets/code-highlight.js?v=1"></script>
+    <script defer src="../../../openclaw/article.js?v=1"></script>
+  </body>
+</html>
