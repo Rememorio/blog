@@ -1,0 +1,87 @@
+<!doctype html><html lang="zh-CN"><head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>DeepSeek Harness 源码笔记（六）：多 Agent 不是多条消息</title>
+  <meta name="description" content="从 SubagentRuntime、spawn/fork、continuable child、workflow worker、Ralph 与实验性 Team，读懂 DeepSeek Harness 的多 Agent 所有权和隔离边界。" />
+  <meta property="og:title" content="DeepSeek Harness 源码笔记（六）：多 Agent 不是多条消息" /><meta property="og:type" content="article" /><meta property="og:image" content="../../assets/multi-agent-runtime-map.png" />
+  <link rel="canonical" href="https://rememorio.github.io/blog/deepseek-harness/zh/multi-agent-runtime/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/deepseek-harness/zh/multi-agent-runtime/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/deepseek-harness/en/multi-agent-runtime/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/deepseek-harness/" />
+  <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+</head><body id="top"><header class="site-header"><a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">DSH 系列</a><a href="../compaction-reconstruction/">上一篇</a><a href="#sources">参考源码</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./">中文</a><a href="../../en/multi-agent-runtime/">English</a></span></nav></header>
+<div class="article-shell"><aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
+<section class="article-hero"><p class="eyebrow">DeepSeek Harness 源码笔记 · 第六篇</p><h1>多 Agent 不是多条消息：从 SubagentRuntime 到 Workflow 与 Team</h1>
+  <p class="lead">DSH 不把 child 当成 parent history 里的一个隐形线程。每个本地 child 都有自己的 Session、lineage、depth 和生命周期；spawn、fork、workflow、Ralph 与实验性 Team 只是在同一 provider seam 之上选择了不同的上下文、调度和回传协议。</p>
+  <div class="meta-line"><span>系列 6 / 7</span><span>源码快照：b150a55</span><span>主题：多 Agent 运行时</span><span>核心：Provider → Child Session → Ownership → Coordination</span></div>
+  <nav class="series-strip"><a href="../runtime-route/"><strong>01</strong> 运行主线</a><a href="../cordis-composition/"><strong>02</strong> Cordis</a><a href="../event-sourced-session/"><strong>03</strong> 事件会话</a><a href="../governed-effects/"><strong>04</strong> 副作用</a><a href="../compaction-reconstruction/"><strong>05</strong> 压缩</a><span class="series-current"><strong>06</strong> 多 Agent</span><a href="../"><strong>路线图</strong></a></nav>
+  <figure class="hero-image"><img src="../../assets/multi-agent-runtime-map.png" alt="DeepSeek Harness 多 Agent 架构：subagent 与 subagent fork 直达 ctx.subagents，workflow 和 Ralph 经 ctx.workflowEngine，实验性 Team 经 ctx.agentTeams；共同路由到 spawn、fork 与 out-of-process provider，再创建独立 child Session" /></figure>
+</section><section class="article-body">
+  <p>“开几个 Agent 并行做”听起来像一个调用选项，实际至少包含六个决定：child 看不看 parent history；谁拥有它的取消与 dispose；结果是同步返回、异步通知还是 durable mailbox；可以继续对话还是一次性结束；并发和深度在哪里封顶；多个 worker 改同一个 workspace 时谁负责冲突。</p>
+  <p>DSH 的答案不是一个巨大的 AgentManager，而是多个 seam。<code>ctx.subagents</code> 统一 child provider 和生命周期；<code>ctx.workflowEngine</code> 执行模型写的编排脚本；Ralph 把固定顺序策略装成普通工具；实验性 <code>ctx.agentTeams</code> 再在 continuable children 上叠 durable roster、mailbox 与 task DAG。</p>
+  <div class="note"><p><strong>阅读契约。</strong>读完以后，你应该能说明：spawn 和 fork 唯一的历史差异；为什么 fork 必须切在最后一个 <code>turn/end</code>；one-shot run 与 continuable Activation 谁负责收尾；<code>reportFrom()</code> 和 settlement notice 为什么不能合并；workflow worker 提供什么隔离、又绝不提供什么安全；以及 Ralph 与 Team 为什么不是“串行版和并行版的同一个功能”。</p></div>
+  <p><strong>证据边界。</strong>本文固定在提交 <a href="https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"><code>b150a55</code></a>。实验性 Team 位于 <code>packages/experimental</code>，需要显式启用；它不是 base bundle 的稳定默认协作协议。<code>toolFilter</code> 和 shared-cwd policy 也不是安全边界，外部进程与 Bash 仍能绕过协调约定。</p>
+
+  <h2>一、一个 provider seam，多个编排消费者</h2>
+  <h3>1.1 SubagentRuntime 只统一启动契约，不统一实现</h3>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/subagent/subagent/README.md"><code>SubagentRuntime</code></a> 注册具名 provider。<code>start(name, request)</code> 只服务 one-shot child；<code>startContinuable(spec)</code> 建立可继续 child；<code>followup</code>、<code>interrupt</code>、<code>reportFrom</code> 与 list/drain 操作都围绕 durable session identity 和 direct-parent authority 工作。provider 可以同进程、跨进程或未来 transport，消费者不必因此改变结果契约。</p>
+  <p><code>subagent</code> 与 <code>subagent_fork</code> 直接选择一个 provider 实例。<code>workflow</code> 和 <code>ralph</code> 先启动 WorkflowRun，再由 worker 通过同一个 seam 启动 children。实验性 Team 使用 continuable provider，但把 identity、mailbox 和 task ownership 收进自己的 domain。</p>
+
+  <h3>1.2 Depth、policy 与 capability 都在 child 创建前固定</h3>
+  <p>Child header 保存 <code>parentSession</code> 与单调的 <code>delegationDepth</code>。tool-subagent 默认 <code>maxDepth: 3</code>；当前 depth 加一超过 cap 就在创建前拒绝，resume 不能通过把 runtime option 调低伪装成 root。provider 还声明 outputSchema、depthLimit、toolFilter、persona 等 capability，不支持的 request 在 child 出现前失败。</p>
+  <p>同进程 delegation 会把 approval 固定为 <code>never</code>；若 parent 有显式 sandbox override，则以 <code>source: delegation</code> 写进 child log。缺省 sandbox mode 不复制。这个 policy snapshot 与可选 <code>toolFilter</code> 是两回事：filter 改 schema、lookup 和执行可见性，却不是从 parent 自动继承的 authority ceiling。</p>
+
+  <h2>二、spawn 与 fork 只在 seed 上不同</h2>
+  <h3>2.1 Spawn 空历史；fork 复制最后一个完整 turn 以前的前缀</h3>
+  <figure class="hero-image"><img src="../../assets/spawn-fork-boundary.png" alt="Spawn 和 fork 边界：spawn 创建空历史 fresh Session；fork 只复制 parent 最后一个 turn end 之前的 balanced prefix，排除当前 assistant tool call 的 in-flight turn；两者都记录 parentSession、delegationDepth、cwd 与 provider model，并获得 fresh flat scope" /></figure>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/subagent/subagent-spawn-in-process/README.md">spawn</a> 不传 seed，child 只看 standalone task。<a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/subagent/subagent-fork-in-process/README.md">fork</a> 传 parent 已完成 turn 的连续前缀。调用 subagent 的那个 parent turn 仍开放，assistant tool call 还没有对应 result 和 <code>turn/end</code>；若复制 raw tail，child Session 一开始就不平衡。</p>
+  <p>所以 fork 只切到最近 <code>turn/end</code>。parent 尚无完整 turn 时，fork 退化成 fresh spawn。seed 是一次性 snapshot，parent 后续消息不会同步给 child。</p>
+
+  <h3>2.2 历史继承不等于 scope 或权限继承</h3>
+  <p>两条路径都走 shared in-process driver：继承 cwd、lineage 和默认 provider/model/maxTokens，却创建 fresh flat registration scope。fork 复制 conversation history，不复制 parent 的 tool restriction；显式 persona、toolFilter 与 structured output 在 unpublished child scope 安装。</p>
+  <p>同 model/route 的 one-shot fork 有机会复用 inherited byte prefix。base composition 因此让 spawn 使用 continuable background，让 fork 保持 one-shot：continuable child 额外的 report tool 与 prompt section 会出现在 inherited history 之前，反而摧毁 fork 想复用的整个 prefix。</p>
+
+  <h2>三、one-shot run 和 continuable child 的所有权不同</h2>
+  <h3>3.1 One-shot 以 SubagentRun 为唯一 holder-owned 边界</h3>
+  <figure class="hero-image"><img src="../../assets/continuable-lifecycle.png" alt="One-shot 与 continuable 生命周期：one-shot 从 ctx subagents start 得到 published SubagentRun，读取 result 后由 caller dispose；continuable 在 inbox accepted 时返回 childId/messageId，durable child Session 最多一个 Activation，并支持 FIFO followup、reportFrom、settlement notice、interrupt keepInbox 与 cold resume" /></figure>
+  <p><code>start()</code> fulfill 前 provider 拥有所有 unpublished resource，失败必须 rollback 并 quiesce；fulfill 后 caller 拥有 <code>SubagentRun</code>，无论 result 成败都必须 <code>dispose()</code>。本地 run 的 id 就是 child Session id，结果只选 child 自己最后的非空 assistant output 或 structured value，不把 fork seed 和中间步骤塞回 parent。</p>
+  <p>Foreground tool 等待 result 并在 finally dispose；one-shot background 则交给 generic Task runtime，返回 job id。多个 sibling 可在 <code>maxParallelToolCalls</code> rolling pool 中重叠执行，但 result 仍按模型 call 顺序提交。它们对同一 workspace 的冲突由上层协调。</p>
+
+  <h3>3.2 Continuable 以 durable Session 和最多一个 Activation 为核心</h3>
+  <p><code>startContinuable()</code> 在 initial prompt 被 inbox 接受时返回 <code>{ childId, messageId }</code>，不等待 turn 开始，也不保证消息已经进入 Session log。之后 continuation manager 拥有最多一个 process-local Activation；running、waiting、settled 从 Agent quiescence 与 owned children 派生，inactive child 可从 persistence cold resume。</p>
+  <p>Parent <code>followup()</code> 总是排到 FIFO next turn，不能 steering 当前工作；<code>interrupt()</code> 只 cancel 当前 turn 并 <code>keepInbox</code>，descendants 继续。Child 的 <code>reportFrom()</code> 是可选、自发的内容回传；Activation settlement notice 是 runtime 必发的 outcome/final-output 通知，来源不同，不能把系统文字伪装成 child 自述。两者都要求 live direct-parent 路径，没有 cross-process durable mailbox 或 exactly-once 保证。</p>
+
+  <h2>四、Workflow 把编排脚本放进 worker，不把 child 放进去</h2>
+  <h3>4.1 Script 是 control plane，Agent 仍在 Host</h3>
+  <figure class="hero-image"><img src="../../assets/workflow-worker-boundary.png" alt="Workflow worker boundary：workflow 经 ctx workflowEngine start 在 worker thread 的 node vm 执行 agent、parallel、pipeline、phase、log hooks，通过 structured clone 和 plain JSON 调 Host 侧 ctx subagents，child SubagentRun 留在 Host；结果前台收集并 dispose" /></figure>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/workflow/workflow-worker-thread/README.md">worker-thread engine</a> 每个 run 使用一个 Node worker。模型脚本只拿到 <code>args</code> 和 <code>agent()</code>、<code>parallel()</code>、<code>pipeline()</code>、<code>phase()</code>、<code>log()</code> hooks；child request 通过 typed protocol 回到 Host 的 <code>ctx.subagents</code>，child Agent 从不进入 worker。</p>
+  <p>边界只接受 plain lossless JSON，拒绝 function、cycle、exotic prototype、non-finite number 等。默认 <code>maxConcurrentAgents: 0</code> 按 CPU 解析，<code>maxTotalAgents: 1000</code>，单次 parallel/pipeline 最多 4096 items；per-run request 只能降低 total cap，不能抬高 deployment ceiling。</p>
+
+  <h3>4.2 Worker 是可终止的调度隔离，不是 security sandbox</h3>
+  <p>worker 让同步死循环不阻塞 Harness event loop，<code>worker.terminate()</code> 也给 dispose 一个最终停止手段；它还以空 environment 启动并用 structured clone 限制正常 API。但 <code>node:vm</code> 只是 API shaping，逃逸脚本仍可能取得 Node capability 与宿主权限。真正不可信脚本需要换成 process/container engine。</p>
+  <p>WorkflowRun 前台收集，result 不 reject：执行错误解析为 stopReason error，取消在 bounded grace 内解析为 cancelled，consumer 仍在 finally dispose。当前没有 journal、resume、saved workflow 或 nested workflow；重启不能续跑中间 child progress。</p>
+
+  <h2>五、Ralph 与实验性 Team 是两种不同的长期协作</h2>
+  <h3>5.1 Ralph 用 fresh child 序列淘汰对话惯性</h3>
+  <figure class="hero-image"><img src="../../assets/ralph-team-contrast.png" alt="Ralph 与实验性 Team 对比：Ralph 把 immutable objective、bounded handoff 和 shared workspace 依次交给 fresh children，最终 complete、blocked 或 budget-limited；Team 在 Lead Session 保存 member、queued/delivered message 与 task 事件，连接 continuable teammates、durable mailbox、task DAG 和 shared checkout" /></figure>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/workflow/tool-ralph/README.md"><code>ralph</code></a> 是固定 foreground workflow，不是 agent-loop 的特殊模式。每一轮启动一个 fresh、无 parent seed 的 structured-output child；immutable objective、轮次、shared-workspace instruction 和上一份 bounded handoff 构成新 prompt。默认最多 256 轮，handoff 最多 16384 字符。</p>
+  <p>Round report 的 status 是 continue、complete 或 blocked；最终 tool result 收敛成 complete、blocked 或 budget-limited。完成与 blocker 都是 worker self-report，没有独立 verifier。每轮 failure 终止 run，不自动重试；workspace 是唯一长期共享事实，未写入的 reasoning 随 child 消失。</p>
+
+  <h3>5.2 Team 用 Lead log 协调具名、可继续、并发成员</h3>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/experimental/agent-team/README.md">实验性 Agent Team</a> 让 root Session id 成为隐式 TeamId。具名 teammate 是 continuable direct child；Lead log 保存 <code>team/member</code>、<code>team/message/queued</code>/<code>delivered</code> 和 revisioned <code>team/task</code> snapshots。mailbox 在尝试投递前先 append+flush，task dependencies 必须形成 DAG。</p>
+  <p>所有成员仍共享一个 checkout。<code>writeScopes</code> 只发 overlap warning，不是锁，也不授权写入；Bash、formatter、generator 和外部进程都能绕过。mailbox 的保证是 process-local retry 加 target-Session de-duplication，不是跨进程 exactly-once。Team 因此适合显式的人类请求和受控协作，而不是自动把普通任务扩成一群 Agent。</p>
+
+  <h2>六、这组多 Agent 机制带来的工程判断</h2>
+  <ol>
+    <li><strong>先选生命周期，再选 provider。</strong>要一次答案就 one-shot；要持续对话才 continuable；不要用 background 当作含糊的第三种状态。</li>
+    <li><strong>没有独立上下文需求，就不要 delegation。</strong>一两个有依赖的动作直接做，large fan-out 才进入 workflow。</li>
+    <li><strong>Fork 只继承完成事实。</strong>复制开放 turn 会制造不平衡工具历史；后续 parent 变化也不会自动同步。</li>
+    <li><strong>Visibility 不是 authority。</strong>toolFilter、prompt policy 和 writeScopes 都不能替代 sandbox、approval 与文件冲突控制。</li>
+    <li><strong>每个 holder 都必须负责 quiescence。</strong>SubagentRun、WorkflowRun、Activation 与 Team forest 各有自己的 dispose/drain 边界。</li>
+    <li><strong>不要把 self-report 当验收。</strong>Ralph complete、child report 与 settlement notice 都需要 parent 或外部证据判断质量。</li>
+  </ol>
+  <p>最后一篇会回到 Cordis 本身：当 runtime 把 <code>cordis_inspect</code>、<code>cordis_define</code>、<code>cordis_run</code>、<code>cordis_stop</code> 和 <code>cordis_undefine</code> 暴露给模型，它究竟获得了哪些自修改能力，又有哪些边界仍然不能越过。</p>
+
+  <h2 id="sources">参考源码</h2><ul>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/subagent/subagent/README.md">subagent seam README</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/subagent/tool-subagent/README.md">tool-subagent README</a>：provider registry、one-shot/continuable、depth、policy 和模型工具生命周期。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/subagent/subagent-spawn-in-process/README.md">spawn README</a>、<a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/subagent/subagent-fork-in-process/README.md">fork README</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/subagent/subagent-in-process-driver/README.md">shared driver</a>：seed boundary、child scope、result 与 dispose。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/workflow/workflow/README.md">workflow seam</a>、<a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/workflow/workflow-worker-thread/README.md">worker-thread engine</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/workflow/tool-workflow/README.md">workflow tool</a>：script hook、caps、JSON boundary、取消与前台收集。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/workflow/tool-ralph/README.md">Ralph README</a>：fresh round、structured handoff、budget 与限制。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/experimental/agent-team/README.md">experimental Agent Team README</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/experimental/tool-agent-team/README.md">tool adapter</a>：durable roster、mailbox、task DAG 与模型权限。</li>
+  </ul>
+</section></article></main></div><script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../../openclaw/article.js?v=1"></script></body></html>
