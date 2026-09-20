@@ -9,7 +9,7 @@
     <meta property="og:title" content="How Claude Code isolates subagents and forked work | Rememorio Blog" />
     <meta property="og:description" content="A source-reading article on Claude Code subagents, AgentTool, worker tool pools, fork path, cache-stable child queries, and context isolation." />
     <meta property="og:type" content="article" />
-    <meta property="og:image" content="../assets/agent-fork-cover.png" />
+    <meta property="og:image" content="../assets/worker-tool-scope.png" />
     <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/en/subagents-fork/" />
     <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/subagents-fork/" />
     <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/claude-code/en/subagents-fork/" />
@@ -100,16 +100,17 @@
             <h1>How Claude Code isolates subagents and forked work</h1>
             <p class="lead">A subagent is not another chat window. Claude Code creates a separate <code>ToolUseContext</code> with its own prompt, tools, transcript, and query loop. A fork takes a different route: it deliberately copies the parent's request prefix so the child can reuse the prompt cache.</p>
             <div class="meta-line">
-              <span>Project: Rememorio/claude-code</span>
+              <span>Project: Claude Code</span>
               <span>Topic: subagents and fork</span>
               <span>Scope: public mirror and official docs</span>
             </div>
             <figure class="hero-image">
-              <img src="../assets/agent-fork-cover.png" alt="Hand-drawn AgentTool diagram with normal subagent path and fork path" />
+              <img src="../assets/worker-tool-scope.png" alt="Normal workers rebuild and filter tools; conditional forks preserve parent definitions; both retain runtime permission checks" />
             </figure>
           </section>
 
           <section class="article-body">
+            <p>This implementation analysis is limited to the <a href="https://github.com/Rememorio/claude-code/tree/5a774a2b62d7949c1d94e0b726281554d7893cfd">public mirror snapshot dated March 31, 2026</a>. The mirror is not an official Anthropic source repository and does not establish behavior in later product releases. Source links are pinned to that commit; official documentation supplies product concepts, while feature gates and missing modules are identified separately.</p>
 
             <p>The <code>AgentTool</code> path starts when the model asks to delegate work. From the parent loop's point of view, this is still a tool call. If it is accepted, Claude Code selects an agent, decides which tools that agent may use, creates separate state, and runs a child query loop.</p>
             <div class="note route-note">
@@ -131,51 +132,58 @@ fork path
 
             <h2>1. AgentTool chooses a concrete execution path</h2>
             <p>The input schema contains a task description and prompt, plus optional fields such as <code>subagent_type</code>, model, and background execution. When the related features are enabled, it may also accept a teammate name, team name, permission mode, isolation choice, and working directory. These fields decide how and where work runs; they do not create a free-form chat.</p>
-            <figure class="figure"><img src="../assets/agent-selection-gates.png" alt="AgentTool checks teammate and fork routes, deny rules, required MCP tools, worktree isolation, and background policy" /><figcaption><code>AgentTool.call()</code> decides which agent may start, whether required MCP tools are ready, and whether the task needs an isolated worktree.</figcaption></figure>
 
-            <p>The code first separates teammate spawning, the fork path, and a named agent definition. It then applies <code>Agent(name)</code> deny rules. An agent definition may also require MCP servers; Claude Code waits for pending servers for a limited time and stops with an actionable error if their tools never become available. The child starts only after the tools promised by its definition are actually present.</p>
+
+            <p>A resolved team name, from parameters or context, plus <code>name</code> selects teammate spawning. Otherwise an explicit <code>subagent_type</code> wins; omitting it selects general-purpose when the fork gate is off, and the fork path when the gate is on. The ordinary type branch applies <code>allowedAgentTypes</code> and <code>Agent(name)</code> deny rules. Required MCP servers still pending are polled every 500 ms for up to 30 seconds, with early exit on a required-server failure. The final check looks for matching server names in advertised tool names. It does not execute those tools or prove that every action works.</p>
 
             <h2>2. A normal subagent gets a rebuilt tool list</h2>
-            <p>The normal path does not copy the parent's tool array verbatim. It starts from the current permission state and MCP tools, selects the agent's permission mode, and calls <code>assembleToolPool()</code>. <code>resolveAgentTools()</code> then removes tools forbidden to all agents, custom agents, or background agents, and applies the definition's <code>tools</code> and <code>disallowedTools</code> lists.</p>
-            <figure class="figure"><img src="../assets/worker-tool-scope.png" alt="Worker tools assembled from parent app state, worker permission settings, MCP tools, and agent-specific filters" /><figcaption>The child receives a newly calculated tool list that can be narrower than the parent's.</figcaption></figure>
+            <p>The normal path does not copy the parent's tool array verbatim. It starts from the current permission state and MCP tools, selects the agent's permission mode, and calls <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L568-L578"><code>assembleToolPool()</code></a>. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/agentToolUtils.ts#L70-L225"><code>resolveAgentTools()</code></a> then removes tools forbidden to all agents, custom agents, or background agents, and applies the definition's <code>tools</code> and <code>disallowedTools</code> lists.</p>
 
-            <p>MCP tools are generally available to agents unless another rule removes them. A non-main-thread Agent tool is filtered out to prevent unbounded nesting. The normal child also receives a system prompt generated from its selected agent definition, environment details, and enabled tools rather than a copy of the parent's rendered prompt.</p>
+
+            <p>MCP tools skip the generic agent-category and async filters, but the definition's <code>tools</code> and <code>disallowedTools</code> lists and execution permissions still apply. Ordinary subagents lose the Agent tool; the main thread skips subagent filtering, while enabled in-process teammates have a separate exception for synchronous child tasks. The normal child also receives a system prompt generated from its selected agent definition, environment details, and enabled tools rather than a copy of the parent's rendered prompt.</p>
 
             <h2>3. The fork path preserves the parent request prefix</h2>
-            <p>The fork path makes a different tradeoff. It inherits the parent's rendered system prompt and uses <code>buildForkedMessages()</code> to clone the relevant assistant message, placeholder tool results, and a directive for the child. It also enables <code>useExactTools</code> and passes the parent's exact tool list.</p>
-            <figure class="figure"><img src="../assets/fork-cache-prefix.png" alt="Parent and forked child sharing system prompt, tools, thinking settings, and message prefix before a child-specific suffix" /><figcaption>The fork child changes the tail of the request while preserving the expensive parent prefix.</figcaption></figure>
+            <p>The fork path makes a different tradeoff. It inherits the parent's rendered system prompt and uses <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/forkSubagent.ts#L104-L173"><code>buildForkedMessages()</code></a> to clone the relevant assistant message, placeholder tool results, and a directive for the child. It also enables <code>useExactTools</code> and passes the parent's exact tool list.</p>
 
-            <p>This exactness matters because tool definitions and thinking configuration contribute to the prompt-cache key. Rebuilding tools with a different permission mode could invalidate the cache at the first changed schema. Fork children therefore inherit the parent's thinking configuration as well. The Agent tool remains in the exact schema list, but a runtime check rejects another fork when the current request is already a fork child, preventing recursive branching.</p>
 
-            <h2>4. createSubagentContext isolates mutable state</h2>
-            <p><code>createSubagentContext()</code> defaults to separating mutable state unless the caller explicitly shares it. It clones file-read state, creates fresh memory and dynamic-Skill trigger sets, assigns a new agent id and tracking depth, and replaces parent UI callbacks such as <code>setToolJSX</code> and <code>addNotification</code> with no-ops.</p>
-            <figure class="figure"><img src="../assets/subagent-context-isolation.png" alt="Parent ToolUseContext creating child state with a new agent id, fresh triggers, isolated UI callbacks, and sidechain transcript" /><figcaption>A child cannot change the parent interface or mutable session state unless the caller explicitly shares that capability.</figcaption></figure>
+            <p>This exactness matters because tool definitions and thinking configuration contribute to the prompt-cache key. Rebuilding tools with a different permission mode could invalidate the cache at the first changed schema. Fork children therefore inherit the parent's thinking configuration as well; this snapshot disables thinking by default for ordinary subagents to control output cost. The Agent tool remains in the exact schema list, but a runtime check rejects another fork when the current request is already a fork child, preventing recursive branching.</p>
 
-            <p>A synchronous interactive subagent may share selected callbacks, response accounting, and an abort controller with its parent. A background subagent is more isolated. When it has no shared interactive controller, its application state sets <code>shouldAvoidPermissionPrompts: true</code>, so unanswered permission requests are handled by hooks or denied instead of waiting for an unavailable dialog.</p>
+            <p>The <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/forkSubagent.ts#L18-L40">fork feature gate</a> requires the <code>FORK_SUBAGENT</code> build feature and excludes coordinator mode and non-interactive sessions. When enabled, it also requests background execution for ordinary named agents, subject to background tasks being enabled. This route differs from a Skill's <code>context: fork</code> and the CLI's <code>--fork-session</code>.</p>
+            <figure class="shape-example"><pre><code class="language-text">parent history
+  + assistant(all tool_use blocks)
+  + user(tool_result placeholders for every tool_use, child directive)</code></pre><figcaption>Simplified message shape: forks share the parent messages and placeholder results; the final directive distinguishes each task. Placeholders do not prove execution.</figcaption></figure>
+            <h2>4. createSubagentContext separates selected state</h2>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/forkedAgent.ts#L350-L462"><code>createSubagentContext()</code></a> clones file-read state and content-replacement decisions, creates fresh memory and dynamic-Skill trigger sets, and assigns a new agent id and tracking depth. The read cache remains writable by the child. By default, <code>setAppState</code> is a no-op and UI callbacks such as <code>setToolJSX</code> and <code>addNotification</code> are absent. Task registration still reaches the root store through <code>setAppStateForTasks</code>, and attribution updates remain shared. This is selected context isolation, not a process or filesystem sandbox.</p>
+            <figure class="figure"><img src="../assets/subagent-context-isolation.png" alt="Child read-cache and replacement-decision copies, fresh triggers, shared task registration and attribution, and explicit background cancellation overrides" /><figcaption>Read caches and trigger sets belong to the child; task registration and attribution still reach shared state. Authorized file writes remain real side effects.</figcaption></figure>
 
+            <p>In the actual <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L696-L714"><code>runAgent()</code></a> call, synchronous agents share <code>setAppState</code>, and both synchronous and background agents contribute to response metrics. The helper's default child abort controller propagates parent cancellation; background execution explicitly supplies an unlinked controller to survive the parent's ESC. Unless the caller overrides <code>getAppState</code> or opts into sharing the interactive controller, the helper sets <code>shouldAvoidPermissionPrompts: true</code>. Background permission behavior must therefore be read with the caller's overrides, not inferred from the helper default alone.</p>
+
+            <p>Worktree isolation is a separate option. When requested, AgentTool creates a worktree and runs with an overridden working directory. A normal agent rebuilds its system prompt inside that directory; a fork appends a notice to translate paths and reread potentially stale files while retaining the parent prefix. Completion cleanup checks whether the worktree has changes before removing it.</p>
             <h2>5. runAgent operates a complete child query loop</h2>
-            <p><code>runAgent()</code> is an asynchronous generator, not a single provider request. It creates child state, runs <code>SubagentStart</code> hooks, registers hooks declared in the agent frontmatter, preloads Skills as messages, connects agent-specific MCP servers, and then enters <code>query()</code>. Child messages are written to a sidechain transcript as the loop continues.</p>
+            <p><code>runAgent()</code> is an asynchronous generator, not a single provider request. It creates child state, runs <code>SubagentStart</code> hooks, registers declared frontmatter hooks for the agent lifecycle, maps Stop to SubagentStop, preloads declared Skills as meta user messages, connects agent-specific MCP servers, and then enters <code>query()</code>. Child messages are written to a sidechain transcript as the loop continues.</p>
 
             <p>A synchronous agent yields progress records to the parent and eventually returns a tool result. A background agent registers a task and reports completion through a notification or task result. Both paths have their own agent id, transcript, and cleanup behavior; neither is hidden code still running inside the parent turn.</p>
 
+            <p>For example, after a parent submits “investigate the failing tests,” <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L686-L765"><code>status: async_launched</code></a> acknowledges a started task, not passing tests. A later notification or TaskOutput supplies its completed, failed, or stopped state. Placeholder tool results in a fork prefix only complete the message pairing; they do not prove that other tool calls succeeded.</p>
             <h2>6. Compare normal, background, and forked work</h2>
             <div class="table-wrap"><table><thead><tr><th>Path</th><th>System prompt</th><th>Tools</th><th>Result behavior</th></tr></thead><tbody>
               <tr><td>Normal synchronous subagent</td><td>Generated from the selected agent definition.</td><td>Rebuilt and filtered for the worker.</td><td>Progress and the final result return to the waiting parent.</td></tr>
               <tr><td>Normal background subagent</td><td>Generated from the selected agent definition.</td><td>Further restricted for background execution.</td><td>A task continues independently and notifies the parent when complete.</td></tr>
               <tr><td>Fork child</td><td>Inherits the parent's rendered prompt.</td><td>Uses the exact parent tool definitions.</td><td>Runs a child-specific suffix while reusing the parent's cached prefix.</td></tr>
+              <tr><td>Worktree isolation</td><td>Rebuilt for the directory, or a fork notice is appended.</td><td>Agent tool rules still apply.</td><td>File changes happen in a separate worktree; cleanup depends on remaining changes.</td></tr>
             </tbody></table></div>
 
             <p>A useful mental model is a child runtime with explicit inputs and outputs. Claude Code selects an agent, calculates its tools, chooses isolated or forked state, runs a separate query loop, records a transcript, and returns progress or a result to the parent.</p>
-        
+
             <h2 id="sources">Sources</h2>
             <p>The source-code claims in this article are based on the public mirror and the linked official documentation. Server-side scheduling is not inferred from client-side code.</p>
             <ul>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L81-L765">AgentTool input, routing, and launch</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/agentToolUtils.ts#L70-L225">Worker tool filtering</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/forkedAgent.ts#L253-L626">Subagent context and fork execution</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L520-L859">Child hooks, Skills, query loop, and transcript</a></li>
-                <li><a href="https://docs.anthropic.com/en/docs/claude-code/sub-agents">Claude Code subagents docs</a></li>
-                <li><a href="https://docs.anthropic.com/en/docs/claude-code/hooks">Claude Code hooks docs</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L81-L765">AgentTool input, routing, and launch</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/agentToolUtils.ts#L70-L225">Worker tool filtering</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/forkedAgent.ts#L253-L626">Subagent context and fork execution</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L520-L859">Child hooks, Skills, query loop, and transcript</a></li>
+                <li><a href="https://code.claude.com/docs/en/sub-agents">Claude Code subagents docs</a></li>
+                <li><a href="https://code.claude.com/docs/en/hooks">Claude Code hooks docs</a></li>
             </ul>
           </section>
         </article>

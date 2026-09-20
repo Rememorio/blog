@@ -15,7 +15,7 @@
       content="Subagent 不是多开一个聊天窗口，而是为子任务创建独立的 ToolUseContext；fork path 则故意复制父级前缀来复用 prompt cache。"
     />
     <meta property="og:type" content="article" />
-    <meta property="og:image" content="../assets/agent-fork-cover.png" />
+    <meta property="og:image" content="../assets/worker-tool-scope.png" />
     <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/zh/subagents-fork/" />
     <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/subagents-fork/" />
     <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/claude-code/en/subagents-fork/" />
@@ -118,13 +118,14 @@
             </div>
             <figure class="hero-image">
               <img
-                src="../assets/agent-fork-cover.png"
-                alt="Claude Code AgentTool 总览图，展示 parent turn 的 Agent tool_use 进入 AgentTool.call 后分成 normal subagent 与 fork path，两条路径返回 agent result 或 async notification"
+                src="../assets/worker-tool-scope.png"
+                alt="普通子代理重建并过滤工具，条件 fork 保留父级工具定义，两条路径均有执行时权限检查"
               />
             </figure>
           </section>
 
           <section class="article-body">
+            <p>本文实现分析限定于 <a href="https://github.com/Rememorio/claude-code/tree/5a774a2b62d7949c1d94e0b726281554d7893cfd">2026 年 3 月 31 日的公开镜像快照</a>，它不是 Anthropic 官方源码仓库，也不代表此后产品版本。正文固定到该提交；官方文档用于说明产品概念，功能开关和缺失模块按可见代码分别说明。</p>
             <p>
               <a href="../commands-skills-mcp/">上一篇</a>把能力入口拆成 slash command、SkillTool 和 MCP。
               这一篇看另一个更高层的能力入口：<code>AgentTool</code>。它不是直接执行一个本地动作，
@@ -132,7 +133,7 @@
             </p>
 
             <p>
-              先说结论：<strong>Claude Code 的 subagent 是“隔离上下文 + 独立 query loop”，不是父会话里的普通函数调用。</strong>
+              先说结论：<strong>Claude Code 为 subagent 建立独立 query loop 和消息上下文，但这不等于进程或文件系统沙箱。</strong>
               普通 subagent 会重新选择 agent definition、重建 worker tool pool；fork path 则反过来，
               故意复用父级 system prompt、tools、thinking config 和 messages prefix，只在尾部加 fork 指令，
               目的就是最大化 prompt cache 命中。
@@ -158,10 +159,10 @@
 
             <p>
               产品层证据来自 Claude Code 的
-              <a href="https://docs.anthropic.com/en/docs/claude-code/sub-agents">sub-agents 文档</a>、
-              <a href="https://docs.anthropic.com/en/docs/claude-code/hooks">hooks 文档</a>；
+              <a href="https://code.claude.com/docs/en/sub-agents">sub-agents 文档</a>、
+              <a href="https://code.claude.com/docs/en/hooks">hooks 文档</a>；
               源码层来自
-              <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
+              <a href="https://github.com/Rememorio/claude-code">公开源码镜像</a>。
               本文只描述客户端代码能证明的路径，不从客户端代码推断服务端调度策略。
             </p>
 
@@ -182,31 +183,23 @@ fork path
             <h2>一、AgentTool 的输入不是“开新会话”</h2>
             <p>
               <code>AgentTool</code> 的 schema 在
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L81-L155"><code>AgentTool.tsx</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L81-L155"><code>AgentTool.tsx</code></a>。
               基础输入有 <code>description</code>、<code>prompt</code>、可选 <code>subagent_type</code>、可选模型和后台运行标记；
               相关功能开关启用时，还可能有 <code>name</code>、<code>team_name</code>、<code>mode</code>、
               <code>isolation</code> 和 <code>cwd</code>。这些字段决定的是执行形态，不是简单的聊天窗口参数。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/agent-selection-gates.png"
-                alt="Claude Code AgentTool 选择步骤图，展示 AgentTool input 经过 teammate、fork path、deny filter、required MCP、worktree isolation 和 background policy 后选中 agent 与运行模式"
-              />
-              <figcaption><code>AgentTool.call()</code> 先完成几项检查：能不能 spawn、选哪个 agent、MCP 是否就绪、是否需要隔离工作树。</figcaption>
-            </figure>
+
 
             <h3>1.1 先分 teammate、fork 和普通 agent</h3>
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L239-L356"><code>AgentTool.call()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L239-L356"><code>AgentTool.call()</code></a>
               先读取 app state 和 permission mode，再处理几条分流。
-              如果 <code>team_name + name</code> 成立，它会走 teammate spawn；
-              如果 <code>subagent_type</code> 为空且 fork feature 打开，它会走 fork path；
-              否则才从 <code>agentDefinitions.activeAgents</code> 里找指定 agent。
+              如果显式参数或当前上下文解析出的 team name 与 <code>name</code> 同时存在，它会走 teammate spawn；否则再看 agent 类型。指定 <code>subagent_type</code> 时按该类型选择；省略类型且 fork 开关关闭时，默认选择 general-purpose；省略类型且 fork 开关打开时，才走 fork path。
             </p>
 
             <p>
-              选择 agent 前还会过滤 deny rule。源码里支持 <code>Agent(name)</code> 这类权限规则：
+              普通类型分支选择 agent 前还会应用 <code>allowedAgentTypes</code> 并过滤 deny rule。源码里支持 <code>Agent(name)</code> 这类权限规则：
               如果某个 agent 被 deny，调用会直接抛出错误，而不是让模型绕过去。
               这和前面的权限篇能接上：启动 subagent 本身也要受明确的权限规则控制。
             </p>
@@ -214,8 +207,8 @@ fork path
             <h3>1.2 required MCP 是启动前置条件</h3>
             <p>
               agent definition 可以声明 required MCP servers。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L365-L410">源码会先检查这些 server 是否已经有 tools</a>。
-              如果所需 server 还在 pending，它会最多等待一段时间；如果失败或没有对应工具，就返回错误并提示通过 <code>/mcp</code> 配置或认证。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L365-L410">源码会先检查这些 server 是否已经有 tools</a>。
+              如果所需 server 还在 pending，它每 500 ms 重读状态，最多等 30 秒，发现必需 server 失败时提前结束等待。最终检查的是匹配名称的 server 是否出现在 MCP 工具名中；这个检查不是一次实际调用测试，不能证明每个动作都可用。若检查失败，就提示通过 <code>/mcp</code> 配置或认证。
             </p>
 
             <p>
@@ -225,39 +218,32 @@ fork path
             <h2>二、普通 subagent 会重建 worker tool pool</h2>
             <p>
               普通 subagent 的关键不是复制父级工具，而是重建一份 worker 工具池。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L568-L578">这段代码</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L568-L578">这段代码</a>
               先从父级 app state 拿 <code>toolPermissionContext</code> 和 <code>mcp.tools</code>，
               再把 mode 改成 <code>selectedAgent.permissionMode ?? "acceptEdits"</code>，
               最后调用 <code>assembleToolPool()</code>。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/worker-tool-scope.png"
-                alt="Claude Code worker tool pool 图，展示 parent AppState、workerPermissionContext、assembleToolPool、resolveAgentTools 和 workerTools 的过滤过程"
-              />
-              <figcaption>普通 subagent 的工具池会重新组装，并按 agent definition、async 策略和 disallowedTools 收窄。</figcaption>
-            </figure>
+
 
             <h3>2.1 <code>resolveAgentTools()</code> 逐项缩小可用工具</h3>
             <p>
               工具收窄的共享逻辑在
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/agentToolUtils.ts#L70-L225"><code>resolveAgentTools()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/agentToolUtils.ts#L70-L225"><code>resolveAgentTools()</code></a>。
               它会先调用 <code>filterToolsForAgent()</code>，过滤所有 agent 都不能用的工具、自定义 agent 不能用的工具、
               async agent 不能用的工具；然后再处理 agent definition 里的 <code>tools</code> 和
               <code>disallowedTools</code>。
             </p>
 
             <p>
-              有个细节很重要：MCP tools 默认允许给所有 agent；但非主线程的 Agent tool 会被过滤掉，
-              防止 subagent 无限套娃。主线程例外，因为主线程工具池已经在 REPL 侧按当前 agent 限制过。
+              MCP tools 在 <code>filterToolsForAgent()</code> 中跳过通用的 agent 类别和 async 过滤；它们仍受后续 <code>tools</code>、<code>disallowedTools</code> 以及执行时权限约束。普通 subagent 的 Agent tool 会被移除，主线程不应用这组 subagent 过滤；启用团队功能的 in-process teammate 则另有允许同步子任务的例外，不能把这一规则推广到全部 agent。
             </p>
 
             <h3>2.2 普通 agent 有自己的系统提示词</h3>
             <p>
               非 fork path 会调用 selected agent 的 <code>getSystemPrompt()</code>，
               再用
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L906-L932"><code>getAgentSystemPrompt()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L906-L932"><code>getAgentSystemPrompt()</code></a>
               加上环境细节和 enabled tools。它不是把父级系统提示词原样带过去，而是按 agent definition 重新生成。
             </p>
 
@@ -269,37 +255,35 @@ fork path
             <h2>三、fork path 反过来：为了缓存，故意复制父级前缀</h2>
             <p>
               fork path 是另一种设计。它不急着给子 agent 新系统提示词，而是尽量复制父级请求前缀。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L483-L513">注释写得很明确</a>：
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L483-L513">注释写得很明确</a>：
               fork child 继承父级 system prompt，并通过 <code>buildForkedMessages()</code> 克隆父级 assistant message、
               placeholder tool_results 和 per-child directive。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/fork-cache-prefix.png"
-                alt="Claude Code fork path cache 前缀图，展示 parent query 与 fork child query 共享 system prompt、tools、thinking config、messages prefix，然后在尾部添加 placeholder tool_results、fork directive 和 child task"
-              />
-              <figcaption>fork path 的目标不是隔离出全新角色，而是在父级稳定前缀后面接一个新的任务尾巴。</figcaption>
-            </figure>
 
+
+            <p>这条 fork 路径受 <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/forkSubagent.ts#L18-L40"><code>isForkSubagentEnabled()</code></a> 约束：需要 <code>FORK_SUBAGENT</code> 构建开关，且不在 coordinator mode 或非交互式 session。开关生效还会让普通命名 agent 一并走后台启动策略，最终仍受后台任务禁用开关限制。它不等同于 Skill 的 <code>context: fork</code>，也不等同于 CLI 的 <code>--fork-session</code>。</p>
             <h3>3.1 exact tools 和 thinking config 都是 cache key 的一部分</h3>
             <p>
               fork path 的 <code>runAgentParams</code> 会设置 <code>useExactTools: true</code>，
               并把 <code>availableTools</code> 设成父级 <code>toolUseContext.options.tools</code>。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L603-L633">源码注释</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L603-L633">源码注释</a>
               解释了原因：worker tools 如果用不同 permission mode 重建，工具定义序列化会变，prompt cache 就会在第一个差异处失效。
             </p>
 
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L666-L695"><code>runAgent()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L666-L695"><code>runAgent()</code></a>
               里也配合了这件事：fork children 继承父级 thinking config；普通 subagent 则默认禁用 thinking 来控制输出成本。
               所以 fork path 是一个专门为“共享父级上下文前缀”设计的路径。
             </p>
 
+            <figure class="shape-example"><pre><code class="language-text">parent history
+  + assistant(all tool_use blocks)
+  + user(tool_result placeholders for every tool_use, child directive)</code></pre><figcaption>简化消息形状：每个 fork 保留同一组父消息和占位结果，只在末尾指令处区分子任务；占位结果不证明工具已执行。</figcaption></figure>
             <h3>3.2 fork 不能递归 fork</h3>
             <p>
               fork child 为了工具定义一致，仍然保留 Agent tool。但
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L318-L335">调用时会做递归 fork guard</a>：
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L318-L335">调用时会做递归 fork guard</a>：
               如果当前 querySource 已经是 fork agent，或者 messages 里能识别 fork child 标记，就直接拒绝再次 fork。
               这避免了“为了 cache 保留工具 schema，却允许无限分叉”的矛盾。
             </p>
@@ -307,35 +291,33 @@ fork path
             <h2>四、createSubagentContext 默认隔离</h2>
             <p>
               真正把 subagent 变成独立运行单元的，是
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/forkedAgent.ts#L253-L462"><code>createSubagentContext()</code></a>。
-              它的注释非常直接：默认隔离所有 mutable state，调用者如果要共享，必须显式 opt-in。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/forkedAgent.ts#L253-L462"><code>createSubagentContext()</code></a>。
+              它克隆读取缓存和内容替换决策，创建新的触发集合，并限制父 UI 回调。不过实际返回值仍保留共享入口：任务登记始终能到 root store，文件归属统计回调也继续共享。这里应按字段理解隔离，不能把注释中的默认原则读成“所有副作用都与父级断开”。
             </p>
 
             <figure class="figure">
               <img
                 src="../assets/subagent-context-isolation.png"
-                alt="Claude Code createSubagentContext 隔离图，展示 parent ToolUseContext 生成 subagent ToolUseContext，克隆 read cache、新建 child abort、避免权限提示、UI callback no-op、fresh trigger sets、sidechain transcript"
+                alt="子代理克隆读取缓存和替换决策，新建触发集合，保留任务登记和归属统计共享入口；默认传播父取消，后台显式覆盖"
               />
-              <figcaption>默认隔离，显式共享：这是 subagent 不污染父级运行时状态的核心。</figcaption>
+              <figcaption>读取缓存与触发集合属于子 agent；任务登记和归属统计仍可回到共享 store。上下文隔离不阻止已获许可的文件写入。</figcaption>
             </figure>
 
             <h3>4.1 默认不让子 agent 控制父 UI</h3>
             <p>
               <code>createSubagentContext()</code> 会克隆 <code>readFileState</code>，新建 nested memory / dynamic skill
               trigger sets，生成新的 <code>agentId</code> 和 query tracking depth。
-              默认情况下，<code>setAppState</code>、<code>setToolJSX</code>、<code>addNotification</code>、
-              <code>setStreamMode</code> 这些父级 UI 或状态回调都是 no-op。
+              默认情况下，<code>setAppState</code> 是 no-op，<code>setToolJSX</code>、<code>addNotification</code>、<code>setStreamMode</code> 则不提供。克隆的读取缓存可由子 agent 自己更新，并不是只读文件系统。
             </p>
 
             <p>
               这不是保守过度，而是避免子 agent 在后台或嵌套执行时随便改父级界面。
-              如果是同步、交互式 subagent，调用方可以选择共享 <code>setAppState</code>、响应长度和 abort controller；
-              如果是异步后台 agent，就倾向于隔离。
+              在 <code>runAgent()</code> 的实际调用中，同步 agent 共享 <code>setAppState</code>，同步与异步 agent 都计入响应指标。helper 默认创建会传播父取消的 child controller；后台任务显式传入不与父 ESC 联动的 controller，才能继续独立运行。两种情况都保留任务登记入口，避免后台 Bash 进程失去清理记录。
             </p>
 
             <h3>4.2 无 UI 的 subagent 会避免权限弹窗</h3>
             <p>
-              如果没有共享父级 abort controller，<code>getAppState()</code> 会被包装成
+              在未覆盖 <code>getAppState</code> 且没有选择共享父级 abort controller 时，helper 才把读取结果包装成
               <code>shouldAvoidPermissionPrompts: true</code>。这和权限篇能对上：
               无法弹窗的后台路径应该先让 hook 决策，没人能决策就 deny，而不是卡死等待用户点击。
             </p>
@@ -343,14 +325,14 @@ fork path
             <h2>五、runAgent 是子 agent 的小 query loop</h2>
             <p>
               <code>AgentTool.call()</code> 最后会把参数交给
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L248-L260"><code>runAgent()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L248-L260"><code>runAgent()</code></a>。
               它不是只发一次 API 请求，而是一个 async generator：初始化上下文，执行 hooks，预加载 skills，接上 agent-specific MCP，
               然后进入 <code>query()</code> 循环，把子 agent 的消息逐条 yield 回父级。
             </p>
 
             <h3>5.1 SubagentStart、frontmatter hooks 和 skills 都在 agent 内部展开</h3>
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L520-L646">启动阶段</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L520-L646">启动阶段</a>
               会执行 <code>SubagentStart</code> hooks，把额外上下文作为 attachment message 放进 initial messages；
               如果 agent frontmatter 有 hooks，会注册到该 agent lifecycle，并把 Stop 转成 SubagentStop；
               如果有预加载 skills，则把 skill content 作为 meta user message 加进去。
@@ -363,7 +345,7 @@ fork path
 
             <h3>5.2 Sidechain transcript 是子 agent 可恢复的前提</h3>
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L732-L805"><code>runAgent()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L732-L805"><code>runAgent()</code></a>
               会把 initial messages 写入 sidechain transcript，然后在 query loop 中继续记录 assistant、user、progress
               和压缩分界点。这个 sidechain 不是 UI 装饰，而是后面查看、恢复和统计 subagent 的基础。
             </p>
@@ -374,6 +356,7 @@ fork path
               transcript 和清理流程。
             </p>
 
+            <p>例如父 agent 提交“检查测试失败原因”后，<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L686-L765"><code>status: async_launched</code></a> 只表示后台任务已经启动，并不表示测试已通过。稍后的任务通知或 TaskOutput 才提供完成、失败或停止状态。fork 前缀里的 placeholder tool_results 只用于补齐消息配对，也不是其他工具已成功执行的证据。</p>
             <h2>六、同步、异步、fork 三条路径怎么记</h2>
             <div class="table-wrap">
               <table>
@@ -428,20 +411,20 @@ fork path
 
             <h2 id="sources">参考源码与文档</h2>
             <ul class="source-list">
-              <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
-              <li><a href="https://docs.anthropic.com/en/docs/claude-code/sub-agents">Claude Code sub-agents 文档</a></li>
-              <li><a href="https://docs.anthropic.com/en/docs/claude-code/hooks">Claude Code hooks 文档</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L81-L155">AgentTool.tsx：input and output schema</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L239-L356">AgentTool.tsx：selection and fork routing</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L365-L410">AgentTool.tsx：required MCP servers</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L483-L633">AgentTool.tsx：normal and fork runAgent params</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L686-L765">AgentTool.tsx：async agent launch</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/agentToolUtils.ts#L70-L225">agentToolUtils.ts：resolveAgentTools</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/forkedAgent.ts#L253-L462">forkedAgent.ts：createSubagentContext</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/forkedAgent.ts#L489-L626">forkedAgent.ts：runForkedAgent</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L85-L218">runAgent.ts：agent-specific MCP servers</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L520-L714">runAgent.ts：hooks, skills, MCP and subagent context</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L732-L859">runAgent.ts：query loop, transcript and cleanup</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code">公开源码镜像</a></li>
+              <li><a href="https://code.claude.com/docs/en/sub-agents">Claude Code sub-agents 文档</a></li>
+              <li><a href="https://code.claude.com/docs/en/hooks">Claude Code hooks 文档</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L81-L155">AgentTool.tsx：input and output schema</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L239-L356">AgentTool.tsx：selection and fork routing</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L365-L410">AgentTool.tsx：required MCP servers</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L483-L633">AgentTool.tsx：normal and fork runAgent params</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L686-L765">AgentTool.tsx：async agent launch</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/agentToolUtils.ts#L70-L225">agentToolUtils.ts：resolveAgentTools</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/forkedAgent.ts#L253-L462">forkedAgent.ts：createSubagentContext</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/forkedAgent.ts#L489-L626">forkedAgent.ts：runForkedAgent</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L85-L218">runAgent.ts：agent-specific MCP servers</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L520-L714">runAgent.ts：hooks, skills, MCP and subagent context</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L732-L859">runAgent.ts：query loop, transcript and cleanup</a></li>
             </ul>
           </section>
         </article>
