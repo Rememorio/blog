@@ -4,7 +4,7 @@
 <p>长任务很少和某个聊天窗口同时开始、同时结束。任务可能等待 CI、review 或授权，也可能因为时间和环境重启被拆成几次执行。要让后一次真正接住前一次，系统必须把“任务”从“这次对话”里拿出来。</p>
 
 <div class="reading-contract"><p><strong>读完这篇，你应该能回答：</strong>Outer Loop 是什么、为什么需要、最小版本有哪些部分；任务中断、并发处理和外部动作状态不明时分别怎样处理。</p></div>
-<div class="evidence-note"><p><strong>资料说明：</strong>本文从 OpenAI 的 Harness engineering 与 Symphony，以及 Anthropic 的 long-running harness 和 Managed agents 中抽象跨运行机制。篇末社区教程只补充教学视角，不作为产品行为定义。</p></div>
+<div class="evidence-note"><p><strong>资料说明：</strong>本文用 OpenAI Symphony 的<a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/SPEC.md#L35-L65">公开规范</a>与 Elixir 实现解释跨运行调度，并以 Harness engineering 和 Anthropic long-running harness 补充设计经验。源码链接固定到核实快照；任务持久化、跨实例租约与副作用日志是按需求选择的工程设计，不代表 Symphony 已内置这些能力。篇末社区教程只补充教学视角。</p></div>
 
 <h2>一、先从失败故事看懂 Outer Loop</h2>
 <h3>1.1 一个没有 Outer Loop 的任务怎样失败</h3>
@@ -17,28 +17,39 @@
 
 <h3>1.3 一张任务卡怎样从进入系统走到完成</h3>
 <ol><li><strong>创建任务：</strong>测试失败事件或人工请求生成任务卡，写清目标和完成条件。</li><li><strong>选择任务：</strong>系统从等待列表中挑出当前可以处理、优先级合适的一项。</li><li><strong>启动运行：</strong>把目标、可用工具、权限和上次进度交给 Agent。</li><li><strong>持续保存：</strong>运行过程中记录确认事实、代码改动、测试结果和未完成事项，而不是等最后才保存。</li><li><strong>独立验证：</strong>CI、review 或业务检查确认结果；Agent 自己说“完成”只是一条候选结论。</li><li><strong>决定下一步：</strong>验证通过就结束；失败就带着新证据再运行；缺权限就等待；多次尝试无效就交给人。</li></ol>
-<p>这六步才是主干。后面的 queue、lease、checkpoint 和 idempotency，都是在任务变多、运行会中断或存在外部动作后，为这条主干补上的保护机制。</p>
+<p>这六步描述一套完整工作系统应分配的责任；某个调度器可能只实现其中一部分。后面的 queue、lease、checkpoint 和 idempotency，都是在任务变多、运行会中断或存在外部动作后，为这条主干补上的保护机制。</p>
 
 <h2>二、把任务卡变成可运行的控制流程</h2>
 <h3>2.1 任务为什么要离开聊天，成为独立任务卡</h3>
 <p>聊天记录适合保留对话，却不是任务本身。任务卡最先需要的只有稳定编号、目标、完成条件、当前状态、已完成和下一步。任务规模扩大后，再逐步加入优先级、依赖、当前处理者、尝试次数和外部对象引用。Run 只是任务卡上的一次处理记录，不应取代任务卡。</p>
-<figure class="mechanism-figure"><img src="../assets/outer-loop-cover.png" alt="Outer loop 包含 trigger、select work、launch run、verify、persist、retry or next，内部有 agent loop" /><figcaption>Inner loop 处理一个 work item；outer loop 决定何时创建、交给谁、是否接受结果以及下一步。图中的 Persist 是最终交接点，checkpoint 与外部动作状态会在运行中持续写入。</figcaption></figure>
+<figure class="mechanism-figure"><img src="../assets/outer-loop-cover.png" alt="Outer loop 包含 trigger、select work、launch run、verify、persist、retry or next，内部有 agent loop" /><figcaption>Inner loop 处理一个 work item；outer loop 决定何时创建、交给谁、是否接受结果以及下一步。这是通用设计图，不是 Symphony 的实现图。Persist 表示最终交接点；设计中的 checkpoint 与外部动作状态应在运行中持续写入。</figcaption></figure>
 <figure class="shape-example"><pre><code class="language-text">任务：修复支付模块回归
 状态：处理中
 完成条件：支付测试通过，review 接受
 已经确认：缺少过期订单校验
 已经修改：payment.go
 下一步：运行支付测试</code></pre><figcaption><strong>最小任务卡：</strong>先让下一次运行能看懂目标、进度和下一步。并发、重试和副作用字段会在出现相应问题时再加入。</figcaption></figure>
-<p>任务卡的最新版本保存在 Outer Loop 使用的持久化存储中，而不是某次 Prompt 或聊天历史里。启动 Run 时，系统只把当前目标、权限和进度放进 Agent 的输入；Run 通过 checkpoint 写回新事实；verifier 通过后，Outer Loop 才把任务状态从“待验证”改为“完成”。后续 Run 和人类 reviewer 都从这张更新后的任务卡与 artifact 引用继续。</p>
+<p>在这套设计中，任务卡的最新版本保存在 Outer Loop 使用的持久化存储中，而不是某次 Prompt 或聊天历史里。启动 Run 时，系统只把当前目标、权限和进度放进 Agent 的输入；Run 通过 checkpoint 写回新事实；verifier 通过后，Outer Loop 才把任务状态从“待验证”改为“完成”。后续 Run 和人类 reviewer 都从这张更新后的任务卡与 artifact 引用继续。</p>
 
 <h3>2.2 把刚才的六步变成可运行的责任</h3>
 <p>这六项不是只执行一次的直线流水线。保存进度从 run 启动前就开始，并贯穿执行与最终交接；否则进程若在验证前崩溃，系统恰好没有可恢复事实。后文会逐个解释并发领取、checkpoint 和外部动作记录，先用普通语言记住表里的责任即可。</p>
 <div class="table-wrap"><table><thead><tr><th>阶段</th><th>控制问题</th><th>必须留下的事实</th></tr></thead><tbody><tr><td>Trigger</td><td>什么事件或人工请求创建任务？</td><td>任务来源、是否重复、时间</td></tr><tr><td>Select work</td><td>现在哪项任务可以开始？</td><td>选择理由、当前处理者</td></tr><tr><td>Launch run</td><td>本次 Agent 得到什么目标、工具和进度？</td><td>运行配置、输入版本、上次进度</td></tr><tr><td>Verify</td><td>哪些独立检查可以接受结果？</td><td>检查证据、失败原因</td></tr><tr><td>Persist</td><td>哪些进度和外部变化必须保存？</td><td>恢复起点、动作记录</td></tr><tr><td>Retry / next</td><td>结束、等待、换策略还是找人？</td><td>决定理由、剩余尝试</td></tr></tbody></table></div>
 
+<h4>2.2.1 Symphony 怎样接力支付任务</h4>
+<p>把支付问题放进 issue tracker 后，Symphony 负责轮询、挑选、启动 worker 和重新检查状态。<a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/SPEC.md#L35-L65">规范把它定位为 scheduler/runner 与 tracker reader</a>：改 ticket 状态、写评论与 PR 链接通常由 coding agent 通过工具完成；CI 与 review 的通过标准仍由团队工作流定义。成功交接可以停在 Human Review，不能直接等同于业务任务 Done。</p>
+<p>同一次 worker 内，<a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/agent_runner.ex#L90-L173">AgentRunner 在每个正常结束的 turn 后刷新 issue</a>；仍活跃且符合路由条件时，继续使用当前 session，直到达到本次运行的 turn 上限。worker 正常退出且未进入等待输入状态后，<a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/orchestrator.ex#L208-L224">调度器安排约 1 秒后的 continuation 检查</a>，再读取 issue 决定是否启动新 worker。源码里的 <code>completed</code> 只是本地记账，<a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/orchestrator.ex#L816-L827">派发条件并不拿它拦截后续运行</a>。</p>
+<figure class="shape-example"><pre><code class="language-text">支付 issue 仍活跃
+→ turn 完成：刷新 issue；未到上限则在同一 session 继续
+→ worker 达到 turn 上限：正常退出
+→ 约 1 秒后重新检查：仍符合条件则启动新 worker
+→ issue 进入工作流的非活跃交接状态：释放 claim
+→ CI / review / 人工验收：按团队规则决定任务是否完成</code></pre><figcaption><strong>运行与任务分开：</strong>前三个完成信号都不能单独证明支付修复已被接受；tracker 状态决定是否继续调度，验收规则决定结果是否合格。</figcaption></figure>
+
 <h3>2.3 怎样防止两个执行者同时写同一任务</h3>
-<p>想象两名执行者同时从等待列表里拿到了同一张支付任务卡，两边都开始改代码。等待列表只能决定谁先看到任务，还需要一种“限时领取”机制：某名执行者在一段时间内取得处理权，持续证明自己还在工作；超过时间后，任务才能被别人重新领取。这种限时处理权叫 lease。</p>
-<p>真实系统里的 Webhook 可能重复，定时任务可能重叠，worker 也可能崩溃。没有这套领取与过期规则，同一任务会被并发修改，或在执行者死亡后永久卡住。</p>
-<figure class="mechanism-figure"><img src="../assets/outer-loop-control-plane.png" alt="Outer loop 使用去重、队列、租约、验证、重试预算和人工升级协调多次运行" /><figcaption>Queue 管等待顺序，lease 管当前处理权，fencing token 拒绝旧处理者的迟到写入；重复外部动作会在 3.3 节单独处理。</figcaption></figure>
+<p>先看只有一个调度器的情况。Symphony 用一个 GenServer 串行修改调度状态，派发前检查 <code>claimed</code>、<code>running</code> 与 <code>blocked</code>，再检查总并发、issue 状态和 worker 容量。<a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/orchestrator.ex#L816-L837">这些检查</a>与<a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/orchestrator.ex#L954-L991">启动后的 claim 记录</a>防止该调度器重复派发同一 issue；它们是进程内的集合和 map，不是多个独立调度器共享的租约服务。</p>
+<p>若改成多个调度器共同领取同一张支付任务卡，才需要额外解决跨实例互斥与故障接管。常见设计是把限时处理权写入共享存储：执行者定期续期，过期后别人才能领取，这叫 lease；存储或执行外部写的接收方还要检查递增的 fencing token，拒绝旧执行者迟到的写入。仅在 Prompt 中要求“别重复执行”不能建立这个保证。</p>
+<figure class="mechanism-figure"><img src="../assets/symphony-scheduling-state.png" alt="Symphony 的 claim、running 与 retry 位于调度器内存，重启后从 tracker 和保留的 workspace 重新调度" /><figcaption>Symphony 的<a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/orchestrator.ex#L24-L79">进程内调度状态</a>与外部 issue、workspace 分开保存。下面的 lease、fencing 与副作用日志是扩展设计，图中没有把它们画成现有实现。</figcaption></figure>
+<p>当部署确实需要这些扩展时，各机制分别保护以下条件：</p>
 <ul><li><strong>Deduplication：</strong>相同外部事件只创建一个 work item。</li><li><strong>Lease：</strong>同一时刻只有一个 run 可以写任务状态；只读调查可另设并行策略。</li><li><strong>Heartbeat：</strong>区分长运行与已死亡 worker。</li><li><strong>Fencing token：</strong>旧 lease 即使迟到，也不能覆盖新 worker 写入的状态。</li><li><strong>Backpressure：</strong>根据资源、风险和人工审查容量限制启动。</li></ul>
 <figure class="shape-example"><pre><code class="language-text">queued
   -- worker-A claim, fence=1 --> running(A)
@@ -46,21 +57,22 @@
   -- worker-B claim, fence=2 --> running(B)
 
 complete(worker-A, fence=1)  # rejected: stale lease
-complete(worker-B, fence=2)  # accepted</code></pre><figcaption><strong>Lease 实验：</strong>Queue 只决定谁先被看见；lease 让处理权过期；fencing token 让旧 worker 的迟到写被确定性拒绝。</figcaption></figure>
+complete(worker-B, fence=2)  # accepted</code></pre><figcaption><strong>分布式设计示例，并非 Symphony 状态机：</strong>Queue 只决定谁先被看见；lease 让处理权过期；fencing token 让旧 worker 的迟到写被确定性拒绝。</figcaption></figure>
 
 <h2>三、进阶：跨运行恢复、重试与副作用</h2>
 <h3>3.1 中断以后，下一次运行怎样接上</h3>
 <p><strong>Checkpoint 就是下一次运行可以恢复的已保存起点。</strong>回到支付故事：Run 1 在结束前写下目标、已确认原因、<code>payment.go</code> 的修改、尚未执行的测试和日志引用；Run 2 启动后先核对文件与引用是否仍然有效，再从“运行支付测试”继续，而不是重新调查。</p>
+<p>Symphony 的恢复范围更小：<a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/orchestrator.ex#L24-L79">启动时重新建立空的调度状态</a>，随后轮询 tracker 并复用保留的 workspace；<a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/SPEC.md#L1691-L1704">规范明确不恢复旧进程的 retry timer、运行 session 或 live worker 状态</a>。因此“工作目录还在”可以保住代码与文件，却不等于旧会话和重试次数仍在。团队仍需让 Agent 写下可核对的进展、测试与外部对象引用，后续运行再确认它们是否有效。</p>
 <p>Anthropic 的 long-running harness 经验强调，让后续 agent 能从明确进展文件、git 状态和干净的任务切片继续。这样的 handoff 同时服务机器与人：结构化字段保证恢复，叙述记录决策与异常；原始 artifact 保留证据。</p>
-<figure class="mechanism-figure"><img src="../assets/cross-run-handoff.png" alt="Run N 通过 checkpoint、外部动作记录和 artifacts 把状态交给 Run N+1" /><figcaption>下一次 run 不应该重新猜上次发生了什么，也不应该盲信一段找不到原始结果的摘要。</figcaption></figure>
+<figure class="mechanism-figure"><img src="../assets/cross-run-handoff.png" alt="Run N 通过 checkpoint、外部动作记录和 artifacts 把状态交给 Run N+1" /><figcaption>通用交接设计：下一次 run 不应重新猜上次发生了什么，也不应盲信无原始结果的摘要。图中的 checkpoint 与副作用账本不是 Symphony 内置数据库。</figcaption></figure>
 <div class="table-wrap"><table><thead><tr><th>Handoff 字段</th><th>回答的问题</th><th>恢复检查</th></tr></thead><tbody><tr><td>Goal / done</td><td>要完成什么？</td><td>是否仍有效</td></tr><tr><td>Confirmed facts</td><td>已经知道什么？</td><td>来源是否可访问、新鲜</td></tr><tr><td>Effects</td><td>已经改了什么外部状态？</td><td>与真实世界对账</td></tr><tr><td>Attempts</td><td>哪些路径失败、为什么？</td><td>避免同策略重复</td></tr><tr><td>Open / next</td><td>阻塞点和最小下一步？</td><td>能力与权限是否足够</td></tr><tr><td>Artifacts</td><td>日志、diff、测试和截图在哪里？</td><td>引用是否完整</td></tr></tbody></table></div>
 
 <h3>3.2 失败后不是简单地“再试一次”</h3>
 <p>Inner loop 的一次工具重试与 outer loop 的整次 run 重试不同。后者成本更高，也更容易重复副作用。每次重新启动前要问：失败类别是什么？新 run 会得到什么变化？旧效果是否已对账？还剩多少预算？如果答案只有“再试一次”，就不该自动重试。</p>
-<p>重试预算应随 work item 持久化，不能在 worker 重启后归零。可以按错误类别设置不同策略：基础设施短暂错误自动退避；权限阻塞直接等待审批；同一 invariant 连续失败转人工；高风险外部写在状态不明时先 reconcile，不能重放。</p>
+<p>需要跨进程重启限制总尝试次数或总花费时，重试预算应随 work item 持久化。Symphony 当前把 <a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/orchestrator.ex#L1034-L1072">retry attempt 与 timer 保存在内存</a>，失败重试使用<a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/orchestrator.ex#L1232-L1243">带最大等待时间的指数退避</a>；等待时间上限并不是总尝试次数上限，重启也不会恢复这些重试记录。可以按错误类别设置不同策略：基础设施短暂错误自动退避；权限阻塞直接等待审批；同一 invariant 连续失败转人工；高风险外部写在状态不明时先 reconcile，不能重放。</p>
 
 <h3>3.3 请求超时，不等于外部动作没有发生</h3>
-<p>“创建 PR”“退款”“发通知”都可能出现请求成功但响应丢失。Outer loop 若只看本地超时，会再次执行。每个可重试副作用应携带稳定 idempotency key，并把 proposed、started、committed、observed 状态写入动作状态日志。恢复时先查询外部系统，再决定继续、补偿或完成。</p>
+<p>“创建 PR”“退款”“发通知”都可能出现请求成功但响应丢失。Outer loop 若只看本地超时，会再次执行。在需要避免重复效果的工作流中，每个可重试副作用应携带稳定 idempotency key，并把 proposed、started、committed、observed 状态写入动作状态日志。恢复时先查询外部系统，再决定继续、补偿或完成。这是业务工作流应落实的设计，不能从 Symphony 的 issue claim 推导出创建 PR 或退款已经具备幂等性。</p>
 <figure class="shape-example"><pre><code class="language-text">effect_key = "issue-1842:create-pr:v3"
 status log: proposed → started → unknown
 remote: PR #41 already exists
@@ -75,9 +87,9 @@ reconcile(effect_key)
 <p>OpenAI Harness engineering 强调人类注意力稀缺。Outer loop 应只在需要人的判断时打断：目标冲突、高风险授权、无法自动判定的质量，或是否继续投入预算。系统要给出精简但充分的说明：发生了什么、已验证什么、有哪些选项与影响、推荐动作和截止时间。</p>
 
 <h2>四、复盘：从最小版本逐步加保护</h2>
-<div class="table-wrap"><table><thead><tr><th>问题</th><th>最低机制</th><th>没有它会怎样</th></tr></thead><tbody><tr><td>重复事件会创建重复工作吗？</td><td>dedupe key</td><td>并发重复副作用</td></tr><tr><td>哪个 worker 当前可以写任务？</td><td>lease + fencing</td><td>双写或永久卡住</td></tr><tr><td>Run 结束后怎样判断完成？</td><td>独立 verifier</td><td>把 final 当结果真值</td></tr><tr><td>下一次 run 从什么继续？</td><td>checkpoint + artifacts</td><td>丢状态、重做调查</td></tr><tr><td>重试会改变什么？</td><td>error class + persistent budget</td><td>无限烧钱</td></tr><tr><td>外部效果状态不明怎么办？</td><td>idempotency + action status log</td><td>重复退款、PR 或通知</td></tr><tr><td>什么时候找人？</td><td>escalation policy</td><td>任务无人处理或人被频繁打断</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>问题</th><th>最低机制</th><th>没有它会怎样</th></tr></thead><tbody><tr><td>重复事件会创建重复工作吗？</td><td>dedupe key</td><td>并发重复副作用</td></tr><tr><td>多个调度器中哪个 worker 可以写任务？</td><td>共享 lease + 接收方 fencing 检查</td><td>双写或永久卡住</td></tr><tr><td>Run 结束后怎样判断完成？</td><td>独立 verifier</td><td>把 final 当结果真值</td></tr><tr><td>下一次 run 从什么继续？</td><td>checkpoint + artifacts</td><td>丢状态、重做调查</td></tr><tr><td>重试会改变什么？</td><td>error class + persistent budget</td><td>无限烧钱</td></tr><tr><td>外部效果状态不明怎么办？</td><td>idempotency + action status log</td><td>重复退款、PR 或通知</td></tr><tr><td>什么时候找人？</td><td>escalation policy</td><td>任务无人处理或人被频繁打断</td></tr></tbody></table></div>
 <p>Outer loop 把 run 变成了可运营的工作系统。但它仍需要一个外部真值来判断“verify”是否可信。最后一篇进入 <strong>Evals 与反馈</strong>：怎样测结果、定位失败层，并把证据变成下一次系统改动。</p>
-<h2 id="sources">官方资料</h2><ul class="source-list"><li><a href="https://openai.com/index/open-source-codex-orchestration-symphony/">OpenAI：An open-source spec for Codex orchestration: Symphony</a></li><li><a href="https://openai.com/index/harness-engineering/">OpenAI：Harness engineering</a></li><li><a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents">Anthropic：Effective harnesses for long-running agents</a></li><li><a href="https://www.anthropic.com/engineering/managed-agents">Anthropic：Managed agents</a></li></ul>
+<h2 id="sources">官方资料</h2><ul class="source-list"><li><a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/SPEC.md">OpenAI Symphony：公开规范与恢复边界</a></li><li><a href="https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/elixir/lib/symphony_elixir/orchestrator.ex">OpenAI Symphony：Elixir 调度器实现</a></li><li><a href="https://openai.com/index/open-source-codex-orchestration-symphony/">OpenAI：An open-source spec for Codex orchestration: Symphony</a></li><li><a href="https://openai.com/index/harness-engineering/">OpenAI：Harness engineering</a></li><li><a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents">Anthropic：Effective harnesses for long-running agents</a></li><li><a href="https://www.anthropic.com/engineering/managed-agents">Anthropic：Managed agents</a></li></ul>
 <h2>延伸阅读</h2><ul class="source-list"><li><a href="https://www.runoob.com/ai-agent/loop-engineering.html">菜鸟教程：Loop Engineering</a></li><li><a href="https://addyosmani.com/blog/loop-engineering/">Addy Osmani：Loop Engineering</a></li><li><a href="https://walkinglabs.github.io/learn-harness-engineering/en/lectures/lecture-13-loop-engineering/">Learn Harness Engineering：From Manual Prompting to Autonomous Loops</a></li></ul>
 </section></article></main></div><script src="../../assets/article.js?v=1"></script>
   <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
