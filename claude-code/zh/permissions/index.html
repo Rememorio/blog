@@ -15,7 +15,7 @@
       content="权限不是一个 UI 弹窗，而是模型 tool_use 和本地文件、shell、网络副作用之间的运行时刹车系统。"
     />
     <meta property="og:type" content="article" />
-    <meta property="og:image" content="../assets/permission-side-effect-brake.png" />
+    <meta property="og:image" content="../assets/permission-decision-stack.png" />
     <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/zh/permissions/" />
     <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/permissions/" />
     <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/claude-code/en/permissions/" />
@@ -119,13 +119,14 @@
             </div>
             <figure class="hero-image">
               <img
-                src="../assets/permission-side-effect-brake.png"
-                alt="Claude Code 权限刹车图，展示 tool_use 经过 rules、tool check、hooks 和 user 后才进入 file、shell、network 副作用，deny 会回填 tool_result"
+                src="../assets/permission-decision-stack.png"
+                alt="Claude Code 正常权限判断顺序，展示规则、工具检查、安全检查保留 ask，以及默认放行和最终结果"
               />
             </figure>
           </section>
 
           <section class="article-body">
+            <p>本文核对的是公开镜像的 <a href="https://github.com/Rememorio/claude-code/tree/5a774a2b62d7949c1d94e0b726281554d7893cfd">2026 年 3 月 31 日源码快照</a>。该镜像并非 Anthropic 官方源码发布；下文描述这一固定快照，不能据此断言当前发行版具有相同实现。官方文档用于说明产品或 API 合同。</p>
             <p>
               <a href="../tools/">上一篇</a>把工具调用拆成四层：模型产生 <code>tool_use</code>，
               <code>query()</code> 收集申请，<code>runTools()</code> 调度，<code>runToolUse()</code> 执行单个工具。
@@ -142,7 +143,7 @@
             <div class="note key-point">
               <p>
                 这一篇的主线可以压成一句话：<code>tool_use</code> 进入工具执行后，先跑 PreToolUse hook，
-                再通过 <code>resolveHookPermissionDecision()</code> 进入 <code>canUseTool()</code>；
+                再通过 <code>resolveHookPermissionDecision()</code> 选择 hook 决策或正常权限路径；
                 <code>canUseTool()</code> 读取 <code>ToolPermissionContext</code>、工具自身检查、模式和规则，
                 最后返回 allow / deny / ask。只要不是 allow，客户端不会执行副作用，而是生成错误型 <code>tool_result</code>。
               </p>
@@ -158,10 +159,10 @@
 
             <p>
               产品层证据来自 Claude Code 的
-              <a href="https://docs.anthropic.com/en/docs/claude-code/settings">settings 文档</a>、
-              <a href="https://docs.anthropic.com/en/docs/claude-code/hooks">hooks 文档</a>、
-              <a href="https://docs.anthropic.com/en/docs/claude-code/security">security 文档</a>
-              和 <a href="https://docs.anthropic.com/en/docs/claude-code/iam">IAM 文档</a>；
+              <a href="https://code.claude.com/docs/en/settings">settings 文档</a>、
+              <a href="https://code.claude.com/docs/en/hooks">hooks 文档</a>、
+              <a href="https://code.claude.com/docs/en/security">security 文档</a>
+              和 <a href="https://code.claude.com/docs/en/iam">IAM 文档</a>；
               源码层来自
               <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
               本文只把客户端源码可见的决策顺序写成事实；auto classifier 的模型策略、服务端安全策略和 provider 内部实现不从客户端代码里硬推。
@@ -181,7 +182,8 @@
 
 tool_use
   -&gt; PreToolUse hook
-  -&gt; canUseTool({ mode, rules, toolCheck, context })
+  -&gt; resolveHookPermissionDecision(...)
+  -&gt; rule-checked hook result OR canUseTool(...)
   -&gt; allow | deny | ask
   -&gt; execute tool | return denial result | suspend for user choice</code></pre>
               <figcaption>源码形状：权限不是一个 UI 弹窗，而是工具执行路径里的三分支决策。</figcaption>
@@ -190,22 +192,21 @@ tool_use
             <h2>一、权限上下文保存本轮规则与状态</h2>
             <p>
               权限判断读取的状态集中在
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/Tool.ts#L123-L148"><code>ToolPermissionContext</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/Tool.ts#L123-L148"><code>ToolPermissionContext</code></a>。
               它不是一个布尔开关，而是一组会共同影响结果的字段：当前 mode、allow / deny / ask 规则、额外工作目录、
               bypass 是否可用、auto mode 是否可用、是否避免权限弹窗、是否要先等自动检查。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/permission-context-ledger.png"
-                alt="Claude Code ToolPermissionContext 状态图，展示 mode、allow rules、deny rules、ask rules、directories 和 no prompts 被 canUseTool 读取"
-              />
-              <figcaption><code>ToolPermissionContext</code> 保存本轮权限配置，<code>canUseTool()</code> 每次决策都会读取它。</figcaption>
-            </figure>
 
-            <h3>1.1 mode 不是唯一输入</h3>
+
+            <figure class="shape-example"><pre><code class="language-text">ToolPermissionContext（节选）
+mode: default / plan / acceptEdits / bypassPermissions / dontAsk
+alwaysAllowRules / alwaysDenyRules / alwaysAskRules
+additionalWorkingDirectories
+shouldAvoidPermissionPrompts
+isBypassPermissionsModeAvailable / isAutoModeAvailable</code></pre><figcaption>状态字段示意：ask、allow、deny 是决策结果，不是这里的三种 mode。</figcaption></figure><h3>1.1 mode 不是唯一输入</h3>
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/types/permissions.ts#L16-L38">权限模式类型</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/types/permissions.ts#L16-L38">权限模式类型</a>
               里能看到外部可用模式：<code>default</code>、<code>plan</code>、<code>acceptEdits</code>、
               <code>bypassPermissions</code>、<code>dontAsk</code>；内部还可能有受功能开关控制的 <code>auto</code>。
               但 mode 只是其中一个输入。规则、目录、安全检查、工具实现自己的判断，都会影响最后结果。
@@ -219,10 +220,10 @@ tool_use
             <h3>1.2 权限更新可以只影响本轮，也可以写入设置</h3>
             <p>
               权限弹窗或 hook 允许时，可能带回 permission updates。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/PermissionUpdate.ts#L55-L205"><code>applyPermissionUpdate()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/PermissionUpdate.ts#L55-L205"><code>applyPermissionUpdate()</code></a>
               支持改 mode、增加/替换/删除规则、增加/删除额外目录。
               如果目的地是 user / project / local settings，
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/PermissionUpdate.ts#L208-L265">更新还可以持久化</a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/PermissionUpdate.ts#L208-L265">更新还可以持久化</a>。
             </p>
 
             <p>
@@ -232,17 +233,11 @@ tool_use
             <h2>二、权限判断按固定顺序执行</h2>
             <p>
               权限判断的内核是
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L1158-L1315"><code>hasPermissionsToUseToolInner()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L1158-L1315"><code>hasPermissionsToUseToolInner()</code></a>。
               这段代码最值得看的不是某个 if，而是顺序。它先检查“必须停”的东西，再看“可以放行”的东西。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/permission-decision-stack.png"
-                alt="Claude Code 权限判断顺序图，展示 deny rule、ask rule、tool check、safety check、bypass mode、allow rule 和 final ask 的顺序"
-              />
-              <figcaption>判断顺序很重要：deny、ask 和 safety check 先于 bypass / allow，模式开关不能覆盖这些检查。</figcaption>
-            </figure>
+
 
             <h3>2.1 deny 和 ask 先于工具默认放行</h3>
             <p>
@@ -259,7 +254,7 @@ tool_use
 
             <h3>2.2 bypass 也绕不过内容级 ask 和 safety check</h3>
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L1238-L1260">两类 ask 会优先于 bypass</a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L1238-L1260">两类 ask 会优先于 bypass</a>。
               第一类是 content-specific ask rule，比如某个命令前缀必须确认；第二类是 safety check，
               注释里明确说 `.git/`、`.claude/`、`.vscode/`、shell configs 这类路径是 bypass-immune。
             </p>
@@ -269,7 +264,7 @@ tool_use
               <code>bypassPermissions</code> 是“默认不问”，不是“所有安全闸都失效”。
             </p>
 
-            <h3>2.3 最后的 passthrough 会变成 ask</h3>
+            <p>这里保留的是 ask，而不是直接 deny；之后由外层模式决定如何处理询问。另一个细节是 <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L1262-L1286">plan 模式的 bypass 判断</a>：如果当前会话保留了 bypass 可用状态，plan 也可能走这一放行分支。</p><h3>2.3 最后的 passthrough 会变成 ask</h3>
             <p>
               走过 deny、ask、工具检查、safety、bypass、allow rule 以后，如果工具结果还是 <code>passthrough</code>，
               源码会把它转换成 ask，并生成 permission request message。
@@ -313,14 +308,14 @@ tool_use
             <h2>三、外层会把 ask 改造成不同路径</h2>
             <p>
               <code>hasPermissionsToUseToolInner()</code> 给出初步结果后，外层
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L473-L956"><code>hasPermissionsToUseTool()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L473-L956"><code>hasPermissionsToUseTool()</code></a>
               还会根据运行模式改造 ask。这里正是 dontAsk、auto mode、headless agent 的分水岭。
             </p>
 
             <h3>3.1 dontAsk 把 ask 变成 deny</h3>
             <p>
               如果结果是 ask，并且当前 mode 是 <code>dontAsk</code>，
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L503-L517">源码直接返回 deny</a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L503-L517">源码直接返回 deny</a>。
               这不是“更严格的 default”，而是明确禁止交互确认：需要确认的动作全部拒绝。
             </p>
 
@@ -340,15 +335,16 @@ tool_use
             <p>
               后台或 headless 路径不能弹窗。源码里如果 <code>shouldAvoidPermissionPrompts</code> 为 true，
               会先运行
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L390-L450"><code>PermissionRequest</code> hooks</a>；
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L390-L450"><code>PermissionRequest</code> hooks</a>；
               如果 hook 没给出 allow / deny，才自动 deny。
               这让自动化环境有机会通过预先配置的 hook 决策，但不会卡在一个没人能点的弹窗上。
             </p>
 
-            <h2>四、交互弹窗其实是一场赛跑</h2>
+            <p>PreToolUse 的 allow 还存在独立快路：<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolHooks.ts#L340-L433"><code>resolveHookPermissionDecision()</code></a>保留 settings deny/ask，却不总是重跑完整权限函数。工具需要交互且 hook 没有用 <code>updatedInput</code> 满足交互，或 <code>requireCanUseTool</code> 被设置时，才强制正常回调。图中的正常权限栈不能冒充所有 hook 分支。</p>
+            <p>这里的<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L1071-L1155"><code>checkRuleBasedPermissions()</code></a>仍会解析输入 schema 并运行 <code>tool.checkPermissions()</code>，保留工具级 deny、内容规则 ask 和 <code>safetyCheck</code> ask；它跳过的是完整的模式与默认放行流程，并非只匹配 settings。</p><h2>四、交互弹窗其实是一场赛跑</h2>
             <p>
               真正需要 ask 且处在交互主线程时，<code>useCanUseTool()</code> 会进入
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L180"><code>handleInteractivePermission()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/useCanUseTool.tsx#L27-L180"><code>handleInteractivePermission()</code></a>。
               这时你看到的弹窗只是队列里的一个 <code>ToolUseConfirm</code>；它背后同时存在用户选择、hook、bash classifier、
               bridge 回调、channel 回调等多个可能的决策来源。
             </p>
@@ -363,24 +359,23 @@ tool_use
 
             <h3>4.1 resolve-once 保护“只决策一次”</h3>
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/PermissionContext.ts#L63-L94"><code>createResolveOnce()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/PermissionContext.ts#L63-L94"><code>createResolveOnce()</code></a>
               用 <code>claim()</code> / <code>resolve()</code> 防止多个异步来源同时完成。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/handlers/interactiveHandler.ts#L92-L232">弹窗队列项</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/handlers/interactiveHandler.ts#L92-L232">弹窗队列项</a>
               提供 <code>onAllow</code>、<code>onReject</code>、<code>onAbort</code>、<code>recheckPermission</code> 等回调；
               每个回调在真正 resolve 前都要先 claim。
             </p>
 
             <p>
-              这个设计保护的不是 UI 漂亮，而是副作用不能被重复提交。想象一个 Bash 权限请求：用户点了允许，classifier 又晚一步返回允许，
-              如果没有 resolve-once，工具可能被执行两次，或者记录出两个互相矛盾的决策。
+              这保护的是决策回调中的设置更新、日志和队列清理只由一个来源执行。用户与 classifier 同时批准时，<code>claim()</code> 在任何 await 之前抢占请求，后来者退出。JavaScript Promise 本来就只兑现一次；不能据此声称重复 resolve 本身会把工具执行两次。
             </p>
 
             <h3>4.2 hook 和 classifier 可以抢在用户之前完成</h3>
             <p>
               如果不是 coordinator worker，交互处理会异步跑
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/handlers/interactiveHandler.ts#L410-L430"><code>PermissionRequest</code> hook</a>；
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/handlers/interactiveHandler.ts#L410-L430"><code>PermissionRequest</code> hook</a>；
               如果是 Bash 且存在 pending classifier check，还会异步跑
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/handlers/interactiveHandler.ts#L433-L530">classifier check</a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/handlers/interactiveHandler.ts#L433-L530">classifier check</a>。
               只要用户还没交互、请求还没 resolve，hook 或 classifier 的 allow/deny 可以先完成并关闭队列项。
             </p>
 
@@ -388,10 +383,10 @@ tool_use
             <p>
               Coordinator worker 的路径会先等待 hook，再等待 classifier，仍然不成才落回交互弹窗；
               这在
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/handlers/coordinatorHandler.ts#L16-L62"><code>handleCoordinatorPermission()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/handlers/coordinatorHandler.ts#L16-L62"><code>handleCoordinatorPermission()</code></a>
               的注释里写得很清楚。Swarm worker 则先试 classifier，再把请求通过 mailbox 转给 leader，
               这条路径在
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/handlers/swarmWorkerHandler.ts#L26-L120"><code>handleSwarmWorkerPermission()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/handlers/swarmWorkerHandler.ts#L26-L120"><code>handleSwarmWorkerPermission()</code></a>。
             </p>
 
             <p>
@@ -401,20 +396,22 @@ tool_use
             <h2>五、拒绝结果也要告诉模型</h2>
             <p>
               权限结果回到 <code>toolExecution.ts</code> 后，如果不是 allow，
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L995-L1103">客户端不会执行工具</a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L995-L1103">客户端不会执行工具</a>。
               它会构造一条 user message，里面包含 <code>is_error: true</code> 的 <code>tool_result</code>，
               并且使用原来的 <code>toolUseID</code>。也就是说，拒绝不是沉默失败，而是模型下一轮能看到的事实。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/permission-denied-result.png"
-                alt="Claude Code 权限拒绝回填图，展示 tool_use A 被 permission deny 后，生成 is_error 的 tool_result A，并进入 next query"
-              />
-              <figcaption>权限拒绝会被写成配对的错误型 <code>tool_result</code>，让下一轮模型知道动作没有发生以及原因。</figcaption>
-            </figure>
 
-            <h3>5.1 deny 的 message 是给下一轮模型的约束</h3>
+
+            <figure class="shape-example"><pre><code class="language-json">{
+  "role": "user",
+  "content": [{
+    "type": "tool_result",
+    "tool_use_id": "A",
+    "content": "Permission denied",
+    "is_error": true
+  }]
+}</code></pre><figcaption>形状级示例：拒绝以原调用 id 返回；没有执行工具，也没有自动重试。</figcaption></figure><h3>5.1 deny 的 message 是给下一轮模型的约束</h3>
             <p>
               <code>permissionDecision.message</code> 会进入 <code>tool_result</code> 的 content。
               如果 PreToolUse hook 阻止继续且没有详细消息，源码会生成类似“Execution stopped by PreToolUse hook”的错误文本。
@@ -424,7 +421,7 @@ tool_use
             <h3>5.2 PermissionDenied hook 可以给 retry hint</h3>
             <p>
               auto mode classifier 拒绝后，源码还会跑
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L1073-L1101"><code>PermissionDenied</code> hooks</a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L1073-L1101"><code>PermissionDenied</code> hooks</a>。
               如果 hook 返回 retry，客户端会额外给模型一条 meta user message，提示它可以重试。
               这说明“拒绝”也不是一个绝对终点：它可以改变下一轮策略，但仍然不能越过当前这次副作用。
             </p>
@@ -487,26 +484,26 @@ tool_use
             <h2 id="sources">参考源码与文档</h2>
             <ul class="source-list">
               <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
-              <li><a href="https://docs.anthropic.com/en/docs/claude-code/settings">Claude Code settings 文档</a></li>
-              <li><a href="https://docs.anthropic.com/en/docs/claude-code/hooks">Claude Code hooks 文档</a></li>
-              <li><a href="https://docs.anthropic.com/en/docs/claude-code/security">Claude Code security 文档</a></li>
-              <li><a href="https://docs.anthropic.com/en/docs/claude-code/iam">Claude Code IAM 文档</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/Tool.ts#L123-L148">Tool.ts：ToolPermissionContext</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/types/permissions.ts#L16-L38">types/permissions.ts：permission modes</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/PermissionUpdate.ts#L55-L205">PermissionUpdate.ts：apply permission updates</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/PermissionUpdate.ts#L208-L265">PermissionUpdate.ts：persist permission updates</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L1158-L1315">permissions.ts：hasPermissionsToUseToolInner</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L473-L956">permissions.ts：hasPermissionsToUseTool outer transforms</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L390-L450">permissions.ts：headless PermissionRequest hooks</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L916-L1103">toolExecution.ts：permission boundary and denied result</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L1073-L1101">toolExecution.ts：PermissionDenied hooks</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L180">useCanUseTool.tsx：permission function</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/PermissionContext.ts#L63-L94">PermissionContext.ts：createResolveOnce</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/PermissionContext.ts#L216-L345">PermissionContext.ts：hooks, allow and deny helpers</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/handlers/interactiveHandler.ts#L92-L232">interactiveHandler.ts：permission queue callbacks</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/handlers/interactiveHandler.ts#L410-L530">interactiveHandler.ts：hook and classifier race</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/handlers/coordinatorHandler.ts#L16-L62">coordinatorHandler.ts：coordinator permission flow</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/handlers/swarmWorkerHandler.ts#L26-L120">swarmWorkerHandler.ts：swarm worker permission flow</a></li>
+              <li><a href="https://code.claude.com/docs/en/settings">Claude Code settings 文档</a></li>
+              <li><a href="https://code.claude.com/docs/en/hooks">Claude Code hooks 文档</a></li>
+              <li><a href="https://code.claude.com/docs/en/security">Claude Code security 文档</a></li>
+              <li><a href="https://code.claude.com/docs/en/iam">Claude Code IAM 文档</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/Tool.ts#L123-L148">Tool.ts：ToolPermissionContext</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/types/permissions.ts#L16-L38">types/permissions.ts：permission modes</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/PermissionUpdate.ts#L55-L205">PermissionUpdate.ts：apply permission updates</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/PermissionUpdate.ts#L208-L265">PermissionUpdate.ts：persist permission updates</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L1158-L1315">permissions.ts：hasPermissionsToUseToolInner</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L473-L956">permissions.ts：hasPermissionsToUseTool outer transforms</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L390-L450">permissions.ts：headless PermissionRequest hooks</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L916-L1103">toolExecution.ts：permission boundary and denied result</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L1073-L1101">toolExecution.ts：PermissionDenied hooks</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/useCanUseTool.tsx#L27-L180">useCanUseTool.tsx：permission function</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/PermissionContext.ts#L63-L94">PermissionContext.ts：createResolveOnce</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/PermissionContext.ts#L216-L345">PermissionContext.ts：hooks, allow and deny helpers</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/handlers/interactiveHandler.ts#L92-L232">interactiveHandler.ts：permission queue callbacks</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/handlers/interactiveHandler.ts#L410-L530">interactiveHandler.ts：hook and classifier race</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/handlers/coordinatorHandler.ts#L16-L62">coordinatorHandler.ts：coordinator permission flow</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/handlers/swarmWorkerHandler.ts#L26-L120">swarmWorkerHandler.ts：swarm worker permission flow</a></li>
             </ul>
           </section>
         </article>

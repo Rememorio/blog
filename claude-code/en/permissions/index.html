@@ -9,7 +9,7 @@
     <meta property="og:title" content="Permissions are the side-effect brake | Rememorio Blog" />
     <meta property="og:description" content="A source-reading article on Claude Code permissions: permission context, allow/deny/ask decisions, hooks, permission requests, and denied tool results." />
     <meta property="og:type" content="article" />
-    <meta property="og:image" content="../assets/permission-side-effect-brake.png" />
+    <meta property="og:image" content="../assets/permission-decision-stack.png" />
     <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/en/permissions/" />
     <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/permissions/" />
     <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/claude-code/en/permissions/" />
@@ -105,11 +105,12 @@
               <span>Scope: public mirror and official docs</span>
             </div>
             <figure class="hero-image">
-              <img src="../assets/permission-side-effect-brake.png" alt="Hand-drawn permission brake between model tool_use and local side effects" />
+              <img src="../assets/permission-decision-stack.png" alt="Normal permission path with rules, tool checks, preserved ask results, and default allows" />
             </figure>
           </section>
 
           <section class="article-body">
+            <p>This article examines the public mirror’s <a href="https://github.com/Rememorio/claude-code/tree/5a774a2b62d7949c1d94e0b726281554d7893cfd">March 31, 2026 source snapshot</a>. The mirror is not an official Anthropic source release. Implementation claims concern this fixed snapshot, not necessarily the current product release; official documentation establishes product or API contracts.</p>
 
             <p>A coding agent reads files, edits files, runs commands, and talks to external tools. Those actions do not carry the same risk. Claude Code therefore evaluates permissions inside the tool runtime instead of treating confirmation as a UI-only feature.</p>
             <div class="note route-note">
@@ -120,58 +121,73 @@
 
 tool_use
   -&gt; PreToolUse hook
-  -&gt; canUseTool({ mode, rules, toolCheck, context })
+  -&gt; resolveHookPermissionDecision(...)
+  -&gt; rule-checked hook result OR canUseTool(...)
   -&gt; allow | deny | ask
   -&gt; execute tool | return denial result | suspend for user choice</code></pre>
               <figcaption>Source shape: permission is a branch in the tool runtime, not merely the dialog that may appear for the ask branch.</figcaption>
             </figure>
 
             <h2>1. Permission context holds the current rules and state</h2>
-            <p><code>ToolPermissionContext</code> supplies the inputs used for each decision: the current mode, allow/deny/ask rules, additional working directories, prompt availability, and feature state. No single field determines the result. A mode can change the default behavior, but configured rules and checks performed by the tool still apply.</p>
-            <figure class="figure"><img src="../assets/permission-context-ledger.png" alt="Permission context with mode, rules, settings, hooks, and tool request" /><figcaption><code>canUseTool()</code> reads the current permission state whenever it evaluates a request.</figcaption></figure>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/Tool.ts#L123-L148"><code>ToolPermissionContext</code></a> supplies the inputs used for each decision: the current mode, allow/deny/ask rules, additional working directories, prompt availability, and feature state. No single field determines the result. A mode can change the default behavior, but configured rules and checks performed by the tool still apply.</p>
 
-            <h3>1.1 One-time approval and saved approval are different</h3>
-            <p>A permission response may allow only the current request, or it may include an update that adds a rule. <code>applyPermissionUpdate()</code> can change the in-memory mode, rules, and working directories; updates targeted at user, project, or local settings can also be persisted. “Allow once” therefore continues one call, while “always allow” changes how later matching calls are evaluated.</p>
+
+            <figure class="shape-example"><pre><code class="language-text">ToolPermissionContext (selected fields)
+mode: default / plan / acceptEdits / bypassPermissions / dontAsk
+alwaysAllowRules / alwaysDenyRules / alwaysAskRules
+additionalWorkingDirectories
+shouldAvoidPermissionPrompts
+isBypassPermissionsModeAvailable / isAutoModeAvailable</code></pre><figcaption>State shape: ask, allow, and deny are decisions, not three permission modes.</figcaption></figure><p><code>auto</code> is additionally feature-gated in this snapshot. Mode alone does not determine whether a call executes.</p><h3>1.1 One-time approval and saved approval are different</h3>
+            <p>A permission response may allow only the current request, or it may include an update that adds a rule. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/PermissionUpdate.ts#L55-L265"><code>applyPermissionUpdate()</code></a> can change the in-memory mode, rules, and working directories; updates targeted at user, project, or local settings can also be persisted. “Allow once” therefore continues one call, while “always allow” changes how later matching calls are evaluated.</p>
 
             <h2>2. Checks run in a deliberate order</h2>
-            <p><code>hasPermissionsToUseToolInner()</code> checks reasons to stop before reasons to proceed. It evaluates configured deny and ask rules, then calls the tool's own <code>checkPermissions()</code>. Content-specific prompts and safety checks are considered before bypass mode or an allow rule. A remaining <code>passthrough</code> result becomes ask.</p>
-            <figure class="figure"><img src="../assets/permission-decision-stack.png" alt="Permission check order with deny rule, ask rule, tool check, safety check, bypass mode, allow rule, and final ask" /><figcaption>The order prevents bypass and allow settings from overriding an explicit denial or a required safety check.</figcaption></figure>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L1158-L1315"><code>hasPermissionsToUseToolInner()</code></a> checks reasons to stop before reasons to proceed. It evaluates configured deny and ask rules, then calls the tool's own <code>checkPermissions()</code>. Content-specific prompts and safety checks are considered before bypass mode or an allow rule. A remaining <code>passthrough</code> result becomes ask.</p>
+
 
             <p>This ordering explains a common surprise: <code>bypassPermissions</code> means “do not ask by default,” not “ignore every safety check.” A deny rule, a tool-level denial, required user interaction, or a protected-path check can still stop the request.</p>
 
-            <h2>3. Modes transform an ask result</h2>
-            <p>The outer <code>hasPermissionsToUseTool()</code> function decides what to do after the initial result is ask. In <code>dontAsk</code> mode, ask becomes deny because no interactive confirmation is permitted. Auto mode first excludes requests that cannot be approved automatically, then tries low-cost checks and an allowlist before using <code>classifyYoloAction()</code>. The classifier can approve, reject, or fail closed; auto mode is automated decision-making, not automatic approval.</p>
+            <p>There is a specific exception to a whole-tool ask rule: Bash may proceed to its own checks when sandboxing and sandbox auto-allow are enabled and the input will actually use that sandbox. Excluded commands and <code>dangerouslyDisableSandbox</code> do not qualify. A tool-level deny still wins. Tool-required interaction, content-specific ask rules, and an ask result marked <code>safetyCheck</code> are preserved before bypass is considered.</p><p>The protected-path check covers examples such as <code>.git/</code>, <code>.claude/</code>, <code>.vscode/</code>, and shell configuration. Its result is ask, not automatic deny; the outer mode handler then determines how an ask can be resolved. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L1238-L1286">Bypass handling</a> also recognizes plan mode entered from an available bypass mode. If no bypass or whole-tool allow applies, a tool’s remaining allow/ask result is retained and only passthrough becomes ask.</p><h2>3. Modes transform an ask result</h2>
+            <p>The outer <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L473-L956"><code>hasPermissionsToUseTool()</code></a> function decides what to do after the initial result is ask. In <code>dontAsk</code> mode, ask becomes deny because no interactive confirmation is permitted. Auto mode first excludes requests that cannot be approved automatically, then tries low-cost checks and an allowlist before using <code>classifyYoloAction()</code>. The classifier can approve, reject, or fail closed; auto mode is automated decision-making, not automatic approval.</p>
             <p>A background or headless agent cannot display a prompt. When <code>shouldAvoidPermissionPrompts</code> is true, Claude Code gives <code>PermissionRequest</code> hooks a chance to return allow or deny. If no hook decides, the request is denied instead of waiting forever for a dialog nobody can answer.</p>
 
-            <h2>4. Hooks can decide before execution</h2>
+            <p>Auto mode excludes safety checks and tools requiring user interaction; PowerShell also requires explicit approval unless its corresponding feature is enabled. It then tries an acceptEdits fast path and a safe-tool allowlist before the classifier. Blocked actions, classifier unavailability, and an oversized transcript have different fallback or fail-closed handling. These are visible client branches, not evidence of the classifier’s internal policy.</p><h2>4. Hooks can decide before execution</h2>
             <p><code>PreToolUse</code> hooks run before the main permission check, and <code>PermissionRequest</code> hooks can answer a pending ask. These hooks are concrete decision points: an allow result continues the current request, while a deny result prevents the tool from changing local or remote state.</p>
 
-            <h2>5. Interactive confirmation has several possible responders</h2>
-            <p>On the interactive path, the visible <code>ToolUseConfirm</code> is only one possible source of a decision. A user choice, permission hook, Bash classifier, bridge callback, or channel callback may answer first. <code>createResolveOnce()</code> lets one responder claim and resolve the request so that later responses cannot execute the tool again or record a conflicting answer.</p>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolHooks.ts#L340-L433"><code>resolveHookPermissionDecision()</code></a> gives PreToolUse allow a rule-and-tool fast path while preserving settings deny/ask. If user interaction remains unsatisfied or <code>requireCanUseTool</code> is set, it invokes the full permission callback. Supplying <code>updatedInput</code> can satisfy an interactive tool’s input requirement. A hook deny stops directly; no decision or hook ask enters normal handling. These alternatives must not be drawn as one mandatory stack.</p>
+            <p>This <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L1071-L1155"><code>checkRuleBasedPermissions()</code> helper</a> still parses the input and runs <code>tool.checkPermissions()</code>, preserving tool denials, content-specific ask rules, and <code>safetyCheck</code> asks. It skips the full mode and default-allow flow; its checks extend beyond settings rules.</p><h2>5. Interactive confirmation has several possible responders</h2>
+            <p>On the interactive path, the visible <code>ToolUseConfirm</code> is only one possible source of a decision. A user choice, permission hook, Bash classifier, bridge callback, or channel callback may answer first. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/PermissionContext.ts#L63-L94"><code>createResolveOnce()</code></a> lets one responder claim and resolve the request before asynchronous work begins, preventing duplicate settings updates, queue cleanup, and conflicting decision logs. A JavaScript Promise already settles once; repeated resolve calls alone do not prove duplicate tool execution.</p>
             <figure class="figure"><img src="../assets/permission-dialog-race.png" alt="Permission request with user choice, hook, classifier, bridge, and channel competing to resolve once" /><figcaption>Several responders may be active, but exactly one result is accepted for the tool request.</figcaption></figure>
 
             <p>Coordinator and swarm workers adapt the same ask state to their environment. A coordinator waits for a hook and classifier before falling back to its interactive path. A swarm worker tries its classifier and can forward the request to the leader through its mailbox. Ask therefore means “a decision is still required,” not necessarily “show a dialog in this terminal.”</p>
 
-            <h2>6. Denial still returns a tool result</h2>
+            <p>Interactive responders are conditional. PermissionRequest hooks are launched asynchronously outside the coordinator-worker case; a pending Bash classifier runs only for an applicable Bash request. Hook or classifier decisions can complete before the user while the request is still available. The atomic claim is taken before awaiting decision-side work.</p><h2>6. Denial still returns a tool result</h2>
             <p>When the final decision is not allow, Claude Code does not execute the tool. It returns an error-shaped <code>tool_result</code> with the original <code>toolUseID</code> and an explanation. The next model turn can see that the action did not happen and choose a safer alternative instead of waiting for a missing response.</p>
-            <figure class="figure"><img src="../assets/permission-denied-result.png" alt="Denied permission becoming a paired error tool_result for the model" /><figcaption>A denied local action is still a completed protocol event that the next model turn can inspect.</figcaption></figure>
+
 
             <p>After an auto-mode classifier denial, a <code>PermissionDenied</code> hook may also return a retry hint. That hint can influence the next attempt, but it does not retroactively approve the blocked action.</p>
 
-            <h2>7. The rule to keep in mind</h2>
+            <figure class="shape-example"><pre><code class="language-json">{
+  "role": "user",
+  "content": [{
+    "type": "tool_result",
+    "tool_use_id": "A",
+    "content": "Permission denied",
+    "is_error": true
+  }]
+}</code></pre><figcaption>Shape-level example: denial returns the original call id; the tool does not execute or automatically retry.</figcaption></figure><h2>7. The rule to keep in mind</h2>
             <p>Permission is the brake between a model proposal and an observable side effect. The runtime first checks explicit restrictions and tool-specific risks, then considers configured shortcuts, and finally asks an eligible responder when no earlier rule settles the request. Each outcome is visible: the tool runs, the request is refused, or execution pauses for a decision.</p>
-        
+
             <h2 id="sources">Sources</h2>
             <p>The source-code claims in this article are based on the public mirror and the linked official documentation. Server-side behavior and private feature policy are described only where the client exposes an observable request or result.</p>
             <ul>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/Tool.ts#L123-L148">ToolPermissionContext</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/PermissionUpdate.ts#L55-L265">Permission updates and persistence</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L473-L1315">Permission evaluation and mode handling</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L180">Interactive permission entry point</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/toolPermission/handlers/interactiveHandler.ts#L92-L530">Interactive responders and resolve-once handling</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L916-L1103">Permission check and denied tool result</a></li>
-                <li><a href="https://docs.anthropic.com/en/docs/claude-code/settings#permissions">Claude Code permissions docs</a></li>
-                <li><a href="https://docs.anthropic.com/en/docs/claude-code/hooks">Claude Code hooks docs</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/Tool.ts#L123-L148">ToolPermissionContext</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/PermissionUpdate.ts#L55-L265">Permission updates and persistence</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L473-L1315">Permission evaluation and mode handling</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/useCanUseTool.tsx#L27-L180">Interactive permission entry point</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/toolPermission/handlers/interactiveHandler.ts#L92-L530">Interactive responders and resolve-once handling</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L916-L1103">Permission check and denied tool result</a></li>
+                <li><a href="https://code.claude.com/docs/en/settings#permissions">Claude Code permissions docs</a></li>
+                <li><a href="https://code.claude.com/docs/en/hooks">Claude Code hooks docs</a></li>
             </ul>
           </section>
         </article>
