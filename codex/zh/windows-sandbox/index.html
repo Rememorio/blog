@@ -97,12 +97,15 @@
             <figure class="hero-image">
               <img
                 src="../assets/windows-sandbox-boundary.png"
-                alt="Codex Windows 沙箱图，展示 sandbox attempt、setup、sandbox users、runner、restricted token、file ACL 和 firewall 的关系"
+                alt="Legacy 与 Registered 配置分支、沙箱用户、runner、受限 token、网络规则与文件 ACL"
               />
+            <figcaption>两种 setup 入口是条件分支。虚线表示用户身份与网络规则、进程权限与 ACL 的关系，不表示先执行命令再安装限制。</figcaption>
             </figure>
           </section>
 
           <section class="article-body">
+            <p><strong>阅读契约。</strong>从权限决定追到 Windows 用户、ACL、网络规则和命令进程，并区分 setup 可恢复与运行时就绪。 本文核实于 2026-09-20，依据公开源码 <a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">固定公开源码快照</a>；不推断未公开的服务实现。</p>
+
             <p>
               如果只看产品体验，沙箱像是一个开关：允许写工作区、禁止联网、必要时请求审批。
               但源码阅读不能停在这个说法上。模型请求执行命令以后，真正保护本机的不是一句 prompt，
@@ -333,20 +336,24 @@ const ONLINE_USERNAME: &amp;str = "CodexSandboxOnline";</code></pre>
               后续 runner 才能为每次工具调用选择对应身份。
             </p>
 
+            <h3>4.1 setup 入口还要区分运行时与资源归属</h3>
+            <p>配置安全材料并不只有一条启动方式。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/setup.rs#L1073-L1106"><code>run_elevated_setup_with_proxy_settings</code></a> 在请求 registered Core 时，通过经过认证的 sandbox service 协调配置；这条路径要求服务成功响应，不会静默退回 legacy setup。普通 legacy 路径才调用原来的提权 helper。二者是条件分支，不是每次命令都依次执行的两次安装。</p>
+
+            <p>Registered runtime 还必须证明资源属于谁。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/runtime_ownership.rs#L65-L128"><code>RuntimeRegistration</code></a> 记录 package family、两个 sandbox account 的 SID 和 alias、metadata roots，以及 <code>ready_package</code>。后者只在账户注册与 metadata 授权都成功后提交；<code>can_resume_registration()</code> 只表示注册可以继续，不能当作命令已经可以执行。进入配置时还检查 user SID、安装目录与 package family，清理中的资源不能直接重新使用。</p>
+<pre><code class="language-text">运行时选择：
+  Legacy     -> 提权 helper 配置
+  Registered -> 已认证 service 校验所有者并协调配置
+
+注册状态：
+  记录资源归属 -> 注册账户与 metadata 授权 -> ready_package
+  可恢复注册 ≠ 可执行命令</code></pre>
             <h2>五、command runner 以 sandbox 用户启动真正的命令</h2>
             <p>
               有了 sandbox 用户，还剩一个实际问题：Codex 主进程通常以真实用户身份运行，
               它怎样让最终命令在 sandbox 用户身份下启动，同时还能拿回 stdin/stdout、exit code 和 terminal 尺寸变化？
             </p>
 
-            <p>
-              源码把这件事拆成两段。第一段在 <code>runner_client.rs</code>：
-              Codex 创建管道，找到 <code>codex-command-runner.exe</code>，再用
-              <code>CreateProcessWithLogonW</code> 以 sandbox 用户身份启动 runner。
-              第二段在 runner 进程内部：runner 通过 IPC 读到 <code>SpawnRequest</code>，
-              再基于当前 sandbox 用户 token 派生更窄的 restricted token，最后用 ConPTY 或普通 stdio
-              启动真正的命令。
-            </p>
+            <p>源码把这件事拆成两段。<code>runner_client.rs</code> 选择与当前 runtime 对应的 runner 路径，创建管道，再用 <code>CreateProcessWithLogonW</code> 以 sandbox 用户启动它；registered Core 还涉及验证后的 app 执行别名。runner 收到 <code>SpawnRequest</code> 后，从该用户的 token 派生受限 token，再用 ConPTY 或普通 stdio 启动真正的命令。</p>
 
             <pre><code class="language-text">Codex 主进程
   -> CreateProcessWithLogonW(sandbox user, command runner)
@@ -429,22 +436,17 @@ const ONLINE_USERNAME: &amp;str = "CodexSandboxOnline";</code></pre>
             </p>
 
             <h2 id="sources">参考源码</h2>
-            <ul>
-              <li><a href="https://openai.com/zh-Hans-CN/index/building-codex-windows-sandbox/">OpenAI 官方工程文章：为 Codex 构建 Windows 沙箱</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/core/src/exec.rs#L91-L128"><code>ExecParams</code> 和 sandbox manager 选择本轮执行边界</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/core/src/exec.rs#L599-L740"><code>exec_windows_sandbox</code> 在 elevated backend 与 legacy restricted-token path 之间选择</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/setup.rs#L48-L54"><code>CodexSandboxOffline</code> / <code>CodexSandboxOnline</code> 用户名常量</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/setup.rs#L300-L329">setup refresh payload：read/write/deny roots、sandbox 用户和 proxy ports</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs#L54-L91">创建 sandbox 用户组、offline/online 用户和随机密码</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs#L405-L462">DPAPI 保护 sandbox 用户 secret 并写入 <code>sandbox_users.json</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/firewall.rs#L30-L43">Codex Windows sandbox firewall 规则命名和说明</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/firewall.rs#L55-L206">offline 用户的 loopback 例外和出站 block 规则</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/workspace_acl.rs#L13-L27"><code>.codex</code> / <code>.agents</code> 写保护规则</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/token.rs#L448-L505"><code>CreateRestrictedToken</code>、restricting SID 和 <code>WRITE_RESTRICTED</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs#L310-L365">Codex 启动 sandbox 用户身份下的 command runner</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs#L1-L8">command runner 的职责说明</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs#L234-L287">runner 根据 permission profile 派生 restricted token</a></li>
-              <li><a href="https://github.com/openai/codex/blob/bb5054fe47abe73ecbbd454751066a28c89f4bb9/codex-rs/unified_exec/src/backends/elevated.rs#L111-L190">unified_exec elevated backend 构造 Windows sandbox session</a></li>
+            <ul class="source-list">
+              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">openai/codex · 5c5308fc9a9e</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/setup.rs#L1069-L1138">setup / runtime selection</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/setup_provisioning/sandbox_users.rs#L70-L159">sandbox user provisioning</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/setup_provisioning/firewall.rs">firewall rules</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/runtime_ownership.rs#L15-L128">registered runtime ownership / readiness</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs">runner launch / IPC</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs">restricted command process</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/token.rs">restricted token</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/workspace_acl.rs">workspace ACL</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs">unified exec Windows backend</a></li>
             </ul>
           </section>
         </article>
