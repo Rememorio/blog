@@ -1025,7 +1025,20 @@ sample. Choose one exposure mode per series and keep it consistent:
   checking only that one representative card exists. Keep the series index in
   reading order; follow the established home chronology, usually newest first.
 - In series-level mode, expose one landing card and no stray individual chapter
-  card. Do not silently mix series-level and chapter-level modes.
+  card. Do not silently mix series-level and chapter-level modes. When a home
+  section promises numbered articles, every card must open an actual chapter;
+  keep landing-page shortcuts in the series navigation instead.
+- Give every chapter card a stable localized series name and a chapter number:
+  `系列名 · 第一篇` in Chinese and `Series name · Part 1` in English. Do not
+  mix generic category labels, missing numbers, Roman numerals, or `2 / 7`
+  counters in that same home list. Derive numbers from the series reading
+  order, never the home's display order. Compare the full route-to-series-and-
+  ordinal mapping across both languages and their series indexes.
+- Make introductory-route numbering explicit. Preserve existing numbered
+  chapters; an introductory article outside their sequence may use
+  `第零篇` / `Part 0`, declared consistently on its page and in the index.
+  A landing page itself is not a numbered chapter. Do not invent a chapter
+  number just to make a directory card fit the format.
 - Treat topic shortcuts as navigation only. Every shortcut in a series or topic
   shelf must open a dedicated landing page that explains the route and lists
   the published chapters; it must not open a chapter or long-form article
@@ -1036,9 +1049,18 @@ sample. Choose one exposure mode per series and keep it consistent:
   chapter slug and replace the root with the route page. Update canonicals,
   language siblings, home cards, series cards, previous/next links, assets, and
   route-map references as one navigation graph.
-- Keep standalone articles in the post inventory, separate from series
-  shortcuts. A clearly labeled standalone-article navigation group may link
-  directly to them; do not invent a series landing page just to expose one.
+- Keep genuinely standalone articles in the post inventory, separate from
+  series shortcuts. When a subject has a coherent multi-project reading scope,
+  it may start a series with one finished chapter. Preserve the article's
+  established URL when assigning it to the series, and synchronize its series
+  navigation and identity with the new directory, home cards, gateway, and
+  README. A directory must explain the common questions and reading route,
+  rather than exist only to expose one link.
+- Separate published chapters from external project-reading resources. Verify
+  official repositories and project relationships, describe why each resource
+  matters, and link it directly. External resources do not count as published
+  chapters and receive no speculative future chapter numbers. Related articles
+  may remain in their original series without duplicate home cards.
 - Verify discoverability from the default home state, not merely the presence
   of a link in HTML. When the list is folded or limited to a first batch, ensure
   readers can find every published article through clear navigation or search.
