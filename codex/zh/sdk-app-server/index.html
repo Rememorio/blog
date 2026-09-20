@@ -12,7 +12,7 @@
     <meta property="og:title" content="Codex 源码阅读（十一）：SDK 与 app-server 怎样把外部调用转成 thread 和 turn" />
     <meta
       property="og:description"
-      content="从 app-server 的初始化检查、typed ClientRequest、request processor、ThreadManager、Op::UserInput、listener 和 SDK router，看外部应用怎样接入 Codex。"
+      content="从 app-server 的初始化检查、typed ClientRequest、request processor、ThreadManager、TurnInputRequest、listener 和 SDK router，看外部应用怎样接入 Codex。"
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/protocol-event-stream.png" />
@@ -98,8 +98,9 @@
             <figure class="hero-image">
               <img
                 src="../assets/protocol-event-stream.png"
-                alt="Codex protocol 与事件流，展示 client、TurnStart、Submission、Op、Session、EventMsg、v2 view、rollout 和 resume"
+                alt="turn/start 输入经 app-server 解析后进入 core，通知、审批往返与筛选持久化分开"
               />
+              <figcaption>turn/start 示意输入经 app-server 解析后进入 core；审批回复也由 app-server 回传。</figcaption>
             </figure>
           </section>
 
@@ -133,22 +134,11 @@
             </div>
 
             <div class="note">
-              <p>
-                <strong>取材范围。</strong>
-              app-server 的通信方式、生命周期、API 列表来自公开 README；
-              request dispatch、thread/turn processor、listener、SDK router 来自公开源码。
-              对 hosted service、远端控制面和私有后端的行为，本文不做实现级推断。
-            </p>
+              <p><strong>取材范围。</strong> 源码快照：<a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f"><code>5c5308fc9a9e</code></a>。通信方式和连接生命周期参考 <a href="https://learn.chatgpt.com/docs/app-server">官方 App Server 文档</a>；具体字段、dispatch、thread/turn processor、listener 和 SDK router 以固定公开源码快照为准。文档中仍可能出现较旧接口，例如当前请求枚举已移除 <code>thread/rollback</code>，而旧持久记录仍保留回放支持。本文不推断 hosted service 或私有后端。</p>
             </div>
 
             <h2>一、先把“嵌入 Codex”拆开</h2>
-            <p>
-              如果你写一个 IDE 插件或自动化脚本，最自然的需求可能是“发一句话，让 Codex 继续工作”。
-              但源码中的公开接口并不是一条简单的 <code>prompt -&gt; answer</code> API。
-              <code>codex app-server</code> 的 README 开头就说明，它是用来支撑富客户端的接口层；
-              对外通信采用 JSON-RPC 2.0 消息，默认 transport 是 stdio JSONL，还列出 websocket、unix socket 和 off
-              几种模式。随后 README 把公开模型收敛成三个 primitive：<code>Thread</code>、<code>Turn</code>、<code>Item</code>。
-            </p>
+            <p>如果你写一个 IDE 插件或自动化脚本，“发送一句话”实际需要一段会话、一次执行和一组事件。官方文档用 <code>Thread</code>、<code>Turn</code>、<code>Item</code> 描述它们。app-server 使用 JSON-RPC 消息，stdio 用 JSONL 传输，源码也提供 WebSocket、Unix socket 和同进程入口。<code>turn/start</code> 的响应确认输入提交，最终结果由完成通知给出。</p>
 
             <div class="table-wrap">
               <table>
@@ -170,7 +160,7 @@
                   <tr>
                     <td>发起一次用户输入。</td>
                     <td><code>turn/start</code>，携带 input、settings override、additional context。</td>
-                    <td><code>CodexThread.submit(...)</code> 处理 <code>Op::UserInput</code>。</td>
+                    <td><code>CodexThread.start_or_steer_turn(...)</code> 让 core 决定新建或补充。</td>
                     <td>输入会影响模型视图、工具权限、usage、事件和持久记录。</td>
                   </tr>
                   <tr>
@@ -180,8 +170,8 @@
                     <td>进度是流式事实，不能等 response 结束后一次性返回。</td>
                   </tr>
                   <tr>
-                    <td>恢复、fork、回滚。</td>
-                    <td><code>thread/resume</code>、<code>thread/fork</code>、<code>thread/rollback</code>。</td>
+                    <td>恢复或 fork。</td>
+                    <td><code>thread/resume</code>、<code>thread/fork</code>。</td>
                     <td>第十篇讲过的 rollout / recovery 记录。</td>
                     <td>继续运行依赖可重放证据，而不只是旧 UI 消息。</td>
                   </tr>
@@ -196,17 +186,18 @@
 
             <p>
               如果把这一轮拆成最小可重放形状，外部调用方看到的并不是一条长回复，而是一组 request
-              和 notification 交替出现。下面只保留关键字段，帮助你把 README 里的 primitive
+              和 notification 交替出现。下面只保留关键字段，帮助你把 文档里的 primitive
               和后面的源码模块对上：
             </p>
 
-            <pre><code class="language-json">{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ide"}}}
-{"method":"initialized","params":{}}
-{"id":2,"method":"thread/start","params":{"cwd":"workspace","model":"gpt-5"}}
-{"id":3,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"fix failing test"}]}}
-{"method":"turn/started","params":{"threadId":"t1","turnId":"u1"}}
-{"method":"item/completed","params":{"turnId":"u1","item":{"type":"tool_result"}}}
-{"method":"turn/completed","params":{"threadId":"t1","turnId":"u1"}}</code></pre>
+            <p>下例是新建 turn 的简化 JSONL 形状：省略常规 response、时间戳与可选字段；<code>t1</code> 代表 thread/start 实际返回的 id，通知与响应可交错到达。</p>
+            <pre><code class="language-json">{"id":1,"method":"initialize","params":{"clientInfo":{"name":"example_client","version":"1.0.0"}}}
+{"method":"initialized"}
+{"id":2,"method":"thread/start","params":{}}
+{"id":3,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"fix failing test","text_elements":[]}]}}
+{"method":"turn/started","params":{"threadId":"t1","turn":{"id":"u1","status":"inProgress","items":[],"itemsView":"notLoaded","error":null}}}
+{"method":"item/completed","params":{"threadId":"t1","turnId":"u1","item":{"type":"agentMessage","id":"m1","text":"Fixed the test."}}}
+{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"u1","status":"completed","items":[],"itemsView":"notLoaded","error":null}}}</code></pre>
 
             <p>
               这段 JSONL 的价值不在字段完整，而在顺序：连接先初始化，thread 再建立身份和运行设置，
@@ -217,7 +208,7 @@
             <h2>二、app-server 先把连接变成一个受控会话</h2>
             <p>
               app-server 的第一项检查落在 <code>initialize</code>。
-              README 在 lifecycle 里写得很清楚：每个 transport connection 打开后要先发送一次
+              官方文档在 lifecycle 中说明：每个 transport connection 打开后要先发送一次
               <code>initialize</code> request，再发 <code>initialized</code> notification；在这之前的其他请求会被拒绝。
               初始化完成后，后续 request 才能使用 client metadata、experimental API 能力和 notification opt-out。
             </p>
@@ -278,7 +269,7 @@ JSON-RPC request
               </p>
             </div>
 
-            <h2>四、<code>turn/start</code> 才把用户输入变成 core operation</h2>
+            <h2>四、<code>turn/start</code> 让 core 决定启动或补充</h2>
             <p>
               thread 建好以后，外部调用方真正驱动 agent 的入口是 <code>turn/start</code>。
               <code>TurnStartParams</code> 也可以按职责读：输入本身是 <code>threadId</code>、
@@ -290,39 +281,30 @@ JSON-RPC request
               一次 turn 已经超出纯文本追加：它可以改变后续运行设置，也可以带额外上下文和结构化输出约束。
             </p>
 
-            <p>
-              <code>turn_start_inner</code> 的顺序很适合作为阅读主线：
-              先加载 thread，确认 direct input 允许，校验输入大小；再把 v2 input 映射成 core input item，
-              把 <code>additionalContext</code> 映射为 core 结构；接着构造 settings overrides。
-              如果 caller 同时传了 <code>permissions</code> 和 <code>sandboxPolicy</code>，这里会直接拒绝。
-              如果覆盖项存在，代码会先调用 <code>preview_thread_settings_overrides</code> 验证这些设置能否应用。
-            </p>
+            <p><code>turn_start_inner</code> 先加载 thread，检查 direct input 和 provider 配置，再校验输入大小。普通 input 转成 <code>TurnInput::UserInput</code>；另一条 <code>toolOutput</code> 路径接收具名独立工具输出，禁止与非空 input 同传。settings builder 仍拒绝互斥的 <code>permissions</code> / <code>sandboxPolicy</code>。最后构造 <code>TurnInputRequest</code> 并调用 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs#L640-L717"><code>start_or_steer_turn</code></a>，等待 core 的路由决定。</p>
 
             <pre><code class="language-text">turn/start shape:
 input + overrides + additionalContext
-  -> CoreInputItem[]
-  -> ThreadSettingsOverrides
-  -> Op::UserInput
-  -> CodexThread.submit_user_input_with_client_user_message_id()</code></pre>
+  -> TurnInput + ThreadSettingsOverrides
+  -> TurnInputRequest
+  -> CodexThread.start_or_steer_turn()
+  -> Started | Steered | NotSubmitted</code></pre>
 
-            <p>
-              最后一步才是关键：app-server 构造 <code>Op::UserInput</code>，交给
-              <code>CodexThread</code>。返回给 caller 的 <code>TurnStartResponse</code> 里，
-              turn 状态是 <code>InProgress</code>，items 还没有加载。后续事实要靠 notification 流回来。
-            </p>
+            <p>返回值区分 <code>Started</code>、<code>Steered</code> 和 <code>NotSubmitted</code>。前两种生成状态为 <code>InProgress</code>、<code>itemsView = notLoaded</code> 的响应；Steered 使用已有 turn id。拒绝则返回错误，例如 server 正在排空。成功只表示输入已接受，最终完成、失败或中断仍须等待通知。</p>
 
             <h2>五、进度为什么要走 notification</h2>
             <p>
               从使用者角度看，最希望的是一个同步函数直接返回最终答案。但 Codex 的运行过程里有模型 delta、
-              工具调用、权限请求、计划更新、token usage、rollback marker、thread status 等多种事件。
+              工具调用、权限请求、计划更新、token usage、thread status 等多种事件。
               如果把它们塞进一个最终 response，客户端就无法实时显示，也很难在中途处理 approval 或 interrupt。
             </p>
 
             <figure class="hero-image">
               <img
                 src="../assets/client-projection-fanout.png"
-                alt="Codex 客户端事件转换，展示 EventMsg 分流到 app-server ServerNotification、TUI streaming、rollout resume 等视图"
+                alt="core 经 app-server 通知 TUI 与其他客户端，rollout 为后续 turn 和 item 重建提供记录"
               />
+            <figcaption>客户端实时通知与 rollout 后续重建是两条不同路径。</figcaption>
             </figure>
 
             <p>
@@ -336,13 +318,7 @@ input + overrides + additionalContext
               turn 完成时会发 <code>ServerNotification::TurnCompleted</code>。
             </p>
 
-            <p>
-              这也解释了为什么 SDK 里一定要有 router。stdio 是一条有序 stdout 流，
-              同时混着 JSON-RPC response 和 notification。如果多个调用方各自读 stdout，
-              很快就会互相抢消息。Python SDK 的 <code>MessageRouter</code> 统一处理这个问题：
-              response 按 request id 投递；turn notification 按 turn id 投递；早到的 turn 事件会暂存，
-              等 caller 开始 streaming 后再 replay；transport 失败时，所有 waiter 都会被唤醒，避免调用永远阻塞。
-            </p>
+            <p>stdio 的单一 stdout 同时包含 JSON-RPC response 和 notification，必须由一个 reader 分发。Python <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/_message_router.py#L21-L212"><code>MessageRouter</code></a> 按 request id 路由响应，并为每个 turn consumer 保存独立游标：多个 handle 指向同一 turn 时，不会互相抢走事件。请求发送前记录游标并缓冲早到事件；所有订阅者都读过的前缀才会清理。新的独立订阅从下一条事件开始，不等于重放整个 turn；transport 失败会唤醒所有 waiter。</p>
 
             <h2>六、Python SDK：把 app-server stdio 包成 thread API</h2>
             <p>
@@ -505,42 +481,41 @@ input + overrides + additionalContext
 
             <h2 id="sources">参考源码</h2>
             <ul>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/README.md#L1-L90">app-server README：富客户端、transport、primitives 与 initialize lifecycle</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/README.md#L131-L167">app-server API overview：thread、turn、rollback、steer、interrupt</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-api/src/lib.rs#L1-L86"><code>core-api</code> public facade re-export thread/runtime primitives</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L177-L241"><code>ClientRequest</code> macro 与 serialization scope</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1320-L1345"><code>ServerNotification</code> macro 与 JSON-RPC notification 转换</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L560-L620">JSON-RPC request 与 typed request 进入同一处理路径</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L797-L903">initialize 检查、experimental API 检查与 serialization queue dispatch</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L1052-L1086"><code>ThreadStart</code> / <code>ThreadResume</code> / <code>ThreadFork</code> dispatch</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L1277-L1296"><code>TurnStart</code> / <code>TurnSteer</code> / <code>TurnInterrupt</code> dispatch</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_serialization.rs#L18-L150">request serialization queue keys 与 exclusive/shared read</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L90-L172"><code>ThreadStartParams</code> public shape</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L310-L403"><code>ThreadResumeParams</code> resume variants</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L475-L560"><code>ThreadForkParams</code> fork variants</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L61-L151"><code>TurnStartParams</code> public shape</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/thread_processor.rs#L840-L1245"><code>thread_start_inner</code> 与 <code>thread_start_task</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L392-L508"><code>turn_start_inner</code> 构造 <code>Op::UserInput</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L535-L687">turn settings overrides validation</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/thread_lifecycle.rs#L137-L185">conversation listener subscription</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/thread_lifecycle.rs#L212-L390">listener task 读取并转换 core events</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L140-L210"><code>TurnStarted</code> / <code>TurnComplete</code> notification handling</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L840-L865">item delta events 转成 <code>ServerNotification</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1324-L1345"><code>TurnCompleted</code> notification emission</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/in_process.rs#L1-L39">in-process app-server runtime host 设计说明</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/in_process.rs#L347-L370">in-process start 内部完成 initialize / initialized</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/in_process.rs#L452-L481">in-process request 仍进入 <code>process_client_request</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/client.py#L193-L335">Python SDK <code>CodexClient</code> 配置、启动 app-server 与 initialize</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/client.py#L430-L463">Python SDK thread start/resume/fork wrappers</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/client.py#L602-L748">Python SDK turn start、wait 和 stream helpers</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/_message_router.py#L17-L240">Python SDK <code>MessageRouter</code> 分流 response 与 notifications</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/api.py#L75-L170">Python SDK high-level <code>Codex</code> 和 <code>thread_start</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/api.py#L534-L606">Python SDK <code>Thread.run</code> / <code>Thread.turn</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/_run.py#L68-L99">Python SDK 收集 <code>TurnResult</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/README.md#L1-L149">TypeScript SDK README：CLI JSONL wrapper、streaming、resume</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/src/exec.ts#L63-L153">TypeScript SDK <code>CodexExec.run</code> 构造 <code>codex exec --experimental-json</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/src/exec.ts#L181-L243">TypeScript SDK spawn CLI 并逐行读取 stdout</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/src/thread.ts#L40-L138">TypeScript SDK <code>Thread.runStreamed</code> / <code>run</code></a></li>
+              <li><a href="https://learn.chatgpt.com/docs/app-server">官方 App Server 协议、初始化与生命周期</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core-api/src/lib.rs"><code>core-api</code> public facade re-export thread/runtime primitives</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs"><code>ClientRequest</code> macro 与 serialization scope</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs"><code>ServerNotification</code> macro 与 JSON-RPC notification 转换</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/message_processor.rs">JSON-RPC request 与 typed request 进入同一处理路径</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/message_processor.rs">initialize 检查、experimental API 检查与 serialization queue dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/message_processor.rs"><code>ThreadStart</code> / <code>ThreadResume</code> / <code>ThreadFork</code> dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/message_processor.rs"><code>TurnStart</code> / <code>TurnSteer</code> / <code>TurnInterrupt</code> dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_serialization.rs">request serialization queue keys 与 exclusive/shared read</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/thread.rs"><code>ThreadStartParams</code> public shape</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/thread.rs"><code>ThreadResumeParams</code> resume variants</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/thread.rs"><code>ThreadForkParams</code> fork variants</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/turn.rs"><code>TurnStartParams</code> public shape</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/thread_processor.rs"><code>thread_start_inner</code> 与 <code>thread_start_task</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs"><code>turn_start_inner</code> 构造 <code>TurnInputRequest</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs">turn settings overrides validation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/thread_lifecycle.rs">conversation listener subscription</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/thread_lifecycle.rs">listener task 读取并转换 core events</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs"><code>TurnStarted</code> / <code>TurnComplete</code> notification handling</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs">item delta events 转成 <code>ServerNotification</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs"><code>TurnCompleted</code> notification emission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/in_process.rs">in-process app-server runtime host 设计说明</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/in_process.rs">in-process start 内部完成 initialize / initialized</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/in_process.rs">in-process request 仍进入 <code>process_client_request</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/client.py">Python SDK <code>CodexClient</code> 配置、启动 app-server 与 initialize</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/client.py">Python SDK thread start/resume/fork wrappers</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/client.py">Python SDK turn start、wait 和 stream helpers</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/_message_router.py">Python SDK <code>MessageRouter</code> 分流 response 与 notifications</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/api.py">Python SDK high-level <code>Codex</code> 和 <code>thread_start</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/api.py">Python SDK <code>Thread.run</code> / <code>Thread.turn</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/_run.py">Python SDK 收集 <code>TurnResult</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/typescript/README.md">TypeScript SDK README：CLI JSONL wrapper、streaming、resume</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/typescript/src/exec.ts">TypeScript SDK <code>CodexExec.run</code> 构造 <code>codex exec --experimental-json</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/typescript/src/exec.ts">TypeScript SDK spawn CLI 并逐行读取 stdout</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/typescript/src/thread.ts">TypeScript SDK <code>Thread.runStreamed</code> / <code>run</code></a></li>
             </ul>
           </section>
         </article>

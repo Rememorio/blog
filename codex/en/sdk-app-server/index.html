@@ -12,7 +12,7 @@
     <meta property="og:title" content="Codex Source Notes XI: How SDKs turn external calls into threads and turns" />
     <meta
       property="og:description"
-      content="Read how external clients enter the same Codex runtime through app-server initialization, typed requests, request processors, ThreadManager, Op::UserInput, listener notifications, and SDK routers."
+      content="Read how external clients enter the same Codex runtime through app-server initialization, typed requests, request processors, ThreadManager, TurnInputRequest, listener notifications, and SDK routers."
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/protocol-event-stream.png" />
@@ -100,8 +100,9 @@
             <figure class="hero-image">
               <img
                 src="../assets/protocol-event-stream.png"
-                alt="Codex protocol and event stream showing client, TurnStart, Submission, Op, Session, EventMsg, v2 view, rollout, and resume"
+                alt="App-server parses turn/start input for core, separating notifications, approval replies, and selected persistence"
               />
+              <figcaption>The turn/start envelope represents input parsed by app-server; approval replies also return through app-server.</figcaption>
             </figure>
           </section>
 
@@ -139,26 +140,11 @@
             </div>
 
             <div class="note">
-              <p>
-                <strong>Source scope.</strong>
-                Transport, lifecycle, and API details come from the app-server
-                README. Dispatch, processors, listener conversion, and SDK
-                routing come from verified public source. This article does not
-                infer hosted-service internals, remote-control backend behavior,
-                or private storage implementation.
-              </p>
+              <p><strong>Evidence boundary.</strong> Source snapshot: <a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f"><code>5c5308fc9a9e</code></a>. Transport and connection lifecycle follow the <a href="https://learn.chatgpt.com/docs/app-server">official App Server documentation</a>; concrete fields, dispatch, processors, listener conversion, and SDK routing follow the pinned public snapshot. Documentation can lag the implementation: the current request enum has removed <code>thread/rollback</code>, while historical markers retain replay support. Hosted services and private backends are outside this analysis.</p>
             </div>
 
             <h2>1. Start by splitting “embed Codex”</h2>
-            <p>
-              A host application usually wants a simple action: send user input
-              and let Codex continue working. app-server exposes a richer shape
-              than a <code>prompt -&gt; answer</code> call. Its README describes
-              <code>codex app-server</code> as the interface for rich clients,
-              communicates with JSON-RPC-shaped messages over transports such
-              as stdio JSONL, and reduces the public model to three primitives:
-              <code>Thread</code>, <code>Turn</code>, and <code>Item</code>.
-            </p>
+            <p>Embedding requires a conversation, an execution, and a stream of events. Official documentation calls these <code>Thread</code>, <code>Turn</code>, and <code>Item</code>. App-server exchanges JSON-RPC messages over stdio JSONL, with WebSocket, Unix-socket and in-process entry points also visible in source. A <code>turn/start</code> response confirms input submission; completion notifications deliver the final execution state.</p>
 
             <div class="table-wrap">
               <table>
@@ -180,7 +166,7 @@
                   <tr>
                     <td>Send user input.</td>
                     <td><code>turn/start</code> with input, overrides, and additional context.</td>
-                    <td><code>CodexThread.submit(...)</code> handles <code>Op::UserInput</code>.</td>
+                    <td><code>CodexThread.start_or_steer_turn(...)</code> asks core to start or steer.</td>
                     <td>The input affects model view, tools, usage, events, and persistence.</td>
                   </tr>
                   <tr>
@@ -190,8 +176,8 @@
                     <td>Progress is a stream of facts, not only a final response.</td>
                   </tr>
                   <tr>
-                    <td>Resume, fork, or roll back.</td>
-                    <td><code>thread/resume</code>, <code>thread/fork</code>, <code>thread/rollback</code>.</td>
+                    <td>Resume or fork.</td>
+                    <td><code>thread/resume</code>, <code>thread/fork</code>.</td>
                     <td>The rollout and recovery records from Part X.</td>
                     <td>Continuation depends on replayable evidence, not only visible messages.</td>
                   </tr>
@@ -209,17 +195,18 @@
             <p>
               The smallest replayable shape is a sequence of requests and
               notifications, not one long answer. This abbreviated JSONL keeps
-              only the fields needed to connect the README primitives to the
+              only the fields needed to connect the documented primitives to the
               source modules below:
             </p>
 
-            <pre><code class="language-json">{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ide"}}}
-{"method":"initialized","params":{}}
-{"id":2,"method":"thread/start","params":{"cwd":"workspace","model":"gpt-5"}}
-{"id":3,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"fix failing test"}]}}
-{"method":"turn/started","params":{"threadId":"t1","turnId":"u1"}}
-{"method":"item/completed","params":{"turnId":"u1","item":{"type":"tool_result"}}}
-{"method":"turn/completed","params":{"threadId":"t1","turnId":"u1"}}</code></pre>
+            <p>This is a simplified new-turn JSONL shape. Ordinary responses, timestamps and optional fields are omitted; <code>t1</code> stands for the id returned by thread/start. Notifications and responses may interleave.</p>
+            <pre><code class="language-json">{"id":1,"method":"initialize","params":{"clientInfo":{"name":"example_client","version":"1.0.0"}}}
+{"method":"initialized"}
+{"id":2,"method":"thread/start","params":{}}
+{"id":3,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"fix failing test","text_elements":[]}]}}
+{"method":"turn/started","params":{"threadId":"t1","turn":{"id":"u1","status":"inProgress","items":[],"itemsView":"notLoaded","error":null}}}
+{"method":"item/completed","params":{"threadId":"t1","turnId":"u1","item":{"type":"agentMessage","id":"m1","text":"Fixed the test."}}}
+{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"u1","status":"completed","items":[],"itemsView":"notLoaded","error":null}}}</code></pre>
 
             <p>
               The useful part is the order. A connection is initialized first.
@@ -232,7 +219,7 @@
             <h2>2. app-server turns a transport into an initialized session</h2>
             <p>
               The first check is not <code>turn/start</code>; it is
-              <code>initialize</code>. The lifecycle section in the README says
+              <code>initialize</code>. The official lifecycle documentation says
               each transport connection must send one <code>initialize</code>
               request, then an <code>initialized</code> notification. Requests
               issued before that handshake are rejected. This gives the server a
@@ -301,7 +288,7 @@ JSON-RPC request
               </p>
             </div>
 
-            <h2>4. <code>turn/start</code> becomes <code>Op::UserInput</code></h2>
+            <h2>4. <code>turn/start</code> asks core to start or steer</h2>
             <p>
               Once a thread exists, <code>turn/start</code> is the entry point
               that actually drives the agent. <code>TurnStartParams</code>
@@ -313,33 +300,21 @@ JSON-RPC request
               may also update the runtime settings used by following turns.
             </p>
 
-            <p>
-              <code>turn_start_inner</code> is a compact execution trace. It
-              loads the thread, checks that direct input is allowed, validates
-              input size, maps v2 input into core input items, maps additional
-              context, builds settings overrides, rejects incompatible
-              <code>permissions</code> and <code>sandboxPolicy</code>, and
-              previews overrides before accepting them. Only then does it build
-              <code>Op::UserInput</code> and submit it to <code>CodexThread</code>.
-            </p>
+            <p><code>turn_start_inner</code> loads the thread, checks direct input and provider configuration, then validates input size. Normal input becomes <code>TurnInput::UserInput</code>; a separate <code>toolOutput</code> path accepts a named standalone tool result and rejects nonempty input alongside it. The settings builder still rejects conflicting <code>permissions</code> and <code>sandboxPolicy</code>. It then creates a <code>TurnInputRequest</code>, calls <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs#L640-L717"><code>start_or_steer_turn</code></a>, and waits for core’s routing decision.</p>
 
             <pre><code class="language-text">turn/start shape:
 input + overrides + additionalContext
-  -> CoreInputItem[]
-  -> ThreadSettingsOverrides
-  -> Op::UserInput
-  -> CodexThread.submit_user_input_with_client_user_message_id()</code></pre>
+  -> TurnInput + ThreadSettingsOverrides
+  -> TurnInputRequest
+  -> CodexThread.start_or_steer_turn()
+  -> Started | Steered | NotSubmitted</code></pre>
 
-            <p>
-              The immediate <code>TurnStartResponse</code> contains an
-              in-progress turn with unloaded items. The interesting facts return
-              later through notifications.
-            </p>
+            <p>The result distinguishes <code>Started</code>, <code>Steered</code>, and <code>NotSubmitted</code>. The first two return an <code>InProgress</code> turn with <code>itemsView = notLoaded</code>; steering returns the existing turn id. Declined input returns an error, including when the server is draining. Success confirms acceptance, not completion: notifications still report completion, failure, or interruption.</p>
 
             <h2>5. Progress returns as notifications</h2>
             <p>
               A running turn may emit model deltas, tool activity, permission
-              requests, plan updates, token usage, rollback state, thread status
+              requests, plan updates, token usage, thread status
               changes, and completion. A final response object would be too
               late for interactive clients and too narrow for approval or
               interrupt flows.
@@ -348,8 +323,9 @@ input + overrides + additionalContext
             <figure class="hero-image">
               <img
                 src="../assets/client-projection-fanout.png"
-                alt="Codex client event conversion from EventMsg into app-server ServerNotification, TUI streaming, rollout, and resume"
+                alt="App-server relays core events to TUI and other clients, while rollout supports later turn and item reconstruction"
               />
+            <figcaption>Live client notifications and later reconstruction from rollout follow separate paths.</figcaption>
             </figure>
 
             <p>
@@ -365,15 +341,7 @@ input + overrides + additionalContext
               and completion into <code>ServerNotification::TurnCompleted</code>.
             </p>
 
-            <p>
-              SDKs therefore need routing. stdio is one ordered stdout stream
-              containing both JSON-RPC responses and notifications. Python’s
-              <code>MessageRouter</code> gives each in-flight request and each
-              active turn its own queue. It routes responses by request id,
-              turn notifications by turn id, buffers early turn events until the
-              caller starts streaming, and wakes all waiters on transport
-              failure.
-            </p>
+            <p>One reader must consume stdio stdout, which mixes JSON-RPC responses and notifications. Python’s <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/_message_router.py#L21-L212"><code>MessageRouter</code></a> routes responses by request id and gives each turn consumer an independent cursor. Multiple handles pointing at the same turn do not steal one another’s events. It captures cursors before sending a request and buffers early events; only prefixes consumed by every subscriber are pruned. A fresh independent subscription starts at the next event, not the beginning of turn history. Transport failure wakes all blocked waiters.</p>
 
             <h2>6. Python SDK wraps app-server stdio</h2>
             <p>
@@ -553,42 +521,41 @@ input + overrides + additionalContext
 
             <h2 id="sources">Sources</h2>
             <ul>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/README.md#L1-L90">app-server README: rich interfaces, transport, primitives, and initialization lifecycle</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/README.md#L131-L167">app-server API overview: thread, turn, rollback, steer, interrupt</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-api/src/lib.rs#L1-L86"><code>core-api</code> public facade re-exporting thread and runtime primitives</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L177-L241"><code>ClientRequest</code> macro and serialization scope</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1320-L1345"><code>ServerNotification</code> macro and JSON-RPC notification conversion</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L560-L620">JSON-RPC and typed requests enter the same processing path</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L797-L903">initialize check, experimental API check, and serialization queue dispatch</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L1052-L1086"><code>ThreadStart</code>, <code>ThreadResume</code>, and <code>ThreadFork</code> dispatch</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/message_processor.rs#L1277-L1296"><code>TurnStart</code>, <code>TurnSteer</code>, and <code>TurnInterrupt</code> dispatch</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_serialization.rs#L18-L150">request serialization queue keys and exclusive/shared read access</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L90-L172"><code>ThreadStartParams</code> public shape</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L310-L403"><code>ThreadResumeParams</code> resume variants</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L475-L560"><code>ThreadForkParams</code> fork variants</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L61-L151"><code>TurnStartParams</code> public shape</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/thread_processor.rs#L840-L1245"><code>thread_start_inner</code> and <code>thread_start_task</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L392-L508"><code>turn_start_inner</code> builds <code>Op::UserInput</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L535-L687">turn settings override validation</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/thread_lifecycle.rs#L137-L185">conversation listener subscription</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/thread_lifecycle.rs#L212-L390">listener task reads core events and projects them</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L140-L210"><code>TurnStarted</code> and <code>TurnComplete</code> notification handling</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L840-L865">item delta events become <code>ServerNotification</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1324-L1345"><code>TurnCompleted</code> notification emission</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/in_process.rs#L1-L39">in-process app-server runtime host design note</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/in_process.rs#L347-L370">in-process start performs initialize / initialized</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/in_process.rs#L452-L481">in-process request still enters <code>process_client_request</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/client.py#L193-L335">Python SDK <code>CodexClient</code> config, app-server startup, and initialization</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/client.py#L430-L463">Python SDK thread start/resume/fork wrappers</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/client.py#L602-L748">Python SDK turn start, wait, and stream helpers</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/_message_router.py#L17-L240">Python SDK <code>MessageRouter</code> routes responses and notifications</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/api.py#L75-L170">Python SDK high-level <code>Codex</code> and <code>thread_start</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/api.py#L534-L606">Python SDK <code>Thread.run</code> / <code>Thread.turn</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/python/src/openai_codex/_run.py#L68-L99">Python SDK collects <code>TurnResult</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/README.md#L1-L149">TypeScript SDK README: CLI JSONL wrapper, streaming, and resume</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/src/exec.ts#L63-L153">TypeScript SDK <code>CodexExec.run</code> builds <code>codex exec --experimental-json</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/src/exec.ts#L181-L243">TypeScript SDK spawns CLI and reads stdout lines</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/sdk/typescript/src/thread.ts#L40-L138">TypeScript SDK <code>Thread.runStreamed</code> / <code>run</code></a></li>
+              <li><a href="https://learn.chatgpt.com/docs/app-server">Official App Server protocol, initialization, and lifecycle</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core-api/src/lib.rs"><code>core-api</code> public facade re-exporting thread and runtime primitives</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs"><code>ClientRequest</code> macro and serialization scope</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs"><code>ServerNotification</code> macro and JSON-RPC notification conversion</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/message_processor.rs">JSON-RPC and typed requests enter the same processing path</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/message_processor.rs">initialize check, experimental API check, and serialization queue dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/message_processor.rs"><code>ThreadStart</code>, <code>ThreadResume</code>, and <code>ThreadFork</code> dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/message_processor.rs"><code>TurnStart</code>, <code>TurnSteer</code>, and <code>TurnInterrupt</code> dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_serialization.rs">request serialization queue keys and exclusive/shared read access</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/thread.rs"><code>ThreadStartParams</code> public shape</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/thread.rs"><code>ThreadResumeParams</code> resume variants</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/thread.rs"><code>ThreadForkParams</code> fork variants</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/turn.rs"><code>TurnStartParams</code> public shape</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/thread_processor.rs"><code>thread_start_inner</code> and <code>thread_start_task</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs"><code>turn_start_inner</code> builds <code>TurnInputRequest</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs">turn settings override validation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/thread_lifecycle.rs">conversation listener subscription</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/thread_lifecycle.rs">listener task reads core events and projects them</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs"><code>TurnStarted</code> and <code>TurnComplete</code> notification handling</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs">item delta events become <code>ServerNotification</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs"><code>TurnCompleted</code> notification emission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/in_process.rs">in-process app-server runtime host design note</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/in_process.rs">in-process start performs initialize / initialized</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/in_process.rs">in-process request still enters <code>process_client_request</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/client.py">Python SDK <code>CodexClient</code> config, app-server startup, and initialization</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/client.py">Python SDK thread start/resume/fork wrappers</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/client.py">Python SDK turn start, wait, and stream helpers</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/_message_router.py">Python SDK <code>MessageRouter</code> routes responses and notifications</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/api.py">Python SDK high-level <code>Codex</code> and <code>thread_start</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/api.py">Python SDK <code>Thread.run</code> / <code>Thread.turn</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/python/src/openai_codex/_run.py">Python SDK collects <code>TurnResult</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/typescript/README.md">TypeScript SDK README: CLI JSONL wrapper, streaming, and resume</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/typescript/src/exec.ts">TypeScript SDK <code>CodexExec.run</code> builds <code>codex exec --experimental-json</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/typescript/src/exec.ts">TypeScript SDK spawns CLI and reads stdout lines</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/sdk/typescript/src/thread.ts">TypeScript SDK <code>Thread.runStreamed</code> / <code>run</code></a></li>
             </ul>
           </section>
         </article>
