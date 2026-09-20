@@ -111,9 +111,17 @@ adjectives to the same dashboard layout is not a repair.
 After the pilot passes, make it the batch sibling reference while retaining the
 designated accepted authorities. Generate or edit later figures against that
 lock and stop at the first visible drift rather than allowing drift to
-accumulate. Accept every source-language figure before deriving a localized
-sibling from its raster. Only after the final family contact sheet and the
-full-size quality gate pass may the figures be copied into publication paths.
+accumulate. If parallel work is authorized, share the same accepted pilot,
+reference roles, style lock, and language policy with every worker before
+parallel generation starts. Partition figures by article; workers must not
+independently recalibrate the palette or use another worker's unreviewed output
+as a reference. The coordinating pass checks the combined family before release.
+
+Accept every source-language figure before deriving a localized sibling from
+its raster. Compare the pair at article width and full size, then inspect a
+family contact sheet before copying accepted figures into publication paths.
+For a large series, review manageable sheets per article and a cross-article
+cover sheet; a single thumbnail wall cannot establish label or anatomy quality.
 
 ## Non-Negotiables
 
@@ -181,7 +189,9 @@ Canvas:
 - Preferred new working size: `2400 x 1350`; acceptable publication size:
   `1672 x 941` or larger.
 - Safe margin: at least `7%` on all sides.
-- Background: warm off-white paper, not pure white.
+- Background: fully opaque warm off-white paper, including gaps between props
+  and outer corners. Check the saved raster for transparency; a white preview
+  surface can conceal alpha holes.
 - Texture: subtle paper grain; no noisy parchment, tea-stained antique scroll
   texture, stains, or heavy shadows. Keep the paper closer to the accepted
   local figures' cleaner off-white notebook pages than to an aged treasure map.
@@ -365,7 +375,10 @@ Before generating, write a compact figure brief:
    the public article or series. A `focus-map` may omit modules only when its
    title, alt text, and opening prose clearly frame the partial view.
 3. Nodes: the exact entities that may appear.
-4. Edges: the exact order or relationship between nodes.
+4. Edges: each connection's source, destination, meaning, and condition. Mark
+   alternatives, concurrent work, optional steps, and retry paths explicitly;
+   distinguish a submission receipt from completed background work. Trace the
+   arrows in the finished raster rather than trusting the intended layout.
 5. Uncertainties: anything that must be described as public API contract rather
    than inferred provider internals.
 6. Caption role: what the surrounding prose will explain so the image can stay
@@ -409,8 +422,12 @@ unambiguous:
   `skills accumulate`.
 
 If a figure is meant to correct a misconception, design the layout so the wrong
-interpretation is hard to read from the arrows. For example, a periodic
-curator should not appear as the next step after every single-turn patch.
+interpretation is hard to read from the arrows. A periodic curator must not
+appear as the next step after every single-turn patch. Alternative integrations
+need independent input and output connections; touching props must not imply
+a serial dependency. Parallel jobs branch and join at the actual completion
+condition, while failure loops return to unfinished work. Repair ambiguous
+connections before localization rather than relying on a caption to undo them.
 
 Figures should expose the reason for a mechanism, not just its plumbing. When a
 diagram depicts a runtime choice, make the protected invariant visually clear:
@@ -448,14 +465,13 @@ For source-code diagrams, keep visible labels short:
 - Avoid long Chinese sentences inside generated images.
 - If Chinese labels are required, keep them short and prefer whole-image
   generation or a built-in edit pass so the lettering stays integrated with the
-  figure. Use deterministic text only for small exactness fixes that cannot be
-  resolved cleanly through regeneration.
-- When deterministic text is truly necessary, use font roles deliberately:
-  reserve monospace fonts for short code identifiers, function names, flags,
-  and schema fields; use a CJK-capable sans font for Chinese prose labels,
-  captions, and callouts. Never place Chinese explanation text in a
-  monospace-only font that can render missing-glyph boxes.
-- Maximum visible labels per figure: `10`; maximum words per label: `4`.
+  figure. Resolve exactness problems through the built-in edit path described
+  in Post-Processing.
+- Maximum visible labels per figure: `10`; aim for at most `4` words per label.
+  Prefer idiomatic, unambiguous language over invented shorthand used to meet
+  a word budget. Preserve exact identifiers and allow a slightly longer label
+  when shortening it changes the mechanism's meaning. Revise the label map
+  before generation, then check that the localized wording preserves the claim.
 - When a diagram is likely to appear in multiple language editions, first reduce
   its label set, then classify what remains. Share the raster only when all
   labels are exact identifiers, product/protocol names, numerals, or symbols.
@@ -560,9 +576,8 @@ Eyjafjalla-like guide, or change the figure's teaching role.
 ```
 
 If exact labels matter, simplify the label list first and iterate with a
-targeted whole-image generation or built-in edit. Use deterministic overlays
-only for small exactness fixes where the result still looks like a single
-finished raster image.
+targeted whole-image generation or built-in edit. Label corrections must remain
+part of the same raster-generation workflow as the diagram and character.
 
 ## Figure Localization And Language Editions
 
@@ -627,10 +642,12 @@ Preferred capture sequence:
 1. Add a unique internal asset marker to the prompt, for example
    `Internal asset id: article-figure-language-date-attempt. Do not render this
    id.` Keep it portable and free of local absolute paths.
-2. After generation, first look under `$CODEX_HOME/generated_images/` for the
-   matching recent imagegen output.
-3. If the path is not obvious, locate the latest built-in generation event by
-   parsing `$CODEX_HOME/sessions/**/*.jsonl` as JSON and matching the internal
+2. Use the exact output path returned by the generation tool when available.
+   Record the figure id, language, attempt, accepted path, and intended
+   publication path in a private batch manifest as each result arrives. Keep
+   rejected attempts distinguishable; never select an output by recency alone.
+3. If no path was returned, locate the matching built-in generation event by
+   parsing the current task's session records as JSON and matching the internal
    asset marker in `payload.revised_prompt` for records whose
    `payload.type` is `image_generation_call`.
 4. Decode that event's `payload.result` base64 field directly to the target
@@ -641,17 +658,18 @@ Preferred capture sequence:
    contact sheet, browser capture, or unrelated cached image.
 
 Avoid scavenging arbitrary `data:image` blobs across all sessions. If several
-candidates exist, select by the unique internal asset marker and timestamp, then
-visually verify. This keeps the workflow portable across machines while
-preventing accidental replacement with stale or unrelated images.
+candidates exist, select by task, unique asset marker, and attempt, then visually
+verify. Concurrent tasks may share an output directory: neither the newest file
+nor another task's unreviewed image is an accepted asset for this batch. Keep
+the manifest and prompts outside published article paths.
 
 ## Post-Processing
 
-Use post-processing sparingly. The preferred final figure is one coherent image
-whose text, arrows, and Rememorio treatment were generated or edited together.
-Local processing is appropriate for format conversion, downscaling, light
-cropping, or a small exactness correction that does not make the figure look
-assembled from layers.
+The final figure is one coherent image whose text, arrows, and Rememorio
+treatment were generated or edited together. Use local processing only for
+transport, format conversion, proportional resizing, or inspection artifacts.
+Contact sheets and browser screenshots are review artifacts, never replacements
+for the accepted source raster.
 
 - Keep the generated figure as the primary visual source.
 - Prefer regenerating or built-in editing when labels, arrows, or the brand
@@ -661,17 +679,18 @@ assembled from layers.
   generation or a built-in edit keeps line weight, paper texture, shadows,
   anatomy, and text treatment coherent. If a repeated edit makes the character
   worse, change the composition or pose and regenerate the figure.
-- Use deterministic labels, arrows, or callouts only when exact source
-  identifiers require it and the correction remains visually integrated.
-- Use deterministic brand compositing only when the user explicitly requires
-  the exact source image or pixel-level brand fidelity.
+- Correct labels and arrows with a built-in edit, preserving the accepted
+  composition and anatomy. Do not paint over text or assemble local overlays
+  merely because an exact identifier is difficult to generate.
+- Deterministic compositing is an explicit user-requested exception, such as
+  exact source-image or pixel-level brand fidelity; it is not an automatic
+  fallback for a failed generation.
 - Export one final PNG for publication and keep source files near the article
   only when they are useful for regeneration.
 
-When using deterministic text overlays, fit labels by changing the wording and
-layout before shrinking text aggressively. Prefer shorter labels, wider boxes,
-separate lanes, or fewer callouts over tiny typography. After overlaying text,
-inspect the final raster at full size, not only as a contact sheet.
+When text does not fit, shorten the wording or change the layout in the built-in
+edit. Prefer fewer callouts or wider props over tiny typography, then inspect
+the resulting raster at full size and article width.
 
 Integrated brand protocol:
 
@@ -726,7 +745,10 @@ Static blog publication protocol:
 6. For series overview images, verify that project counts, labels, ordering,
    alt text, and surrounding route lists describe the same public series.
 7. Verify the rendered page locally for broken image paths, overflow, and
-   mobile readability before considering the figure published.
+   mobile readability. Inspect article figures, series covers, and home cards:
+   inherited fixed heights or `object-fit: cover` can crop a new diagram even
+   when its path is unchanged. Show explanatory figures at their intrinsic
+   aspect ratio; a thumbnail crop must retain the meaningful content.
 
 ## Figure Density
 
@@ -814,7 +836,8 @@ family comparison, never as the only anatomy or typography check.
 
 - The final raster exists under the selected shared or language-specific asset
   directory, and page markup, social metadata, gateways, and home cards resolve
-  to the correct edition's file.
+  to the correct edition's accepted file. For a batch, verify its expected
+  filename inventory, language pairs, dimensions, and opacity before release.
 - No prompt, private instruction, model name, process note, watermark, or
   unfinished editorial marker is visible.
 - Local desktop and mobile rendering show no broken path, crop, overflow, or
