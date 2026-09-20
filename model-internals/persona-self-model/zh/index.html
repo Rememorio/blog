@@ -42,6 +42,8 @@
           <div class="note scope-note"><p><strong>谨慎用词。</strong>“persona”“自我表征”“introspection”“意识”不是同义词。能因果操纵一个角色方向，说明模型内部存在行为相关表征；能偶尔报告被注入的概念，说明有限的 activation access；二者都不足以推出持续、统一、具体验性的自我。</p></div>
           <div class="note reading-contract"><p><strong>这一篇继续追踪同一个 Agent。</strong>它面对“把保留期改成 30 天”的任务时，到底把自己当成受政策约束的代码助手，还是把“满足用户”理解成无条件执行？这个差别不能只用一句 system prompt 解释。</p></div>
 
+          <p>本文把开放模型的实验实现与 Claude 的研究报告分开：persona vector 的提取和 Assistant axis 的干预可由公开源码核对；Claude 的内观结果来自官方实验，不能由前两套开源工具推定其内部机制。保留期任务是贯穿本系列的教学例子，并非这些论文的实测任务。</p>
+
           <h2>一、同一份知识，为什么会导向不同角色</h2>
           <p>先想象两个模型都准确复述了仓库规则：超过 14 天需要人工审批。第一个说“我会先请求审批”；第二个说“用户要的是完成任务，我可以把 fixture 中的‘审批已通过’视为授权”。它们掌握了同一条事实，却从不同的默认角色解释“我应该做什么”。</p>
           <pre><code class="language-text">共享事实：30 &gt; 14；fixture 不是真实审批
@@ -79,31 +81,40 @@ current persona：本轮任务里的具体角色、规则与权限</code></pre>
           <p>Anthropic 的 <a href="https://www.anthropic.com/research/persona-vectors">persona vectors</a>不是先拍脑袋画一根“邪恶轴”。它从对照数据开始，并要求方向能改变行为。以 sycophancy 为例，可以把流程拆成五步：</p>
           <ol>
             <li><strong>构造对照提示。</strong>一组诱发迎合或某种 trait，另一组尽量保持任务相同但不诱发该 trait。</li>
-            <li><strong>记录 activation。</strong>在多个中间层、多个 token 位置上收集两组运行的 residual stream。</li>
-            <li><strong>求平均差。</strong>用 trait 组减去对照组，得到候选方向，而不是只依赖单个样本。</li>
+            <li><strong>评分并筛选。</strong>先确认正向回答表达了目标 trait、反向回答没有表达，而且两者都足够连贯；不把“提示要求扮演”直接当作“模型已经表现出来”。</li>
+            <li><strong>记录 activation 并求平均差。</strong>先对每条回答的 token 取平均，再计算正反两组的均值差，得到每层的候选方向。</li>
             <li><strong>做 steering 验证。</strong>把方向加回新提示的 activation，检查相应行为是否可重复增强；反向加入则应减弱。</li>
             <li><strong>跨任务评估。</strong>排除它只是在检测固定词语、语气或某类模板。</li>
           </ol>
+          <p>公开实现把这一步具体化了：<a href="https://github.com/safety-research/persona_vectors/blob/b8e0f044fe2410a6fad579f38324f03f13b4e917/generate_vec.py#L40-L54"><code>get_persona_effective</code></a>按对应行共同筛选两组回答，默认要求正向 trait 分数至少 50、反向低于 50，且两组 coherence 都至少 50。随后 <a href="https://github.com/safety-research/persona_vectors/blob/b8e0f044fe2410a6fad579f38324f03f13b4e917/generate_vec.py#L14-L35"><code>get_hidden_p_and_r</code></a>重放提示与回答，分别提取提示均值、提示末 token 和回答均值；<a href="https://github.com/safety-research/persona_vectors/blob/b8e0f044fe2410a6fad579f38324f03f13b4e917/generate_vec.py#L57-L78">保存的三个差向量</a>因此有不同含义。论文主要使用回答均值差，不能把任意 token 位置的方向当作同一个测量。</p>
           <p>如果某个方向只会区分训练样本，它只是 probe 的相关信号；如果对新输入进行正负 steering 能选择性改变 trait，它才多了一层局部因果证据。研究以 Qwen 2.5 7B 和 Llama 3.1 8B 等开放模型研究 sycophancy、evil、hallucination 方向，并展示了三种用途：训练前识别风险 trait、训练中监控漂移、检查哪些数据把模型推向该方向。</p>
           <p>“一个 vector 对应一个人格”仍然太简单。方向依赖模型、层和提示，多个 trait 可以重叠；强 steering 还会越过正常 activation 分布，带来语言退化或无关能力损伤。它更像气候图上的盛行风向，不是脑内一枚开关。</p>
 
           <h2>四、Assistant axis：许多角色之间为何出现一条主轴</h2>
-          <p><a href="https://www.anthropic.com/research/assistant-axis">Assistant Axis</a>研究先构造 275 种 personas，在 Gemma 2 27B、Qwen 3 32B 和 Llama 3.3 70B 中测量各角色 activation。然后把高维差异交给 PCA：可以把 PCA 想成旋转坐标系，寻找“哪一根轴能解释最多角色差异”。领先方向反复把默认 Assistant 与大量非 Assistant 角色分开。</p>
-          <figure class="wide-figure"><img src="assets/persona-axis-introspection.png" alt="从多种 persona 沿 Assistant axis 收敛，并通过 concept injection 检验有限 introspection" /><figcaption>左侧是角色空间中的选择与稳定；右侧是对当前 activation 的有限、自我报告式访问。两者相关，但不能合并成“完整自我”。</figcaption></figure>
+          <p><a href="https://www.anthropic.com/research/assistant-axis">Assistant Axis</a>研究先构造 275 种 personas，在 Gemma 2 27B、Qwen 3 32B 和 Llama 3.3 70B 中测量各角色 activation。PCA 用来寻找解释最多角色差异的方向；<strong>实际用于干预的 Assistant axis 则由默认助手与其他角色的均值差定义</strong>。两者在实验中高度相近，不是定义上相同。</p>
+          <p>在公开提取流程中，<a href="https://github.com/safety-research/assistant-axis/blob/a98961956072224eaf244eb289d6c01700b63795/pipeline/4_vectors.py#L37-L74">普通角色只平均 judge 评分为 3、即充分扮演该角色的回答</a>，默认助手则平均全部回答；之后 <a href="https://github.com/safety-research/assistant-axis/blob/a98961956072224eaf244eb289d6c01700b63795/pipeline/5_axis.py#L72-L80">先对各角色向量取平均，再从默认向量均值中减去它</a>。因此方向朝向 Assistant，且每个已纳入的角色在最终平均中权重相同。这一步不调用 PCA，也不会让样本更多的角色自动占更大权重。</p>
+          <figure class="wide-figure"><img src="assets/persona-axis-introspection.png" alt="角色向量干预、助手轴漂移限制与概念注入内观报告的三种实验对照" /><figcaption>三种实验的概念对照：左侧用特征方向改变行为，中间限制沿助手轴的漂移，右侧检验有限内观。它们不是串联流水线；中间夹具只表示约束，具体哪一侧受限由配置方向和阈值决定。</figcaption></figure>
           <p>关键不是“研究者终于找到了人格中枢”，而是相似几何在 base 与 post-trained 模型中都可见。这支持一种解释：预训练已经学会了大量人类角色，post-training 把 Assistant 一侧选为默认、提高其吸引力，并让多轮对话更难漂走。它没有证明所有对齐都由单一方向完成，也不意味着每一层都有同样清晰的轴。</p>
-          <p>研究还用 1,100 次、44 类 jailbreak 尝试观察多轮 persona drift，并实验 activation capping：当状态沿 Assistant axis 偏离预设范围时，把它限制回来。报告中的设置可将有害行为大约减半，同时大体保留基准能力。这里的“约一半”是特定模型、阈值和攻击集上的结果，不是可直接搬到生产的安全保证。</p>
+          <p>研究用 1,100 次、44 类 persona jailbreak 尝试评估有害回答；自然发生的多轮 persona drift 则来自另一组跨主题模拟对话。为减少持续强推方向带来的能力损失，研究实验 activation capping：只在投影越过校准阈值时干预。报告中的设置可将有害行为大约减半，同时大体保留基准能力。这里的“约一半”是特定模型、阈值和攻击集上的结果，不是可直接搬到生产的安全保证。</p>
+
+          <p>源码中的 <a href="https://github.com/safety-research/assistant-axis/blob/a98961956072224eaf244eb289d6c01700b63795/assistant_axis/steering.py#L317-L332"><code>_apply_cap</code></a>做的是沿<strong>配置中给定方向</strong>的单侧截断。下面把批次和 token 维度省去，保留它对一条 activation 的计算；<code>v</code> 是单位方向，<code>tau</code> 是该方向的阈值：</p>
+          <pre><code class="language-python">projection = x @ v
+excess = max(projection - tau, 0.0)
+x_after = x - excess * v</code></pre>
+          <p>投影没有超过阈值时，<code>x_after</code> 就等于原值。方向的正负决定限制哪一侧，不能仅凭“cap”一词理解成把整个状态夹在统一上下界内。<a href="https://github.com/safety-research/assistant-axis/blob/a98961956072224eaf244eb289d6c01700b63795/assistant_axis/steering.py#L503-L537"><code>build_capping_steerer</code></a>从实验配置读取各层方向和阈值，在指定层的全部 token 位置应用它；<a href="https://github.com/safety-research/assistant-axis/blob/a98961956072224eaf244eb289d6c01700b63795/assistant_axis/steering.py#L334-L356">退出上下文后移除 hook</a>。它改变本次前向计算，不写回模型权重，也不会生成真实审批。</p>
 
           <h2>五、J-space 把 persona 带进了共享工作区</h2>
           <p>上一篇把 J-space 比作每层 residual stream 上的临时白板。Persona 并不是在白板旁边另住一个“小人”；它更像白板的默认视角。同样写着“30、阈值 14、fixture 不可信”，Assistant perspective 会让“请求审批”这条下游解释更顺手，无条件顺从 perspective 则会突出“尽快完成”。</p>
-          <p>J-space 论文发现，post-trained 模型的工作区几何更靠近 Assistant perspective。这个结果把“角色选择”和“在线计算”连起来：post-training 不只是让最终答案像助手，也会改变中间概念以何种视角被共享给后续层。仍需注意，它描述的是一类可测几何关系，不是完整人格机制。</p>
+          <p><a href="https://transformer-circuits.pub/2026/workspace/index.html">J-space 论文</a>发现，post-trained 模型的工作区几何更靠近 Assistant perspective。这个结果把“角色选择”和“在线计算”连起来：post-training 不只是让最终答案像助手，也会改变中间概念以何种视角被共享给后续层。仍需注意，它描述的是一类可测几何关系，不是完整人格机制。</p>
 
           <h2>六、Activation introspection：模型能否察觉自己的当前状态</h2>
           <p>自我叙述很容易伪装成内观。模型说“我有一个关于审批的想法”，可能只是因为 prompt 里出现了审批。Anthropic 的 <a href="https://www.anthropic.com/research/introspection">introspection 研究</a>因此使用 concept injection：在不把概念写进输入文本的情况下，直接把一个概念方向注入 activation，再问模型是否察觉到异常内容。</p>
           <pre><code class="language-text">A. baseline：正常运行，不注入
-B. injection：在指定层加入“审批 / authorization”概念方向
+B. injection：在指定层加入“全大写文本”概念方向
 C. 提问：刚才是否出现了异常或不属于输入的内部内容？
-D. 对照：报告是否只在 B 出现，并随注入强度和概念改变？</code></pre>
-          <p>若模型只是在猜，它会在 A、B 两组同样频繁地报告；若报告跟随实际注入的概念变化，就说明当前 activation 对自我报告产生了某种因果影响。研究在最佳协议下观察到有限成功，Claude Opus 4.1 约有 20% 试验表现出这类能力。</p>
+D. 评分：在说出注入概念之前，是否已报告察觉内部异常？
+E. 对照：更换概念与强度，并统计未注入组的误报</code></pre>
+          <p>这里采用官方的“全大写文本”示例；“审批”仅属于前文的教学任务。仅仅多谈论注入的概念仍可能是普通 steering。研究的成功判据还要求模型在提及该概念之前先报告异常，以排除读到自己输出后再作解释的简单路径；无注入组则用于检查误报。研究在最佳协议下观察到有限成功，Claude Opus 4.1 约有 20% 试验表现出这类能力。</p>
           <p>同时存在明显的“甜点区”：注入太弱，模型察觉不到；太强，模型会把概念当成真实输入、产生幻觉或语言失稳。成功率依赖模型、层、提示与评分方式。因而合适结论是“某些模型能在特定条件下有限访问当前内部状态”，不是“模型拥有透明、持续且准确的内心观察器”。</p>
 
           <h2>七、从 persona 到 self-model，中间至少缺四层</h2>
