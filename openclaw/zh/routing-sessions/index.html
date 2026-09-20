@@ -13,13 +13,13 @@
       <p class="lead">同一个人可以从不同渠道、账号、群组和 thread 发来消息。OpenClaw 先用 binding、DM 与群组会话策略决定由哪个 Agent 处理、写入哪段历史，再由队列决定消息加入当前运行、等待下一轮、合并还是打断。</p>
       <div class="meta-line"><span>系列 3 / 8</span><span>源码快照：e6b4264</span><span>主题：routing · session · queue</span><span>前置：Gateway</span></div>
       <nav class="series-strip"><a href="../overview/"><strong>01</strong> 主线</a><a href="../gateway/"><strong>02</strong> Gateway</a><span class="series-current"><strong>03</strong> 路由与会话</span><a href="../context-memory/"><strong>04</strong> 上下文与记忆</a></nav>
-      <figure class="hero-image"><img src="../assets/routing-session-key.png" alt="OpenClaw 消息路由：channel、accountId、peer、threadId 与 binding、dmScope、可选 identityLinks 进入 resolveAgentRoute，得到 agentId、sessionKey、mainSessionKey 和 matchedBy；图展示默认 DM 与群组策略，显式覆盖见正文" /><figcaption>图示默认策略：DM 合入 main，群组各自隔离。显式 dmScope/groupScope 或 binding 覆盖会改变基础会话地址；thread 的渠道规则仍单独生效。</figcaption></figure>
+      <figure class="hero-image"><img src="../assets/routing-session-key.png" alt="消息来源经 resolveAgentRoute 先按 binding 选择 Agent，再按 dmScope、groupScope 与可选 identityLinks 构造 sessionKey，输出 agentId、sessionKey、mainSessionKey 和 matchedBy" /><figcaption>图聚焦 Agent 选择与历史地址构造的分工，省略其他匹配条件。parentPeer 支持 binding 继承；渠道 thread 分流需单独核实。</figcaption></figure>
     </section>
     <section class="article-body">
       <p>继续用前两篇的现场，但把问题换一下。Alice 先从 Telegram 私聊 Agent，后来又从 Slack 私聊同一个 Agent；她还在一个 Discord 项目群里 @ 它，并在群里开了 thread。如果我们只按“用户显示名 Alice”找历史，会把私人对话、团队群组和 thread 全部混在一起。如果完全按渠道隔离，她换到 Slack 后又像第一次见面。</p>
       <p>这不是 prompt 能修好的问题。模型拿到历史以前，runtime 必须先计算一条稳定、可解释、能落盘、能控制并发的状态地址。OpenClaw 把这份结果称为 route，其中最重要的字段是 <code>sessionKey</code>。它既是 session store 的 key，也是 embedded run 的 session lane key。</p>
       <p>可是 route 只回答“消息属于哪儿”。当 Alice 在 Agent 跑工具时补一句“别改生成文件”，系统还得判断新消息在时间上属于当前 turn 还是下一 turn。这就是 queue mode 的职责。路由和队列分别控制空间与时间，缺一边都会让 transcript 失去因果顺序。</p>
-      <div class="note"><p><strong>阅读契约。</strong>读完后你应该能区分：binding 决定目标 Agent，DM scope 决定私聊怎样折叠，identityLinks 只规范化已知同一人的 peer identity，<code>sessionKey</code> 是稳定地址，<code>sessionId</code> 是该地址下当前会话实例，transcript 是实例的历史；还应该能说清 steer、followup、collect、interrupt 对当前运行分别做了什么。</p></div>
+      <div class="note"><p><strong>阅读契约。</strong>读完后你应该能区分：binding 决定目标 Agent，DM scope 决定私聊怎样折叠，identityLinks 只规范化已知同一人的 peer identity，<code>sessionKey</code> 是稳定地址，<code>sessionId</code> 标识持久历史，<code>lifecycleRevision</code> 区分当前生命周期，transcript 保存消息与边界事件；还应该能说清 steer、followup、collect、interrupt 对当前运行分别做了什么。</p></div>
       <p><strong>证据边界。</strong>本文固定在提交 <a href="https://github.com/openclaw/openclaw/commit/e6b42643e7aae229d115477596b33c36c38f7101">e6b4264</a>，以 <a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/routing/resolve-route.ts"><code>resolve-route.ts</code></a>、auto-reply queue 源码与官方 <a href="https://docs.openclaw.ai/concepts/session">Session</a>、<a href="https://docs.openclaw.ai/concepts/queue">Command queue</a> 文档为证。跨会话 memory 检索不改变 session key，本篇不把它当路由；第四篇再讨论。</p>
 
       <h2>一、路由怎样选择 Agent 与会话历史</h2>
@@ -70,16 +70,16 @@
       <p>thread 不能只当消息 metadata。Discord、Slack 等平台里，同一群组下不同 thread 往往对应不同任务，必须有独立 session。与此同时，thread 可能需要继承 parent peer 的 Agent binding，所以 <code>ResolveAgentRouteInput</code> 同时带 peer 与 parentPeer。</p>
       <p>源码的 <code>matchedBy</code> 为 <code>binding.peer.parent</code> 保留独立结果，正是为了让这种继承可观察。否则同一个 Agent 被选中时，你无法知道是 thread 自己有规则，还是继承了父会话。继承规则应参与诊断输出，而不能只藏在 fallback 分支里。</p>
 
-      <h3>1.6 sessionKey 保持地址稳定，sessionId 标识当前实例</h3>
-      <p>这是整篇最重要的区分。<code>sessionKey</code> 是路由得到的稳定 store/concurrency address；<code>sessionId</code> 是这个 key 当前绑定的会话实例。用户执行 <code>/new</code>、<code>/reset</code>，或 daily/idle policy 到期时，key 可以保持不变，而 sessionId 滚成新值。</p>
-      <p>为什么要两层？如果 reset 连 key 一起换，渠道 route 很难再找到“当前对话”；如果只清空 transcript 不换 sessionId，后台 followup、approval 或恢复 claim 又无法判断自己属于 reset 前还是 reset 后。稳定地址让新消息继续找到入口，实例 id 让异步结果钉在正确时代。</p>
+      <h3>1.6 地址、历史身份与生命周期版本分开</h3>
+      <p><code>sessionKey</code> 是路由得到的 store/concurrency address；<code>sessionId</code> 关联 transcript；<code>lifecycleRevision</code> 区分同一地址当前处于哪一次生命周期。三者不能简化成“reset 必换 sessionId”。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/auto-reply/reply/session.ts#L830-L873">当前初始化实现</a>让普通持久会话在 <code>/new</code>、<code>/reset</code> 或已启用的 daily/idle reset 后保留原 sessionId，以保持历史游标连续性；ACP reset 与 tombstone parent-fork 重启则会生成新 ID。</p>
+      <p>稳定地址让渠道继续找到对话，稳定历史身份让旧消息仍可查询，而<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/auto-reply/reply/session.ts#L968-L979">新的生命周期版本</a>区分 reset 前后的运行状态。这里的 lifecycleRevision 是生命周期并发检查字段，不应直接等同于 transcript generation。</p>
 
       <h2>二、队列怎样安排当前运行与后续消息</h2>
       <h3>2.1 steer、followup、collect、interrupt 的四种选择</h3>
-      <figure class="hero-image"><img src="../assets/routing-queue-modes.png" alt="OpenClaw 新消息到达 active run 时的四种 queue mode：steer 等当前工具完成后在下一次 LLM 前注入，followup 排到下一 turn，collect 在 quiet window 后合并，interrupt 中止当前 run 再执行最新消息；global main lane 由 maxConcurrent 控制" /></figure>
+      <figure class="hero-image"><img src="../assets/routing-queue-modes.png" alt="运行中新消息可选 steer、followup、collect 或 interrupt；串行 steer 示例中已运行的 A 完成、尚未启动的 B 跳过，已启动并行批次继续完成" /><figcaption>四行是替代模式，不是依次执行的步骤。steer 行展示内建循环的串行示例；runtime 差异与并发 lane 另见正文。</figcaption></figure>
       <p>当 session 没有 active run，新消息可以直接开始。当已有 run 时，四种 mode 不是不同性能参数，而是不同因果语义：</p>
       <ul>
-        <li><strong>steer：</strong>默认模式。当前 assistant turn 的工具调用先完整执行，然后 pending messages 在下一次 LLM 前注入 active runtime。steer 不会把正在运行的 tool 从中间切断；runtime 不支持 steering 时退化为 followup。</li>
+        <li><strong>steer：</strong>默认模式。已运行的工具不被 steer 取消；内建循环可以跳过尚未启动的串行尾部工具，再在下一次模型调用前注入 pending messages。已启动并行批次的边界见下节；runtime 不支持 steering 时退化为 followup。</li>
         <li><strong>followup：</strong>不改变当前 run，把每条消息排成之后的独立 Agent turn。</li>
         <li><strong>collect：</strong>同样不 steer，但在 quiet window 内把同 route 的多条消息合成一个 followup；若目标 channel/thread 不同，就分开 drain，保留投递归属。</li>
         <li><strong>interrupt：</strong>abort 当前 session run，然后让最新消息开始。它适合“停下，方向错了”，而不是普通补充信息。</li>
@@ -87,8 +87,8 @@
       <p><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/auto-reply/reply/queue/settings.ts#L24-L58"><code>resolveQueueSettingsCore</code></a> 的优先级也体现了 session 语义：inline → sessionEntry 持久 override → channel config → global config → 默认 steer。用户对当前 session 的明确选择高于部署默认。</p>
 
       <h3>2.2 steer 等待安全的工具交接点</h3>
-      <p>假设 Agent 正在执行“删除旧构建产物”，用户补充“保留昨天的压缩包”。在 tool 已经开始后把一句新消息硬塞进同一次 tool call，模型并没有机会修改已经发出的参数；强行终止工具又可能留下半完成副作用。OpenClaw 因此在当前 assistant turn 完成工具调用后、下一次 LLM 前注入 steering。</p>
-      <p>这个边界保证 transcript 仍能表示真实顺序：assistant 提议工具 → tool result → 用户 steering → 下一次 assistant。模型看到补充信息的时间点与外部世界实际接受它的时间点一致。若用户真的要立即停止，就选择 interrupt，让 abort 成为显式生命周期事件。</p>
+      <p>假设 assistant 提议串行执行工具 A“检查构建产物”和 B“删除旧文件”。A 已经运行时，用户补充“先别删除”。新消息不能改写 A 已发出的参数，但<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/packages/agent-core/src/agent-loop.ts#L562-L733">内建循环的启动前检查</a>可以在 A 完成后跳过尚未启动的 B。B 仍获得<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/packages/agent-core/src/agent-loop.ts#L1445-L1488">配对结果</a>：<code>status: "skipped"</code>、<code>deniedReason: "steering"</code>，而不是伪装成执行成功；随后用户消息进入下一次模型决策。</p>
+      <p>如果 A、B 已作为并行批次跨过启动检查，两者继续完成，steer 不会回收已发生的副作用。因而边界是“已运行调用完成，未启动串行尾部可跳过”，不是“一律等完整工具列表执行完”。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/docs/concepts/queue-steering.md#L17-L43">不同 runtime 的合同也不同</a>：原生 Codex harness 在静默窗口后调用 <code>turn/steer</code>，由上游在下一模型边界接收，不能把内建循环的逐工具检查套过去。需要显式停止当前 run 时用 interrupt；中止也不意味着回滚外部副作用。</p>
 
       <h3>2.3 session lane 与 global lane 限制不同冲突</h3>
       <p>每个 embedded run 先进入 <code>session:&lt;key&gt;</code> lane，保证同一会话最多一个 active run；随后进入 global <code>main</code> lane，用 <code>agents.defaults.maxConcurrent</code> 限制跨 session 并发。把两层合成一个全局 mutex 会让 Alice 的长任务阻塞所有人；只做全局 cap 则允许同一 transcript 的两个 writer 并发。</p>
@@ -99,22 +99,23 @@
       <p>这揭示一条经常被忽略的规则：<strong>等待执行的消息也必须记录谁提交、属于哪个 session。</strong>否则多用户 session 无法安全地只取消某个请求者自己的任务。</p>
 
       <h2>三、会话滚动后怎样保护历史与异步结果</h2>
-      <h3>3.1 key 保持不变，sessionId 让旧结果过期</h3>
-      <figure class="hero-image"><img src="../assets/routing-session-roll.png" alt="OpenClaw session 生命周期：稳定 sessionKey 下的 sessionId A 经 /new、/reset、daily 或 idle reset 变为 sessionId B，旧 transcript 归档，绑定 A 的 stale queued notice 被丢弃；incognito 单独只存进程内且无磁盘 transcript" /></figure>
-      <p>SessionEntry 用不同时间戳服务不同策略：<code>sessionStartedAt</code> 标记当前 sessionId 何时开始，daily reset 看它；<code>lastInteractionAt</code> 只由真实 user/channel interaction 推进，idle reset 看它；<code>updatedAt</code> 表示 store row 最近一次变化，heartbeat、cron 或 bookkeeping 也可能更新，不能拿它延长会话寿命。</p>
-      <p>reset 时，旧 transcript 可以归档，新 sessionId 获得新 transcript。绑定旧 sessionId 的 system notice、approval followup 或 detached completion 必须检查 rebind；若 key 已经指向 B，就丢掉属于 A 的陈旧结果。只比较 key 会把上一段对话的后台结果投进新对话。</p>
+      <h3>3.1 重置追加边界，并清理旧生命周期状态</h3>
+      <figure class="hero-image"><img src="../assets/routing-session-roll.png" alt="普通持久会话 reset 保留 sessionKey 和 sessionId，将 lifecycleRevision A 更新为 B，原始历史保留并追加 reset 边界，另行清理旧队列与通知；daily 和 idle 仅在启用时发生" /><figcaption>图聚焦已有普通持久会话。ACP reset 与 tombstone parent-fork 重启会换 sessionId；历史保留不代表旧消息全部进入重置后的模型窗口。</figcaption></figure>
+      <p>SessionEntry 用不同时间戳服务不同策略：<code>sessionStartedAt</code> 标记当前生命周期何时开始，daily reset 看它；<code>lastInteractionAt</code> 只由真实 user/channel interaction 推进，idle reset 看它；<code>updatedAt</code> 表示 store row 最近一次变化，heartbeat、cron 或 bookkeeping 也可能更新，不能拿它延长会话寿命。daily/idle 是显式启用的策略，不能把图中可选触发理解为每个会话都会定期重置。</p>
+      <p><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/auto-reply/reply/session.ts#L1069-L1088">这条普通持久会话初始化路径</a>不归档旧 transcript，而是在同一历史中追加 reset 边界：手动 <code>/new</code>/<code>/reset</code> 使用 <code>context: "clear"</code>，自动到期使用 <code>preserve-tail</code>。后者可保留近期对话尾部，原始历史与本轮模型窗口因此是两回事。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/config/sessions/session-accessor.sqlite-lifecycle.ts#L230-L265">边界追加与 session entry 更新在事务内提交</a>，旧消息仍可搜索。</p>
+      <p>显式 reset 在提交前停止子任务时，<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/auto-reply/reply/session-reset-cleanup.ts#L18-L60">清理守卫同时检查 sessionId 与 lifecycleRevision</a>，避免清理已经换代的会话。提交后再<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/auto-reply/reply/session.ts#L1179-L1189">尽力清理旧 queued followup、system event 与 active-run registry</a>；此时清理异常会记录日志，不把已持久提交的 reset 重新判为失败。排查异步结果时不能只问 key 是否相同，也不能假定普通 reset 必然生成不同 sessionId。</p>
       <p>incognito 是另一种 storage mode：session row、transcript 与 compaction state 只在进程内，Gateway 重启后消失，不写磁盘 transcript。它不限制工具写文件，也不阻止 model provider 处理消息，所以“无 session 落盘”不等于“无外部副作用”或“端到端隐私模式”。</p>
 
       <h3>3.2 transcript 按真实顺序追加消息与工具结果</h3>
-      <p>路由与队列最终保护的是 transcript 的先后关系。用户消息、assistant tool call、tool result、steering message 和最终回答必须按发生顺序持久化；reset、compaction 和 repair 可能重写结构，但同一 session 的写入仍然串行执行。</p>
+      <p>路由与队列最终保护的是 transcript 的先后关系。用户消息、assistant tool call、tool result、steering message 和最终回答必须按发生顺序持久化；reset 与 compaction 边界会改变重放窗口，repair 另有结构修复职责；同一 session 的写入仍然串行执行。</p>
       <p>因此不要让 channel plugin 各自 append 自定义 JSONL，也不要让两个运行同时把“最后一条消息”当作自己的 parent。当前 OpenClaw 把 runtime session row 与热 transcript 存入每 Agent 的 <code>openclaw-agent.sqlite</code>，旧 JSON/JSONL 是迁移来源或归档形态，不是新运行状态的并行真相。</p>
 
-      <h3>3.3 按路由、队列和 sessionId 三层排查</h3>
+      <h3>3.3 按路由、队列和生命周期三层排查</h3>
       <div class="table-wrap"><table><thead><tr><th>症状</th><th>先查什么</th><th>不要先改什么</th></tr></thead><tbody>
         <tr><td>同一个用户“失忆”</td><td>route inputs、matchedBy、dmScope、identityLinks、sessionKey。</td><td>不要先加 memory 或扩大 prompt。</td></tr>
         <tr><td>不同用户看到同一历史</td><td>多人 DM 是否仍用 main，binding/identityLinks 是否误合并。</td><td>不要靠 system prompt 要模型保密。</td></tr>
         <tr><td>补充信息没有影响当前工具</td><td>queue mode、tool boundary、runtime 是否接受 steer。</td><td>不要假设 steer 会取消 in-flight tool。</td></tr>
-        <tr><td>reset 后收到旧任务结果</td><td>followup 是否钉住旧 sessionId，rebind 检查是否生效。</td><td>不要只按 sessionKey 投递。</td></tr>
+        <tr><td>reset 后收到旧任务结果</td><td>sessionId、lifecycleRevision 与 reset 清理是否对应当前生命周期。</td><td>不要只按 sessionKey 投递。</td></tr>
         <tr><td>所有聊天互相阻塞</td><td>global maxConcurrent 与 lane 配置。</td><td>不要取消 session serialization。</td></tr>
       </tbody></table></div>
 
@@ -123,7 +124,7 @@
         <li><strong>路由决定空间归属，队列决定时间归属。</strong>二者共同定义 transcript 因果顺序。</li>
         <li><strong>选择 Agent 与构造 session key 分层。</strong>binding 选择处理者，dmScope、groupScope 与 identityLinks 决定会话隔离。</li>
         <li><strong>隐私必须编码进 key。</strong>模型提示不能补救错误的多人 DM 合并。</li>
-        <li><strong>稳定地址与滚动实例分开。</strong>sessionKey 便于路由，sessionId 让异步结果过期。</li>
+        <li><strong>稳定地址、历史身份与生命周期分开。</strong>reset 可以保留 sessionKey/sessionId，同时更新生命周期版本与模型窗口。</li>
         <li><strong>steer 在安全 runtime boundary 注入。</strong>补充消息不能重写已经发出的工具副作用。</li>
         <li><strong>排队项也要保存来源。</strong>取消、drop 与 overflow summary 都要保留 requester/run identity。</li>
       </ol>
