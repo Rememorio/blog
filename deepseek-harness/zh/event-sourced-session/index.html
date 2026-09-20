@@ -8,25 +8,26 @@
 <div class="article-shell"><aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
 <section class="article-hero"><p class="eyebrow">DeepSeek Harness 源码笔记 · 第三篇</p><h1>Model-visible means logged：从事件到模型历史</h1>
   <p class="lead">Session 不是 message 数组的另一个名字。DSH 先保存不可变事件，再维护一层可替换 surface，最后才派生模型历史；UI、恢复和模型因此可以共享事实源，而不必共享同一种视图。</p>
-  <div class="meta-line"><span>系列 3 / 7</span><span>源码快照：b150a55</span><span>主题：事件溯源会话</span><span>核心：SessionEvent → Surface → Message</span></div>
+  <div class="meta-line"><span>系列 3 / 7</span><span>源码核实：2026-09-20</span><span>主题：事件溯源会话</span><span>核心：SessionEvent → Surface → Message</span></div>
   <nav class="series-strip"><a href="../runtime-route/"><strong>01</strong> 运行主线</a><a href="../cordis-composition/"><strong>02</strong> Cordis</a><span class="series-current"><strong>03</strong> 事件会话</span><a href="../governed-effects/"><strong>04</strong> 副作用</a><a href="../compaction-reconstruction/"><strong>05</strong> 压缩</a><a href="../multi-agent-runtime/"><strong>06</strong> 多 Agent</a><a href="../self-referential-runtime/"><strong>07</strong> 自指</a><a href="../"><strong>路线图</strong></a></nav>
-  <figure class="hero-image"><img src="../assets/session-event-source.png" alt="DeepSeek Harness 事件会话：append 把不可变 SessionEvent 写入日志，SurfaceManager 维护 surface nodes，再分别派生成模型消息与 Web 视图" /></figure>
+  <figure class="hero-image"><img src="../assets/session-event-source.png" alt="DeepSeek Harness 事件日志分成两条读取路径：surface 派生模型历史，人类时间线读取原始对话而不经过当前 surface" /></figure>
 </section><section class="article-body">
   <p>很多 Agent 系统一开始只有 <code>messages.push()</code>。工具状态、token、approval、重试和 UI 进度随后被塞进旁边的 Map；需要恢复时，再猜哪些 Map 能从 messages 重建。DSH 反过来：先把运行事实写入追加日志，模型消息只是其中一个投影。</p>
-  <p>这不是为了把简单系统复杂化，而是因为一次 turn 同时服务三类消费者。模型只需要规范的 user/assistant/tool messages；人类时间线需要看见原始对话和工具过程；恢复路径还需要 turn/step 边界、request header、错误与 lineage。让它们共用一个数组，迟早会让某个消费者得到多余或缺失的事实。</p>
-  <div class="note"><p><strong>阅读契约。</strong>读完以后，你应该能说明：<code>append()</code> 提交前后分别保证什么；为什么只有三种事件可以携带 <code>surfaceOp</code>；<code>replace</code> 为什么遮蔽模型表面却不删除原始日志；人类 transcript 为什么不能直接读取 current surface；以及未知事件、sourceEventSeqs 和 session/end-seed 如何让恢复失败得更安全。</p></div>
-  <p><strong>证据边界。</strong>本文固定在提交 <a href="https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"><code>b150a55</code></a>。Session 根包一直负责事件快照、冻结、surface 验证和 seed 接纳；持久化是外部插件。源码能证明内存契约和重建规则，但不能证明某个自定义 backend 已正确实现 durability。</p>
+  <p>这不是为了把简单系统复杂化，而是因为一次 turn 同时服务三类消费者。模型需要规范的 system/user/assistant/tool messages；人类时间线需要看见原始对话和工具过程；恢复路径还需要 turn/step 边界、request header、错误与 lineage。让它们共用一个数组，迟早会让某个消费者得到多余或缺失的事实。</p>
+  <div class="note"><p><strong>阅读契约。</strong>读完以后，你应该能说明：<code>append()</code> 提交前后分别保证什么；为什么四种消息事件需要声明 <code>surfaceOp</code>；<code>replace</code> 为什么遮蔽模型表面却不删除原始日志；人类 transcript 为什么不能直接读取 current surface；以及未知事件、sourceEventSeqs 和 session/end-seed 如何让恢复失败得更安全。</p></div>
+  <p><strong>证据边界。</strong>本文固定在提交 <a href="https://github.com/deepseek-ai/deepseek-harness/commit/ddefc45fbc7f8e46dd73185e68295696d1297887"><code>ddefc45</code></a>。当前逻辑格式为 v3。Session 根包负责追加、surface 验证和 seed 接纳；持久化、格式迁移与插件消息投影各有明确接口。下文区分内存提交、持久化完成与实时流帧，不把其中一个当成另外两个的保证。</p>
 
   <h2>一、Session 是追加事实源，不是可编辑 transcript</h2>
   <h3>1.1 append 先快照，再验证，最后一次提交</h3>
-  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/index.ts#L570-L654"><code>Session.append()</code></a> 不把调用方传入的对象引用直接塞进 log。它先把 data、surface metadata 和 sourceEventSeqs 做 lossless JSON 快照，验证 marker、引用和 replacement coverage，再创建连续的 <code>seq</code> 与时间戳。SurfaceManager 先规划 transition；所有检查通过后，log 和 surface 才同步 commit。</p>
-  <p>提交后的事件与嵌套 message 会被深冻结，<code>session.events</code> 返回缓存的 frozen snapshot。调用方不能事后修改一个 content block，悄悄改变模型历史却不产生新事件。要改变当前模型表面，只能追加一条明确的 replacement event。</p>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/src/index.ts#L683-L770"><code>Session.append()</code></a> 不把调用方传入的对象引用直接塞进 log。它先把 data、surface metadata 和 sourceEventSeqs 做 lossless JSON 快照，给候选事件分配连续的 <code>seq</code> 与时间戳并冻结，再验证 marker、引用和 replacement coverage。SurfaceManager 先验证并规划 transition；检查通过后事件才进入私有 log，surface 随后按已接纳的日志增量折叠。验证失败不能留下半条事件或半次替换。</p>
+  <p>通过 <code>append()</code> 接纳的事件与嵌套 message 会被深冻结。调用方不能事后修改 content block，悄悄改变模型历史。改变模型输入要追加明确的 replacement，或追加由已注册解释器处理的消息投影事件。旧的 <code>session.events</code> 已不再是接口；<code>snapshotEvents()</code> 虽仍返回稳定快照，也已标记 deprecated，新生产逻辑应使用查询或投影接口，而不是逐次扫描整份日志。</p>
+  <p>下面展示调用形状：<code>message</code>、<code>summary</code> 是已构造的消息，端点是当前节点的 <code>SessionSeq</code>，<code>shadowedSeqs</code> 覆盖全部被替换节点。</p>
   <pre><code class="language-typescript">session.append('user/message', message, {
   surfaceOp: 'append',
 })
 
 session.append('user/message', summary, {
-  surfaceOp: { op: 'replace', start, end },
+  surfaceOp: { op: 'replace', startSeq, endSeq },
   sourceEventSeqs: shadowedSeqs,
 })</code></pre>
 
@@ -35,20 +36,29 @@ session.append('user/message', summary, {
   <p>持久化 listener 可以做 write-behind，但真正需要耐久语义的生产者还必须显式等待 <code>ctx.sessions.flush(session)</code>。下一篇会讨论这个 observation barrier；在 Session 本身看来，append 负责原子内存事实，flush 才负责等待外部镜像。</p>
 
   <h2>二、事件词汇把内容、执行与诊断分开</h2>
-  <h3>2.1 只有三种事件能进入模型 surface</h3>
-  <figure class="hero-image"><img src="../assets/session-event-taxonomy.png" alt="SessionEvent 分类：turn 和 step 边界、assistant chunk、tool call 与 request header 只进入日志；user message、assistant message 和 tool result 携带 surfaceOp 并可派生模型消息" /></figure>
-  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/types.ts#L343-L386"><code>SurfaceEventType</code></a> 是严格联合：<code>user/message</code>、<code>assistant/message</code>、<code>tool/result</code>。它们保存完整、带身份的 Message，并强制携带 <code>surfaceOp</code>。<code>deriveEventMessage()</code> 只是返回事件里已经冻结的 message，不重新发明 id、role 或 framing。</p>
-  <p>其他事件回答运行问题而不是对话内容：<code>turn/start</code> 和 <code>step/end</code> 界定生命周期；<code>assistant/chunk</code> 保留流式来源和 usage；<code>tool/call</code> 证明执行已经开始；<code>request/header</code> 保存非历史请求封装。这些记录留在日志，却投影成 <code>null</code>，不会污染 provider transcript。</p>
+  <h3>2.1 四种消息事件进入 surface，流帧单独结算</h3>
+  <figure class="hero-image"><img src="../assets/session-event-taxonomy.png" alt="四种模型消息事件：system/message、user/message、assistant/message、tool/result；assistant/attempt 和 request/header 只记录运行事实" /></figure>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/src/types.ts#L410-L456"><code>SurfaceEventType</code></a> 包含 <code>system/message</code>、<code>user/message</code>、<code>assistant/message</code>、<code>tool/result</code>。四者都必须声明 <code>surfaceOp</code>。系统提示词因此也属于可恢复的模型历史：loop 在首条用户消息前写入第一个 system 节点；<code>request/header</code> 只保存调用配置、工具 schema 与适配器默认值，不能再携带 <code>header.system</code>。</p>
+  <p>一次回答正在流式输出时，界面消费的是 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/agent-loop/src/agent.ts#L380-L487"><code>agent/assistant-stream</code></a> 实时帧，日志不再为每个 chunk 追加独立事件。一次尝试结束后，成功输出结算为 <code>assistant/message</code>，失败或准备重试且没有提交消息的尝试结算为 <code>assistant/attempt</code>；两者都内嵌保留时序和 delta 边界的 <code>stream</code>。取消时若已有文本或 reasoning 前缀，则可提交带 <code>interrupted: true</code> 的部分消息，尚未派发的工具调用不进入它。</p>
+  <p><strong>界面已经显示几个字，不等于这些字已经持久化。</strong>实时帧先供显示，结算事件才进入 Session，之后仍需持久化屏障。<code>assistant/attempt</code>、turn/step 边界、<code>tool/call</code> 与请求记录本身不直接派生消息；其中 <code>tool/call</code> 表示记录了调用入口，并不证明工具成功甚至已产生外部效果。</p>
+
+  <p>把一次“先失败、再成功”的请求重试压成记录形状，三条通道的区别会更清楚：</p>
+  <pre><code class="language-text">实时显示：attempt 1 的帧 → attempt 2 的帧
+Session：assistant/attempt { stream: … }
+         assistant/message { message: …, stream: … }
+模型历史：只接纳已提交的 assistant/message
+持久化：由 flush 等待上述 Session 记录写入</code></pre>
 
   <h3>2.2 sourceEventSeqs 把产物连回来源</h3>
-  <p><code>assistant/message</code> 可以引用组成它的 <code>assistant/chunk</code> seq；compaction replacement 必须引用所有被遮蔽 surface nodes；tool result rewrite 也要引用原结果。引用只能指向更早、唯一的 seq，replacement 不得漏掉覆盖范围里的任何节点。</p>
+  <p><code>system/message</code>、<code>user/message</code> 与 <code>tool/result</code> 可以通过 <code>sourceEventSeqs</code> 引用来源。Compaction replacement 必须引用所有被遮蔽 surface nodes，tool result rewrite 也要引用原结果。引用必须非空、唯一且只指向更早 seq；replacement 不得漏掉覆盖范围里的节点。<code>assistant/message</code> 则内嵌自己的原始 stream，明确禁止顶层 <code>sourceEventSeqs</code>，不再用 chunk 事件编号拼接来源。</p>
   <p>这不是通用 DAG 系统，而是一条窄 provenance 线：当日志保留 raw source 和 canonical product 时，审计者可以确认“这条 message/summary 从哪些事件产生”，恢复器也能拒绝一条声称替换范围却未完整引用来源的记录。</p>
 
   <h2>三、Surface 是当前模型历史的有序投影</h2>
   <h3>3.1 append 扩展尾部，replace 遮蔽连续区间</h3>
-  <figure class="hero-image"><img src="../assets/session-surface-generation.png" alt="Session 原始事件日志永久保留；surface nodes 先 append 消息节点，再用 replace 将 start 到 end 的连续区间遮蔽成一个新节点，并增加 replaceGeneration 后重建 deriveMessages" /></figure>
-  <p><code>SurfaceOp</code> 只有两种形状：<code>'append'</code>，或 <code>{ op: 'replace', start, end }</code>。Replace 的 start/end 必须都是当前 surface node，并构成顺序正确的闭区间；新事件进入该位置，被覆盖的 seq 只从 surface nodes 中移除，仍留在 <code>SessionEvent[]</code>。</p>
-  <p>每次 replacement 会增加 <code>replaceGeneration</code>。普通 append 不需要让已有 message projection 失效；replace 改变了中间位置，<code>deriveMessages()</code> 必须清空缓存并按新 surface 重建。这种 generation 设计把增量快路径和中段改写分开。</p>
+  <figure class="hero-image"><img src="../assets/session-surface-generation.png" alt="节点替换与插件消息投影分别增加 contentGeneration，触发 deriveMessages 重建；两条路径都保留原始事件，消息投影不改变节点成员" /></figure>
+  <p><code>SurfaceOp</code> 只有两种形状：<code>'append'</code>，或 <code>{ op: 'replace', startSeq, endSeq }</code>。Replace 的 startSeq/endSeq 必须都是当前 surface node，并构成顺序正确的闭区间；新事件进入该位置，被覆盖的 seq 只从 surface nodes 中移除，仍留在 <code>SessionEvent[]</code>。</p>
+  <p>每次 replacement 同时增加 <code>replaceGeneration</code> 与 <code>contentGeneration</code>；插件只改变消息内容、不改变节点集合时，只增加后者。普通 append 仍走增量尾部路径，<code>deriveMessages()</code> 则以 <code>contentGeneration</code> 为重建依据。否则节点位置虽然没动，模型却可能继续读到旧内容。</p>
+  <p>系统提示词还有一条位置约束：当 surface 的第 0 个节点是 <code>system/message</code>，覆盖它的 replacement 也必须是 system 事件，且只能覆盖该节点。后续追加的 system 节点没有这项保护。是否在历史尾部追加非空的新提示词，由当前已绑定模型路由的 <code>systemPromptUpdate: 'in-history'</code> 能力和请求系列决定；不支持时需要归并到首个 system 节点，清空提示词则要把所有仍生效的 system 节点逐个替换为空。<a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/agent-loop/src/runtime-context.ts">SystemPromptProjection</a> 负责这些实际写入，而不是由 UI 原地改文本。</p>
 
   <h3>3.2 人类 transcript 与模型 surface 故意不同</h3>
   <p>假设一段十轮历史被 summary replacement 遮蔽。模型下一步应该只看到 summary 与较新消息；人类已经看过的十轮对话却不应该从 UI 时间线消失。Session 因而提供 <code>isAppendSurfaceEvent()</code>：人类 transcript 从 append-origin events 构建，replacement copies 只改变 model-facing surface。</p>
@@ -56,41 +66,46 @@ session.append('user/message', summary, {
 
   <h2>四、deriveMessages 是一条受约束的增量缓存</h2>
   <h3>4.1 每个新 surface node 只投影一次</h3>
-  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/index.ts#L708-L746"><code>deriveMessages()</code></a> 记住已处理 nodes 数量和 generation。generation 未变时，只遍历新尾部；返回的新数组共享深冻结 Message 对象。后续 append 不会让调用者先前保存的数组偷偷增长。</p>
-  <p>空 content 的 <code>assistant/message</code> 可以只承载 max-token usage，因此投影为 <code>null</code>。普通消息则原样通过：direct prompt、synthetic injection 与 goal round 都是 user/message，真正区分它们的是 typed <code>source</code>，不是 projection 额外包一层含糊字符串。</p>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/src/index.ts#L824-L883"><code>deriveMessages()</code></a> 记住已处理 nodes 数量和 <code>contentGeneration</code>。该 generation 未变时，只遍历新尾部；返回的新数组共享深冻结 Message 对象。后续 append 不会让调用者先前保存的数组偷偷增长。未改变的消息可以复用原数据；插件产生的投影内容则是不可变派生副本，保留原消息身份。</p>
+  <p>空 content 的 <code>assistant/message</code> 可以只承载 max-token usage；空 <code>system/message</code> 则记录该位置没有系统指令。两者都投影为 <code>null</code>。普通消息则原样通过：direct prompt、synthetic injection 与 goal round 都是 user/message，真正区分它们的是 typed <code>source</code>，不是 projection 额外包一层含糊字符串。</p>
 
-  <h3>4.2 “Model-visible means logged” 也有反向约束</h3>
+  <h3>4.2 插件改变消息内容，也必须留下可重放决定</h3>
+  <p>例如工具结果仍占据同一个 seq，但裁剪插件希望模型只读其中一部分。插件不能直接改写原结果，而要声明消息投影事件，并用 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/src/index.ts#L917-L943"><code>registerMessageProjection()</code></a> 注册纯解释器。Session 在接纳决定前调用它验证来源与输出，再缓存保持身份的消息副本。</p>
+  <p>这条路径保持 <code>surface.nodes</code> 不变，却会使内容缓存失效。缺少解释器时，append 和 restore 都拒绝该事件；卸载已被使用的解释器后，缓存读取同样会被阻止。因此保存“裁剪完成”还不够，恢复时必须能解释当时究竟怎样改变了模型消息。</p>
+
+  <h3>4.3 “Model-visible means logged” 也有反向约束</h3>
   <p>它不只是说“写日志很重要”，而是双向规则：</p>
   <ol>
     <li>想进入模型 history 的内容，必须是已提交的 surface event；局部 prompt buffer 不是可靠历史。</li>
-    <li>已写入日志的内容不一定进入模型；只有 current surface 上的三类 message event 才会投影。</li>
-    <li>system、tools、provider 与 adapter defaults 属于 <code>request/header</code>，在 history 外重建，避免日志本身制造第二份 token。</li>
+    <li>已写入日志的内容不一定进入模型；只有 current surface 上的四类 message event 才提供消息，并叠加已记录的消息投影。</li>
+    <li>system 来自 surface；tools、provider/model 配置与 adapter defaults 来自 <code>request/header</code>。<code>request/context</code> 记录路由能力，不参与 header 相等性或请求重建，也不能代替当前 prepared call 的能力判断。</li>
   </ol>
 
   <h2>五、恢复不是 JSON parse，而是拒绝错误世界</h2>
   <h3>5.1 Seed 必须是可验证的当前格式前缀</h3>
-  <figure class="hero-image"><img src="../assets/session-restore-invariants.png" alt="Session.fromRestore 依次检查版本、seq、surfaceOp 与 sourceEventSeqs；仅 ignorable 未知事件可跳过，随后重建 surface nodes 和 request header，并用 session end seed 分隔恢复历史与新事件" /></figure>
-  <p><code>Session.fromRestore()</code> 会分离、快照并验证 header 与 seed：id 必须一致，seq 连续，数据 lossless JSON，surface transition 合法，assistant message 有 provider/model provenance，request header 至少有 provider/model。一个事件若类型未知且没有 <code>ignorable: true</code>，恢复必须拒绝，而不是假设跳过不会改变后续解释。</p>
-  <p><code>SESSION_FORMAT_VERSION</code> 仍是 pre-release 的 0，当前 Session 只接纳当前 shape；窄兼容转换属于 persistence read boundary。这个选择牺牲“尽量打开旧日志”，换来“不在错误历史上继续产生副作用”。</p>
+  <figure class="hero-image"><img src="../assets/session-restore-invariants.png" alt="历史格式先迁移到 v3，再由 Session.fromRestore 验证连续 seq、合法 surface 和必要解释器；无法解释时拒绝继续运行" /></figure>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/src/index.ts#L521-L620"><code>Session.fromRestore()</code></a> 接纳持久化层交付的、独立拥有或已深冻结的 seed，验证运行必需字段、事件封装、连续 seq、surface 转移和 header。它不再对全部事件重复复制和冻结，内嵌 assistant stream 也留给流消费者或存储校验器检查。相比之下，普通 <code>Session.create()</code> 的 seed 仍走完整快照路径。调用者必须满足传入数据的所有权约定，不能把可变共享对象伪装成已准备好的恢复数据。</p>
+  <p>一个事件若类型未知且没有 <code>ignorable: true</code>，恢复必须拒绝；需要消息投影却没有对应解释器时也一样。可忽略未知事件仍留在日志中，只是不改变 surface，不能把“可跳过解释”理解为删掉原记录。</p>
+  <p><code>SESSION_FORMAT_VERSION</code> 当前为 <strong>3</strong>。Session 只接纳当前 shape；<a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/session/session-format-catalog/src/generated.ts">内置格式目录</a> 在读取存储时提供相邻的 v0→v1→v2→v3 迁移。历史 stream 和 system 字段先变成当前语义，再构造 Session；未来版本或缺失迁移路线应拒绝读取，不能仅修改 header.version 后继续执行。</p>
 
   <h3>5.2 session/end-seed 划清恢复历史和本次生命周期</h3>
-  <p>恢复或 fork 的 seed 被接纳后，构造器追加 <code>session/end-seed</code>。它不是在线心跳，而是一个位置标记：之前的事件来自 constructor seed，之后才是当前 live lifecycle 产生的记录。Compaction 等独立 bracket 可以用它判断未闭合 start 是旧生命周期的 crash tail，还是本次进程正在进行的工作。</p>
+  <p>新 fork 子会话在精确的继承前缀之后写入带 <code>inherited: true</code> 的 <code>session/end-seed</code>；恢复保留该继承分界，并在需要时追加普通生命周期 marker（若 seed 已以 marker 结束则不重复追加）。它不是在线心跳，而是一个位置标记：之前的事件来自 constructor seed，之后才是当前 live lifecycle 产生的记录。Compaction 等独立 bracket 可以用它判断未闭合 start 是旧生命周期的 crash tail，还是本次进程正在进行的工作。</p>
   <p>Session 的 invariant companion 还重放 seq、turn/step enclosure 与同 step tool pairing。根包始终执行结构和 surface 验证；关系 invariant 作为插件补强执行轨迹，两层不会互相代替。</p>
 
   <h2>六、这套状态模型带来的工程判断</h2>
   <ol>
     <li><strong>不要把 UI store 当真相。</strong>UI 可以消费更多事件，但恢复与模型 history 必须回到 Session。</li>
-    <li><strong>不要原地编辑 message。</strong>修改当前模型表面应追加带 provenance 的 replacement。</li>
-    <li><strong>不要把 raw log 全塞给模型。</strong>边界、chunk、usage 和 request header 是恢复/诊断事实，不是对话消息。</li>
+    <li><strong>不要原地编辑 message。</strong>修改节点应追加带 provenance 的 replacement；只改变消息内容则记录可重放的插件投影决定。</li>
+    <li><strong>不要把 raw log 全塞给模型。</strong>边界、失败尝试及其 stream、usage 和 request header 是恢复/诊断事实，不是独立对话消息。</li>
     <li><strong>不要用 current surface 画人类历史。</strong>它会正确地隐藏 compaction 旧节点，却让用户误以为历史被删除。</li>
     <li><strong>不知道某个新事件是否可跳过，就默认 required。</strong>过度拒绝只是升级成本，错误跳过可能在残缺状态上继续执行。</li>
   </ol>
   <p>下一篇会接上这份 append-only log，讨论它怎样越过进程边界：write-behind、flush checkpoint、approval、sandbox 与 crash repair 如何共同决定一个工具调用可不可以安全继续。</p>
 
   <h2 id="sources">参考源码</h2><ul>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/README.md">dsh-session README</a>：事件源、surface、模型体验、恢复与扩展点。</li>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/index.ts">Session</a>：append、fromRestore、deriveMessages 与 store 生命周期。</li>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/surface.ts">surface.ts</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/types.ts">types.ts</a>：SurfaceOp、projection 与 provenance 验证。</li>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/invariant.ts">invariant.ts</a>：seq、turn/step 与 tool pairing 关系检查。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/README.md">dsh-session README</a>：事件源、surface、模型体验、恢复与扩展点。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/src/index.ts">Session</a>：append、fromRestore、deriveMessages 与 store 生命周期。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/src/surface.ts">surface.ts</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/src/types.ts">types.ts</a>：SurfaceOp、projection 与 provenance 验证。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/src/invariant.ts">invariant.ts</a>：seq、turn/step 与 tool pairing 关系检查。</li>
   </ul>
 </section></article></main></div><script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../../openclaw/article.js?v=1"></script></body></html>
