@@ -103,6 +103,7 @@
                 src="../assets/prompt-cache-discipline.png"
                 alt="Codex prompt cache discipline showing stable prefix, dynamic tail, prompt_cache_key, cache route, and usage metrics"
               />
+            <figcaption>Stable prefixes and new tails form the request; a key does not guarantee a hit. Routing and cache-accounting behavior depend on the model contract. The usage label shows Codex’s internal counter name.</figcaption>
             </figure>
           </section>
 
@@ -116,26 +117,13 @@
             </p>
 
             <p>
-              The official
-              <a href="https://developers.openai.com/api/docs/guides/prompt-caching">OpenAI prompt caching guide</a>
-              gives the server-side conditions: cache hits require exact prefix
-              matches; stable content belongs at the beginning; dynamic content
-              belongs near the end; <code>prompt_cache_key</code> can influence
-              routing; and <code>usage.prompt_tokens_details.cached_tokens</code>
-              is the observable result. Codex source then answers a narrower
-              question: how does the client build a repeatable model-visible
-              request?
+              The official <a href="https://developers.openai.com/api/docs/guides/prompt-caching">OpenAI prompt caching guide</a> requires a matching reusable prefix and recommends stable content before dynamic input. Eligibility, billing, TTL, and key semantics depend on the model. GPT-5.6 and later route automatically and may use <code>prompt_cache_key</code> for separate customer or user cache accounting; earlier models use a stable key to optimize routing. Responses reports reads under <code>usage.input_tokens_details.cached_tokens</code>, rather than the Chat Completions usage path.
             </p>
 
             <div class="note key-point">
               <p>
-                The working claim is simple: <strong>Codex prompt caching is
-                request-shape discipline.</strong> <code>prompt_cache_key</code>
-                helps similar requests land in a useful cache domain, but the
-                hit still depends on the ordered request fields: instructions,
-                tools, input history, context updates, tool output, and
-                compaction shape.
-              </p>
+              <code>prompt_cache_key</code> is not a cache-hit switch. It can guide routing on earlier models or separate cache accounting on newer models; neither use repairs a changed prefix. The client controls the stability of ordered input, tool definitions, and context updates.
+            </p>
             </div>
 
             <div class="note">
@@ -154,7 +142,7 @@
             <p>This part follows six questions:</p>
             <ol>
               <li>Which view is actually cacheable?</li>
-              <li>Where does Codex get <code>prompt_cache_key</code>, and why is it thread-scoped by default?</li>
+              <li>Where does Codex get <code>prompt_cache_key</code>, and how do sessions and internal request families determine it?</li>
               <li>How do <code>instructions</code>, <code>tools</code>, and <code>input</code> form a stable prefix?</li>
               <li>Why should settings, environment context, and tool output land after that prefix?</li>
               <li>Why does compaction reduce pressure while changing future cache shape?</li>
@@ -207,7 +195,7 @@
               Codex makes this separation visible in <code>Prompt</code>. It
               carries conversation <code>input</code>, model-visible
               <code>tools</code>, <code>parallel_tool_calls</code>,
-              <code>base_instructions</code>, personality, and output schema.
+              <code>base_instructions</code> and output schema.
               <code>ModelClient::build_responses_request</code> turns that into
               a Responses payload: <code>instructions</code>, <code>input</code>,
               <code>tools</code>, <code>reasoning</code>, <code>text</code>, and
@@ -220,38 +208,25 @@ Responses request
   tools:        model-visible tool schemas
   input:        prior context + dynamic turn tail
   text:         output schema / verbosity
-  prompt_cache_key: thread-scoped cache domain</code></pre>
+  prompt_cache_key: session/request-family cache key</code></pre>
 
-            <h2>2. The Cache Domain Comes From the Thread</h2>
+            <h2>2. Cache Keys Follow Sessions and Request Families</h2>
             <p>
-              <code>ModelClient</code> is session-scoped. Its comments say it
-              holds cross-turn state such as auth, provider selection, thread id,
-              and transport fallback state. That scope explains its default
-              prompt cache key.
+              <code>ModelClient</code> is session-scoped and retains authentication, provider, and transport state across turns. That does not make every key equal to the thread id. The durable thread identity, the current runtime session, and an internal helper request family must be distinguished.
             </p>
 
             <p>
-              <code>ModelClient::prompt_cache_key()</code> returns an override
-              when one exists; otherwise it uses the <code>thread_id</code>.
-              <code>build_responses_request</code> places that value on every
-              Responses request. Consecutive turns in one thread therefore share
-              a stable cache domain unless a higher-level session type has a
-              reason to override it.
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L549-L583"><code>ModelClient::prompt_cache_key()</code></a> returns an override first. For an internal session with a parent thread id, it returns <code>source:parent_thread_id</code>. Otherwise it uses <code>responses_metadata.session_id</code>. The request builder serializes that value, so helper requests can share a request-family key while ordinary requests follow the current session; the default is no longer simply thread_id.
             </p>
 
             <div class="note key-point">
               <p>
-                <code>prompt_cache_key</code> should not be read as a manual
-                breakpoint. It does not tell the provider where to cache. It
-                keeps related requests near the same routing domain so repeated
-                prefixes have a better chance to be found.
-              </p>
+              The key neither chooses a message breakpoint nor guarantees a hit. Public API behavior must also be separated from the ChatGPT client adapter: <code>responses_session_id()</code> preserves the actual session id for non-root agents and otherwise uses the selected key for request affinity. This visible header choice does not prove one server routing algorithm across all model families.
+            </p>
             </div>
 
             <p>
-              Guardian review sessions are the visible exception: session setup
-              can call <code>with_prompt_cache_key_override</code>. That keeps
-              the key tied to a request family, not to a one-off user message.
+              Callers such as Guardian review sessions can supply an override through <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L549-L559"><code>with_session_options</code></a>. That groups related requests; a new user message does not need a newly invented key. Observe usage separately to establish actual reuse.
             </p>
 
             <h2>3. Stable Prefix: Instructions, Tools, Context Base</h2>
@@ -263,7 +238,7 @@ Responses request
 
             <h3>3.1 Instructions Stay Stable Across Ordinary Turns</h3>
             <p>
-              <code>build_responses_request</code> reads
+              For ordinary Responses, <code>build_responses_request</code> reads
               <code>prompt.base_instructions.text</code> into
               <code>instructions</code>. The prompt caching test suite submits
               two ordinary turns and checks that <code>instructions</code>
@@ -275,8 +250,7 @@ Responses request
             <h3>3.2 Tools Are Prefix Material</h3>
             <p>
               OpenAI docs say tool definitions can be cached and count toward
-              the eligibility threshold. Codex converts <code>prompt.tools</code>
-              into the Responses <code>tools</code> field. Parts IV and VII
+              the eligibility threshold. Ordinary Responses converts <code>prompt.tools</code> into the top-level <code>tools</code> field; Responses Lite places <code>AdditionalTools</code> in input. Both use the tool router captured by the current StepContext. Parts IV and VII
               already showed why that list can be large: core tools, MCP tools,
               deferred tool search, dynamic tools, and plugin or skill supplied
               capabilities all feed the model-visible tool list.
@@ -299,6 +273,18 @@ Responses request
               demonstrates the effect: the second request preserves the first
               request's input prefix and appends the next user message.
             </p>
+
+            <h3>3.4 Request shape and WebSocket deltas are separate choices</h3>
+            <p><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L869-L931">The builder</a> has two request shapes. Ordinary Responses sends top-level instructions and tools. Responses Lite prepends <code>AdditionalTools</code> and base-instruction messages to input, leaving top-level instructions empty and tools absent. Prefix item ids are stable hashes within a thread namespace. Tool eligibility and the minimum cacheable length still depend on the model.</p>
+            <p><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L1376-L1443">WebSocket continuation</a> compares the complete logical request. When non-input properties are compatible and previous input plus returned output remains a prefix, it sends only new input with <code>previous_response_id</code>. Compaction, configuration changes, or a prefix mismatch can require full input. A full network payload does not imply a complete cache miss.</p>
+            <pre><code class="language-text">shape-level, fields omitted:
+Ordinary Responses: instructions + tools + input
+Responses Lite: input = AdditionalTools + base instructions + history
+
+Logical input: S + prior output + new tool result
+Reusable WebSocket continuation: previous_response_id + new tool result
+No continuation: full input
+Cache result: observe usage separately from transmitted bytes</code></pre>
 
             <h2>4. Dynamic Tail: Change Later, Not Earlier</h2>
             <p>
@@ -363,18 +349,11 @@ Responses request
               grows too large, Codex still has to compact. <code>ContextManager</code>
               stores token usage, estimates counts, and bumps
               <code>history_version</code> when history is rewritten. The
-              <code>get_context_remaining</code> tool exposes the remaining
-              window by subtracting active token usage from the model context
-              window.
+              <code>get_context_remaining</code> tool reports the smaller remaining allowance across the auto-compact scope and effective full window, using the shared context-window status.
             </p>
 
             <p>
-              In remote compaction v2, Codex clones history, reads base
-              instructions, and trims function-call history to fit the window
-              before building the compact request. The compact path then reuses
-              the same shared request fields. Tests assert that the compact
-              request carries a string <code>prompt_cache_key</code> and that it
-              matches the normal Responses request.
+              The current remote compact v2 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact_remote_v2_attempt.rs#L30-L121">attempt</a> clones history, trims tool outputs to fit the window, retains history metadata, and appends <code>CompactionTrigger</code>. It uses the shared ModelClientSession streaming path. <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact_remote_v2.rs#L387-L502">Collection</a> requires <code>response.completed</code> and exactly one compaction output before replacement history can be installed. Sending a request, receiving an output item, and installing a checkpoint are distinct states.
             </p>
 
             <div class="note key-point">
@@ -500,7 +479,7 @@ Responses request
             <p>
               The next part returns to persistence and recovery: how Codex writes
               a turn into rollout, reconstructs history from <code>RolloutItem</code>,
-              handles rollback, fork, compact transitions, and token usage. That
+              handles historical rollback markers, fork, compact transitions, and token usage. That
               connects what the user saw, what disk retained, and
               what the model sees on the next turn.
             </p>
@@ -510,28 +489,28 @@ Responses request
               <li><a href="https://developers.openai.com/api/docs/guides/prompt-caching">OpenAI Prompt caching guide</a></li>
               <li><a href="https://developers.openai.com/cookbook/examples/prompt_caching_201">OpenAI Prompt Caching 201</a></li>
               <li><a href="https://developers.openai.com/api/docs/guides/latest-model">OpenAI latest model guide: reasoning models and prompt caching</a></li>
-              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex pinned source snapshot</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client_common.rs#L18-L87"><code>Prompt</code> and <code>get_formatted_input_for_request()</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L207-L236"><code>ModelClient</code> and turn-scoped <code>ModelClientSession</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L355-L367"><code>with_prompt_cache_key_override()</code> and default thread id key</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L705-L758"><code>build_responses_request()</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/codex-api/src/common.rs#L182-L224"><code>ResponsesApiRequest</code> and websocket request mapping</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/session.rs#L1022-L1038">session model client initialization and Guardian override</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L145-L225"><code>run_turn</code> request input construction</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L32-L114"><code>ContextManager</code>, <code>reference_context_item</code>, and <code>for_prompt()</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context_manager/history.rs#L249-L321">token usage update and local estimation</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1989-L2024"><code>TokenUsageInfo</code> and <code>TokenCountEvent</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tasks/mod.rs#L335-L393">turn start token usage snapshot</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tasks/mod.rs#L646-L721">turn completion cached / non-cached token usage</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tasks/mod.rs#L728-L751">turn duration and time-to-first-token event</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/get_context_remaining.rs#L78-L90"><code>get_context_remaining</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact_remote_v2.rs#L179-L239">remote compaction v2 prompt construction</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/client.rs#L455-L485">compact request reuses <code>prompt_cache_key</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L110-L220">prompt caching tests: stable tools and instructions</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L304-L399">prompt caching tests: reused contextual prefix</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L401-L529">prompt caching tests: thread settings overrides</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/prompt_caching.rs#L690-L816">prompt caching tests: per-turn overrides</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/tests/suite/compact_remote.rs#L727-L743">remote compact tests: matching <code>prompt_cache_key</code></a></li>
+              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">openai/codex pinned source snapshot</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client_common.rs#L20-L67"><code>Prompt</code> and <code>get_formatted_input_for_request()</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L249-L283"><code>ModelClient</code> and turn-scoped <code>ModelClientSession</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L549-L583"><code>with_session_options()</code> and session / internal-family keys</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L869-L985"><code>build_responses_request()</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/codex-api/src/common.rs#L259-L308"><code>ResponsesApiRequest</code> and websocket request mapping</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/session.rs#L1684-L1720">session model client initialization and Guardian override</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L177-L456"><code>run_turn</code> request input construction</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/history.rs#L74-L476"><code>ContextManager</code>, <code>reference_context_item</code>, and <code>for_prompt()</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/history.rs#L718-L794">token usage update and local estimation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L2305-L2340"><code>TokenUsageInfo</code> and <code>TokenCountEvent</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tasks/mod.rs#L308-L362">turn start token usage snapshot</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tasks/mod.rs#L714-L773">turn completion cached / non-cached token usage</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tasks/mod.rs#L803-L837">turn duration and time-to-first-token event</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/handlers/get_context_remaining.rs#L81-L91"><code>get_context_remaining</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact_remote_v2_attempt.rs#L30-L121">remote compaction v2 prompt construction</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact_remote_v2_attempt.rs#L30-L121">compact attempt and the shared request path</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/tests/suite/prompt_caching.rs#L132-L287">prompt caching tests: stable tools and instructions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/tests/suite/prompt_caching.rs#L383-L476">prompt caching tests: reused contextual prefix</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/tests/suite/prompt_caching.rs#L478-L602">prompt caching tests: thread settings overrides</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/tests/suite/prompt_caching.rs#L751-L879">prompt caching tests: per-turn overrides</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact_remote_v2_attempt.rs#L30-L121">remote compact v2 shared sampling path</a></li>
             </ul>
           </section>
         </article>
