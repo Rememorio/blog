@@ -151,8 +151,8 @@ User-visible state: 6 / 8 shots complete</code></pre>
               <li><strong>Create the job:</strong> the business API starts a Workflow Execution with a stable business ID, then it can return the HTTP response.</li>
               <li><strong>Record the starting point:</strong> Temporal writes “this music video started” before handing a small decision task to a Worker.</li>
               <li><strong>Decide the next step:</strong> the Worker runs the Workflow; seeing no treatment yet, the Workflow schedules a “write treatment” Activity.</li>
-              <li><strong>Touch the real world:</strong> another Worker runs the Activity and calls the LLM or video provider; the returned result is recorded in history.</li>
-              <li><strong>Wait and hand off:</strong> shot generation holds no Worker open. When a callback, timer, or poll result arrives, any available Worker can read history and decide what follows.</li>
+              <li><strong>Touch the real world:</strong> an Activity Worker runs the Activity and calls the LLM or video provider; the returned result is recorded in history.</li>
+              <li><strong>Wait and hand off:</strong> separating submission from waiting leaves no Activity Worker occupied during remote generation. When a callback, timer, or poll result arrives, a compatible Worker polling the right queue can continue.</li>
               <li><strong>Finish and observe:</strong> composition writes the video to object storage, a notification Activity sends the message, and a reopened browser queries the same execution ID.</li>
             </ol>
 
@@ -174,9 +174,9 @@ User-visible state: 6 / 8 shots complete</code></pre>
               <p>
                 <strong>Source scope.</strong>
                 Temporal platform semantics come from official documentation and the fixed
-                <a href="https://github.com/temporalio/temporal/tree/752e480a9882fee372ba3db28b9aa78d70ec686e">temporalio/temporal source snapshot</a>.
+                <a href="https://github.com/temporalio/temporal/tree/ea83bf5f6d85d2e9a6236e948bc56ef36d1aa24a">temporalio/temporal source snapshot</a>.
                 The tRPC-Agent-Go comparison uses its
-                <a href="https://github.com/trpc-group/trpc-agent-go/tree/8f8042aa8350b0fb37c93873cef1f343d462dc7a">public source snapshot</a>.
+                <a href="https://github.com/trpc-group/trpc-agent-go/tree/e76458566eece2ca33c3da28fadd1691929fb46a">public source snapshot</a>.
                 Temporal's source cannot show provider-side deduplication, cancellation, or callback internals, so this article states what the integration must handle itself.
               </p>
             </div>
@@ -204,7 +204,7 @@ User-visible state: 6 / 8 shots complete</code></pre>
               Now map the job card to implementation. The start request does not send that whole teaching record verbatim. It answers three ordinary questions: which business job is this, which workflow rules govern it,
               and which group of Workers can handle it. The SDK expresses those answers as Workflow ID, Workflow Type, Task Queue, and input before calling <code>StartWorkflowExecution</code>.
               The repository README is explicit that this repository contains the
-              <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/README.md#L64-L65">Temporal Server</a>;
+              <a href="https://github.com/temporalio/temporal/blob/ea83bf5f6d85d2e9a6236e948bc56ef36d1aa24a/README.md#L64-L65">Temporal Server</a>;
               language SDKs implement Workflows, Activities, and Workers. Temporal is a platform plus SDKs, not an imported library that silently takes over arbitrary goroutines.
             </p>
 
@@ -216,9 +216,16 @@ User-visible state: 6 / 8 shots complete</code></pre>
             <h3>3.1 Frontend creates an execution instead of holding a connection</h3>
             <p>
               The service entry point
-              <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/frontend/workflow_handler.go#L532-L565"><code>WorkflowHandler.StartWorkflowExecution</code></a>
+              <a href="https://github.com/temporalio/temporal/blob/ea83bf5f6d85d2e9a6236e948bc56ef36d1aa24a/service/frontend/workflow_handler.go#L546-L585"><code>WorkflowHandler.StartWorkflowExecution</code></a>
               prepares the request, resolves the namespace, and delegates creation to History Service. Its comment says that the call creates a
               <code>WorkflowExecutionStarted</code> event and schedules the first Workflow Task. Once Start succeeds, a connected browser is no longer a condition for execution.
+            </p>
+
+            <p>
+              Business identity differs from one run: <a href="https://docs.temporal.io/workflow-execution/workflowid-runid">Workflow ID and Run ID</a>
+              identify the business flow and a particular run respectively. Within a Namespace, only one execution with a given Workflow ID can be open at once;
+              Continue-As-New or a Workflow Retry creates a new Run ID. For duplicate start requests, Conflict Policy handles an open execution,
+              while Reuse Policy and retention constrain reuse after closure. A stable business ID matters, but it is not a permanent deduplication table.
             </p>
 
             <h3>3.2 History records facts before Workers advance them</h3>
@@ -226,7 +233,7 @@ User-visible state: 6 / 8 shots complete</code></pre>
               History Service maintains mutable state and an append-only Event History for each Workflow Execution.
               The architecture document states the central design directly: complete workflow state can be rebuilt through replay;
               Workflow code must be deterministic and side-effect free, while Activity code must be idempotent or explicitly non-retryable.
-              See <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/docs/architecture/README.md#L17-L35"><code>docs/architecture/README.md</code></a>.
+              See <a href="https://github.com/temporalio/temporal/blob/ea83bf5f6d85d2e9a6236e948bc56ef36d1aa24a/docs/architecture/README.md#L17-L35"><code>docs/architecture/README.md</code></a>.
             </p>
 
             <p>
@@ -244,19 +251,33 @@ Workflow Worker -> Temporal Service
 Temporal Service -> Event History
   ActivityTaskScheduled
 Activity Worker -> Temporal Service
+  RespondActivityTaskCompleted(result_ref=object://mv-42/treatment.json)
+Temporal Service -> Event History
   ActivityTaskCompleted(result_ref=object://mv-42/treatment.json)
 
 Workflow Worker -> Temporal Service
   Command: ScheduleActivity(submit-scene-03)
 Activity Worker -> Temporal Service
+  RespondActivityTaskCompleted(provider_job_id=vid-8831)
+Temporal Service -> Event History
   ActivityTaskCompleted(provider_job_id=vid-8831)
 Webhook API -> Temporal Service
+  SignalWorkflowExecution(scene-03-ready, artifact_ref=object://mv-42/scene-03.mp4)
+Temporal Service -> Event History
   WorkflowExecutionSignaled(scene-03-ready, artifact_ref=object://mv-42/scene-03.mp4)</code></pre>
+
+            <p>
+              API calls and history events come from different actors. An Activity Worker reports completion; the server's
+              <a href="https://github.com/temporalio/temporal/blob/ea83bf5f6d85d2e9a6236e948bc56ef36d1aa24a/service/history/api/respondactivitytaskcompleted/api.go#L111-L127"><code>RespondActivityTaskCompleted</code> handler</a>
+              appends the completion event and requests another Workflow Task. Completion of a submission Activity means it obtained a provider job ID, not that the video exists.
+              Likewise, <a href="https://github.com/temporalio/temporal/blob/ea83bf5f6d85d2e9a6236e948bc56ef36d1aa24a/service/history/api/signalworkflow/api.go#L87-L105">recording a Signal in history</a>
+              acknowledges delivery; processing the message, validating the artifact, and advancing Workflow state happen afterward.
+            </p>
 
             <p>
               A Worker takes the Workflow Task, replays the Workflow function until it waits on an Activity, Timer, Signal, or Child Workflow,
               and returns Commands describing what should happen next. Matching's
-              <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/matching/matching_engine.go#L668-L735"><code>PollWorkflowTaskQueue</code></a>
+              <a href="https://github.com/temporalio/temporal/blob/ea83bf5f6d85d2e9a6236e948bc56ef36d1aa24a/service/matching/matching_engine.go#L696-L752"><code>PollWorkflowTaskQueue</code></a>
               shows how replaceable Workers poll Matching and receive queued work.
             </p>
 
@@ -296,7 +317,7 @@ Webhook API -> Temporal Service
                 <tbody>
                   <tr><td>Write and split the treatment</td><td>LLM Activity returning structured shots.</td><td>The recorded result prevents repeated LLM calls during replay.</td></tr>
                   <tr><td>Submit each shot</td><td>One Activity or Child Workflow per shot.</td><td>Independent retry, rate limits, cancellation, and visibility.</td></tr>
-                  <tr><td>Wait for generation</td><td>Signal/webhook, async completion, or polling Activity.</td><td>Waiting consumes no dedicated Worker thread.</td></tr>
+                  <tr><td>Wait for generation</td><td>Signal/webhook, async completion, or short polling Activities separated by Workflow Timers.</td><td>Durable waiting occupies no Activity Worker; each poll performs one status query.</td></tr>
                   <tr><td>Compose and upload</td><td>Long Activity writing to object storage.</td><td>History stores URIs and metadata, not video bytes.</td></tr>
                   <tr><td>Notify the user</td><td>Separate idempotent Activity.</td><td>A composition retry should not resend notifications.</td></tr>
                 </tbody>
@@ -321,13 +342,20 @@ Webhook API -> Temporal Service
             <p>
               Event History does not serialize a Worker stack. It records state transitions accepted by the Service.
               A new Worker starts the Workflow function from the beginning; the SDK supplies recorded Activity results, Timers, and Signals and checks generated Commands against history.
-              Real forward progress begins only at the first action that has no recorded outcome.
+              Completed Activity results are reused; running steps and pending retries continue according to their own recorded state.
             </p>
 
             <figure class="figure">
-              <img src="assets/replay-recovery.png" alt="Worker A crashes, Worker B replays Event History, skips completed work, and resumes at the first unrecorded action" />
-              <figcaption>Replay reruns Workflow code that remains compatible with old history, not Activities whose completed results are already recorded.</figcaption>
+              <img src="assets/replay-recovery.png" alt="Sequential recovery example: Worker B replays Workflow code, reuses recorded Activity A and Timer outcomes, and continues Activity B after Worker A crashes" />
+              <figcaption>This is a sequential example: “skip” means not repeating completed Activities, not skipping Workflow code. Parallel shots recover according to their own completed, running, or retrying state.</figcaption>
             </figure>
+
+            <p>
+              Return to the eight parallel shots: six are complete, scene-03 is queued at the provider, and scene-08 awaits retry.
+              A new Worker neither resubmits all eight nor resumes only one “next step.” It reuses six results, keeps waiting for scene-03,
+              and lets scene-08 follow its retry policy; composition starts after every shot passes acceptance.
+              Losing a Workflow Worker alone does not require recreating an Activity that was already scheduled and is still pending.
+            </p>
 
             <h3>5.1 Browser, Workflow Worker, and Activity Worker failures differ</h3>
             <div class="table-wrap">
@@ -348,7 +376,12 @@ Webhook API -> Temporal Service
               The official failure guide explains Start-To-Close timeout and heartbeat payload recovery:
               <a href="https://docs.temporal.io/encyclopedia/detecting-activity-failures">Detecting Activity Failures</a>.
               The server entry point documents the same liveness/progress split in
-              <a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/service/history/history_engine.go#L630-L641"><code>RecordActivityTaskHeartbeat</code></a>.
+              <a href="https://github.com/temporalio/temporal/blob/ea83bf5f6d85d2e9a6236e948bc56ef36d1aa24a/service/history/history_engine.go#L667-L676"><code>RecordActivityTaskHeartbeat</code></a>.
+            </p>
+
+            <p>
+              A heartbeat is a recovery hint, not a promise that every frame is durable. SDKs may coalesce reports, so a later attempt can read only details the Service actually received.
+              The compositor must still safely repeat its last chunk. Record live UI progress separately; a heartbeat is not a Workflow business-completion event.
             </p>
 
             <h3>5.2 Processes may change; the Workflow semantics behind old executions cannot change arbitrarily</h3>
@@ -409,7 +442,7 @@ A safe rollout must answer:
             <h3>6.2 Cancellation is a cooperation protocol, not remote kill</h3>
             <p>
               Workflow cancellation can stop unscheduled work and propagate cancellation to running Activities.
-              An Activity must heartbeat or check its context to receive it promptly; the provider must expose a cancellation API before business code can stop the remote GPU job.
+              The remote long-running Activities used here receive server cancellation through heartbeats; business code must then observe its context and exit. Checking a local context alone does not replace heartbeating, and heartbeat throttling may delay delivery. The provider must also expose a cancellation API before business code can stop the remote GPU job.
               “Canceled in Temporal” therefore does not automatically mean “all external compute stopped instantly.”
             </p>
 
@@ -445,7 +478,7 @@ if any acceptance gate fails
 
             <figure class="figure">
               <img src="assets/trpc-temporal-layers.png" alt="Temporal preserves workflow state, queue, and recovery while tRPC-Agent-Go runs agent graph, model, and tools inside replaceable Workers" />
-              <figcaption>A natural composition lets Temporal preserve job identity, retries, and waits while tRPC-Agent-Go runs models, tools, and the Agent graph.</figcaption>
+              <figcaption>This is an integration design, not a bundled Temporal adapter: Temporal preserves job identity, retries, and waits; tRPC-Agent-Go runs models, tools, and the Agent graph. The deployment platform replaces Worker processes.</figcaption>
             </figure>
 
             <h3>7.1 The durable-looking pieces already in tRPC-Agent-Go</h3>
@@ -459,7 +492,7 @@ if any acceptance gate fails
                 <thead><tr><th>Capability</th><th>Status in the snapshot</th><th>What it solves now</th><th>What it does not automatically solve</th></tr></thead>
                 <tbody>
                   <tr><td><code>WithDetachedCancel</code></td><td>An implemented RunOption.</td><td>A run can survive parent cancellation inside the current process.</td><td>Process restart and multi-node recovery.</td></tr>
-                  <tr><td>Dynamic Workflow</td><td>Implemented; documented as a foreground, one-shot first version.</td><td>Temporary Python orchestration across Agents.</td><td>It does not persist execution state for cross-process recovery.</td></tr>
+                  <tr><td>Dynamic Workflow</td><td>Implemented; still foreground and one-shot, with local and sandbox Runtimes.</td><td>Temporary Python orchestration across Agents, with optional guest process isolation.</td><td>It does not persist execution state for cross-process recovery.</td></tr>
                   <tr><td>Graph checkpoint</td><td>An implemented checkpoint / resume mechanism.</td><td>State/frontier persistence, explicit resume, and time travel.</td><td>Detecting a dead executor, assigning its work elsewhere, and retrying external Activities.</td></tr>
                   <tr><td><code>taskrun.Controller</code></td><td>The interface exists; the bundled controller is in-process.</td><td>Run ID, status, wait, cancel, and child sessions.</td><td>Distributed storage, queue, lease, and takeover belong to the product.</td></tr>
                 </tbody>
@@ -468,16 +501,24 @@ if any acceptance gate fails
 
             <p>
               The source makes these conclusions explicit.
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/agent/invocation.go#L674-L684"><code>WithDetachedCancel</code></a>
-              changes parent-context cancellation propagation only. Dynamic Workflow calls its first version
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/docs/mkdocs/en/dynamic-workflow.md#L330-L346">foreground and one-shot</a>;
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/e76458566eece2ca33c3da28fadd1691929fb46a/agent/invocation.go#L675-L685"><code>WithDetachedCancel</code></a>
+              changes parent-context cancellation propagation only. Dynamic Workflow still describes execution as
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/e76458566eece2ca33c3da28fadd1691929fb46a/docs/mkdocs/en/dynamic-workflow.md#L470-L493">foreground and one-shot</a>;
               the Graph documentation presents checkpoints as the basis for
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/docs/mkdocs/en/graph.md#L78-L84">explicit recovery and time travel</a>;
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/e76458566eece2ca33c3da28fadd1691929fb46a/docs/mkdocs/en/graph.md#L104-L109">explicit recovery and time travel</a>;
               taskrun says a multi-node controller needs
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/docs/mkdocs/en/taskrun.md#L7-L23">external storage, queues, leases, and cross-node cancellation</a>;
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/e76458566eece2ca33c3da28fadd1691929fb46a/docs/mkdocs/en/taskrun.md#L7-L23">external storage, queues, leases, and cross-node cancellation</a>;
               and the bundled FileStore's
-              <a href="https://github.com/trpc-group/trpc-agent-go/blob/8f8042aa8350b0fb37c93873cef1f343d462dc7a/agent/taskrun/inprocess/store.go#L163-L180"><code>normalizeLoadedRuns</code></a>
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/e76458566eece2ca33c3da28fadd1691929fb46a/agent/taskrun/inprocess/store.go#L163-L180"><code>normalizeLoadedRuns</code></a>
               marks unfinished runs as interrupted by a prior runtime restart instead of resuming them.
+            </p>
+
+            <p>
+              For example, the current <a href="https://github.com/trpc-group/trpc-agent-go/blob/e76458566eece2ca33c3da28fadd1691929fb46a/tool/dynamicworkflow/sandbox.go#L21-L66"><code>SandboxRunner.ExecuteWorkflow</code></a>
+              starts a fresh isolated Python guest for each call and passes an optional timeout context to the guest and host callbacks.
+              This improves generated-code isolation without turning Python control flow into replayable history. Persisted child Agent events in a Session do not let a restarted process resume at the next Python line;
+              <a href="https://github.com/trpc-group/trpc-agent-go/blob/e76458566eece2ca33c3da28fadd1691929fb46a/docs/mkdocs/en/dynamic-workflow.md#L490-L493">external side effects already performed do not roll back automatically</a> either.
+              Treat script isolation, conversation persistence, and execution recovery as separate capabilities when deciding which layer remains missing.
             </p>
 
             <h3>7.2 Coarse and fine-grained integrations</h3>
@@ -494,7 +535,7 @@ if any acceptance gate fails
                 <thead><tr><th>Integration</th><th>Representative durable unit</th><th>What Temporal records</th><th>After a mid-run Worker crash</th></tr></thead>
                 <tbody>
                   <tr><td>Coarse</td><td>Whole Agent run: run ID, input reference, idempotency scope.</td><td>One Activity's scheduled / completed facts and final artifact reference.</td><td>If the result never reached history, the whole <code>runner.Run</code> attempt may repeat.</td></tr>
-                  <tr><td>Fine-grained</td><td>One logical step: scene ID, tool/model operation, stable effect key.</td><td>Each step's result reference, wait point, and completion fact.</td><td>Only the first unrecorded step continues, but the Agent loop must become an explicit replayable state machine.</td></tr>
+                  <tr><td>Fine-grained</td><td>One logical step: scene ID, tool/model operation, stable effect key.</td><td>Each step's result reference, wait point, and completion fact.</td><td>Recorded step results are reused and unfinished branches continue; the Agent loop must become an explicit replayable state machine.</td></tr>
                 </tbody>
               </table>
             </div>
@@ -565,14 +606,14 @@ if any acceptance gate fails
 
             <h2 id="sources">Sources</h2>
             <ul>
-              <li><a href="https://github.com/temporalio/temporal/tree/752e480a9882fee372ba3db28b9aa78d70ec686e">temporalio/temporal fixed source snapshot</a></li>
-              <li><a href="https://github.com/temporalio/temporal/blob/752e480a9882fee372ba3db28b9aa78d70ec686e/docs/architecture/README.md">Temporal Server architecture</a></li>
+              <li><a href="https://github.com/temporalio/temporal/tree/ea83bf5f6d85d2e9a6236e948bc56ef36d1aa24a">temporalio/temporal fixed source snapshot</a></li>
+              <li><a href="https://github.com/temporalio/temporal/blob/ea83bf5f6d85d2e9a6236e948bc56ef36d1aa24a/docs/architecture/README.md">Temporal Server architecture</a></li>
               <li><a href="https://docs.temporal.io/workflow-execution">Temporal Workflow Execution</a></li>
               <li><a href="https://docs.temporal.io/activities">Temporal Activities</a></li>
               <li><a href="https://docs.temporal.io/encyclopedia/detecting-activity-failures">Activity failure detection and heartbeat</a></li>
               <li><a href="https://docs.temporal.io/encyclopedia/workflow-message-passing">Signals, Queries, and Updates</a></li>
               <li><a href="https://docs.temporal.io/production-deployment/worker-deployments">Temporal Worker Deployments</a></li>
-              <li><a href="https://github.com/trpc-group/trpc-agent-go/tree/8f8042aa8350b0fb37c93873cef1f343d462dc7a">trpc-group/trpc-agent-go fixed source snapshot</a></li>
+              <li><a href="https://github.com/trpc-group/trpc-agent-go/tree/e76458566eece2ca33c3da28fadd1691929fb46a">trpc-group/trpc-agent-go fixed source snapshot</a></li>
             </ul>
           </section>
         </article>
