@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -108,9 +109,12 @@ func TestTransportReusesConnectionAfterBodyEOF(t *testing.T) {
 	}
 }
 
-func TestEarlyBodyClosePreventsHTTP1Reuse(t *testing.T) {
+func TestEarlyLargeBodyClosePreventsHTTP1Reuse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "response body must reach EOF")
+		// A declared body larger than the drain budget is not eligible for
+		// the bounded early-close drain used by newer transports.
+		w.Header().Set("Content-Length", "262145")
+		_, _ = io.WriteString(w, strings.Repeat("x", (256<<10)+1))
 	}))
 	t.Cleanup(server.Close)
 
