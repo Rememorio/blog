@@ -104,7 +104,7 @@
               <span>Scope: public mirror and official docs</span>
             </div>
             <figure class="hero-image">
-              <img src="../assets/fork-cache-prefix.png" alt="Hand-drawn prompt cache prefix showing stable parent prefix and fork-specific suffix" />
+              <img src="../assets/fork-cache-prefix.png" alt="One-off internal fork sharing parent prefix S and appending task F after the cache marker; F remains uncached input without a cache-tail write" />
             </figure>
           </section>
 
@@ -128,11 +128,22 @@ content replacement / cache_edits
               <figcaption>Source shape: a marker identifies a reusable prefix, but only stable request content makes that prefix reusable.</figcaption>
             </figure>
 
-            <h2>1. Cache markers are only part of the request</h2>
-            <p><code>getCacheControl()</code> produces an ephemeral marker and may add a one-hour TTL or global scope. <code>buildSystemPromptBlocks()</code> places a marker on the system blocks, while <code>addCacheBreakpoints()</code> adds at most one message-level marker. A normal request marks its final message. With <code>skipCacheWrite</code>, Claude Code moves the marker to the preceding message so a short-lived fork can read the shared parent prefix without writing its private suffix.</p>
+            <p>This article verifies the public mirror’s fixed March 31, 2026 snapshot at one immutable commit. The mirror is not Anthropic’s official source repository and does not establish later product behavior. Client implementation, official API contracts, and provider-side inference remain separate.</p>
 
-            <p>The TTL choice is itself kept stable. <code>should1hCacheTTL()</code> records user eligibility and allowlist state in bootstrap state instead of reevaluating a changing experiment or overage condition on every turn. Otherwise the marker could alternate between the default TTL and one hour even when all prompt text remained identical.</p>
-            <figure class="figure"><img src="../assets/prompt-cache-api-view.png" alt="Provider request with system blocks, tool schemas, messages, cache markers, and a changing suffix" /><figcaption>The provider receives request blocks, headers, and model options; the local transcript is only an input to that request.</figcaption></figure>
+            <h2>1. Cache markers are only part of the request</h2>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L360-L373"><code>getCacheControl()</code></a> produces an ephemeral marker and may add a one-hour TTL or global scope. The conditional <code>scope: "global"</code> field is visible in this client; it is not a universal public API contract. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L3213-L3237"><code>buildSystemPromptBlocks()</code></a> places a marker on the system blocks, while <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L3062-L3211"><code>addCacheBreakpoints()</code></a> adds at most one message-level marker. A normal request marks its final message. With <code>skipCacheWrite</code>, Claude Code moves the marker to the preceding message so a short-lived fork can read the shared parent prefix without writing its private suffix.</p>
+
+            <p>The TTL choice is itself kept stable. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L376-L430"><code>should1hCacheTTL()</code></a> first returns true for Bedrock with an explicit <code>ENABLE_PROMPT_CACHING_1H_BEDROCK</code> opt-in. Other paths latch user eligibility and allowlist state in bootstrap state on first use instead of reevaluating a changing experiment or overage condition on every turn. Otherwise the marker could alternate between the default TTL and one hour even when all prompt text remained identical. Source comments treat that as a cache risk; this does not prove that every provider uses identical TTL cache-key rules.</p>
+
+
+            <figure class="shape-example"><pre><code class="language-text">main turn:
+  S = system + tools + stable history
+  U = current user turn; marker after S + U
+fire-and-forget fork:
+  S = shared parent prefix
+  F = fork-only task; marker after S, before F
+example F:
+  a compact summary instruction, still sent as uncached input</code></pre><figcaption>The parent will not resume from S + F. Moving the marker avoids writing that side-task tail; it does not omit the task from the request.</figcaption></figure>
 
             <h2>2. Dynamic material is kept out of the stable prefix when possible</h2>
             <p>Deferred tools and late Chrome instructions illustrate the problem. Prepending a fresh meta message whenever tools appear would change every later byte. When delta attachments are enabled, Claude Code emits <code>deferred_tools_delta</code> or <code>mcp_instructions_delta</code> instead of repeatedly changing earlier messages or the system prompt.</p>
@@ -151,51 +162,80 @@ content replacement / cache_edits
             </tbody></table></div>
 
             <h2>3. Fork children copy the parent prefix exactly</h2>
-            <p>A fork child inherits the parent's rendered system prompt, exact tool array, messages, non-interactive setting, and thinking configuration. <code>buildForkedMessages()</code> copies the parent assistant message and placeholder tool results, then appends a directive and task for that child.</p>
-            <figure class="figure"><img src="../assets/fork-cache-prefix.png" alt="Fork child sharing the parent system prompt, tools, thinking settings, and messages before a child-specific suffix" /><figcaption>The expensive parent prefix stays unchanged; only the task-specific tail differs.</figcaption></figure>
+            <p>A fork child inherits the parent's rendered system prompt, exact tool array, messages, non-interactive setting, and thinking configuration. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L483-L541"><code>buildForkedMessages()</code></a> copies the parent assistant message and placeholder tool results, then appends a directive and task for that child.</p>
+
 
             <p>This is why a fork is intentionally unlike a normal subagent. Rebuilding worker tools under another permission mode could change serialized tool definitions at the first schema. A new system prompt or thinking setting would do the same. <code>useExactTools: true</code> preserves those request fields instead.</p>
+
+            <p>Two implementations should remain distinct: the preceding explanation describes an <code>AgentTool</code> fork child, while the cover focuses on one-off internal <code>runForkedAgent()</code> calls such as compact summaries. Both preserve shared parameters; transcript writing, tool restrictions, and <code>skipCacheWrite</code> depend on the caller, so the cover is not a rule for every subagent.</p>
 
             <h2>4. Full compact and cached microcompact take different approaches</h2>
             <p>Full compact summarizes older work and creates a new prefix for later turns. The summary request can still reuse the current session's cached prefix through its fork-like path. Once the summary is installed, however, future requests naturally use the new compacted history.</p>
 
-            <p>Cached microcompact tries to shorten old tool results without rewriting local messages. When the service cache is likely still useful and the current model and thread support the feature, <code>cachedMicrocompactPath()</code> leaves message content untouched, queues <code>cache_edits</code>, and adds <code>cache_reference</code> blocks while converting the provider request. If the cache is probably expired, Claude Code can clear old result content directly because the full prefix will be written again anyway.</p>
-            <figure class="figure"><img src="../assets/prompt-cache-microcompact.png" alt="Full compact creating a new prefix and cached microcompact applying cache references and edits" /><figcaption>Cached microcompact edits the provider-side cached material without mutating the local transcript on every turn.</figcaption></figure>
+            <p>Cached microcompact tries to shorten old tool results without rewriting local messages. When the service cache is likely still useful and the current model and thread support the feature, <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/microCompact.ts#L295-L399"><code>cachedMicrocompactPath()</code></a> leaves message content untouched, queues <code>cache_edits</code>; the API adapter later adds <code>cache_reference</code> fields to tool-result blocks. Queuing is only a deletion request: <code>cache_deleted_input_tokens</code> from the response, minus its earlier cumulative value, provides the reported per-operation result. If the cache is probably expired, Claude Code can clear old result content directly because the full prefix will be written again anyway.</p>
+
 
             <p>Pending edits are consumed before <code>paramsFromContext</code> can be called by logging, retry, or fallback code. Consuming the same edit twice during one turn could make retry requests differ from the original attempt.</p>
+
+            <figure class="shape-example"><pre><code class="language-text">cache-edit state transition (simplified):
+old tool_result: tool_use_id = T, cache_reference = T, original content
+queue this turn: cache_edits → delete(cache_reference = T)
+API assembly: insert and pin edits; retries reuse the same batch
+response: cumulative cache_deleted_input_tokens - prior total = reported deletion
+
+Local transcript retains the result; queuing does not mean deletion completed.</code></pre><figcaption>This is the visible deletion-reference and response-counter contract, not a claim about how the provider recomputes or retains suffix KV states.</figcaption></figure>
 
             <h2>5. Tool-result replacement must repeat the same decision</h2>
             <p>Large tool results can be stored locally and represented by a preview in the model request. The important cache rule is consistency: an old result cannot be full text on one turn and a preview on another, and a regenerated preview cannot differ by a few bytes.</p>
 
-            <p><code>ContentReplacementState</code> records ids that have already been evaluated and the exact preview used for replacements. Later turns reapply the preview through a map lookup without reading the file again. Previously seen results that were not replaced are frozen in that state; only fresh results participate in the next budget decision. Forks that share a prefix clone the replacement state so parent and child serialize the same old results.</p>
-            <figure class="figure"><img src="../assets/prompt-cache-replacement-state.png" alt="Transcript and ContentReplacementState producing the same tool-result previews after resume and fork" /><figcaption>Resume and fork must reconstruct the exact replacement history or the next request prefix changes.</figcaption></figure>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/toolResultStorage.ts#L367-L405"><code>ContentReplacementState</code></a> records ids that have already been evaluated and the exact preview used for replacements. Later turns reapply the preview through a map lookup without reading the file again. Previously seen results that were not replaced are frozen in that state; only fresh results participate in the next budget decision. Forks that share a prefix clone the replacement state so parent and child serialize the same old results.</p>
+
 
             <p>The update around asynchronous file persistence is also kept atomic. If another reader observed an id in <code>seenIds</code> before its replacement appeared, it could send full content while the main thread sends the preview. The same historical result would then have two different wire representations.</p>
 
-            <h2>6. Cache-break detection compares requests with response counters</h2>
-            <p><code>PreviousState</code> records client-visible inputs that can affect reuse: hashes of system blocks, tools, and cache control; tool names; model; fast mode; global strategy; beta headers; overage; microcompact state; effort; extra body; and prior cache-read tokens. Separate tracking keys keep unrelated agents and SDK calls from being compared, while compact shares the main REPL key because its summary path reuses those parameters.</p>
+            <figure class="shape-example"><pre><code class="language-text">replacement decisions (conceptual shape):
+seenIds = {A, B}
+replacements = {B: "saved result location + identical preview"}
+next turn:
+A was seen, no replacement → retain original; do not decide again
+B has a replacement → reuse the exact string without file I/O
+C was never seen → evaluate against this turn's budget
+resume restores decisions; a cache-sharing fork copies them</code></pre><figcaption>The preview is deterministic persisted-result text, not a newly generated summary or an invented automatically resolved URI.</figcaption></figure>
 
-            <p>Before the request, <code>recordPromptState()</code> captures the final sticky headers and excludes deferred-loading tools that will not appear in the prompt. After the response, <code>checkResponseForCacheBreak()</code> compares <code>cache_read_input_tokens</code>. A small or absent drop clears pending changes; a drop expected after cached microcompact deletion is recorded as expected. Only a suspicious decrease is paired with changes in model, system, tools, cache control, headers, effort, or extra body.</p>
-            <figure class="figure"><img src="../assets/prompt-cache-break-detection.png" alt="Previous request fields and cache-read tokens compared with the next response to identify a suspected cache break" /><figcaption>When reuse falls, the client can report which observable request fields changed instead of treating slowdown as a mystery.</figcaption></figure>
+            <h2>6. Cache-break detection compares requests with response counters</h2>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/promptCacheBreakDetection.ts#L28-L99"><code>PreviousState</code></a> records client-visible inputs that can affect reuse: hashes of system blocks, tools, and cache control; tool names; model; fast mode; global strategy; beta headers; overage; microcompact state; effort; extra body; and prior cache-read tokens. Separate tracking keys keep unrelated agents and SDK calls from being compared, while compact shares the main REPL key because its summary path reuses those parameters.</p>
+
+            <p>Before the request, <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1460-L1485"><code>recordPromptState()</code></a> captures the final sticky headers and excludes deferred-loading tools that will not appear in the prompt. After the response, <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/promptCacheBreakDetection.ts#L437-L499"><code>checkResponseForCacheBreak()</code></a> compares <code>cache_read_input_tokens</code>. The first call has no comparison baseline. A later drop must exceed 5% and be at least 2,000 tokens to trigger diagnosis; smaller drops clear pending changes. The explicit cached-microcompact deletion flag instead resets the baseline as an expected decrease. Suspicious decreases are paired with changes in model, system, tools, cache control, headers, effort, or extra body as candidate explanations. This threshold and correlation do not prove causation; provider timing, routing, or eviction may still require server-side evidence.</p>
+            <figure class="figure"><img src="../assets/prompt-cache-break-detection.png" alt="Previous request fields and cache-read tokens compared with the next response to identify a suspected cache break" /><figcaption>The detector separates expected deletion from suspicious decreases and offers investigation clues, not proof of a server-side cache failure.</figcaption></figure>
 
             <h2>7. The practical rule</h2>
             <p>Prompt-cache performance follows the serialized provider request. Stable memory text, ordered tools, sticky headers, exact fork prefixes, deterministic replacements, and carefully placed compact edits all serve the same goal: avoid changing old request bytes unless the underlying information truly changed.</p>
-        
+
+            <table><thead><tr><th>Mechanism</th><th>Cache consequence</th></tr></thead><tbody>
+              <tr><td>Memory</td><td>Reloaded instructions can alter an early request prefix.</td></tr>
+              <tr><td>Context management</td><td>Selection determines the stable history, suffix, and summaries.</td></tr>
+              <tr><td>Tools / MCP</td><td>Schemas and dynamic instructions need deliberate insertion points.</td></tr>
+              <tr><td>Permissions / hooks</td><td>Results and runtime state can change subsequent request material.</td></tr>
+              <tr><td>Subagents / forks</td><td>Independent context and shared-prefix execution have different request rules.</td></tr>
+              <tr><td>Resume / replacement</td><td>Restoration must preserve prior tool-result replacement decisions.</td></tr>
+              <tr><td>Compact / microcompact</td><td>A newly installed summary differs from provider-side cache edits.</td></tr>
+            </tbody></table>
+
             <h2 id="sources">Sources</h2>
             <p>The source-code claims in this article are based on the public mirror and the linked official documentation. Provider-side KV implementation and eviction policy are not inferred from client code.</p>
             <ul>
-                <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic prompt caching docs</a></li>
+                <li><a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">Anthropic prompt caching docs</a></li>
                 <li><a href="../memory-layer/">Claude Code memory chapter</a></li>
-                <li><a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory docs</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L360-L430">Cache control and TTL selection</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1207-L1689">Dynamic tools, global strategy, and sticky headers</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3062-L3237">Message and system cache markers</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts#L449-L474"><code>prependUserContext()</code></a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/claudemd.ts#L790-L910"><code>getMemoryFiles()</code></a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L483-L633">Fork cache-prefix reuse</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L253-L390">Cached microcompact</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L367-L849">Deterministic tool-result replacement</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L28-L481">Cache-break detection</a></li>
+                <li><a href="https://code.claude.com/docs/en/memory">Claude Code memory docs</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L360-L430">Cache control and TTL selection</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1207-L1689">Dynamic tools, global strategy, and sticky headers</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L3062-L3237">Message and system cache markers</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/api.ts#L449-L474"><code>prependUserContext()</code></a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/claudemd.ts#L790-L910"><code>getMemoryFiles()</code></a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L483-L633">Fork cache-prefix reuse</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/microCompact.ts#L253-L390">Cached microcompact</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/toolResultStorage.ts#L367-L849">Deterministic tool-result replacement</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/promptCacheBreakDetection.ts#L28-L481">Cache-break detection</a></li>
             </ul>
           </section>
         </article>

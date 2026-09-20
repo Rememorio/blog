@@ -118,7 +118,7 @@
             <figure class="hero-image">
               <img
                 src="../assets/fork-cache-prefix.png"
-                alt="Claude Code fork path 图，展示父查询和分叉子查询共享 system prompt、tools、thinking config 和 messages prefix，只在尾部追加 fork directive"
+                alt="一次性内部 fork 复用父前缀 S，并在缓存断点之后追加任务 F；F 仍发送，但不写旁路缓存尾部"
               />
             </figure>
           </section>
@@ -152,12 +152,12 @@
 
             <p>
               产品和 API 行为参考 Anthropic
-              <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">prompt caching 文档</a>
+              <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">prompt caching 文档</a>
               与 Claude Code
-              <a href="https://docs.anthropic.com/en/docs/claude-code/overview">官方概览</a>；
+              <a href="https://code.claude.com/docs/en/overview">官方概览</a>；
               源码层来自
               <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
-              本文只讲客户端源码能观察到的请求字段、缓存标记、计数和恢复行为，不推断 provider 内部如何实现 KV 或缓存替换。
+              本文核对的是公开镜像 2026 年 3 月 31 日的固定快照，源码链接指向同一提交。它不是 Anthropic 官方源码仓库，也不能代表此后的产品实现。下文区分客户端可见字段、官方 API 合同和推断，不推导 provider 内部的 KV、缓存驱逐或替换算法。
             </p>
 
             <h2>一、Prompt cache 复用的是稳定前缀</h2>
@@ -169,36 +169,29 @@
 
             <p>
               源码里最直接的 marker 生成在
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L360-L373"><code>getCacheControl()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L360-L373"><code>getCacheControl()</code></a>。
               它返回 <code>{ type: "ephemeral" }</code>，并在符合条件时加上 <code>ttl: "1h"</code>，
               在全局缓存策略允许时加上 <code>scope: "global"</code>。这说明 marker 本身并不神秘：
-              它只是告诉 API 哪个断点值得缓存。真正难的是：下次请求来到同一个断点时，前面的结构还像不像上次。
+              它告诉 API 哪个断点可参与缓存；<code>scope: "global"</code> 属于这份客户端的条件路径，不能直接当作普通公开 API 对所有调用者的合同。真正难的是：下次请求来到同一个断点时，前面的结构还像不像上次。
             </p>
 
             <h3>1.1 TTL 也会影响请求形状</h3>
             <p>
-              一个容易忽略的细节是 TTL。<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L376-L430"><code>should1hCacheTTL()</code></a>
-              不只是查一次功能开关。源码注释明确说，用户资格和 allowlist 会在会话开始时固定到 bootstrap state，
+              一个容易忽略的细节是 TTL。<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L376-L430"><code>should1hCacheTTL()</code></a>
+              并不总走同一条资格检查。Bedrock 调用显式启用 <code>ENABLE_PROMPT_CACHING_1H_BEDROCK</code> 时直接返回 true；其他路径在首次需要时把用户资格和 allowlist 缓存到 bootstrap state，
               目的是避免会话中途 GrowthBook 缓存或 overage 状态变化，导致 <code>cache_control</code>
-              从 5 分钟形状变成 1 小时形状，或者反过来。对 provider 来说，这不是“同一段文本只是缓存时长不同”，
-              而是请求里的 cache marker 变了。
+              从 5 分钟形状变成 1 小时形状，或者反过来。源码注释把这种变化视为缓存风险；能直接确认的是客户端 marker 与选择策略的稳定性，不能据此推导所有 provider 都使用相同的 TTL 缓存键规则。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/prompt-cache-api-view.png"
-                alt="Prompt cache 请求图，展示 UI、transcript、运行时状态、API request 和 provider 看到的 stable prefix"
-              />
-              <figcaption>Prompt cache 命中的是 API request 里的稳定前缀；transcript 和 UI 只是生成请求时使用的材料。</figcaption>
-            </figure>
+
 
             <h3>1.2 system 和 message 各有自己的 marker 位置</h3>
             <p>
               system prompt 的 marker 在
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3213-L3237"><code>buildSystemPromptBlocks()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L3213-L3237"><code>buildSystemPromptBlocks()</code></a>
               里加。源码还留下一个很硬的提醒：不要再为了缓存多加 block，否则可能被 API 拒绝。
               message 侧则由
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3062-L3109"><code>addCacheBreakpoints()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L3062-L3109"><code>addCacheBreakpoints()</code></a>
               控制。它每个请求只放一个 message-level <code>cache_control</code> marker；
               普通请求放在最后一条 message，<code>skipCacheWrite</code> 场景则把 marker 放到倒数第二条，
               让共享前缀可以被读到，但 fork-only 尾巴不留下新的缓存尾部。
@@ -218,7 +211,7 @@ fire-and-forget fork:
   cache marker sits after S, not after S + F</code></pre>
               <figcaption>
                 这只是形状示例，不表示 provider 内部索引。源码事实是：<code>skipCacheWrite</code>
-                会改变 marker index，让短生命周期 fork 读共享前缀而不写入自己的尾巴。
+                会改变 marker index，让短生命周期 fork 读共享前缀而不写入自己的尾巴。<code>F</code> 仍会作为未缓存输入处理；在 compact fork 里它就是摘要任务指令，父对话之后不会从这段旁路尾部继续。
               </figcaption>
             </figure>
 
@@ -231,17 +224,17 @@ fire-and-forget fork:
 
             <p>
               Claude Code 的源码里有很多“为了不动前缀”的小设计。
-              在 API 请求装配中，<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1322-L1345">deferred tools</a>
+              在 API 请求装配中，<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1322-L1345">deferred tools</a>
               原本会被 prepend 成一段 meta user message；注释说如果启用 delta attachment，就改走持久化的
               <code>deferred_tools_delta</code>，因为每次工具池变化都 prepend 会 bust cache。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1347-L1356">Chrome tool-search instructions</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1347-L1356">Chrome tool-search instructions</a>
               也是同样逻辑：Chrome 晚连接时，如果把说明 append 到 system prompt，会打穿 prompt cache，
               所以启用 delta 后挪到 <code>mcp_instructions_delta</code>。
             </p>
 
             <p>
               MCP 和 global cache 的关系也在请求装配处显式处理。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1207-L1230">源码判断</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1207-L1230">源码判断</a>
               全局缓存可用时，如果将要渲染的是用户级、动态的 MCP tool，就不把 marker 放在 system prompt 的全局缓存路径上。
               这不是保守地牺牲性能，而是避免把某个用户的动态工具段误当成全局稳定材料。
             </p>
@@ -303,7 +296,7 @@ fire-and-forget fork:
             <h3>2.1 headers 也要稳定</h3>
             <p>
               很多 cache miss 不来自正文，而来自请求配置。Claude Code 在
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1405-L1458">API 装配中 latch 动态 beta headers</a>：
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1405-L1458">API 装配中 latch 动态 beta headers</a>：
               AFK、fast mode、cache editing、thinking clear 都有各自的 sticky 逻辑。
               注释写得很清楚：一旦某个 header 首次发送，就尽量在本会话余下请求中继续发送，
               以免中途 toggle 改变 server-side cache key。
@@ -311,9 +304,9 @@ fire-and-forget fork:
 
             <p>
               这里的微妙之处是“header 稳定”和“行为仍可动态”并不冲突。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1642-L1657">fast mode</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1642-L1657">fast mode</a>
               的 header 会 latch，<code>speed="fast"</code> 仍然会按 cooldown 动态决定；
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1672-L1689">cache editing</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1672-L1689">cache editing</a>
               的 beta header 会 latch，但是否真的发送 <code>cache_edits</code> 仍由当前 feature 和 provider 条件决定。
               也就是说，源码把“会影响 cache key 的外形”和“本轮实际行为”拆开了。
             </p>
@@ -327,28 +320,24 @@ fire-and-forget fork:
 
             <p>
               这个设计在
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L483-L541"><code>AgentTool.tsx</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L483-L541"><code>AgentTool.tsx</code></a>
               里写得很直白：fork child 继承父级 system prompt，而不是使用 FORK_AGENT 自己的 system prompt；
               <code>buildForkedMessages()</code> 会复制父 assistant message 和占位 tool results，再追加每个 child 自己的 directive。
               到
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L603-L633">组装 <code>runAgent</code> 参数</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L603-L633">组装 <code>runAgent</code> 参数</a>
               时，fork path 还会传父级工具数组、父级消息和 <code>useExactTools: true</code>。
             </p>
 
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L666-L695"><code>runAgent()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L666-L695"><code>runAgent()</code></a>
               继续沿着这个选择走：<code>useExactTools</code> 的 fork child 继承父级
               <code>isNonInteractiveSession</code> 和 <code>thinkingConfig</code>。普通 subagent 则会关闭 thinking 来控输出成本。
               如果把 fork child 当普通 subagent 处理，system、tools、thinking config 任意一个不一致，缓存前缀都可能从第一次不同处断掉。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/fork-cache-prefix.png"
-                alt="Fork path 复制父级前缀图，展示子查询共享 system prompt、tools、thinking config 和 messages prefix，尾部追加 placeholder tool_results、fork directive 和 child task"
-              />
-              <figcaption>Fork path 的关键不是“又启动一个 agent”，而是“共享父级稳定前缀，只替换任务尾巴”。</figcaption>
-            </figure>
+
+
+            <p>还要区分两条实现：上面解释的是 <code>AgentTool</code> 的 fork child；封面则聚焦内部 <code>runForkedAgent()</code> 的一次性摘要等旁路。两者都维护共享参数，但是否写 transcript、是否限制工具、是否设置 <code>skipCacheWrite</code> 由具体调用决定，不能把封面的策略推广到所有 subagent。</p>
 
             <h2>四、Compact：缩短上下文时，也不能随手改旧前缀</h2>
             <p>
@@ -359,14 +348,14 @@ fire-and-forget fork:
             </p>
 
             <p>
-              full compact 也有 cache sharing。<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L431-L458">compact 主流程</a>
+              full compact 也有 cache sharing。<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L431-L458">compact 主流程</a>
               读取 <code>tengu_compact_cache_prefix</code>，默认让 compact summary 的 fork 路径复用主会话 prompt cache。
               这和前面的 fork path 是同一套思想：summary request 是短生命周期 side path，
               它应该读取主会话稳定前缀，而不是把自己当成完全陌生的请求从头开始。
             </p>
 
             <p>
-              cached microcompact 更直接。<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L253-L292"><code>microcompactMessages()</code></a>
+              cached microcompact 更直接。<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/microCompact.ts#L253-L292"><code>microcompactMessages()</code></a>
               先处理时间触发：如果离上一条 assistant message 太久，源码认为服务端缓存可能已经过期，
               这时直接走 content-clear 老工具结果，因为完整前缀反正要重写。只有在 main thread、feature 打开、模型支持、
               缓存仍有意义时，才进入 cached microcompact。
@@ -374,34 +363,36 @@ fire-and-forget fork:
 
             <p>
               cached path 的关键注释在
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L295-L304"><code>cachedMicrocompactPath()</code></a>：
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/microCompact.ts#L295-L304"><code>cachedMicrocompactPath()</code></a>：
               它不修改本地 message content；<code>cache_reference</code> 和 <code>cache_edits</code>
               在 API 层添加；它追踪工具结果并排队 cache edits。
-              真正有删除发生时，
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L332-L390">源码会 queue <code>cache_edits</code></a>，
-              通知 cache break detection 这是预期下降，然后返回未改动的 messages。
+              选出需要删除的引用时，
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/microCompact.ts#L332-L390">源码会 queue <code>cache_edits</code></a>，
+              通知 cache break detection 之后可能出现预期下降，然后返回未改动的 messages。此时只是排队删除意图；实际收益要等 API 响应的 <code>cache_deleted_input_tokens</code>，再扣除前次累计值后才能报告。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/prompt-cache-microcompact.png"
-                alt="Prompt cache compact 图，展示 full compact 建立新前缀，cached microcompact 通过 cache_reference、cache_edits 编辑缓存"
-              />
-              <figcaption>Full compact 会生成新的请求前缀；cached microcompact 则尽量把删除动作推到 API 层，避免直接修改本地历史。</figcaption>
-            </figure>
+
+
+            <figure class="shape-example"><pre><code class="language-text">缓存编辑的简化状态变化：
+旧 tool_result：tool_use_id = T，cache_reference = T，正文不改
+本轮排队：cache_edits → delete(cache_reference = T)
+API 构造：加入并固定 edits 的消息位置；重试复用同一批 edits
+响应之后：累计 cache_deleted_input_tokens - 旧累计值 = 本次报告删除量
+
+本地 transcript 保留工具结果；排队删除不等于服务端已经删除。</code></pre><figcaption>公开快照展示的是删除引用与响应计数合同，不证明 provider 怎样重算或保留后续 KV 状态。</figcaption></figure>
 
             <h3>4.1 cache_edits 不是“本地删消息”</h3>
             <p>
               <code>addCacheBreakpoints()</code> 里可以看到 cache editing 的真正入口。
               它先把正常 message 转成 API param，再在启用 cached microcompact 时
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3112-L3159">去重并插入 <code>cache_edits</code> block</a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L3112-L3159">去重并插入 <code>cache_edits</code> block</a>。
               后面还会给处于缓存前缀内的 tool_result 加 <code>cache_reference</code>。
               所以它保护的是 provider-side cached prefix 的可编辑路径，而不是把本地 transcript 改得更短。
             </p>
 
             <p>
               这也是为什么它要把 pending edits 在
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1528-L1533">定义 <code>paramsFromContext</code> 之前消费一次</a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1528-L1533">定义 <code>paramsFromContext</code> 之前消费一次</a>。
               <code>paramsFromContext</code> 可能被 logging、retry、fallback 多次调用；
               如果每次调用都重新消费 pending edits，同一轮重试里的请求形状就会自己不一致。
             </p>
@@ -415,7 +406,7 @@ fire-and-forget fork:
             </p>
 
             <p>
-              所以 <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L367-L405"><code>toolResultStorage.ts</code></a>
+              所以 <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/toolResultStorage.ts#L367-L405"><code>toolResultStorage.ts</code></a>
               明确维护 <code>ContentReplacementState</code>。<code>seenIds</code> 记录哪些 tool result 已经过预算判断；
               <code>replacements</code> 记录已经持久化并替换的 preview 字符串。
               注释强调：被替换过的结果以后通过 Map lookup 重新应用，不做文件 I/O，保证 byte-identical。
@@ -423,21 +414,26 @@ fire-and-forget fork:
             </p>
 
             <p>
-              预算执行时，<a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L641-L667">候选结果先按历史决策分区</a>：
+              预算执行时，<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/toolResultStorage.ts#L641-L667">候选结果先按历史决策分区</a>：
               以前替换过的必须复用同一段 preview；以前见过但没替换的冻结，不允许后面再替换；
               只有从未见过的 fresh 结果才参与新一轮预算选择。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L739-L789"><code>enforceToolResultBudget()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/toolResultStorage.ts#L739-L789"><code>enforceToolResultBudget()</code></a>
               的注释把这个约束说得更直接：以前处理过的消息每轮只重新应用缓存 replacement，
               新消息才做预算判断。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/prompt-cache-replacement-state.png"
-                alt="Prompt cache tool result replacement 图，展示 transcript、ContentReplacementState、API request、resume 和 fork"
-              />
-              <figcaption>工具结果替换会改变 API request；transcript 还要能让 resume 重建同一套替换状态。</figcaption>
-            </figure>
+
+
+            <figure class="shape-example"><pre><code class="language-text">替换决策示例（概念形状）：
+seenIds = {A, B}
+replacements = {B: "已保存结果的位置 + 同一段 preview"}
+
+下一轮：
+A 已见过但无 replacement → 保留原文，不重新决定
+B 已有 replacement → 复用同一个字符串，不重新读取文件
+C 从未见过 → 进入本轮预算选择
+
+resume 恢复决策；共享前缀的 fork 复制决策。</code></pre><figcaption>preview 是持久化后的确定文本，不是模型重新写出的摘要，也不是一个自动解引用的虚构 URI。</figcaption></figure>
 
             <h3>5.1 resume 和 fork 都要带上替换历史</h3>
             <p>
@@ -449,7 +445,7 @@ fire-and-forget fork:
 
             <p>
               并发执行时还有一个更细的时序问题：
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L802-L849">源码在 await 前后维护 <code>seenIds</code> 和 <code>replacements</code> 的原子性</a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/toolResultStorage.ts#L802-L849">源码在 await 前后维护 <code>seenIds</code> 和 <code>replacements</code> 的原子性</a>。
               如果并发读者看到某个 id 已经 seen，但 replacement 还没写入，它可能把这个结果误判成 frozen，
               发送完整内容；而主线程发送的是 preview。两条路径对同一个历史前缀给出不同 wire content，结果就是 cache miss。
             </p>
@@ -462,28 +458,28 @@ fire-and-forget fork:
             </p>
 
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L28-L99"><code>PreviousState</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/promptCacheBreakDetection.ts#L28-L99"><code>PreviousState</code></a>
               里保存 system hash、tools hash、cache_control hash、tool names、model、fast mode、global cache strategy、
               beta headers、overage、cached microcompact、effort、extra body、上一轮 cache read tokens 和 pending changes。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L133-L158"><code>getTrackingKey()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/promptCacheBreakDetection.ts#L133-L158"><code>getTrackingKey()</code></a>
               又把 main thread、SDK、tracked agents 和 compact 分开；compact 会共享 <code>repl_main_thread</code>
               的 tracking key，因为它共享同一套 cache-safe params。
             </p>
 
             <p>
-              API 请求前，<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1460-L1485">query 装配调用 <code>recordPromptState()</code></a>。
+              API 请求前，<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1460-L1485">query 装配调用 <code>recordPromptState()</code></a>。
               注意它传的是已经 latch 后的 header 状态，并且排除了 <code>defer_loading</code> tools，
               因为这些工具不会进入实际 prompt。也就是说 detection 不是拿“用户开了什么开关”做猜测，
               而是记录“本次真的会影响 server-side cache key 的客户端可见形状”。
             </p>
 
             <p>
-              API 响应后，<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L2382-L2392">源码用 response usage 调 <code>checkResponseForCacheBreak()</code></a>。
+              API 响应后，<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L2382-L2392">源码用 response usage 调 <code>checkResponseForCacheBreak()</code></a>。
               这个函数先比较上一轮和本轮的 <code>cache_read_input_tokens</code>，
-              如果下降不明显就直接清空 pending changes；如果 cached microcompact 刚做过 cache deletion，
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L470-L481">它把下降视为预期现象</a>。
+              首次调用没有比较基线；之后只有下降超过上一轮的 5%，且至少减少 2,000 tokens，才继续诊断。如果 cached microcompact 已设置预期删除标志，
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/promptCacheBreakDetection.ts#L470-L481">它把下降视为预期现象</a>。
               真正疑似 break 时，才把 model、system、tools、cache_control、betas、effort、extra body
-              等变化整理成原因。
+              等变化整理成候选解释。下降阈值和同时观察到的字段变化并不证明因果；缓存时间、路由或驱逐仍可能需要服务端证据。
             </p>
 
             <figure class="figure">
@@ -491,7 +487,7 @@ fire-and-forget fork:
                 src="../assets/prompt-cache-break-detection.png"
                 alt="Prompt cache break detection 图，展示 PreviousState、cache_read tokens、expected deletion、suspected break 和原因清单"
               />
-              <figcaption>Cache break detection 的作用，是把“前缀为什么没活下来”从体感问题变成可归因的请求形状问题。</figcaption>
+              <figcaption>Cache break detection 先排除预期的缓存删除，再把异常下降与请求变化对照；它提供排查线索，不是服务端缓存失效的因果证明。</figcaption>
             </figure>
 
             <h2>七、把十篇串起来：这些机制都会改变下一次请求</h2>
@@ -561,25 +557,25 @@ fire-and-forget fork:
             <h2 id="sources">参考源码与文档</h2>
             <ul class="source-list">
               <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
-              <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic prompt caching</a></li>
-              <li><a href="https://docs.anthropic.com/en/docs/claude-code/overview">Claude Code overview</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L360-L373">claude.ts：getCacheControl</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L376-L430">claude.ts：should1hCacheTTL</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1207-L1230">claude.ts：global cache strategy and MCP tools</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1322-L1356">claude.ts：deferred tools and Chrome instructions</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1405-L1458">claude.ts：latched beta headers</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1518-L1720">claude.ts：paramsFromContext and cache edits</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3048-L3165">claude.ts：addCacheBreakpoints</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3213-L3237">claude.ts：buildSystemPromptBlocks</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/AgentTool.tsx#L483-L633">AgentTool.tsx：fork path cache-identical prefix</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/runAgent.ts#L666-L695">runAgent.ts：useExactTools options</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L431-L458">compact.ts：promptCacheSharingEnabled</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/microCompact.ts#L253-L390">microCompact.ts：cached microcompact path</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L367-L405">toolResultStorage.ts：ContentReplacementState</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolResultStorage.ts#L641-L789">toolResultStorage.ts：replacement partition and budget</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L28-L158">promptCacheBreakDetection.ts：tracking state and keys</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L247-L430">promptCacheBreakDetection.ts：recordPromptState</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/promptCacheBreakDetection.ts#L437-L698">promptCacheBreakDetection.ts：checkResponseForCacheBreak</a></li>
+              <li><a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">Anthropic prompt caching</a></li>
+              <li><a href="https://code.claude.com/docs/en/overview">Claude Code overview</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L360-L373">claude.ts：getCacheControl</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L376-L430">claude.ts：should1hCacheTTL</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1207-L1230">claude.ts：global cache strategy and MCP tools</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1322-L1356">claude.ts：deferred tools and Chrome instructions</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1405-L1458">claude.ts：latched beta headers</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1518-L1720">claude.ts：paramsFromContext and cache edits</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L3048-L3165">claude.ts：addCacheBreakpoints</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L3213-L3237">claude.ts：buildSystemPromptBlocks</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/AgentTool.tsx#L483-L633">AgentTool.tsx：fork path cache-identical prefix</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/runAgent.ts#L666-L695">runAgent.ts：useExactTools options</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L431-L458">compact.ts：promptCacheSharingEnabled</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/microCompact.ts#L253-L390">microCompact.ts：cached microcompact path</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/toolResultStorage.ts#L367-L405">toolResultStorage.ts：ContentReplacementState</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/toolResultStorage.ts#L641-L789">toolResultStorage.ts：replacement partition and budget</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/promptCacheBreakDetection.ts#L28-L158">promptCacheBreakDetection.ts：tracking state and keys</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/promptCacheBreakDetection.ts#L247-L430">promptCacheBreakDetection.ts：recordPromptState</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/promptCacheBreakDetection.ts#L437-L698">promptCacheBreakDetection.ts：checkResponseForCacheBreak</a></li>
             </ul>
           </section>
         </article>
