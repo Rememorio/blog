@@ -12,7 +12,7 @@
     <meta property="og:title" content="Codex 源码阅读（五）：权限与 sandbox 怎样约束一次执行" />
     <meta
       property="og:description"
-      content="从一次 shell/apply_patch 这类有副作用的工具请求出发，读懂 Codex 在哪里审批、在哪里放进 sandbox、失败后怎样决定是否重试。"
+      content="从一次 unified_exec/apply_patch 这类有副作用的工具请求出发，读懂 Codex 在哪里审批、在哪里放进 sandbox、失败后怎样决定是否重试。"
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/permission-sandbox-gates.png" />
@@ -98,12 +98,15 @@
             <figure class="hero-image">
               <img
                 src="../assets/permission-sandbox-gates.png"
-                alt="Codex 权限与 sandbox 流程图，展示 tool call、pre hooks、approval、sandbox、attempt、denial、retry、output、events 和 history"
+                alt="策略判断、条件审批、SandboxAttempt、结果与按策略重试"
               />
+            <figcaption>这是策略与执行关系图。需要审批才进入审核；拒绝可以终止执行；sandbox denial 只有满足策略条件才允许重试。</figcaption>
             </figure>
           </section>
 
           <section class="article-body">
+            <p><strong>阅读契约。</strong>跟随一条测试命令，区分策略结果、审批决定、执行环境和失败重试。 本文核实于 2026-09-20，依据公开源码 <a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">固定公开源码快照</a>；不推断未公开的服务实现。</p>
+
             <p>
               先从一个很普通的动作开始：模型想跑测试。它返回了一个 shell tool call，命令看起来也没问题。
               但真正执行之前，Codex 还要知道这轮的工作目录是什么、当前允许读写哪些路径、网络是否受限、
@@ -149,7 +152,7 @@
             <h2>一、turn 启动时就确定权限参数</h2>
             <p>
               Codex 并不是等到 shell handler 运行时才检查权限。app-server v2 的
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L116"><code>TurnStartParams</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/turn.rs"><code>TurnStartParams</code></a>
               里已经能看到入口参数：<code>approval_policy</code> 可以覆盖本轮审批策略，
               <code>sandbox_policy</code> 可以覆盖本轮 sandbox，<code>permissions</code> 可以选择一个命名权限 profile，
               而且注释明确写着 <code>permissions</code> 不能和 <code>sandboxPolicy</code> 同时使用。
@@ -160,13 +163,7 @@
               环境选择、模型参数放在同一层配置里；后面的工具会读取这些明确的配置值。
             </p>
 
-            <p>
-              到 core 层后，<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L70-L104"><code>TurnContext</code></a>
-              保存了 <code>approval_policy</code>、<code>permission_profile</code>、<code>network</code> 和 Windows sandbox level。
-              它还提供
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L115-L130"><code>file_system_sandbox_policy()</code> 与 <code>network_sandbox_policy()</code></a>，
-              从 <code>PermissionProfile</code> 拆出文件系统和网络两类运行时策略。
-            </p>
+            <p><code>TurnContext</code> 保留 turn 的配置入口；真正执行当前请求时，<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L132-L172">orchestrator</a> 从 <code>StepContext.settings</code> 读取审批策略，从工具请求选定的 <code>TurnEnvironment</code> 读取权限 profile、workspace roots 和 sandbox 配置。这样已排队请求使用自己所属步骤的环境，而不是下一步修改后的设置。</p>
 
             <div class="table-wrap">
               <table>
@@ -202,13 +199,7 @@
               </table>
             </div>
 
-            <p>
-              如果某一轮更新了权限，session 配置会把这些更新合并进 thread state。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/session.rs#L248-L341"><code>apply_updates</code></a>
-              先处理新的 approval policy，再处理 permission profile 或 legacy sandbox policy。
-              选择 permission profile 时，它会调用 <code>set_permission_profile_projection</code>；
-              选择 legacy sandbox policy 时，则会重新构造文件系统和网络 policy，并写回 permission profile state。
-            </p>
+            <p>权限更新会进入 session 的配置状态，供后续步骤捕获；权限 profile 与 legacy sandbox policy 是两种输入形状，最终都要得到文件系统和网络策略。读具体命令时，应继续追到 <code>tool.turn_environment(req)</code>，确认权限应用于哪一个执行环境。</p>
 
             <h2>二、approval、permissions、sandbox 和 hooks 各管什么</h2>
             <p>
@@ -263,25 +254,27 @@
 
             <p>
               对照源码看会更清楚。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L791-L821"><code>AskForApproval</code></a>
-              包含 <code>UnlessTrusted</code>、<code>OnFailure</code>、<code>OnRequest</code>、<code>Granular</code> 和
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs"><code>AskForApproval</code></a>
+              包含 <code>UnlessTrusted</code>、<code>OnRequest</code>、<code>Granular</code> 和
               <code>Never</code>。其中 <code>GranularApprovalConfig</code> 还把 sandbox approval、execpolicy rules、
               skill approval、request_permissions 和 MCP elicitation 分开控制。
             </p>
 
             <p>
               旁边的
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L881-L930"><code>SandboxPolicy</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L1068-L1117"><code>SandboxPolicy</code></a>
               则描述执行限制：<code>danger-full-access</code>、<code>read-only</code>、<code>external-sandbox</code>、
               <code>workspace-write</code>，以及各自的网络和可写目录配置。审批策略回答“要不要问”，sandbox policy
               回答“在什么限制下跑”。
             </p>
 
-            <h2>三、registry 先给工具一次前置检查机会</h2>
+
+            <p>配置兼容性还需单独看：当前枚举没有独立的 <code>OnFailure</code>，但 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L980-L1005"><code>OnRequest</code></a> 保留 <code>on-failure</code> 的 serde alias。旧字符串仍可解析，不过不能据此推断仍有单独的“失败后审批”运行模式。</p>
+<h2>三、registry 先给工具一次前置检查机会</h2>
             <p>
               第四篇已经讲过 <code>ToolRegistry</code> 是工具派发壳。放到权限主题里，它的第一个作用是：
               在 handler 真正执行前，先跑 pre-tool-use hooks。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L491-L537">这段逻辑</a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/registry.rs">这段逻辑</a>
               会从工具拿 <code>pre_tool_use_payload</code>，调用 <code>run_pre_tool_use_hooks</code>。
               hook 可以直接阻止这次工具调用，也可以返回 updated input，让 registry 用改写后的 invocation 继续往下走。
             </p>
@@ -294,7 +287,7 @@
 
             <p>
               handler 成功后，registry 还有 post-tool-use hooks。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L581-L628">post hook</a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/registry.rs">post hook</a>
               可以追加上下文，也可以用 feedback message 替换模型可见输出。也就是说，hook 不只管“能不能执行”，
               还可能影响模型下一步看到什么。
             </p>
@@ -307,26 +300,16 @@
             </div>
 
             <h2>四、有副作用的工具进入 orchestrator</h2>
-            <p>
-              到这里，工具还没有真正碰系统。以 shell 为例，handler 构造 <code>ShellRequest</code> 后，
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/shell.rs#L180-L214">创建 <code>ToolOrchestrator</code> 和 <code>ShellRuntime</code>，再调用 <code>orchestrator.run(...)</code></a>。
-              <code>apply_patch</code> 也类似：
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/apply_patch.rs#L399-L428">构造 <code>ApplyPatchRequest</code> 后进入同一个 orchestrator</a>。
-            </p>
+            <p>以执行命令为例，<code>exec_command</code> 进入 unified-exec 管理逻辑，构造 <code>UnifiedExecRequest</code>，由 <code>ToolOrchestrator</code> 驱动 <code>UnifiedExecRuntime</code>；<code>apply_patch</code> 则使用自己的 request 和 runtime。二者共用审批、sandbox 选择和 retry 的控制流程。</p>
 
             <p>
               这也补全了第四篇的执行路径。模型发出的只是 call；有副作用的 call 会被翻译成 runtime request，
               然后交给统一的 orchestrator。审批、sandbox 选择和失败重试这三个决定集中在
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L1-L8"><code>orchestrator.rs</code> 文件头</a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L1-L8"><code>orchestrator.rs</code> 文件头</a>
               已经写明的三件事：approval、sandbox selection、retry semantics。
             </p>
 
-            <p>
-              这套统一入口来自
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L316-L407"><code>Approvable</code>、<code>Sandboxable</code> 和 <code>ToolRuntime</code></a>。
-              工具 runtime 可以提供审批 key、sandbox permissions、审批 payload、是否允许失败后升级、真正的 <code>run</code> 方法。
-              orchestrator 不需要知道每个工具的业务细节，只要按这些 trait 问问题。
-            </p>
+            <p>工具 runtime 通过 <code>Approvable</code> 提供 sandbox permissions、自定义审批要求和 <code>approval_action</code>，通过 <code>Sandboxable</code> 声明 sandbox 偏好与是否允许失败升级，最后实现 <code>ToolRuntime::run</code>。审批 action 描述待审查动作，session 负责选择 hook、Guardian 或用户处理它。</p>
 
             <p>
               继续固定一条请求：模型想在当前 workspace 里跑 <code>npm test</code>。进入 orchestrator 之后，
@@ -334,11 +317,12 @@
             </p>
 
             <pre><code class="language-json">{
-  "tool": "shell",
+  "tool": "exec_command",
   "input": {"cmd": "npm test", "cwd": "workspace"},
   "approval_policy": "on-request",
   "sandbox_attempt": {
-    "type": "workspace-write",
+    "sandbox_requested": true,
+    "file_system": "workspace-write",
     "permission_profile": "project-write",
     "workspace_roots": ["workspace"]
   },
@@ -352,78 +336,31 @@
             </p>
 
             <h2>五、第一个决定：这次需要审批吗</h2>
-            <p>
-              <code>ToolOrchestrator::run</code> 的第一步就是 approval。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L131-L218">源码先拿到本轮的文件系统和网络 sandbox policy</a>，
-              然后问工具有没有自定义 <code>exec_approval_requirement(req)</code>。
-              如果没有，就调用
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L197-L238"><code>default_exec_approval_requirement</code></a>。
-            </p>
 
-            <p>
-              默认规则很直观：<code>Never</code> 和 <code>OnFailure</code> 默认不问；
-              <code>OnRequest</code> 和 <code>Granular</code> 在文件系统受限时需要审批；
-              <code>UnlessTrusted</code> 总是问。<code>Granular</code> 还能直接把不允许的审批类别变成
-              <code>Forbidden</code>，这样请求不会被展示给用户，而是被运行时拒绝。
-            </p>
+            <p><code>ToolOrchestrator::run</code> 先取请求环境的权限 profile，再读取工具自定义 <code>exec_approval_requirement(req)</code>；没有自定义时使用 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/sandboxing.rs#L190-L237">默认规则</a>：<code>Never</code> 返回 Skip，<code>OnRequest</code> 与 <code>Granular</code> 在文件系统受限时需要审批，<code>UnlessTrusted</code> 需要审批。在本来需要 sandbox 审批时，Granular 禁止该类审批才会返回 Forbidden；文件系统不受限时默认仍为 Skip。</p>
 
-            <p>
-              一旦得到 <code>ExecApprovalRequirement</code>，orchestrator 只处理三种结果：
-              <code>Skip</code> 表示当前规则允许继续；<code>Forbidden</code> 直接返回 rejected；
-              <code>NeedsApproval</code> 则创建 <code>ApprovalCtx</code>，把 call id、turn、retry reason、
-              network approval context 和可能的 guardian review id 带进审批请求。
-            </p>
-
-            <pre><code class="language-text">approval 决策骨架：
-  tool.exec_approval_requirement(req)
-      或 default_exec_approval_requirement(policy, fs_policy)
-        ↓
-  Skip / Forbidden / NeedsApproval
-        ↓
-  允许继续 / 直接拒绝 / request_approval(...)</code></pre>
-
+            <p>这只是策略阶段的结果。<strong><code>Skip</code> 不能无条件读成“绝不审核”。</strong> <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L173-L204">strict auto-review 分支</a> 即使看到 Skip，也会构造 <code>ApprovalAction</code> 与 <code>ApprovalContext</code>，调用 <code>Session::request_approval</code>。普通 Skip 才直接继续；Forbidden 返回拒绝，NeedsApproval 进入相同的统一审批入口。</p>
+<pre><code class="language-text">policy requirement: Skip / Forbidden / NeedsApproval
+Skip + strict_auto_review -> request_approval(action, context)
+Skip + ordinary mode     -> select sandbox
+Forbidden                -> reject
+NeedsApproval            -> request_approval(action, context)</code></pre>
             <h2>六、审批请求前，permission hooks 可以先回答</h2>
-            <p>
-              <code>request_approval</code> 里还有一个容易忽略的前置点：
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L482-L546">PermissionRequest hooks 优先处理审批请求</a>。
-              只要当前路径允许评估 hook，而且工具提供了 <code>permission_request_payload(req)</code>，
-              Codex 会先调用 <code>run_permission_request_hooks</code>。
-            </p>
 
-            <p>
-              hook 返回 <code>Allow</code>，这次审批直接变成 approved；返回 <code>Deny</code>，
-              orchestrator 直接把 message 作为 rejected 原因；没有匹配结果，才落到正常的 guardian 或用户审批路径。
-              shell runtime 会把命令作为 bash payload 交给 permission hook；
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/shell.rs#L190-L203">源码里能看到它返回 <code>PermissionRequestPayload::bash</code></a>。
-              apply patch runtime 也会用 <code>apply_patch</code> hook name 提供 patch 命令内容。
-            </p>
+            <p>审批现在由 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/approvals.rs#L473-L549"><code>Session::request_approval</code></a> 统一处理。<code>ApprovalAction</code> 区分命令、stdin 写入、patch、MCP 调用、网络和权限请求；它把具体动作转换成 <code>permission_request_payload</code>。先运行 PermissionRequest hooks：Allow 批准，Deny 拒绝，没有 verdict 时再进入 Guardian 或用户审批。</p>
 
-            <p>
-              这里的顺序很关键：permission hook 不是工具执行前的普通 hook，也不是执行后的反馈 hook。
-              它专门挂在审批请求之前，用来让配置或扩展先给出 allow / deny。只有 hook 没有回答时，才进入用户或 guardian。
-            </p>
+            <p>命令 action 生成 bash hook payload，patch action 生成 apply_patch payload；重试时 hook run id 带 <code>:retry</code>。这个入口与 registry 的 PreToolUse 不同：前者回答一次审批，后者在 handler 前检查或改写输入。审批通过仍然只允许接下来的尝试，不会取消请求环境的 sandbox 限制。</p>
 
             <h2>七、审批完成后选择初次 sandbox attempt</h2>
-            <p>
-              审批通过以后，orchestrator 才会选择初次 sandbox。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L220-L268">这段代码</a>
-              会先算 <code>sandbox_override_for_first_attempt</code>，再根据 override 和当前 policy 调
-              <code>SandboxManager::select_initial</code>。最后组装 <code>SandboxAttempt</code>：
-              sandbox 类型、permission profile、是否启用 managed network、cwd、workspace roots、平台相关 sandbox 参数都会放进去。
-            </p>
+            <p>审批阶段放行后，orchestrator 根据权限 profile、override 与 managed network 决定是否需要 sandbox。对本地执行，<code>SandboxManager::select_initial</code> 选择平台实现；对执行器自行管理进程 sandbox 的环境，本地 <code>SandboxType::None</code> 可以与 <code>sandbox_requested = true</code> 同时出现。此时限制交给执行器落实，不能把本地 None 解读为权限完全开放。</p>
 
-            <p>
-              <code>SandboxAttempt</code> 的定义在
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L409-L459"><code>sandboxing.rs</code></a>。
-              它还提供 <code>env_for</code>，把 <code>SandboxCommand</code> 和当前权限 profile 交给 sandbox manager transform，
-              得到真正用于执行的 <code>ExecRequest</code>。
-            </p>
+            <p><code>SandboxAttempt</code> 携带 <code>sandbox_requested</code>、权限、执行器权限、cwd、workspace roots 和网络状态；<code>env_for</code> 与 <code>env_for_exec_server</code> 分别服务对应执行路径。<code>UnifiedExecRuntime</code> 用这些字段准备实际命令执行，patch runtime 则准备文件系统操作。</p>
 
             <p>
               shell runtime 的 <code>run</code> 里就能看到这一步的落点：
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/shell.rs#L236-L318">它从 attempt 取 runtime permissions，构造 sandbox command，再调用 <code>attempt.env_for(...)</code> 执行</a>。
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/runtimes/unified_exec.rs">它从 attempt 取 runtime permissions，构造 sandbox command，再调用 <code>attempt.env_for(...)</code> 执行</a>。
               <code>apply_patch</code> runtime 也会从 attempt 生成文件系统 sandbox context；如果失败看起来像 sandbox denied，
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/apply_patch.rs#L220-L267">会返回 <code>SandboxErr::Denied</code></a>。
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/runtimes/apply_patch.rs">会返回 <code>SandboxErr::Denied</code></a>。
             </p>
 
             <div class="note key-point">
@@ -436,7 +373,7 @@
             <h2>八、失败后能不能 retry，要再过一遍规则</h2>
             <p>
               如果初次 attempt 成功，orchestrator 直接返回 output。真正复杂的是 sandbox denied。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L270-L466">retry 分支</a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs">retry 分支</a>
               会先看 denial 里有没有网络策略信息，再看工具是否允许 <code>escalate_on_failure()</code>，
               当前文件系统策略是否允许无 sandbox 执行，以及 approval policy 是否允许为了 no-sandbox retry 再问一次。
             </p>
@@ -449,12 +386,7 @@
               因为那些 denied reads 只有在 sandbox 里才能被执行。
             </p>
 
-            <p>
-              需要 retry 时，orchestrator 会构造新的 retry reason，例如网络 host 被 policy 阻止，或者命令需要“retry without sandbox”。
-              它可能再次调用 <code>request_approval</code>，这次 permission request run id 会带上 <code>:retry</code>。
-              审批通过后，才会选择 retry sandbox：如果允许无 sandbox，就用 <code>SandboxType::None</code>；
-              否则仍然通过 <code>select_initial</code> 选择一个可表达当前限制的 sandbox。
-            </p>
+            <p>需要 retry 时，orchestrator 构造网络拒绝或 sandbox 拒绝原因，并可能再次请求审批。<code>strict_auto_review</code> 下，初次审批只覆盖当时的 sandboxed attempt，不能靠缓存直接跳过更宽重试的审核。没有 denied-read 限制时才可能取消文件系统 sandbox；执行器管理隔离的路径仍分别传递 sandbox 意图和权限。</p>
 
             <pre><code class="language-text">sandbox denied 后：
   denial output + network policy
@@ -468,29 +400,10 @@
   retry attempt 或把 denied 返回给模型</code></pre>
 
             <h2>九、审批事件怎样交给客户端</h2>
-            <p>
-              当审批真的要展示给客户端时，protocol 里有清晰的事件形状。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/approvals.rs#L217-L264"><code>ExecApprovalRequestEvent</code></a>
-              包含 call id、approval id、turn id、命令、cwd、reason、network approval context、
-              proposed execpolicy amendment、additional permissions 和 available decisions。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/approvals.rs#L373-L390"><code>ApplyPatchApprovalRequestEvent</code></a>
-              则包含 patch changes、reason 和 grant root。
-            </p>
 
-            <p>
-              shell runtime 在
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/shell.rs#L135-L188"><code>start_approval_async</code></a>
-              中调用 <code>session.request_command_approval</code>；apply patch runtime 在
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/apply_patch.rs#L132-L180"><code>start_approval_async</code></a>
-              中调用 <code>session.request_patch_approval</code>。
-              用户或 guardian 的返回值最后会落成
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L3718-L3744"><code>ReviewDecision</code></a>。
-            </p>
+            <p>审批向客户端发送结构化事件：<code>ExecApprovalRequestEvent</code> 描述命令、cwd、原因、网络上下文、额外权限和可选 decision；<code>ApplyPatchApprovalRequestEvent</code> 描述文件修改与 grant root。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/approvals.rs#L473-L570">统一审批模块</a> 将 action 路由给 reviewer，用户路径再调用 session 的命令或 patch 审批接口，最终收回 <code>ReviewDecision</code>。</p>
 
-            <p>
-              这一步也解释了客户端为什么能显示“批准本次”“本会话允许”“拒绝”等不同选择：
-              客户端拿到的是带有可用 decision、网络上下文、额外权限和未来规则建议的结构化请求。
-            </p>
+            <p>因此要分清三个时刻：请求已经发给 reviewer，reviewer 已批准尝试，以及工具实际完成。审批事件或 Approved decision 都不能代替工具退出状态与结果记录；持续运行进程还可能在之后写 stdin 或访问网络时触发新的审批。</p>
 
             <h2>十、读这段执行流程时，带走三条规则</h2>
             <div class="table-wrap">
@@ -506,7 +419,7 @@
                   <tr>
                     <td>模型请求执行命令。</td>
                     <td>handler 是否把它翻成有副作用 runtime request？</td>
-                    <td>shell/apply_patch handler 调用 <code>ToolOrchestrator</code>。</td>
+                    <td>unified_exec/apply_patch handler 调用 <code>ToolOrchestrator</code>。</td>
                   </tr>
                   <tr>
                     <td>工具被问审批。</td>
@@ -534,47 +447,30 @@
 
             <p>
               到这里，权限和 sandbox 的主线可以连起来了：turn 入口带入审批和权限策略；
-              <code>TurnContext</code> 把它们保存成运行时对象；registry 在工具入口前后提供 hook；
+              <code>TurnContext</code> 保留 turn 配置，<code>StepContext</code> 捕获当前步骤的设置，选定的 <code>TurnEnvironment</code> 提供执行权限；registry 在工具入口前后提供 hook；
               有副作用的 handler 把请求交给 <code>ToolOrchestrator</code>；
               orchestrator 先判定审批，再选择 sandbox attempt，失败后按 policy 决定能不能 retry。
             </p>
 
             <p>
               这也是读 Codex agent 时最容易错过的一点：模型提出动作，只是流程开始。
-              真正决定动作能不能碰系统的，是这条运行时路径。下一篇继续往外看：这些结构化事件和历史记录，
-              怎样被 TUI、app-server 和恢复逻辑投影成用户看到的同一套事实。
+              真正决定动作能不能碰系统的，是这条运行时路径。下一篇把这条路径落到 Windows：用户身份、ACL、受限 token 与网络规则怎样让操作系统执行这些限制。
             </p>
 
             <h2 id="sources">参考源码</h2>
             <ul class="source-list">
-              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex 固定源码快照</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L116">TurnStartParams 的 approval_policy、sandbox_policy 与 permissions</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L70-L130">TurnContext 的 approval_policy、permission_profile 与 sandbox policy helper</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/session.rs#L248-L341">SessionConfiguration apply_updates 处理 approval、permission profile 与 sandbox policy</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L791-L821">AskForApproval</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L824-L860">GranularApprovalConfig</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L881-L930">SandboxPolicy</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L491-L537">ToolRegistry pre-tool-use hooks</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L581-L628">ToolRegistry post-tool-use hooks</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/shell.rs#L180-L214">shell handler 进入 ToolOrchestrator</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/apply_patch.rs#L399-L428">apply_patch handler 进入 ToolOrchestrator</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L118-L179">ApprovalCtx、PermissionRequestPayload 与 ExecApprovalRequirement</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L197-L238">default_exec_approval_requirement</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L246-L303">sandbox_override_for_first_attempt 与 denied reads 保护</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L316-L407">Approvable、Sandboxable 与 ToolRuntime</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/sandboxing.rs#L409-L459">SandboxAttempt</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L1-L8">ToolOrchestrator 文件头说明</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L131-L218">ToolOrchestrator approval 阶段</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L220-L268">ToolOrchestrator 初次 sandbox attempt</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L270-L466">ToolOrchestrator sandbox denied retry</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L482-L546">request_approval 与 PermissionRequest hooks</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/shell.rs#L135-L203">ShellRuntime approval 与 permission request payload</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/shell.rs#L236-L318">ShellRuntime 使用 SandboxAttempt 执行</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/apply_patch.rs#L132-L213">ApplyPatchRuntime approval 与 permission request payload</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/runtimes/apply_patch.rs#L220-L267">ApplyPatchRuntime 使用 SandboxAttempt 执行</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/approvals.rs#L217-L264">ExecApprovalRequestEvent</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/approvals.rs#L373-L390">ApplyPatchApprovalRequestEvent</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L3718-L3744">ReviewDecision</a></li>
+              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">openai/codex · 5c5308fc9a9e</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/turn.rs">TurnStartParams</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/step_context.rs#L27-L46">StepContext</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn_context.rs#L212-L272">TurnEnvironment / permissions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/approvals.rs#L57-L155">ApprovalAction / Session::request_approval</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/approvals.rs#L473-L570">hook / Guardian / user routing</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L122-L465">ToolOrchestrator</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/sandboxing.rs#L190-L295">default requirements / denied reads</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/sandboxing.rs#L304-L535">Approvable / SandboxAttempt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/runtimes/unified_exec.rs#L70-L350">UnifiedExecRequest / runtime</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/runtimes/apply_patch.rs">ApplyPatch runtime</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/registry.rs#L580-L790">PreToolUse / PostToolUse</a></li>
             </ul>
           </section>
         </article>
