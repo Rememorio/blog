@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Go 源码阅读（四）：什么时候 channel，什么时候锁</title>
-    <meta name="description" content="Go 从请求到生产现场系列第四篇：沿 fetchd 的 result channel 阅读 Go 1.26.0 的 hchan、chansend、chanrecv、sudog、selectgo，以及 sync.Mutex、runtime semaphore 和饥饿交接。" />
+    <meta name="description" content="Go 从请求到生产现场系列第四篇：沿 fetchd 的 result channel 阅读 Go 开发分支的 hchan、chansend、chanrecv、sudog、selectgo，以及 sync.Mutex、runtime semaphore 和饥饿交接。" />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Go 源码阅读（四）：什么时候 channel，什么时候锁" />
     <meta property="og:description" content="channel 传递值并让拥塞返回发送方，锁保护同一份状态；源码展示两者各自怎样等待、唤醒与建立内存顺序。" />
@@ -49,7 +49,7 @@
             worker 抓完网页，要把结果交给汇总者；这像交接包裹，channel 很自然。所有 worker 只想给同一个成功数加一；这像轮流修改同一个计数器，锁更直接。
             本篇先看数据是否交给另一个 goroutine、发送后还能不能修改，再解释两种工具怎样让 goroutine 等待和继续。
           </p>
-          <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：chansend → sudog → selectgo / Mutex → sema</span><span>实验：concurrency_lab_test.go</span></div>
+          <div class="meta-line"><span>源码：Go 开发分支</span><span>路径：chansend → sudog → selectgo / Mutex → sema</span><span>实验：concurrency_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/channel-or-lock-overview.png" alt="Go channel 与锁的行为对照：channel 在 worker 和聚合器之间传递 fetchResult，并在接收方跟不上时阻塞发送；sync.Mutex 保护同一份共享 map 与临界区" /></figure>
         </section>
 
@@ -57,12 +57,12 @@
           <div class="note route-note"><p><strong>阅读目标：</strong>先不讨论谁“更快”。读完前半篇，你应该能根据一句普通话做选择：数据要交给另一个 goroutine，就先想 channel；多段代码要共同修改一份状态，就先想锁。后半篇再解释它们阻塞、唤醒和建立内存顺序的源码路径。</p></div>
 
           <p>
-            语言层先看 <a href="https://go.dev/ref/mem">Go Memory Model</a> 给出的同步保证；源码细节再固定到 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go">runtime/chan.go</a>、
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/select.go">runtime/select.go</a>、
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/sync/mutex.go">internal/sync/mutex.go</a> 与
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/sema.go">runtime/sema.go</a>。
-            队列形状、状态位、1ms 阈值和直接交接只是当前 gc runtime 的实现证据，不是业务代码可以依赖的固定常数。
+            语言层先看 <a href="https://go.dev/ref/mem">Go Memory Model</a> 给出的同步保证；源码细节再固定到 <a href="https://github.com/golang/go/tree/f043823a99a4118989a34afec015d23b5d54d01e">Go 开发分支固定快照</a> 的
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/chan.go">runtime/chan.go</a>、
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/select.go">runtime/select.go</a>、
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/sync/mutex.go">internal/sync/mutex.go</a> 与
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/sema.go">runtime/sema.go</a>。
+            本文核实的是官方 master 的固定开发快照，并不把它当作已发布稳定版。队列形状、状态位、1ms 阈值和直接交接只是 gc runtime 的实现证据，不是业务代码可以依赖的固定常数。
           </p>
 
           <h2>一、先看两个完全不同的并发问题</h2>
@@ -120,7 +120,7 @@ handler 创建容量为 N 的结果 channel
     sendq    waitq
     lock     mutex
 }</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L34-L60">hchan 与 waitq</a>。</span>
+          <span class="source-caption">字段节选（省略 timer、测试 bubble 等字段）：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/chan.go#L34-L60">hchan 与 waitq</a>。</span>
 
           <h3>2.1 <code>makechan</code> 的分配取决于元素里有没有指针</h3>
           <p>
@@ -152,7 +152,7 @@ if c.qcount &lt; c.dataqsiz {
     unlock(&amp;c.lock)
     return true
 }</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L176-L310">runtime.chansend</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/chan.go#L164-L302">runtime.chansend</a>。</span>
 
           <h4>有等待接收者时，数据绕过 buffer</h4>
           <p>
@@ -182,7 +182,7 @@ c.sendq.enqueue(mysg)
 gp.parkingOnChan.Store(true)
 gopark(chanparkcommit, unsafe.Pointer(&amp;c.lock),
     waitReasonChanSend, traceBlockChanSend, 2)</code></pre>
-          <span class="source-caption">阻塞发送：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L257-L309">sudog、sendq 与 gopark</a>；等待队列：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L872-L919">waitq enqueue/dequeue</a>。</span>
+          <span class="source-caption">阻塞发送：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/chan.go#L249-L302">sudog、sendq 与 gopark</a>；等待队列：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/chan.go#L850-L897">waitq enqueue/dequeue</a>。</span>
 
           <p>
             <code>sudog</code> 是“G 在某个同步对象上的一次等待记录”，不是 goroutine 本身。一个 G 同时只能执行一条指令，却可能因 select 在多个 channel 上各有一个 sudog。
@@ -202,7 +202,7 @@ typedmemmove(c.elemtype, qp, sg.elem.get()) // sender → queue
 c.recvx++
 c.sendx = c.recvx
 goready(sg.g, skip+1)</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L524-L685">chanrecv</a> 与 <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L688-L746">recv</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/chan.go#L508-L685">chanrecv</a> 与 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/chan.go#L688-L739">recv</a>。</span>
 
           <h4>容量决定发送方何时等待，不是随手调大的性能旋钮</h4>
           <p>
@@ -217,7 +217,7 @@ goready(sg.g, skip+1)</code></pre>
           </p>
 
           <p>
-            因此通常应由知道“所有生产者都已结束”的那段代码关闭 channel，接收方不负责猜测还有没有生产者。多个 sender 都可能完成时，应指定一个协调者，或用 <code>sync.Once</code>、<code>WaitGroup</code> 后的汇总 goroutine 统一关闭；recover 不是关闭协调机制。
+            因此通常应由知道“所有生产者都已结束”的那段代码关闭 channel，接收方不负责猜测还有没有生产者。多个 sender 都可能完成时，应由一个协调者等待 <code>WaitGroup</code> 确认所有发送结束，再统一关闭。<code>sync.Once</code> 只能避免重复 close，不能阻止仍在运行的 sender 向已关闭的 channel 发送；recover 也不是关闭协调机制。
           </p>
 
           <h2 id="selectgo">三、<code>selectgo</code> 是一个三遍协议</h2>
@@ -239,7 +239,7 @@ case &lt;-ctx.Done():
           <h3>Pass 1：按随机顺序找已经就绪的 case</h3>
           <p>
             receive case 依次检查等待 sender、buffer 数据和 closed；send case 检查 closed、等待 receiver 和 buffer 空位。找到一个就直接执行。
-            随机 pollorder 降低源码顺序偏置，但不是跨 goroutine FIFO、公平 SLA 或优先级机制。带 default 的非阻塞 select 若没有 ready case，会解锁并返回 default。
+            随机 pollorder 降低源码顺序偏置，但不是跨 goroutine FIFO、公平 SLA 或优先级机制。若结果发送和 <code>ctx.Done()</code> 同时就绪，仍可能选择发送；把取消 case 写在前面也不会赋予它优先级。带 default 的非阻塞 select 若没有 ready case，会解锁并返回 default。
           </p>
 
           <h3>Pass 2/3：一个 G 入多个队，醒来后清理 losers</h3>
@@ -263,14 +263,14 @@ gopark(selparkcommit, nil, waitReasonSelect, traceBlockSelect, 1)
 // pass 3: remove every unsuccessful sudog
 c.recvq.dequeueSudoG(sglist) // or sendq
 releaseSudog(sglist)</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/select.go#L122-L307">准备与 Pass 1</a>、<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/select.go#L309-L405">Pass 2/3</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/select.go#L122-L307">准备与 Pass 1</a>、<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/select.go#L309-L405">Pass 2/3</a>。</span>
 
           <h2 id="mutex">四、<code>sync.Mutex</code> 的快路径只有一次 CAS</h2>
           <pre><code class="language-go">mu.Lock()
 counts["completed"]++
 mu.Unlock()</code></pre>
           <p>
-            Go 1.26 的 public <code>sync.Mutex</code> 把实现委托给 <code>internal/sync.Mutex</code>，核心只有 <code>state int32</code> 与 <code>sema uint32</code>。
+            所核实快照的 public <code>sync.Mutex</code> 把实现委托给 <code>internal/sync.Mutex</code>，核心只有 <code>state int32</code> 与 <code>sema uint32</code>。
             无竞争 <code>Lock</code> 用 CAS 把 state 从 0 改为 <code>mutexLocked</code>；成功即可返回，所以短且低竞争的临界区不会进入 runtime 等待表。
           </p>
           <p>
@@ -278,7 +278,7 @@ mu.Unlock()</code></pre>
             只是 Mutex 在“没人争”和“有人争”时维持这个承诺的两条实现路径。
           </p>
 
-          <figure class="figure"><img src="../assets/mutex-fast-slow-handoff.png" alt="Go sync.Mutex 源码路径：Lock 先用 CAS 进入快路径；竞争时 spin、增加 waiter 并通过 runtime SemacquireMutex、semaRoot、sudog 与 gopark 等待；Unlock 在 normal 模式唤醒竞争，在超过实现阈值后用 starvation direct handoff 与 goyield" /></figure>
+          <figure class="figure"><img src="../assets/mutex-fast-slow-handoff.png" alt="Go sync.Mutex 源码路径：Lock 先用 CAS 进入快路径；竞争时 spin、增加 waiter 并通过 runtime SemacquireMutex、semaRoot、sudog 与 gopark 等待；Unlock 在 normal 模式唤醒竞争，在饥饿模式且满足交接条件时才直接交接并 goyield" /></figure>
 
           <pre><code class="language-go">func (m *Mutex) Lock() {
     if atomic.CompareAndSwapInt32(&amp;m.state, 0, mutexLocked) {
@@ -293,7 +293,7 @@ func (m *Mutex) Unlock() {
         m.unlockSlow(new)
     }
 }</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/internal/sync/mutex.go#L17-L71">Mutex state 与 Lock</a>、<a href="https://github.com/golang/go/blob/go1.26.0/src/internal/sync/mutex.go#L184-L233">Unlock</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/sync/mutex.go#L17-L71">Mutex state 与 Lock</a>、<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/sync/mutex.go#L184-L233">Unlock</a>。</span>
 
           <h3><code>state</code> 同时编码 locked、woken、starving 与 waiter count</h3>
           <p>
@@ -314,16 +314,16 @@ root.nwait.Add(1)
 if cansemacquire(addr) { /* consume wake without sleeping */ }
 root.queue(addr, s, lifo)
 goparkunlock(&amp;root.lock, reason, traceBlockSync, 4+skipframes)</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/sema.go#L5-L18">semaphore 设计目标</a>、<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/sema.go#L146-L201">semacquire1</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/sema.go#L5-L18">semaphore 设计目标</a>、<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/sema.go#L146-L201">semacquire1</a>。</span>
 
           <h4>normal 模式争性能，starvation 模式保尾延迟</h4>
           <p>
             normal 模式按 FIFO 排队，但被唤醒者不直接拥有锁，会与已经在 CPU 上的新到达 G 竞争；后者可能更快。某 waiter 等待超过内部
-            <code>starvationThresholdNs = 1e6</code> 后会请求 starvation 模式：Unlock 用 <code>Semrelease(handoff=true)</code> 把 ticket 与 P 的运行机会直接交给队首 waiter，并在安全时 <code>goyield</code>。
+            <code>starvationThresholdNs = 1e6</code> 后会请求 starvation 模式：Unlock 用 <code>Semrelease(handoff=true)</code> 尝试把 semaphore ticket 交给取出的 waiter，再将它变为 runnable。<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/sema.go#L259-L288">只有成功取得 ticket、当前 M 未持有 runtime 锁且不在 g0 上时</a>才 <code>goyield</code>，让该 waiter 接续当前 P 的时间片；唤醒本身不保证立刻执行。
           </p>
 
           <p>
-            waiter 是最后一个或等待时间又短于阈值时，锁会退出 starvation 模式，因为直接交接吞吐更差。这个 1ms 是 Go 1.26.0 源码中的启发式阈值，可能随版本和平台调整；它不是“Lock 最多等 1ms”的保证。
+            waiter 是最后一个或等待时间又短于阈值时，锁会退出 starvation 模式，因为直接交接吞吐更差。这个 1ms 是所核实快照中的启发式阈值，可能随版本和平台调整；它不是“Lock 最多等 1ms”的保证。
           </p>
 
           <h2>五、两种工具都建立 happens-before，但边不同</h2>
@@ -389,7 +389,7 @@ go test -run '^$' -bench BenchmarkCoordinationContracts -benchmem</code></pre>
 
           <h2>七、回到 <code>fetchd</code> 的工程规则</h2>
           <ol>
-            <li><strong>用 channel 把工作交给下一步。</strong><code>fetchResult</code> 从 worker 单向送到聚合器；发送后 worker 不再修改它，成功通信也同时表示这一份结果已完成。</li>
+            <li><strong>用 channel 把工作交给下一步。</strong><code>fetchResult</code> 从 worker 单向送到聚合器；发送后 worker 不再修改它，发送完成只说明值已交给接收者或 buffer；聚合、编码和响应完成仍需要各自的完成信号。</li>
             <li><strong>用 Mutex 保护同一份短生命周期状态。</strong>计数器、map 或 cache 的不变量留在一个临界区里，不必为一次加法制造 actor 协议。</li>
             <li><strong>把容量当预算。</strong>写清允许积压多少项、多少字节和多老；buffer 不是修复慢消费者的无限仓库。</li>
             <li><strong>每条可能阻塞的 send 都要有退出故事。</strong>要么接收者生命周期更长，要么 select 监听 <code>ctx.Done()</code>，要么容量覆盖有界结果。</li>
@@ -408,13 +408,13 @@ go test -run '^$' -bench BenchmarkCoordinationContracts -benchmem</code></pre>
             <li><a href="https://go.dev/ref/mem">The Go Memory Model</a></li>
             <li><a href="https://pkg.go.dev/sync#Mutex">sync.Mutex documentation</a></li>
             <li><a href="https://go.dev/doc/articles/race_detector">Data Race Detector</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L34-L125">hchan and makechan</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L176-L351">chansend and direct send</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L403-L486">closechan</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/chan.go#L524-L746">chanrecv and recv</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/select.go#L107-L444">selectgo three-pass protocol</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/internal/sync/mutex.go#L17-L233">internal sync.Mutex</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/sema.go#L5-L289">runtime semaphore acquire/release</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/chan.go#L34-L125">hchan and makechan</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/chan.go#L164-L343">chansend and direct send</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/chan.go#L406-L475">closechan</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/chan.go#L508-L739">chanrecv and recv</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/select.go#L107-L444">selectgo three-pass protocol</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/sync/mutex.go#L17-L233">internal sync.Mutex</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/sema.go#L5-L289">runtime semaphore acquire/release</a></li>
             <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/concurrency_lab_test.go">fetchd concurrency lab</a></li>
           </ul>
 
