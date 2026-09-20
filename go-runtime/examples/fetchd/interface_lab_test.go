@@ -84,6 +84,26 @@ func TestTypedNilInterfaceRetainsDynamicType(t *testing.T) {
 	}
 }
 
+func TestTypeAssertDistinguishesNilInterfaceFromTypedNil(t *testing.T) {
+	var err error
+	value := reflect.ValueOf(&err).Elem()
+	if value.Type() != reflect.TypeFor[error]() {
+		t.Fatal("reflected slot lost its static error type")
+	}
+	if got, ok := reflect.TypeAssert[error](value); ok || got != nil {
+		t.Fatalf("nil interface assertion = (%v, %v), want (nil, false)", got, ok)
+	}
+	err = (*fetchProblem)(nil)
+	got, ok := reflect.TypeAssert[error](value)
+	if !ok || got == nil {
+		t.Fatalf("typed nil assertion = (%v, %v), want non-nil interface and true", got, ok)
+	}
+	problem, ok := got.(*fetchProblem)
+	if !ok || problem != nil {
+		t.Fatal("assertion did not preserve the nil *fetchProblem")
+	}
+}
+
 func TestGenericFilterPreservesNamedSliceType(t *testing.T) {
 	input := resultBatch{
 		{URL: "https://go.dev", Status: 200},

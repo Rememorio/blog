@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Go 源码阅读（五）：interface、泛型与反射的边界</title>
-    <meta name="description" content="Go 从请求到生产现场系列第五篇：沿 fetchd 阅读 Go 1.26.0 的 interface 两个 word、typed nil、itab、convT、泛型 shape 与字典，以及 reflect.Value 在什么条件下可以修改原值。" />
+    <meta name="description" content="Go 从请求到生产现场系列第五篇：沿 fetchd 阅读 Go 开发分支固定快照的 interface 两个 word、typed nil、itab、convT、泛型 shape 与字典，以及 reflect.Value 在什么条件下可以修改原值。" />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Go 源码阅读（五）：interface、泛型与反射的边界" />
     <meta property="og:description" content="interface 选择运行时行为，泛型复用静态算法，反射解释运行时模式；三者解决的不是同一个问题。" />
@@ -49,7 +49,7 @@
             只关心一个值“会做什么”、想让同一段算法处理一组已知类型、直到程序运行时才知道字段名，是三个不同的问题。
             它们分别适合 interface、泛型和反射。本篇先学会按“类型什么时候才知道”做选择，再看三者在源码里怎样保存类型信息。
           </p>
-          <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：ITab → getitab / gc shape → dictionary / Value → Set</span><span>实验：interface_lab_test.go</span></div>
+          <div class="meta-line"><span>源码：Go 开发分支固定快照</span><span>路径：ITab → getitab / gc shape → dictionary / Value → Set</span><span>实验：interface_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/abstraction-boundaries-overview.png" alt="Go 三种类型处理方式：interface 按动态类型选择行为，泛型对静态类型复用同一算法，反射按运行时模式检查字段" /></figure>
         </section>
 
@@ -58,11 +58,11 @@
 
           <p>
             前半篇先按使用场景讲语义，后半篇才读实现。规范证据来自 <a href="https://go.dev/ref/spec#Interface_types">Go Language Specification</a>；实现证据固定到
-            <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go">internal/abi/iface.go</a>、
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go">runtime/iface.go</a>、
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go">编译器 noder</a> 与
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go">reflect/value.go</a>。
+            <a href="https://github.com/golang/go/tree/f043823a99a4118989a34afec015d23b5d54d01e">Go 开发分支固定快照</a>（核实于 2026-09-20，不代表稳定发行版）的
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/abi/iface.go">internal/abi/iface.go</a>、
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/iface.go">runtime/iface.go</a>、
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/noder/reader.go">编译器 noder</a> 与
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/reflect/value.go">reflect/value.go</a>。
           </p>
 
           <h2>一、先用三个需求选择抽象</h2>
@@ -113,7 +113,7 @@ type eface struct {
     _type *_type
     data  unsafe.Pointer
 }</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L184-L192">runtime iface / eface</a>；稳定 ABI 形状见 <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go#L9-L33">internal/abi InterfaceType、ITab 与 EmptyInterface</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go#L184-L192">runtime iface / eface</a>；当前内部布局见 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/abi/iface.go#L12-L45">internal/abi.ITab 与 EmptyInterface</a>。</span>
 
           <h3>2.1 typed nil：Data 可以为空，类型 word 仍不为空</h3>
           <p>
@@ -138,7 +138,7 @@ fmt.Printf("%T\n", err)   // *main.fetchProblem</code></pre>
 
           <h3>2.2 <code>getitab</code> 把类型对映射成方法表</h3>
           <p>
-            把具体类型转成非空 interface 时，runtime 需要这对“interface 类型 × 具体类型”的 <code>ITab</code>。<code>getitab</code> 先走无锁查表快路径；未命中时加锁重试，再从 persistent allocator 建表并加入全局 <code>itabTable</code>。
+            非空 interface 需要这对“interface 类型 × 具体类型”的 <code>ITab</code>。编译期能确定的类型对可以直接使用预生成表；需要动态查找时，<code>getitab</code> 先走无锁查表快路径；未命中时加锁重试，再从 persistent allocator 建表并加入全局 <code>itabTable</code>。
             如果具体类型缺方法，失败结果也可被缓存；强制转换需要 panic 的完整缺失方法名时才重新初始化以得到诊断。
           </p>
 
@@ -148,14 +148,14 @@ fmt.Printf("%T\n", err)   // *main.fetchProblem</code></pre>
     Hash  uint32
     Fun   [1]uintptr
 }</code></pre>
-          <span class="source-caption">布局：<a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go#L14-L21">abi.ITab</a>；查找与发布：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L44-L103">runtime.getitab</a>。</span>
+          <span class="source-caption">布局：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/abi/iface.go#L17-L33">abi.ITab</a>；查找与发布：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/iface.go#L44-L103">runtime.getitab</a>。</span>
 
           <p>
             <code>itabInit</code> 利用 interface 方法列表和 concrete 方法列表都按名称排序的事实，用两个游标线性归并，复杂度是 O(ni+nt)。匹配时把具体方法入口写到 <code>Fun[k]</code>；找不到时保留 <code>Fun[0] == 0</code> 并返回缺失方法名。
             这比把每个调用都做成按名字搜索更重要：一次建立/查表之后，接口调用沿已确定的槽位跳到函数入口。
           </p>
 
-          <figure class="figure"><img src="../assets/itab-conversion-assertion.png" alt="Go interface 源码路径：getitab 和 itabInit 匹配有序方法并缓存 ITab，convT 准备 Data，类型断言再检查动态类型" /></figure>
+          <figure class="figure"><img src="../assets/itab-conversion-assertion.png" alt="interface 方法表的动态查找：getitab 命中时复用，未命中时由 itabInit 匹配方法并加入 itabTable，ITab 保存 Inter、Type 与 Fun" /></figure>
 
           <h3>2.3 装进 interface 时，值可能复制，也可能逃逸</h3>
           <p>
@@ -168,7 +168,7 @@ fmt.Printf("%T\n", err)   // *main.fetchProblem</code></pre>
     typedmemmove(t, x, v)
     return x
 }</code></pre>
-          <span class="source-caption">转换实现：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L332-L446">convT 与专用转换函数</a>。</span>
+          <span class="source-caption">转换实现：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/iface.go#L350-L464">convT 与专用转换函数</a>。</span>
 
           <p>
             类型断言会检查动态类型是否实现目标接口，或是否与目标非接口类型一致。runtime 的 <code>assertE2I</code>/<code>typeAssert</code> 执行这项检查并维护断言缓存；带 comma-ok 的断言失败返回零值和 false，不带 ok 的失败 panic。
@@ -199,11 +199,11 @@ func filterBatch[S ~[]E, E any](values S, keep func(E) bool) S {
 
           <h3>3.1 当前 gc 编译器怎样落地：shape body + dictionary</h3>
           <p>
-            Go 规范不规定泛型必须单态化、擦除还是传字典。Go 1.26.0 的 gc 编译器会为可共享实现选择 shape，并写出运行时 dictionary；dictionary 可包含类型参数的方法表达式、子字典、runtime type 和 itab。
-            <code>readerDict</code>/<code>writerDict</code> 负责读写这些条目，<code>shapify</code> 选择 shape。它们是理解当前二进制和 profile 的源码证据，不是可被业务代码依赖的 ABI。
+            Go 规范不规定泛型必须单态化、擦除还是传字典。当前快照的 gc 编译器会为可共享实现选择 shape，并写出运行时 dictionary；dictionary 可包含类型参数的方法表达式、子字典、runtime type 和 itab。
+            <code>readerDict</code>/<code>writerDict</code> 负责读写这些条目，<code>Shapify</code> 选择 shape。它们是理解当前二进制和 profile 的源码证据，不是可被业务代码依赖的 ABI。
           </p>
 
-          <figure class="figure"><img src="../assets/generic-shape-dictionary.png" alt="Go 1.26 gc 泛型实现：具体调用进入共享 shape function，并通过 dictionary 提供 method expression、runtime type 和 itab；这是实现而非语言保证" /></figure>
+          <figure class="figure"><img src="../assets/generic-shape-dictionary.png" alt="gc 编译器的泛型实现：具体调用进入共享 shape function，并通过 dictionary 提供 method expression、runtime type 和 itab；这是实现而非语言保证" /></figure>
 
           <p>
             对实验包禁用内联并查看符号，可以同时看到具体的 dictionary 与 shape 函数：
@@ -213,7 +213,7 @@ func filterBatch[S ~[]E, E any](values S, keep func(E) bool) S {
 ...dict.filterBatch[...resultBatch,...fetchResult]
 sumGeneric[go.shape.struct {...}]
 filterBatch[go.shape.[]fetchResult,go.shape.struct {...}]</code></pre>
-          <span class="source-caption">编译器入口：<a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L157-L210">readerDict</a>、<a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L891-L960">shapify</a> 与 <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/writer.go#L897-L968">objDict</a>。</span>
+          <span class="source-caption">编译器入口：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/noder/reader.go#L164-L220">readerDict</a>、<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/noder/reader.go#L960-L1018">Shapify</a> 与 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/noder/writer.go#L962-L1044">objDict</a>。</span>
 
           <p>
             “有字典”也不等于“每次都慢”，正如“interface 有 itab”不等于“每次都分配”。内联、去虚拟化、逃逸、具体约束操作和 CPU 前端都会改变结果；要优化的是真实 hot path，而不是某个抽象名字。
@@ -230,11 +230,11 @@ filterBatch[go.shape.[]fetchResult,go.shape.struct {...}]</code></pre>
     ptr  unsafe.Pointer
     flag
 }</code></pre>
-          <span class="source-caption">布局与 flag：<a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L40-L70">reflect.Value</a>；打包/拆包：<a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L122-L169">packEface / unpackEface</a>。</span>
+          <span class="source-caption">布局与 flag：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/reflect/value.go#L40-L67">reflect.Value</a>；打包/拆包：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/reflect/value.go#L118-L165">packEface / unpackEface</a>。</span>
 
           <p>
             <code>packEface</code> 还展示了一个不容易从 API 表面猜到的别名处理：把一个可寻址、间接的 Value 暴露为 interface 时，reflect 可能先复制到新存储，避免后来通过 Value 修改已经装箱的值。
-            这种别名控制属于实现机制；调用者应只依赖 <code>CanAddr</code>、<code>CanSet</code> 和导出规则。
+            这种别名控制属于实现机制；调用者应只依赖 <code>CanAddr</code>、<code>CanSet</code> 和导出规则。方法值也说明了内部表示为何不能作为契约：当前 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/reflect/value.go#L1897-L1908"><code>Value.Method</code></a> 直接构造保存接收者和方法信息的 <code>methodValue</code> 闭包，不再把方法序号塞进 <code>flag</code> 的高位。调用语义不变，内部存储和分配时机却可以改变。
           </p>
 
           <h3>4.1 第三定律：要修改，Value 必须可设置</h3>
@@ -254,7 +254,7 @@ func (v Value) Set(x Value) {
     x.mustBeExported()
     var target unsafe.Pointer
     if v.kind() == Interface {
-        target = v.ptr
+        target = abi.NoEscape(v.ptr)
     }
     x = x.assignTo("reflect.Set", v.typ(), target)
     if x.flag&amp;flagIndir != 0 {
@@ -263,27 +263,38 @@ func (v Value) Set(x Value) {
         *(*unsafe.Pointer)(v.ptr) = x.ptr
     }
 }</code></pre>
-          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L339-L355">CanAddr / CanSet</a>、<a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L1216-L1259">Elem</a> 与 <a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L2146-L2167">Set</a>。</span>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/reflect/value.go#L335-L351">CanAddr / CanSet</a>、<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/reflect/value.go#L1213-L1256">Elem</a> 与 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/reflect/value.go#L2129-L2155">Set</a>。</span>
 
           <p>
-            Go 1.26 还提供泛型函数 <code>reflect.TypeAssert[T](v)</code>，语义等价于 <code>v.Interface().(T)</code>，但实现可用 <code>abi.TypeFor[T]()</code> 走更直接的路径，并在 interface 断言失败时避免为了失败结果分配。
-            它让“从反射世界返回静态类型”更清楚，却不会取消 Value 的有效性、导出性和可设置性检查。
+            泛型函数 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/reflect/value.go#L1509-L1588"><code>reflect.TypeAssert[T](v)</code></a> 返回两个结果，语义等价于 <code>value, ok := v.Interface().(T)</code>。实现可用 <code>abi.TypeFor[T]()</code> 走更直接的路径，并在 interface 断言失败时避免为了失败结果分配。
+            它检查动态值是否满足断言，并非比较 <code>v.Type()</code> 与 <code>reflect.TypeFor[T]()</code>：一个声明类型为 <code>error</code>、值为 nil 的可寻址变量，类型相同，断言仍失败；装有 typed nil 的非 nil interface 则可以成功。无效 Value 或来自未导出字段的 Value 仍会 panic；读回类型不要求 Value 可设置。
           </p>
+
+          <pre><code class="language-go">var err error
+v := reflect.ValueOf(&amp;err).Elem()
+fmt.Println(v.Type() == reflect.TypeFor[error]()) // true
+_, ok := reflect.TypeAssert[error](v)
+fmt.Println(ok) // false: the interface value is nil
+
+var problem *fetchProblem
+err = problem
+_, ok = reflect.TypeAssert[error](v)
+fmt.Println(ok) // true: *fetchProblem implements error</code></pre>
 
           <h2 id="evidence">五、实验：分别验证语义，不给抽象排总榜</h2>
           <p>
             <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/interface_lab_test.go">interface_lab_test.go</a>
-            有四组可重复测试：interface 保留动态类型和值；typed nil 不等于 nil；generic filter 保留命名 slice；反射只有通过可寻址 pointer 的导出字段才能修改。
+            覆盖五类行为：interface 保留动态类型和值；typed nil 不等于 nil；generic filter 保留命名 slice；反射只有通过可寻址 pointer 的导出字段才能修改；TypeAssert 区分 nil interface 与 typed nil。
           </p>
 
           <pre><code class="language-bash">cd go-runtime/examples/fetchd
-go test -run 'Test(Interface|TypedNil|Generic|Reflection)'
+go test -run 'Test(Interface|TypedNil|Generic|Reflection|TypeAssert)'
 go test -race ./...
 go vet ./...
 go test -run '^$' -bench BenchmarkAbstractionBoundaries -benchmem</code></pre>
 
           <p>
-            64 个 <code>fetchResult</code> 的微基准把装箱好的 interface slice 放在计时循环外：generic constraint 和 interface 调用都为 0 alloc/op，reflection 也没有每轮分配，但按字段名迭代明显更慢。
+            使用本文固定源码构建工具链时，64 个 <code>fetchResult</code> 的微基准把装箱好的 interface slice 放在计时循环外：generic constraint 和 interface 调用都为 0 alloc/op，reflection 也没有每轮分配，但按字段名迭代明显更慢。
             在这一个构造里，预装箱 interface 甚至略快于 generic method constraint；这正说明不能把泛型宣传成“更快的 interface”。如果把装箱、构造 slice 或逃逸移进循环，结论会随实验问题变化。
           </p>
 
@@ -291,7 +302,7 @@ go test -run '^$' -bench BenchmarkAbstractionBoundaries -benchmem</code></pre>
             <thead><tr><th>证据</th><th>它能回答</th><th>它不能回答</th></tr></thead>
             <tbody>
               <tr><td>规范</td><td>动态类型、断言、比较、type set 的语言语义</td><td>当前二进制用几份代码</td></tr>
-              <tr><td>runtime/reflect 源码</td><td>Go 1.26.0 的布局、缓存、复制与 flag</td><td>未来版本稳定 ABI</td></tr>
+              <tr><td>runtime/reflect 源码</td><td>当前快照的布局、缓存、复制与 flag</td><td>未来版本稳定 ABI</td></tr>
               <tr><td>编译器符号</td><td>该构建里确实存在 shape 与 dictionary</td><td>其他调用一定共享相同 shape</td></tr>
               <tr><td>benchmark + allocs</td><td>固定输入和调用形状的成本</td><td>三种抽象的普遍胜负</td></tr>
             </tbody>
@@ -319,14 +330,14 @@ go test -run '^$' -bench BenchmarkAbstractionBoundaries -benchmem</code></pre>
             <li><a href="https://go.dev/blog/when-generics">When To Use Generics</a></li>
             <li><a href="https://go.dev/blog/intro-generics">An Introduction To Generics</a></li>
             <li><a href="https://go.dev/blog/laws-of-reflection">The Laws of Reflection</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/internal/abi/iface.go#L9-L33">ABI interface and ITab layouts</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L44-L103">runtime.getitab</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L198-L256">runtime.itabInit</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/iface.go#L332-L475">interface conversion and assertion helpers</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L157-L210">gc runtime dictionaries</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/noder/reader.go#L891-L960">gc shaping</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L40-L169">reflect.Value layout and interface conversion</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/reflect/value.go#L1481-L1587">Interface and TypeAssert</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/abi/iface.go#L12-L45">ABI interface and ITab layouts</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/iface.go#L44-L103">runtime.getitab</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/iface.go#L198-L264">runtime.itabInit</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/iface.go#L350-L493">interface conversion and assertion helpers</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/noder/reader.go#L164-L220">gc runtime dictionaries</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/noder/reader.go#L960-L1018">gc shaping</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/reflect/value.go#L40-L165">reflect.Value layout and interface conversion</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/reflect/value.go#L1479-L1589">Interface and TypeAssert</a></li>
             <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/interface_lab_test.go">fetchd abstraction boundary lab</a></li>
           </ul>
 
