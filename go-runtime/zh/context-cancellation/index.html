@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Go 源码阅读（六）：context 取消之后，goroutine 结束了吗</title>
-    <meta name="description" content="Go 从请求到生产现场系列第六篇：沿 fetchd 阅读 Go 1.26.0 的 cancelCtx、propagateCancel、Cause、timerCtx、AfterFunc、WithoutCancel、HTTP request context 与 Server.Shutdown。" />
+    <meta name="description" content="Go 从请求到生产现场系列第六篇：沿 fetchd 阅读 Go 开发分支固定快照的 cancelCtx、propagateCancel、Cause、timerCtx、AfterFunc、WithoutCancel、HTTP request context 与 Server.Shutdown。" />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Go 源码阅读（六）：context 取消之后，goroutine 结束了吗" />
     <meta property="og:description" content="取消只关闭信号；cleanup、join 与 graceful shutdown 是另外三份必须显式完成的工作。" />
@@ -49,7 +49,7 @@
             <code>cancel()</code> 像亮起一盏“请停止”的灯：它不会瞬间杀死 worker，也不会等 worker 收好工具再离开。
             程序还要让 worker 看见信号、主动返回、清理资源，并由创建者确认全部结束。本篇会把这四步讲成一条完整的结束协议。
           </p>
-          <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：cancelCtx → timerCtx / AfterFunc → Request.Context → Shutdown</span><span>实验：context_lab_test.go</span></div>
+          <div class="meta-line"><span>源码：Go 开发分支固定快照</span><span>路径：cancelCtx → timerCtx / AfterFunc → Request.Context → Shutdown</span><span>实验：context_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/cancellation-is-not-completion.png" alt="Go context 取消不是完成：Done 关闭后 worker 才开始 cleanup，显式 Wait 或 join 确认所有 worker 结束，Cause 保留取消原因" /></figure>
         </section>
 
@@ -57,11 +57,11 @@
           <div class="note route-note"><p><strong>阅读目标：</strong>先记住一句话：<code>cancel()</code> 只是发出“请停止”的信号，不会瞬间杀死 goroutine，也不会替你等待它结束。读完前半篇，你应能把结束过程分成发信号、worker 观察并返回、清理资源、等待全部结束四步。</p></div>
 
           <p>
-            前半篇先讲调用者必须遵守的结束协议；传播细节再固定到 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/context/context.go">context/context.go</a> 和
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go">net/http/server.go</a>；API 契约来自
+            前半篇先讲调用者必须遵守的结束协议；传播细节再固定到 <a href="https://github.com/golang/go/tree/f043823a99a4118989a34afec015d23b5d54d01e">Go 开发分支固定快照</a> 的
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/context/context.go">context/context.go</a> 和
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go">net/http/server.go</a>；API 契约来自
             <a href="https://pkg.go.dev/context">context 文档</a> 与 <a href="https://pkg.go.dev/net/http#Server.Shutdown">Server.Shutdown 文档</a>。
-            字段布局、fallback goroutine 与 Shutdown 的 polling 是当前实现；取消传播、Done/Cause/Err 与 Shutdown 公共语义才是调用者契约。
+            该提交是开发分支快照，不代表稳定版承诺。字段布局、fallback goroutine 与 Shutdown 的 polling 是当前实现；取消传播、Done/Cause/Err 与 Shutdown 公共语义才是调用者契约。
           </p>
 
           <h2>一、按下取消键后，程序还要做三件事</h2>
@@ -119,7 +119,7 @@ context 第一次记下 Err / Cause，并关闭 Done
           </p>
           <p>
             <code>cancelCtx</code> 嵌入 parent Context。<code>done</code> 用 <code>atomic.Value</code> 延迟创建 channel；从未调用 Done 的 context 无需分配 channel。<code>err</code> 也用 atomic load 服务高频检查，children map 与 cause 由 mutex 保护。
-            <code>Err()</code> 读到非 nil error 后还会接收一次 Done，确保调用者观察错误时 channel 已经关闭。
+            <code>Err()</code> 读到非 nil error 后，通常还要等 Done 关闭，确保错误与取消信号一致。若 Done 是初始化时已关闭的共享 <code>closedchan</code>，当前实现会跳过接收，避免所有此类检查争用同一个 channel 锁；这项优化没有改变取消语义。
           </p>
 
           <pre><code class="language-go">type cancelCtx struct {
@@ -130,22 +130,26 @@ context 第一次记下 Err / Cause，并关闭 Done
     err      atomic.Value
     cause    error
 }</code></pre>
-          <span class="source-caption">布局与延迟 Done：<a href="https://github.com/golang/go/blob/go1.26.0/src/context/context.go#L431-L473">cancelCtx、Done 与 Err</a>。</span>
+          <span class="source-caption">布局与延迟 Done：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/context/context.go#L432-L477">cancelCtx、Done 与 Err</a>。</span>
 
           <h3>3.1 <code>propagateCancel</code> 有三条传播路</h3>
           <p>
             建立 child 时先检查 parent.Done。parent 永不取消就无需注册；parent 已取消则同步取消 child。最常见的 parent 是标准库 <code>*cancelCtx</code> 或可追溯到它的派生类型，child 直接登记到 parent.children，取消时递归调用。
-            若 parent 提供 <code>AfterFunc</code>，child 注册回调并用 <code>stopCtx</code> 保存注销函数；只有无法识别的自定义 Context 才启一个 fallback goroutine，在 parent.Done 与 child.Done 之间 select。
+            登记前必须持锁再次检查 parent.err：parent 可能刚在第一次检查后取消；此时直接取消 child，不能把它挂到已清空的 children map 上。若 parent 提供 <code>AfterFunc</code>，child 注册回调并用 <code>stopCtx</code> 保存注销函数；只有无法识别的自定义 Context 才启一个 fallback goroutine，在 parent.Done 与 child.Done 之间 select。
           </p>
 
           <figure class="figure"><img src="../assets/cancelctx-propagation.png" alt="cancelCtx 源码结构与传播：propagateCancel 优先注册到 parent children，其次使用 parent AfterFunc，最后才启动 fallback goroutine；cancel 发布错误、关闭 done、递归取消 children 并 removeChild" /></figure>
 
           <pre><code class="language-go">if p, ok := parentCancelCtx(parent); ok {
     p.mu.Lock()
-    if p.children == nil {
-        p.children = make(map[canceler]struct{})
+    if err := p.err.Load(); err != nil {
+        child.cancel(false, err.(error), p.cause)
+    } else {
+        if p.children == nil {
+            p.children = make(map[canceler]struct{})
+        }
+        p.children[child] = struct{}{}
     }
-    p.children[child] = struct{}{}
     p.mu.Unlock()
     return
 }
@@ -165,7 +169,7 @@ go func() {
     case &lt;-child.Done():
     }
 }()</code></pre>
-          <span class="source-caption">完整路径：<a href="https://github.com/golang/go/blob/go1.26.0/src/context/context.go#L475-L545">propagateCancel</a>；父子识别与移除：<a href="https://github.com/golang/go/blob/go1.26.0/src/context/context.go#L382-L424">parentCancelCtx / removeChild</a>。</span>
+          <span class="source-caption">完整路径：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/context/context.go#L480-L550">propagateCancel</a>；父子识别与移除：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/context/context.go#L383-L425">parentCancelCtx / removeChild</a>。</span>
 
           <p>
             调用返回的 CancelFunc 不只是提前关 Done。它还把 child 从 parent.children 删除，或注销 parent AfterFunc；deadline context 还会停止 timer。忘记调用 cancel，child 可能一直被 parent 引用到 parent 自己取消。
@@ -211,12 +215,12 @@ func (c *timerCtx) cancel(removeFromParent bool, err, cause error) {
     if c.timer != nil { c.timer.Stop(); c.timer = nil }
     c.mu.Unlock()
 }</code></pre>
-          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/context/context.go#L619-L688">WithDeadlineCause 与 timerCtx</a>。</span>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/context/context.go#L624-L693">WithDeadlineCause 与 timerCtx</a>。</span>
 
           <h3>3.4 <code>AfterFunc</code> 的 stop 只赢得“是否开始”竞争</h3>
           <p>
             <code>context.AfterFunc(ctx, f)</code> 用内嵌 cancelCtx 订阅 parent，并用一个 <code>sync.Once</code> 在“stop 阻止执行”和“cancel 启动 <code>go f()</code>”之间裁决。
-            stop 返回 true 表示它阻止了 f 开始；返回 false 表示 f 已开始，或之前已 stop。最容易漏掉的一句 API 文档是：<strong>stop 不等待 f 完成</strong>。
+            stop 返回 true 表示它阻止了 f 开始；返回 false 表示 f 已开始，或之前已 stop。下面只有一处调用 stop；若多个调用者共享 stop，某次 false 也可能只是另一处已成功阻止回调，不能据此无条件等待 done。最容易漏掉的一句 API 文档是：<strong>stop 不等待 f 完成</strong>。
           </p>
 
           <figure class="figure"><img src="../assets/timer-afterfunc-boundary.png" alt="Go timerCtx 与 context.AfterFunc 的实际行为：较早 parent deadline 避免新 timer，手动 cancel 停 timer；AfterFunc 用 sync.Once 决定 stop 或 go f，stop=false 不等待已运行回调" /></figure>
@@ -250,7 +254,7 @@ return writeAudit(auditCtx, event)</code></pre>
           <h2 id="http">四、HTTP request context 的关闭点</h2>
           <p>
             HTTP/1 server 在 connection 上先创建 connection context；每次 <code>readRequest</code> 再 <code>context.WithCancel(ctx)</code>，把 cancel func 存进 response。文档保证 incoming request 的 context 在客户端连接关闭、HTTP/2 request 被取消或 <code>ServeHTTP</code> 返回时取消。
-            HTTP/1 实现中 handler 返回后立刻调用 <code>w.cancelCtx()</code>；connection reader 检测读错误时也会取消 connection context，从而向当前 request 传播。
+            HTTP/1 实现中 handler 返回后立刻调用 <code>w.cancelCtx()</code>；connection reader 观察 EOF 或真实读故障时也会取消 connection context。两次请求之间，为回收空闲连接缓冲区而设置的短探测超时是例外：它只表示暂时无数据，不能取消连接 context，否则下次复用连接收到的 request 会一开始就已取消。
           </p>
 
           <pre><code class="language-go">ctx, cancelCtx := context.WithCancel(ctx)
@@ -259,7 +263,7 @@ w = &amp;response{cancelCtx: cancelCtx, req: req, /* ... */}
 
 serverHandler{c.server}.ServeHTTP(w, w.req)
 w.cancelCtx()</code></pre>
-          <span class="source-caption">request context 建立：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L1038-L1067">readRequest</a>；handler 返回后的取消：<a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L2055-L2081">conn.serve</a>。</span>
+          <span class="source-caption">读错误与空闲探测例外：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L868-L907">handleReadErrorLocked</a>；request context 建立：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L1173-L1204">readRequest</a>；handler 返回后的取消：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L2204-L2231">conn.serve</a>。</span>
 
           <p>
             所以 handler 内创建的 worker 不应把 request context 保存到返回之后继续无限使用。handler 应先停止接收新工作，取消 child，等待 worker/errgroup，最后再 return；return 触发的 request cancel 只是最后一道停止信号，不能证明 worker 已退出。
@@ -268,13 +272,14 @@ w.cancelCtx()</code></pre>
 
           <h3>4.1 <code>Server.Shutdown</code> 等 active，不中断 active</h3>
           <p>
-            Shutdown 先标记 inShutdown、关闭 listener，让 Serve 返回 <code>ErrServerClosed</code>；并发启动 <code>RegisterOnShutdown</code> callbacks，等待 listener goroutine；随后关闭 idle connections，并以 1ms 起步、指数退避到最多 500ms 的 timer 轮询 active connections，直到它们回到 idle。
+            Shutdown 先标记 inShutdown、关闭 listener，让 Serve 返回 <code>ErrServerClosed</code>；并发启动 <code>RegisterOnShutdown</code> callbacks，等待 listener goroutine；随后关闭 idle connections，并以 1ms 为起始基值、指数退避至 500ms 基值并加最多约 10% jitter 的 timer 轮询 active connections，直到它们回到 idle。
             传入 Shutdown 的 context 只限制“等多久”，并不会成为每个 active request 的 parent，也不会自动取消 handler。
           </p>
 
           <figure class="figure"><img src="../assets/http-context-shutdown.png" alt="HTTP 请求和关闭生命周期：request context 在连接取消或 handler 返回时关闭，worker 清理并 join；Server.Shutdown 关闭 listener 和 idle connection、等待 active 变 idle，但不打断 active handler，也不等待 hijacked WebSocket" /></figure>
 
-          <pre><code class="language-go">func (s *Server) Shutdown(ctx context.Context) error {
+          <pre><code class="language-go">// HTTP/1 与 HTTP/2 路径摘要，省略轮询间隔计算
+func (s *Server) Shutdown(ctx context.Context) error {
     s.inShutdown.Store(true)
     s.mu.Lock()
     lnerr := s.closeListenersLocked()
@@ -291,7 +296,7 @@ w.cancelCtx()</code></pre>
         }
     }
 }</code></pre>
-          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L3128-L3190">Shutdown</a> 与 <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L3199-L3224">closeIdleConns</a>。</span>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L3373-L3436">Shutdown</a> 与 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L3452-L3477">closeIdleConns</a>。</span>
 
           <p>
             hijacked connection（包括常见 WebSocket 路径）不在 Shutdown 的关闭或等待范围。<code>RegisterOnShutdown</code> 只负责启动协议专用通知，callback 本身也是 goroutine，Shutdown 不等它结束；应用必须维护这些 connection/session 的 registry，并做自己的 broadcast + join。
@@ -300,7 +305,7 @@ w.cancelCtx()</code></pre>
 
           <h2 id="evidence">五、实验把 signal、stop 与 join 分开</h2>
           <p>
-            <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/context_lab_test.go">context_lab_test.go</a>
+            <a href="https://github.com/Rememorio/blog/blob/53621b3239303c5a8ed9a593b6f48b747b0ad395/go-runtime/examples/fetchd/context_lab_test.go">context_lab_test.go</a>
             用 <code>testing/synctest</code> 确定性证明 cancel 返回时 worker 仍可卡在 cleanup；释放 cleanup 并 Wait 后才完成。另一个测试让 AfterFunc callback 已启动但受 channel 阻塞，此时 stop 返回 false 且立即返回，显式 done 才代表完成。
           </p>
 
@@ -349,15 +354,15 @@ go vet ./...</code></pre>
           <ul class="source-list">
             <li><a href="https://pkg.go.dev/context">context package documentation</a></li>
             <li><a href="https://go.dev/blog/context">Go Concurrency Patterns: Context</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/context/context.go#L240-L370">WithCancelCause, Cause, and AfterFunc</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/context/context.go#L382-L585">cancelCtx parent detection, propagation, and cancellation</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/context/context.go#L585-L615">WithoutCancel</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/context/context.go#L619-L714">timerCtx and timeout causes</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/context/context.go#L241-L371">WithCancelCause, Cause, and AfterFunc</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/context/context.go#L383-L590">cancelCtx parent detection, propagation, and cancellation</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/context/context.go#L590-L620">WithoutCancel</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/context/context.go#L624-L719">timerCtx and timeout causes</a></li>
             <li><a href="https://pkg.go.dev/net/http#Request.Context">http.Request.Context</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L1038-L1067">HTTP request context construction</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L1954-L2081">connection and request cancellation</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L3128-L3224">Server.Shutdown and idle-connection polling</a></li>
-            <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/context_lab_test.go">fetchd context lifecycle lab</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L1173-L1204">HTTP request context construction</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L2010-L2231">connection and request cancellation</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L3373-L3477">Server.Shutdown and idle-connection polling</a></li>
+            <li><a href="https://github.com/Rememorio/blog/blob/53621b3239303c5a8ed9a593b6f48b747b0ad395/go-runtime/examples/fetchd/context_lab_test.go">fetchd context lifecycle lab</a></li>
           </ul>
 
           <nav class="article-pager" aria-label="文章翻页"><a href="../abstraction-boundaries/">← 第五篇：抽象边界</a><a href="../escape-allocation-gc/">第七篇：内存与 GC →</a></nav>
