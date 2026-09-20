@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Go Source Notes VII: Why Does One Request Land on the Heap?</title>
-    <meta name="description" content="Chapter VII of Go from Request to Production: trace Go 1.26.0 escape analysis, slice allocation, mallocgc, mcache, concurrent GC, write barriers, mark assists, GOGC, and GOMEMLIMIT through fetchd." />
+    <meta name="description" content="Chapter VII of Go from Request to Production: trace Go compiler escape analysis, slice allocation, mallocgc, mcache, concurrent GC, write barriers, mark assists, GOGC, and GOMEMLIMIT through fetchd." />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Go Source Notes VII: Why Does One Request Land on the Heap?" />
     <meta property="og:description" content="The heap is not a syntax choice. It follows from a lifetime proof, and its cost continues through size classes, GC goals, and mutator assists." />
@@ -50,19 +50,19 @@
             retained for later. The compiler uses that lifetime to choose stack or heap. “On the heap” is not itself a bug; the useful
             questions are how often allocation happens, how much remains alive, and whether GC affects request latency.
           </p>
-          <div class="meta-line"><span>Source: Go 1.26.0</span><span>Route: escape graph → mallocgc / mcache → pacer / assist</span><span>Lab: memory_lab_test.go</span></div>
-          <figure class="hero-image"><img src="../assets/request-memory-journey.png" alt="A fetchd request's memory journey: escape analysis chooses stack or heap, mallocgc allocates through mcache size classes, slice growth and preallocation produce different allocation volumes, and GC marks, assists, and sweeps around a heap goal" /></figure>
+          <div class="meta-line"><span>Source: pinned Go development snapshot</span><span>Route: escape graph → mallocgc / mcache → pacer / assist</span><span>Lab: memory_lab_test.go</span></div>
+          <figure class="hero-image"><img src="../assets/request-memory-journey.png" alt="Memory journey: the compiler proves lifetimes, runtime allocates heap storage when required, preallocation can reduce copying, and allocation rate and live heap are measured separately" /></figure>
         </section>
 
         <section class="article-body">
           <div class="note route-note"><p><strong>Reading goal:</strong> do not treat “heap” as a bad word. First separate three questions: why must an object outlive the current function, how many new objects does the program create each second, and how many remain alive when GC runs? The second half enters escape analysis, allocation, and concurrent GC source.</p></div>
 
           <p>
-            The language does not promise that a value lives on a stack or heap. Concrete decisions are pinned to the <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>:
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go">escape.go</a>,
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go">malloc.go</a>,
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go">mgc.go</a>, and
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcpacer.go">mgcpacer.go</a>.
+            The language does not promise that a value lives on a stack or heap. Concrete decisions are pinned to the <a href="https://github.com/golang/go/tree/f043823a99a4118989a34afec015d23b5d54d01e">fixed Go development-branch snapshot</a> (verified on September 20, 2026; not a stable release):
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/escape/escape.go">escape.go</a>,
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc.go">malloc.go</a>,
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgc.go">mgc.go</a>, and
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go">mgcpacer.go</a>.
             Metric and profile definitions come from the official <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a>,
             <a href="https://pkg.go.dev/runtime/pprof">runtime/pprof</a>, and <a href="https://go.dev/doc/diagnostics">Diagnostics</a> documentation.
           </p>
@@ -130,13 +130,17 @@ func escapingResult() *fetchResult {
             Interprocedural flows are summarized as parameter tags for static call sites.
           </p>
 
-          <figure class="figure"><img src="../assets/escape-analysis-graph.png" alt="Go escape analysis as a weighted location graph: taking an address has weight minus one, assignment zero, and dereference plus one; returning an address or publishing a slice backing array can connect result to the heap and produce compiler escape reports" /></figure>
-          <span class="source-caption">Invariants, weights, and algorithm: <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go#L19-L89">escape.go L19-L89</a>; batch entry: <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go#L138-L188">Batch</a>.</span>
+          <figure class="figure"><img src="../assets/escape-analysis-graph.png" alt="Conceptual compiler escape analysis: address-taking, copying, and dereferencing give assignment edges different weights, pointer lifetimes are checked through the graph, and the compiler reports escapes" /></figure>
+          <span class="source-caption">Invariants, weights, and algorithm: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/escape/escape.go#L20-L90">escape.go</a>; batch entry: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/escape/escape.go#L144-L195">Batch</a>.</span>
 
           <p>
             The graph is a conservative approximation. The source explicitly says it generally lacks full flow, path, and context
             sensitivity, and does not distinguish separate struct fields or slice elements. “Escapes to heap” means the compiler
             lacks a sufficient proof for the current frame. It does not mean the object leaks or that GC is currently under pressure.
+          </p>
+
+          <p>
+            A closure does not always need a capture record. After deciding which variables are captured by value, the compiler uses <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/escape/escape.go#L303-L410"><code>rewriteClosureVarsWithLiterals</code></a> to initialize known constants as locals inside the closure function. If no captures remain, later compilation can use the function directly. For example, the outer variable in <code>n := 42; return func() int { return n }</code> can disappear. This is conditional: address-taken, reassigned, or unproven values do not qualify, and already-inlined closures skip the transformation. It does not make all closures allocation-free.
           </p>
 
           <h3>2.2 Read <code>-m=2</code> as a Flow Report</h3>
@@ -180,7 +184,7 @@ for i := 0; i &lt; count; i++ {
 }</code></pre>
 
           <p>
-            For 64 results, this lab consistently measured <strong>7 allocs/op and about 9.1 KiB/op</strong> for incremental growth,
+            With a toolchain built from the pinned snapshot, 64 results measured <strong>7 allocs/op and about 9.1 KiB/op</strong> for incremental growth,
             versus <strong>1 alloc/op and about 4.8 KiB/op</strong> with preallocation. The escaping pointer path used 1 alloc/op and
             64 B/op; the checksum-only value path used 0 alloc/op. Those numbers describe this shape, not a cross-platform constant.
             Excess preallocation can enlarge the live heap, so use a trustworthy bound rather than “as large as possible.”
@@ -198,13 +202,14 @@ the accumulated new memory reaches the next GC heap goal sooner</code></pre>
             seven backing-array requests. Reducing allocations and changing collection frequency are different actions.
           </p>
           <p>
-            Go 1.26.0 first short-circuits a zero-sized request to shared <code>zerobase</code>. On the regular path, small objects
+            The pinned runtime first short-circuits a zero-sized request to shared <code>zerobase</code>. On the regular path, small objects
             are roughly at most 32 KiB. Pointer-free objects below 16 B may enter the tiny allocator, packing multiple values into
             one 16 B block. Other small objects split by size class and scan/noscan shape; large objects allocate directly from heap
             pages. Pointer-bearing objects also need correct bitmap and zeroing state so the collector knows which words to scan.
           </p>
 
           <figure class="figure"><img src="../assets/mallocgc-allocation-path.png" alt="Go mallocgc allocation paths: zero-sized allocations use zerobase, tiny pointer-free values share a sixteen-byte block, small scan and noscan objects use size classes and per-P mcache spans, full spans refill through mcentral, and large values use mheap pages" /></figure>
+          <span class="source-caption">Assist credit in the diagram is deducted for nonzero allocations during concurrent marking. A zero-size request returns <code>zerobase</code> first and skips this step.</span>
 
           <pre><code class="language-go">if size == 0 {
     return unsafe.Pointer(&amp;zerobase)
@@ -212,8 +217,12 @@ the accumulated new memory reaches the next GC heap goal sooner</code></pre>
 if gcBlackenEnabled != 0 {
     deductAssistCredit(size)
 }
-// small noscan / small scan / large routing follows</code></pre>
-          <span class="source-caption">Entry and routing: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go#L1097-L1217">mallocgc</a>. Go 1.26 also contains size-specialized paths guarded by experiment and sanitizer conditions; applications must not depend on that internal branch.</span>
+// simplified fallback; specialized helpers also account for assists</code></pre>
+          <span class="source-caption">Entry and routing: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc.go#L1043-L1171">mallocgc</a>. This excerpt shows only the zero-size case and generic assist check; it omits earlier returns through specialized entry points.</span>
+
+          <p>
+            The pinned snapshot has removed the size-specialized malloc experiment switch. Builds outside Plan 9 and without the relevant sanitizers route sizes covered by the tables through <code>mallocNoScanTable</code>, <code>mallocScanTable</code>, or the specialized tiny function. Other sizes and restricted builds retain generic paths. This does not bypass GC: the <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc_stubs.go#L100-L178">template</a> used to generate specialized functions still deducts assist credit when necessary. Both entry families obtain storage from the current P's cache and spans.
+          </p>
 
           <p>
             Size classes make fixed-sized slots cheap to manage, while introducing internal fragmentation of
@@ -224,7 +233,7 @@ if gcBlackenEnabled != 0 {
 
           <h3>3.1 The Fast Path Is the Current P's <code>mcache</code> and <code>mspan</code></h3>
           <p>
-            <code>nextFreeFast</code> finds a trailing zero in the current span's <code>allocCache</code>, advances
+            <code>nextFreeFast</code> counts trailing zero bits in the current span's <code>allocCache</code> to locate its first set bit, which represents a free slot, advances
             <code>freeindex</code>, and computes the slot address. It does not visit the global heap for every object.
             When a cached span fills, <code>mcache.nextFree</code> calls <code>refill</code>. Refill returns the full span to the
             central list and obtains a span with space from <code>mcentral.cacheSpan</code>. The source requires a non-preemptible
@@ -239,7 +248,7 @@ if gcBlackenEnabled != 0 {
     }
     return 0
 }</code></pre>
-          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go#L1021-L1092">nextFreeFast and mcache.nextFree</a>; <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mcache.go#L160-L206">mcache.refill</a>.</span>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc.go#L977-L1048">nextFreeFast and mcache.nextFree</a>; <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mcache.go#L160-L206">mcache.refill</a>.</span>
 
           <p>
             “Small allocation is fast” describes the common fast path, not a zero-cost system. Refill can entail sweeping and a GC
@@ -261,14 +270,14 @@ if gcBlackenEnabled != 0 {
             accounting. The runtime returns to <code>_GCoff</code>, disables the barrier, and sweeps concurrently.
           </p>
 
-          <figure class="figure"><img src="../assets/concurrent-gc-pacer.png" alt="Go concurrent GC: a heap goal is constrained by GOGC and the soft memory-limit goal; a brief stop precedes concurrent marking by background workers, hybrid write barriers, and allocation assists; a second brief mark-termination stop leads to concurrent sweep and reuse" /></figure>
+          <figure class="figure"><img src="../assets/concurrent-gc-pacer.png" alt="Concurrent GC cycle: concurrent marking runs between two brief pauses with background marking, write barriers, and allocation assists; concurrent sweeping follows, while GOGC and GOMEMLIMIT influence the heap goal" /></figure>
 
           <p>
             “Go GC is concurrent” and “Go GC has STW” are both incomplete. Examine pauses, concurrent CPU, assist charged to the
             request, and changes in live heap together. Pause quantiles alone can miss tail latency from request goroutines doing
             GC work; GC CPU alone can mislabel an application allocation spike as a collector regression.
           </p>
-          <span class="source-caption">Phases and full cycle: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L22-L79">mgc.go overview</a>; <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L733-L879">gcStart</a>.</span>
+          <span class="source-caption">Phases and full cycle: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgc.go#L22-L79">mgc.go overview</a>; <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgc.go#L733-L861">gcStart</a>.</span>
 
           <h3>4.1 The Hybrid Write Barrier Keeps White Objects Visible</h3>
           <p>
@@ -283,7 +292,7 @@ if gcBlackenEnabled != 0 {
     if current stack is grey:
         shade(ptr)
     *slot = ptr</code></pre>
-          <span class="source-caption">Algorithm, correctness argument, and omission rules: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mbarrier.go#L19-L121">runtime/mbarrier.go</a>.</span>
+          <span class="source-caption">Algorithm, correctness argument, and omission rules: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mbarrier.go#L19-L121">runtime/mbarrier.go</a>.</span>
 
           <p>
             This helps explain why pointer-rich objects and pointer-free buffers have different scanning costs. Do not smuggle a
@@ -304,7 +313,7 @@ if gcBlackenEnabled != 0 {
   → assist debt below zero
   → steal background scan credit or gcAssistAlloc1
   → goroutine pays marking work before continuing</code></pre>
-          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcmark.go#L485-L586">gcAssistAlloc</a> and <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcmark.go#L711-L806">gcAssistAlloc1</a>.</span>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcmark.go#L485-L586">gcAssistAlloc</a> and <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcmark.go#L711-L806">gcAssistAlloc1</a>.</span>
 
           <p>
             GC assists on allocation-heavy goroutines in an execution trace are more actionable than “GC occasionally jitters.”
@@ -314,10 +323,9 @@ if gcBlackenEnabled != 0 {
 
           <h3>4.3 <code>GOGC</code> and <code>GOMEMLIMIT</code> Constrain Different Things</h3>
           <p>
-            <code>GOGC</code> scales the next heap goal from the previous live heap. At the default 100, a useful approximation is
-            that new allocation may approach the current live heap before the next cycle must finish. <code>GOMEMLIMIT</code> gives
-            the runtime a soft memory limit. The controller derives a memory-limit heap goal from runtime-managed mapped memory and
-            reserves headroom. The effective target uses the tighter GOGC-derived or memory-limit-derived goal.
+            <code>GOGC</code> bases allowed heap growth on the previous live heap plus stack and global root scanning size. Before minimum-goal adjustments, the formula is <code>live heap + (live heap + roots) × GOGC / 100</code>; even the default 100 does not universally mean “double the heap.”
+            <code>GOMEMLIMIT</code> supplies a soft runtime-memory limit from which the controller derives another heap goal with headroom. A smaller memory-limit goal takes priority; otherwise, minimum sweep distance and marking runway can adjust the result. A simple <code>min</code> of two numbers is therefore only an approximation.
+            See the <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go#L1288-L1305">percentage-goal calculation</a> and <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go#L1000-L1048">heapGoalInternal</a>.
           </p>
 
           <div class="table-wrap"><table>
@@ -335,7 +343,7 @@ if gcBlackenEnabled != 0 {
             different scopes. Under an extreme limit the runtime must also avoid GC thrashing that starves the application.
             Production settings need load tests across container headroom, live set, peak traffic, CPU budget, and tail latency.
           </p>
-          <span class="source-caption">Pacer goals, 25% background utilization, and memory-limit headroom: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcpacer.go#L22-L92">mgcpacer.go</a>; configuration semantics: <a href="https://pkg.go.dev/runtime/debug#SetGCPercent">SetGCPercent</a> and <a href="https://pkg.go.dev/runtime/debug#SetMemoryLimit">SetMemoryLimit</a>.</span>
+          <span class="source-caption">Pacer goals, 25% background utilization, and memory-limit headroom: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go#L22-L92">mgcpacer.go</a>; configuration semantics: <a href="https://pkg.go.dev/runtime/debug#SetGCPercent">SetGCPercent</a> and <a href="https://pkg.go.dev/runtime/debug#SetMemoryLimit">SetMemoryLimit</a>.</span>
 
           <h2 id="evidence">5. Observe Allocation Rate Separately from Live Heap</h2>
           <p>
@@ -394,14 +402,14 @@ go vet ./...</code></pre>
 
           <h2 id="sources">Source and documentation map</h2>
           <ul class="source-list">
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go#L19-L89">Go 1.26.0 escape analysis invariants and location graph</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/escape/escape.go#L20-L90">Go compiler escape analysis invariants and location graph</a></li>
             <li><a href="https://go.dev/doc/gc-guide">A Guide to the Go Garbage Collector</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go#L1021-L1217">nextFreeFast, mcache.nextFree, and mallocgc</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mcache.go#L160-L206">mcache.refill</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L22-L79">Concurrent GC cycle overview</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mbarrier.go#L19-L121">Hybrid write barrier</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcmark.go#L485-L586">Mark assists</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcpacer.go#L22-L92">GC pacer and memory-limit headroom</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc.go#L977-L1179">nextFreeFast, mcache.nextFree, and mallocgc</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mcache.go#L160-L206">mcache.refill</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgc.go#L22-L79">Concurrent GC cycle overview</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mbarrier.go#L19-L121">Hybrid write barrier</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcmark.go#L485-L586">Mark assists</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go#L22-L92">GC pacer and memory-limit headroom</a></li>
             <li><a href="https://pkg.go.dev/runtime/metrics">runtime/metrics package documentation</a></li>
             <li><a href="https://go.dev/blog/pprof">Profiling Go Programs</a></li>
             <li><a href="https://go.dev/doc/diagnostics">Diagnostics</a></li>

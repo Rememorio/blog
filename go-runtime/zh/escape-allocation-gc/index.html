@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Go 源码阅读（七）：一个请求为什么在堆上</title>
-    <meta name="description" content="Go 从请求到生产现场系列第七篇：沿 fetchd 阅读 Go 1.26.0 的逃逸分析、slice 分配、mallocgc、mcache、并发 GC、写屏障、mark assist、GOGC 与 GOMEMLIMIT。" />
+    <meta name="description" content="Go 从请求到生产现场系列第七篇：沿 fetchd 阅读 Go 开发分支固定快照的逃逸分析、slice 分配、mallocgc、mcache、并发 GC、写屏障、mark assist、GOGC 与 GOMEMLIMIT。" />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Go 源码阅读（七）：一个请求为什么在堆上" />
     <meta property="og:description" content="堆不是语法选择，而是生命周期证明的结果；分配成本也不止一次 malloc，还会进入 size class、GC 目标与 mutator assist。" />
@@ -49,19 +49,19 @@
             一个值只在当前函数里用，和它要被返回、交给别的 goroutine、长期保存，需要的寿命不同。编译器据此决定它适合留在栈上，还是放到堆上。
             “在堆上”本身不是错误；真正要问的是分配有多频繁、多少对象还活着，以及 GC 是否影响了请求延迟。
           </p>
-          <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：escape graph → mallocgc / mcache → pacer / assist</span><span>实验：memory_lab_test.go</span></div>
-          <figure class="hero-image"><img src="../assets/request-memory-journey.png" alt="一个 fetchd 请求的内存旅程：逃逸分析决定栈或堆，mallocgc 从 mcache size class 分配，切片增长与预分配产生不同分配量，GC 依据 heap goal 标记、协助和清扫" /></figure>
+          <div class="meta-line"><span>源码：Go 开发分支固定快照</span><span>路径：escape graph → mallocgc / mcache → pacer / assist</span><span>实验：memory_lab_test.go</span></div>
+          <figure class="hero-image"><img src="../assets/request-memory-journey.png" alt="请求内存旅程：编译器证明对象寿命，运行时为需要堆空间的对象分配；预分配可减少迁移，分配速率与存活堆分别观测" /></figure>
         </section>
 
         <section class="article-body">
           <div class="note route-note"><p><strong>阅读目标：</strong>不需要把“堆”当成坏词。先学会区分三个问题：对象为什么必须活得比当前函数久；程序每秒制造多少新对象；其中多少对象在 GC 时仍然活着。后半篇再进入逃逸分析、分配器与并发 GC 源码。</p></div>
 
           <p>
-            语言并不承诺对象一定放栈或堆；具体判断固定到 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go">escape.go</a>、
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go">malloc.go</a>、
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go">mgc.go</a> 与
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcpacer.go">mgcpacer.go</a>。
+            语言并不承诺对象一定放栈或堆；具体判断固定到 <a href="https://github.com/golang/go/tree/f043823a99a4118989a34afec015d23b5d54d01e">Go 开发分支固定快照</a>（核实于 2026-09-20，不代表稳定发行版）的
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/escape/escape.go">escape.go</a>、
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc.go">malloc.go</a>、
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgc.go">mgc.go</a> 与
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go">mgcpacer.go</a>。
             测量接口来自官方 <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a>、
             <a href="https://pkg.go.dev/runtime/pprof">runtime/pprof</a> 与 <a href="https://go.dev/doc/diagnostics">Diagnostics 文档</a>。
           </p>
@@ -122,12 +122,16 @@ func escapingResult() *fetchResult {
             跨函数信息则压缩成 parameter tags，供静态调用点继续传播。
           </p>
 
-          <figure class="figure"><img src="../assets/escape-analysis-graph.png" alt="Go escape analysis 带权 location graph：取地址边为负一、普通赋值为零、解引用为正一；返回地址或 slice backing array 可把 result 连到 heap，编译器报告 moved to heap 与 append escapes" /></figure>
-          <span class="source-caption">算法不变量、边权和过程：<a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go#L19-L89">escape.go L19-L89</a>；批量分析入口：<a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go#L138-L188">Batch</a>。</span>
+          <figure class="figure"><img src="../assets/escape-analysis-graph.png" alt="编译器逃逸分析示意：赋值边按取地址、复制和解引用带不同权重，沿关系图检查指针寿命，再报告是否逃逸" /></figure>
+          <span class="source-caption">算法不变量、边权和过程：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/escape/escape.go#L20-L90">escape.go</a>；批量分析入口：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/escape/escape.go#L144-L195">Batch</a>。</span>
 
           <p>
             图是保守近似，并不区分 struct 的不同字段或 slice 的不同元素；源码也明确说明分析通常不具备完整的 flow、path 或 context sensitivity。
             “escapes to heap”因此表示编译器没有足够证明把它安全留在当前 frame，不表示这个对象一定泄漏，更不表示 GC 当前就有压力。
+          </p>
+
+          <p>
+            闭包也不一定需要保留一份捕获记录。当前编译器在确认按值捕获后，会用 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/escape/escape.go#L303-L410"><code>rewriteClosureVarsWithLiterals</code></a> 把已知常量改成闭包函数内初始化的局部变量；若不再捕获任何变量，后续可直接使用函数入口。例如 <code>n := 42; return func() int { return n }</code> 的外部变量可以消失。这是有条件的实现优化：被取地址、重新赋值或无法证明为常量的捕获不适用，已内联闭包也会跳过该变换。不能据此断言所有闭包都不分配。
           </p>
 
           <h3>2.2 读 <code>-m=2</code>：看流向，不数关键词</h3>
@@ -167,7 +171,7 @@ for i := 0; i &lt; count; i++ {
 }</code></pre>
 
           <p>
-            本实验聚合 64 个结果时，按需增长稳定为 <strong>7 allocs/op、约 9.1 KiB/op</strong>，预分配为
+            使用本文固定源码构建的工具链聚合 64 个结果，按需增长稳定为 <strong>7 allocs/op、约 9.1 KiB/op</strong>，预分配为
             <strong>1 alloc/op、约 4.8 KiB/op</strong>；返回指针为 1 alloc/op、64 B/op，而只计算校验和的值路径为 0 alloc/op。
             这些数字是该实验形状的证据，不是跨平台常量。预分配过大同样会扩大 live heap；更好的输入是可信上界，而不是“越大越安全”。
           </p>
@@ -183,12 +187,13 @@ append 容量不足 → 申请更大的 backing array → 复制旧结果
             调高 <code>GOGC</code> 也许会推迟下一轮回收，却不会消除这七次 backing array 申请；减少分配与调整回收频率是两种不同动作。
           </p>
           <p>
-            Go 1.26.0 的 <code>mallocgc</code> 先处理零大小请求：返回共享的 <code>zerobase</code>。常规路径中，小对象不超过约 32 KiB；
+            当前快照的 <code>mallocgc</code> 先处理零大小请求：返回共享的 <code>zerobase</code>。常规路径中，小对象不超过约 32 KiB；
             无指针且小于 16 B 的对象可进入 tiny allocator，把多个对象装进一个 16 B block。其他小对象按 size class 和 scan/noscan 分流，
             大对象直接从 heap pages 分配。含指针对象还需要正确的 bitmap/zeroing，让 GC 知道哪些 word 需要扫描。
           </p>
 
           <figure class="figure"><img src="../assets/mallocgc-allocation-path.png" alt="Go mallocgc 分配路径：零大小到 zerobase，tiny noscan 对象共享十六字节块，小对象按 scan 或 noscan size class 从 per-P mcache 的 mspan 取空闲 slot，满后 refill 到 mcentral，大对象从 mheap pages 分配" /></figure>
+          <span class="source-caption">图中的辅助标记额度只针对非零分配在并发标记期间扣减；零大小请求先返回 <code>zerobase</code>，不经过这一步。</span>
 
           <pre><code class="language-go">if size == 0 {
     return unsafe.Pointer(&amp;zerobase)
@@ -196,8 +201,12 @@ append 容量不足 → 申请更大的 backing array → 复制旧结果
 if gcBlackenEnabled != 0 {
     deductAssistCredit(size)
 }
-// small noscan / small scan / large routing follows</code></pre>
-          <span class="source-caption">入口与分流：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go#L1097-L1217">mallocgc</a>。Go 1.26 还包含受 experiment 与 sanitizer 条件控制的 size-specialized 路径；它属于当前内部实现，不应被应用代码依赖。</span>
+// simplified fallback; specialized helpers also account for assists</code></pre>
+          <span class="source-caption">入口与分流：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc.go#L1043-L1171">mallocgc</a>。此处只展示零大小与通用路径的 assist 检查，省略了提前返回的专用入口。</span>
+
+          <p>
+            当前快照已移除 size-specialized malloc 的实验开关：在非 Plan 9 且没有启用相关 sanitizer 的构建里，表覆盖范围内的请求按大小进入 <code>mallocNoScanTable</code>、<code>mallocScanTable</code> 或 tiny 专用函数。表外请求与受限构建仍有通用路径。这不是跳过 GC：生成专用函数的 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc_stubs.go#L100-L178">模板</a> 仍在需要时扣减 assist credit；两类入口最终都从当前 P 的缓存和 span 获取空间。
+          </p>
 
           <p>
             size class 让固定大小 slot 可以批量管理，却也引入 <code>elemsize - requested size</code> 的内部碎片。tiny allocator 则有另一项权衡：
@@ -206,7 +215,7 @@ if gcBlackenEnabled != 0 {
 
           <h3>3.1 快路径是当前 P 的 <code>mcache</code> 与 <code>mspan</code></h3>
           <p>
-            <code>nextFreeFast</code> 从当前 span 的 <code>allocCache</code> 找 trailing zero，推进 <code>freeindex</code> 并计算 slot 地址。
+            <code>nextFreeFast</code> 统计当前 span 的 <code>allocCache</code> 末尾连续 0 位，找到第一个值为 1 的空闲位，推进 <code>freeindex</code> 并计算 slot 地址。
             这条路径不需要去全局 heap 找空间。cached span 满时，<code>mcache.nextFree</code> 调用 <code>refill</code>；
             refill 把已满 span 归还给 central，再用 <code>mcentral.cacheSpan</code> 获取有空位的 span。源码要求这段运行在 non-preemptible context，
             因为 mcache 属于当前 P，抢占后 goroutine 可能换到另一个 P。
@@ -220,7 +229,7 @@ if gcBlackenEnabled != 0 {
     }
     return 0
 }</code></pre>
-          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go#L1021-L1092">nextFreeFast 与 mcache.nextFree</a>；<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mcache.go#L160-L206">mcache.refill</a>。</span>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc.go#L977-L1048">nextFreeFast 与 mcache.nextFree</a>；<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mcache.go#L160-L206">mcache.refill</a>。</span>
 
           <p>
             “小对象分配很快”描述的是常见 fast path，不代表没有系统成本：refill 可能触发 sweep 工作与 GC trigger 检查，内存清零和 sanitizer 也有成本；
@@ -239,13 +248,13 @@ if gcBlackenEnabled != 0 {
             再切回 <code>_GCoff</code>，关闭 write barrier，让 sweep 在后台并发进行。
           </p>
 
-          <figure class="figure"><img src="../assets/concurrent-gc-pacer.png" alt="Go 并发 GC：heap goal 由 GOGC 目标与内存限制目标共同约束，短暂停顿后并发标记，后台 worker、混合写屏障和分配协助共同完成工作，标记终止短暂停顿后并发清扫复用" /></figure>
+          <figure class="figure"><img src="../assets/concurrent-gc-pacer.png" alt="并发 GC 周期：两次短暂停顿之间进行并发标记，后台标记、写屏障和分配协助共同维持正确性与进度，随后并发清扫；堆目标受 GOGC 和 GOMEMLIMIT 影响" /></figure>
 
           <p>
             因此“Go GC 是并发的”和“Go GC 有 STW”都只说了一半。关键是把暂停、并发 CPU、assist 落在哪个请求、以及 live heap 变化一起看。
             只记录 pause quantile，可能漏掉请求 goroutine 亲自做 GC work 的尾延迟；只看 GC CPU，也可能把业务分配激增误判为 collector 回归。
           </p>
-          <span class="source-caption">phase 与完整循环：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L22-L79">mgc.go 概览</a>；<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L733-L879">gcStart</a>。</span>
+          <span class="source-caption">phase 与完整循环：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgc.go#L22-L79">mgc.go 概览</a>；<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgc.go#L733-L861">gcStart</a>。</span>
 
           <h3>4.1 混合写屏障防止 mutator 隐藏白对象</h3>
           <p>
@@ -259,7 +268,7 @@ if gcBlackenEnabled != 0 {
     if current stack is grey:
         shade(ptr)
     *slot = ptr</code></pre>
-          <span class="source-caption">算法、正确性解释与省略条件：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mbarrier.go#L19-L121">runtime/mbarrier.go</a>。</span>
+          <span class="source-caption">算法、正确性解释与省略条件：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mbarrier.go#L19-L121">runtime/mbarrier.go</a>。</span>
 
           <p>
             这也是 pointer-rich object 与 pointer-free buffer 成本不同的一部分：后者无需让 GC 扫描其内容。不要为了“少扫描”把指针偷偷编码成 <code>uintptr</code>；
@@ -278,7 +287,7 @@ if gcBlackenEnabled != 0 {
   → assist debt below zero
   → steal background scan credit or gcAssistAlloc1
   → goroutine pays marking work before continuing</code></pre>
-          <span class="source-caption"><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcmark.go#L485-L586">gcAssistAlloc</a> 与 <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcmark.go#L711-L806">gcAssistAlloc1</a>。</span>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcmark.go#L485-L586">gcAssistAlloc</a> 与 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcmark.go#L711-L806">gcAssistAlloc1</a>。</span>
 
           <p>
             execution trace 中 allocation-heavy goroutine 出现 GC assist，是比“GC 偶尔抖一下”更有行动价值的证据。优先减少请求路径上可避免的 allocation bytes，
@@ -287,9 +296,9 @@ if gcBlackenEnabled != 0 {
 
           <h3>4.3 <code>GOGC</code> 与 <code>GOMEMLIMIT</code> 控制不同约束</h3>
           <p>
-            <code>GOGC</code> 让下一轮 heap goal 随上一轮 live heap 成比例增长；默认 100 可近似理解为允许新分配量接近当前 live heap 后完成下一轮回收。
-            <code>GOMEMLIMIT</code> 则给 runtime 一个软内存限制，控制器从 runtime 管理的总映射内存估计 memory-limit heap goal，并预留 headroom。
-            实际目标取 GOGC-derived goal 与 memory-limit-derived goal 的更紧者。
+            <code>GOGC</code> 按上一轮存活堆加上栈和全局变量的扫描规模，决定允许增加多少堆空间。忽略最小目标等修正，基础公式是 <code>live heap + (live heap + roots) × GOGC / 100</code>；因此默认 100 也不能一概说成“堆翻倍”。
+            <code>GOMEMLIMIT</code> 给 runtime 一个软内存限制，控制器从 runtime 管理的内存估计另一个堆目标，并预留余量。内存限制目标更小时优先采用它；否则还可能为清扫距离和标记进度保留最小空间，所以把最终目标简单写成两个数的 <code>min</code> 只是近似。
+            对应实现是 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go#L1288-L1305">比例目标计算</a> 与 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go#L1000-L1048">heapGoalInternal</a>。
           </p>
 
           <div class="table-wrap"><table>
@@ -306,7 +315,7 @@ if gcBlackenEnabled != 0 {
             soft limit 不是 OOM 保险：non-Go memory、mmap、cgo、kernel page cache 与容器统计口径可能不同；极端 limit 下 runtime 还必须避免 GC thrashing 把应用完全饿死。
             生产值应基于容器余量、live set、峰值流量与 CPU budget 联合压测，不要照抄单一百分比。
           </p>
-          <span class="source-caption">pacer 目标、25% background utilization 与 memory-limit headroom：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcpacer.go#L22-L92">mgcpacer.go</a>；配置语义：<a href="https://pkg.go.dev/runtime/debug#SetGCPercent">SetGCPercent</a> 与 <a href="https://pkg.go.dev/runtime/debug#SetMemoryLimit">SetMemoryLimit</a>。</span>
+          <span class="source-caption">pacer 目标、25% background utilization 与 memory-limit headroom：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go#L22-L92">mgcpacer.go</a>；配置语义：<a href="https://pkg.go.dev/runtime/debug#SetGCPercent">SetGCPercent</a> 与 <a href="https://pkg.go.dev/runtime/debug#SetMemoryLimit">SetMemoryLimit</a>。</span>
 
           <h2 id="evidence">五、把 allocation rate 与 live heap 分开观测</h2>
           <p>
@@ -361,14 +370,14 @@ go vet ./...</code></pre>
 
           <h2 id="sources">参考源码与文档</h2>
           <ul class="source-list">
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/internal/escape/escape.go#L19-L89">Go 1.26.0 escape analysis invariants and location graph</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/cmd/compile/internal/escape/escape.go#L20-L90">Go compiler escape analysis invariants and location graph</a></li>
             <li><a href="https://go.dev/doc/gc-guide">A Guide to the Go Garbage Collector</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/malloc.go#L1021-L1217">nextFreeFast, mcache.nextFree, and mallocgc</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mcache.go#L160-L206">mcache.refill</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgc.go#L22-L79">Concurrent GC cycle overview</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mbarrier.go#L19-L121">Hybrid write barrier</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcmark.go#L485-L586">Mark assists</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/mgcpacer.go#L22-L92">GC pacer and memory-limit headroom</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc.go#L977-L1179">nextFreeFast, mcache.nextFree, and mallocgc</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mcache.go#L160-L206">mcache.refill</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgc.go#L22-L79">Concurrent GC cycle overview</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mbarrier.go#L19-L121">Hybrid write barrier</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcmark.go#L485-L586">Mark assists</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go#L22-L92">GC pacer and memory-limit headroom</a></li>
             <li><a href="https://pkg.go.dev/runtime/metrics">runtime/metrics package documentation</a></li>
             <li><a href="https://go.dev/blog/pprof">Profiling Go Programs</a></li>
             <li><a href="https://go.dev/doc/diagnostics">Diagnostics</a></li>
