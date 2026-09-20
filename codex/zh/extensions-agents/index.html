@@ -97,12 +97,15 @@
             <figure class="hero-image">
               <img
                 src="../assets/extension-runtime-boundaries.png"
-                alt="Codex turn capability map，展示 skills、plugins、MCP tools 和 subagents 四种入口进入 TurnContext 并流向事件"
+                alt="插件资源分向技能上下文和工具注册表，并按需派生子线程"
               />
+            <figcaption>这是能力来源与用途概览，不是单一执行流水线；plugin 资源按种类读取，子线程仅在分派时创建，工具仍需独立通过执行检查。</figcaption>
             </figure>
           </section>
 
           <section class="article-body">
+            <p><strong>阅读契约。</strong>跟踪同一条请求中的技能说明、插件资源、工具规格和子线程，辨认它们各自的读取与执行入口。 本文核实于 2026-09-20，依据公开源码 <a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">固定公开源码快照</a>；不推断未公开的服务实现。</p>
+
             <p>
               先想一个具体场景：你让 Codex 写一篇文章，并点名使用 <code>$article</code> 和
               <code>$image</code>；同时本地装着 Browser、GitHub、Documents 这些 plugin；
@@ -119,7 +122,7 @@
             <div class="note key-point">
               <p>
                 先记住四个具体动作：<code>skills</code> 把说明加入上下文，<code>plugins</code> 声明一组资源，
-                <code>MCP</code> 把工具规格加入本轮工具列表，<code>subagents</code> 创建由父任务管理的子线程。
+                <code>MCP</code> 把工具规格加入当前采样步骤的工具菜单，<code>subagents</code> 创建由父任务管理的子线程。
               </p>
             </div>
 
@@ -162,8 +165,8 @@
                   <tr>
                     <td>工作方法</td>
                     <td><code>$article</code>、<code>$image</code>、显式 skill 选择。</td>
-                    <td>先展示 skill catalog；被点名后读取完整 <code>SKILL.md</code>，作为 contextual user fragment 注入。</td>
-                    <td><code>SkillsManager</code>、<code>build_skill_injections</code>。</td>
+                    <td>先展示 skill catalog；被点名后读取所选技能的 main prompt，作为 contextual user fragment 注入。</td>
+                    <td><code>HostSkillsSnapshot</code>、<code>load_skill_prompts</code>。</td>
                   </tr>
                   <tr>
                     <td>能力包</td>
@@ -174,8 +177,8 @@
                   <tr>
                     <td>可调用工具</td>
                     <td>MCP server、app connector、dynamic tool。</td>
-                    <td>转换成 model-visible tool spec；数量或配置触发时变成 deferred tools，由 <code>tool_search</code> 再发现。</td>
-                    <td><code>build_mcp_tool_exposure</code>、<code>ToolSearchHandler</code>、<code>ToolRouter</code>。</td>
+                    <td>转换成 model-visible tool spec；exposure 配置与工具模式允许时变成 deferred tools，由 <code>tool_search</code> 再发现。</td>
+                    <td><code>apply_mcp_tool_exposure_policy</code>、<code>ToolSearchHandler</code>、<code>ToolRouter</code>。</td>
                   </tr>
                   <tr>
                     <td>并行工作单元</td>
@@ -218,9 +221,9 @@
                   </tr>
                   <tr>
                     <td>能力快照</td>
-                    <td><code>TurnContext</code> 里的 <code>turn_skills</code>、<code>extension_data</code>、<code>dynamic_tools</code>。</td>
+                    <td><code>TurnContext</code> 里的 <code>skills_snapshot()</code>、<code>extension_data</code>、<code>dynamic_tools</code>。</td>
                     <td>runtime 在 turn 边界内维护；后续注入和工具规划读取它。</td>
-                    <td>把“当前有哪些能力”固定成本轮事实。</td>
+                    <td>保留技能来源；工具菜单由当前 step 捕获。</td>
                   </tr>
                   <tr>
                     <td>上下文注入</td>
@@ -250,90 +253,33 @@
             </p>
 
             <h2>二、TurnContext 先把入口留出来</h2>
-            <p>
-              第二篇讲 <code>TurnContext</code> 时，我们重点看上下文、权限和 token budget。第七篇要注意另一组字段：
-              <code>dynamic_tools</code>、<code>extension_data</code>、<code>turn_skills</code>、
-              <code>multi_agent_version</code>、<code>parent_thread_id</code> 和 <code>session_source</code>。
-              它们让一次 turn 有地方承接外部能力。
-            </p>
 
-            <p>
-              <code>make_turn_context</code> 会把当前 turn 的配置、模型信息、权限 profile、动态工具、
-              extension data 和 skills outcome 放进同一个结构里。这里有两个细节很关键。
-              第一，<code>HostLoadedSkills</code> 被插入 <code>extension_data</code>，让 host extension
-              也能看到已加载的 skill 集合。第二，<code>dynamic_tools</code> 来自 session configuration，
-              后面工具规划阶段会把它们追加到本轮工具列表。
-            </p>
+            <p>一次请求的扩展材料分成两层。<code>TurnContext</code> 保留 <code>dynamic_tools</code>、<code>extension_data</code>、多 agent 设置和 <code>HostSkillsSnapshot</code>；每次 sampling 的 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/step_context.rs#L27-L46"><code>StepContext</code></a> 则捕获当时的模型、环境、MCP binding、设置和工具 router。</p>
 
-            <div class="note key-point">
-              <p>
-                所以扩展入口并不是散落在各处临时读取。Codex 会在 turn 开始时先形成一个能力快照：
-                当前配置允许什么、已加载哪些 skill、有哪些 extension data、是否启用多 agent、
-                本轮权限设置是什么。后续注入和工具规划都读取这组字段。
-              </p>
-            </div>
+            <p>因此“这次 turn 有哪些技能”与“这一步模型看见哪些工具”不能混为同一个固定列表。skills snapshot 用于读取已选说明；MCP exposure 与 extension tool contributors 参与每一步的工具规划。已经发出的工具请求保留它所属步骤的上下文，后续菜单变化不会改写这个事实。</p>
 
             <h2>三、skills：先给目录，再按需展开全文</h2>
-            <p>
-              skill 的第一层很轻：Codex 会把可用 skill 的列表和使用规则放进 developer 上下文。
-              <code>AvailableSkillsInstructions</code> 只渲染 catalog 级别的信息，告诉模型有哪些 skill、
-              什么时候应该使用、怎么读取附加说明。
-            </p>
 
-            <p>
-              真正重的部分发生在用户点名之后。<code>build_skills_and_plugins</code> 从本轮 user input
-              里收集显式 skill mention，然后调用 <code>build_skill_injections</code>。这个函数会按 skill metadata
-              找到对应的文件系统，读取完整 <code>SKILL.md</code>，再把内容包装成
-              <code>SkillInstructions</code>。换句话说，完整技能说明是本轮被需要时才进入 prompt。
-            </p>
+            <p>目录与正文仍然分开处理。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/skills/src/fragments.rs#L11-L59"><code>AvailableSkillsInstructions</code></a> 以 developer fragment 提供技能目录和用法，<code>SkillInstructions</code> 以 user fragment 提供被选中的技能内容。两者的 role、content kind 和标记不同。</p>
 
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>阶段</th>
-                    <th>放进模型上下文的内容</th>
-                    <th>为什么这样做</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>可用列表</td>
-                    <td>skill name、description、path、触发规则。</td>
-                    <td>让模型知道“可以选什么”，但不把所有长说明一次塞进上下文。</td>
-                  </tr>
-                  <tr>
-                    <td>显式点名</td>
-                    <td>完整 <code>SKILL.md</code> 内容。</td>
-                    <td>用户或结构化输入已经确认需要它，这时才值得付出上下文成本。</td>
-                  </tr>
-                  <tr>
-                    <td>注入形状</td>
-                    <td><code>ContextualUserFragment</code> 里的 <code>SkillInstructions</code>。</td>
-                    <td>skill 是工作方法和约束，进入的是上下文层，不是工具调用层。</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-
-            <p>
-              这也解释了为什么一个 skill 写得好不好，会直接影响文章或图的质量。runtime 只负责把它放到正确位置，
-              至于模型读到后如何执行，取决于 skill 里面是否把步骤、限制和验收方式写清楚。
-            </p>
+            <p>读取入口已经移到 skills extension 与 host snapshot。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L1009-L1103"><code>build_skills_and_plugins</code></a> 收集显式 mention，调用 <code>skills_snapshot.load_skill_prompts</code>；<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/skills/src/extension.rs#L359-L498">skills extension 的 contributor</a> 还会按来源整理目录，从 provider 读取所选 main prompt。它可以处理 host、executor、bundled 与 orchestrator 等来源，不能假定每个技能都是本机一个可直接读取的文件。</p>
+<div class="table-wrap"><table><thead><tr><th>阶段</th><th>进入上下文的材料</th><th>边界</th></tr></thead><tbody><tr><td>可用目录</td><td>名称、说明、来源和读取入口。</td><td>按 metadata budget 控制长度，不预装全部正文。</td></tr><tr><td>显式选择</td><td>从对应 provider 读取 main prompt。</td><td>读取失败产生 warning；过长正文会截断并提示。</td></tr><tr><td>技能正文</td><td>SkillInstructions user fragment。</td><td>资源型技能还带 authority、package、main_resource，后续读取必须沿相同来源。</td></tr></tbody></table></div>
+            <p>例如同样点名 <code>$article</code>，文件系统技能可以对应 <code>SKILL.md</code>；orchestrator 提供的技能则可能需要资源读取工具。模型最终获得工作说明，但说明的获取方式与工具执行权限仍然是两件事。</p>
 
             <h2>四、plugins：把一组能力打成包</h2>
             <p>
               plugin 解决的是另一个问题：一组能力往往不是单独一个 <code>SKILL.md</code>。例如 Browser plugin
               可能同时带 skill、脚本、MCP server、app connector；GitHub plugin 可能同时提供 PR triage、
               CI 排查和发布流程。源码里
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/manifest.rs#L8-L24"><code>PluginManifest.paths</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/plugin/src/manifest.rs"><code>PluginManifest.paths</code></a>
               把这些入口分开声明：
               <code>skills</code>、<code>mcp_servers</code>、<code>apps</code>、<code>hooks</code>。
             </p>
 
             <pre><code class="language-rust">pub struct PluginManifestPaths&lt;Resource&gt; {
-    pub skills: Option&lt;Resource&gt;,
-    pub mcp_servers: Option&lt;Resource&gt;,
+    pub skills: Vec&lt;Resource&gt;,
+    pub onboarding_skill: Option&lt;Resource&gt;,
+    pub mcp_servers: Option&lt;PluginManifestMcpServers&lt;Resource&gt;&gt;,
     pub apps: Option&lt;Resource&gt;,
     pub hooks: Option&lt;PluginManifestHooks&lt;Resource&gt;&gt;,
 }</code></pre>
@@ -366,57 +312,15 @@
             </p>
 
             <h2>五、MCP 与 tool_search：工具太多时先发现，再展开</h2>
-            <p>
-              第四篇已经讲过普通工具调用路径。第七篇要补上 MCP 工具进入模型前的一层选择：
-              <code>build_mcp_tool_exposure</code> 会先筛出 model-visible 的 MCP tools，
-              再根据配置和数量决定直接暴露，还是作为 deferred tools 交给搜索工具。
-            </p>
 
-            <p>
-              代码里有一个很具体的阈值：<code>DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD</code> 是 100。
-              如果启用了 search tool，并且配置要求始终 defer，或者待暴露工具数量达到阈值，
-              Codex 就不把这一大批工具全塞到 direct tool list；它会提供 <code>tool_search</code>，
-              让模型按 query 找到本轮真正需要的工具规格。
-            </p>
+            <p>MCP 工具注册后，<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/spec_plan.rs#L199-L271"><code>apply_mcp_tool_exposure_policy</code></a> 决定它出现在哪些工具面。源码把 server 与 app connector 的 <code>omit_tools_from</code> 合并，从 <code>ToolExposures::ALL</code> 中减去禁用面；<code>direct_only_tool_namespaces</code> 还会禁止对应 namespace 的 deferred 与 code-mode 暴露。</p>
 
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>工具来源</th>
-                    <th>进入模型前的处理</th>
-                    <th>运行时保护</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>普通 MCP tool</td>
-                    <td>筛 model-visible，数量合适时直接进入 tool spec。</td>
-                    <td>调用时仍走 <code>McpHandler</code> 和 MCP approval metadata。</td>
-                  </tr>
-                  <tr>
-                    <td>大量 MCP tool</td>
-                    <td>作为 deferred tool 建索引，先通过 <code>tool_search</code> 返回匹配工具。</td>
-                    <td>减少上下文噪音，调用路径没有绕开工具审批。</td>
-                  </tr>
-                  <tr>
-                    <td>app connector tool</td>
-                    <td>需要 connector 在本轮允许并启用，才会进入可见集合。</td>
-                    <td>tool metadata 里保留 connector 和 plugin 相关信息。</td>
-                  </tr>
-                  <tr>
-                    <td>dynamic tool</td>
-                    <td>从 <code>TurnContext.dynamic_tools</code> 追加到工具规划。</td>
-                    <td>仍然变成标准 handler，由 <code>ToolRouter</code> 分发。</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-
-            <p>
-              这一层的价值很实际：工具多起来以后，问题不只是“能不能调用”，还有“模型面前应该先出现多少”。
-              direct exposure 适合少量稳定工具；deferred exposure 适合大工具库；tool_search 像一个按需打开的目录。
-            </p>
+            <p>如果 search tool 已启用、该工具允许 deferred，并且当前 tool mode 允许该组合，运行时去掉 direct，保留 deferred；否则去掉 deferred。<strong>这里不再以“达到 100 个工具”作为分界。</strong> 实际结果可以是 Direct、Deferred、CodeModeOnly 或 Hidden 等形态，由配置与工具模式共同决定。</p>
+<pre><code class="language-text">形状示例（省略不相关配置）：
+MCP 工具 + search enabled + deferred allowed -> deferred
+同一工具 + omit_tools_from 含 deferred       -> direct（若允许）
+所有 exposure 都被排除                       -> hidden</code></pre>
+            <p><code>finalize_tool_router</code> 只有在存在带搜索信息的 deferred 工具且 search 启用时，才注册 <code>tool_search</code>。这保证搜索确实有可发现的目标；搜索返回 schema 以后，真正调用仍然经过工具 router 与对应审批，发现能力不会绕过执行限制。</p>
 
             <h2>六、subagents：需要另一条线程时，才开并行轨道</h2>
             <p>
@@ -425,12 +329,7 @@
               但它们执行后的结果不止是一段工具返回值；运行时会创建一条由 <code>AgentControl</code> 管理的子线程。
             </p>
 
-            <p>
-              <code>handle_spawn_agent</code> 会解析 <code>task_name</code>、<code>agent_type</code>、
-              <code>model</code>、<code>reasoning_effort</code>、<code>fork_turns</code> 等参数。
-              之后它会从父 turn 构建子 agent 配置：复制必要的 runtime 字段，应用模型或 role 覆盖，
-              再把本轮权限 profile、sandbox、cwd、environment selection 等运行设置带过去。
-            </p>
+            <p><code>handle_spawn_agent</code> 解析 <code>task_name</code>、<code>agent_type</code>、<code>model</code>、<code>reasoning_effort</code> 和 <code>fork_turns</code>。它使用本次 <code>step_context</code> 构造 child config，再复制允许继承的权限、环境和运行设置；模型与 role 覆盖仍要通过对应校验。</p>
 
             <p>
               真正生成子线程时，<code>AgentControl.spawn_agent_with_metadata</code> 会使用
@@ -443,14 +342,14 @@
             <div class="note key-point">
               <p>
                 subagent 的重点在于多一条受控线程。它有自己的 context、status、
-                history 和 completion notification；但它的权限与环境来自父 turn 的运行时配置，
+                history 和 completion notification；但它的权限与环境来自发起调用的父 step 的运行时配置，
                 不会变成脱离主线程监管的后台过程。
               </p>
             </div>
 
             <h2>七、把四条入口接回同一条主线</h2>
             <p>
-              到这里可以把第七篇合回前六篇的路线图：用户输入进入 turn；<code>TurnContext</code> 固定本轮快照；
+              到这里可以把第七篇合回前六篇的路线图：用户输入进入 turn；<code>TurnContext</code> 保留扩展输入，<code>StepContext</code> 固定当前采样的设置、环境与工具菜单；
               skill 和 plugin guidance 先形成上下文注入；MCP、dynamic tools 和 collaboration tools
               进入工具规划；工具执行、agent 活动和普通模型输出再继续变成事件，交给客户端转换代码。
             </p>
@@ -477,7 +376,7 @@
                   </tr>
                   <tr>
                     <td>“工具很多，先搜索工具”</td>
-                    <td>看 <code>build_mcp_tool_exposure</code> 和 <code>ToolSearchHandler</code>。</td>
+                    <td>看 <code>apply_mcp_tool_exposure_policy</code> 和 <code>ToolSearchHandler</code>。</td>
                     <td>第四篇的 tool spec 与 tool router。</td>
                   </tr>
                   <tr>
@@ -511,31 +410,18 @@
 
             <h2 id="sources">参考源码</h2>
             <ul class="source-list">
-              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex 固定源码快照</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L55-L108">TurnContext 字段：dynamic tools、extension data、turn skills、multi-agent runtime</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn_context.rs#L458-L580">make_turn_context 构建本轮能力快照</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L458-L612">build_skills_and_plugins 组装 skill、plugin 和 extension 注入</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context/available_skills_instructions.rs#L8-L49">AvailableSkillsInstructions</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L2921-L2942">session prompt 中加入 available skills</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/manager.rs#L103-L140">SkillsManager 根据配置计算 skill roots</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/injection.rs#L58-L124">build_skill_injections 读取完整 SKILL.md</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/injection.rs#L146-L214">collect_explicit_skill_mentions</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core-skills/src/skill_instructions.rs#L5-L40">SkillInstructions contextual fragment</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/manifest.rs#L8-L24">PluginManifest paths：skills、MCP、apps、hooks</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/load_outcome.rs#L13-L88">LoadedPlugin 与 PluginLoadOutcome</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/load_outcome.rs#L108-L184">effective skill roots、MCP servers、apps、hooks 和 capability summaries</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/context/available_plugins_instructions.rs#L24-L68">AvailablePluginsInstructions</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/plugins/injection.rs#L14-L58">build_plugin_injections</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/extensions.rs#L45-L95">app-server 注册 extension registry</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/mcp_tool_exposure.rs#L12-L52">build_mcp_tool_exposure 与 deferred threshold</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/tool_search.rs#L23-L139">ToolSearchHandler</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/spec_plan.rs#L630-L820">工具规划：MCP resources、plugin install、collaboration tools、MCP handlers、dynamic tools</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/mcp_tool_call.rs#L957-L1065">MCP tool approval metadata 与 request metadata</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs#L39-L133">handle_spawn_agent 构建子 agent</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs#L185-L233">SpawnAgentArgs 与 fork_turns</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/handlers/multi_agents_common.rs#L197-L278">build_agent_spawn_config 与 runtime overrides</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/agent/control.rs#L84-L190">AgentControl 子线程管理与 inter-agent communication</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/agent/control.rs#L396-L515">subagent completion watcher 与 ThreadSpawn metadata</a></li>
+              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">openai/codex · 5c5308fc9a9e</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/step_context.rs#L27-L46">StepContext</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn_context.rs#L937-L1005">HostSkillsSnapshot / environments</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L1009-L1103">build_skills_and_plugins</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/skills/src/extension.rs#L359-L498">skills extension / selection / prompt reading</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/skills/src/fragments.rs#L11-L111">AvailableSkillsInstructions / SkillInstructions</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/plugin/src/manifest.rs#L17-L41">PluginManifestPaths</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/plugin/src/load_outcome.rs">effective plugin resources</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/spec_plan.rs#L199-L271">MCP exposure policy</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/spec_plan.rs#L338-L405">deferred search registration</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs#L112-L218">subagent spawn / fork mode</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/agent/control.rs">AgentControl</a></li>
             </ul>
           </section>
         </article>
