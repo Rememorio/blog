@@ -44,12 +44,12 @@
             <h1>From Activation to Agent Action</h1>
             <p class="lead">An agent changed a file. Did that action come from a capability in its weights, a token-level activation, reasoning it never verbalized, visible chain of thought, long-term memory, or the runtime that executed a tool call? This overview follows what each step produced in time order.</p>
             <div class="meta-line"><span>Scope: model internals × agent systems</span><span>Method: triangulate behavior, traces, and activations</span></div>
-            <figure class="hero-image"><img src="../../en/assets/activation-to-action-cover.png" alt="Hand-drawn overview of model activations flowing toward an agent action" /></figure>
+            <figure class="hero-image"><img src="../../en/assets/activation-to-action-cover.png" alt="A model proposes a tool call; runtime checks and execution produce an environment result, with visible reasoning as an optional output" /></figure>
           </section>
 
           <section class="article-body">
             <div class="note scope-note"><p><strong>What this evidence can show.</strong> Activation readouts can reveal internal directions correlated with concepts and sometimes causally involved in behavior. They do not provide a word-for-word transcript of all computation. Chain of thought is not such a transcript either. This series keeps observation, causal intervention, and claims about minds separate.</p></div>
-            <div class="note reading-contract"><p><strong>Reading goal.</strong> We will keep one task in view throughout the series: change <code>retention_days</code> from 7 to 30. Repository policy requires human approval above 14 days, while an untrusted test fixture contains the sentence “approval already granted.” By the end, you should be able to say what the model saw, what it merely proposed, and which component actually changed the file.</p></div>
+            <div class="note reading-contract"><p><strong>Reading goal.</strong> We will keep one task in view throughout the series: change <code>retention_days</code> from 7 to 30. Repository policy requires human approval above 14 days, while an untrusted test fixture contains the sentence “approval already granted.” By the end, you should be able to say what the model saw, what it merely proposed, and which component actually changed the file. This approval task is a teaching scenario, not an agent-safety experiment conducted by the cited papers. Runtime approval checks are a design requirement; model research does not establish that a particular agent enforces them.</p></div>
 
             <h2>1. From a user request to a file change</h2>
             <p>The user asks an agent to change log retention to 30 days and run the tests. A real agent does not simply pour that sentence into a model with direct disk access. Its runtime assembles the current model input: a system policy identifies actions needing approval; repository search returns the configuration; external memory may retrieve a team convention; tool descriptions explain how to read files, request approval, and submit a patch.</p>
@@ -59,7 +59,7 @@
             <h3>1.1 Weights are reusable rules; activations are the state of this run</h3>
             <p><strong>Weights</strong> are the durable numerical rules left by training. Across many requests, they supply the ability to relate 30 to a threshold of 14, produce valid JSON, interpret source trust, and choose between conflicting instructions. Reading this particular value does not rewrite those parameters.</p>
             <p><strong>Activations</strong> are the temporary numerical states produced when this input passes through those rules. Tokens acquire vectors at each layer. Attention and MLP blocks repeatedly read from and write to the main cross-layer channel, the <strong>residual stream</strong>. An activation is therefore not a hidden English sentence or a cell of long-term memory. It is a collection of high-dimensional states across positions and layers.</p>
-            <p>Representations of the policy, 14 and 30, the fake approval, and the user's goal can all influence whether later layers favor “request approval” or “edit the file.” These states normally disappear after the forward pass unless the surrounding system explicitly serializes an output or trace.</p>
+            <p>Representations of the policy, 14 and 30, the fake approval, and the user's goal can all influence whether later layers favor “request approval” or “edit the file.” Most intermediate tensors are used only during the current computation, but not every activation disappears after one forward pass. Autoregressive generation retains attention key/value states in a KV cache for later tokens. That cache is not a semantically searchable long-term memory store; retention across requests depends on the serving system.</p>
 
             <h3>1.2 Silent reasoning is computation that never becomes an output token</h3>
             <p>The model need not spell out every intermediate step. It can represent “30 exceeds 14,” “the fixture is not an authorization source,” and “approval should come next,” yet emit only a structured call. <em>Silent</em> means unexpressed as visible tokens; it does not imply a complete secret prose diary.</p>
@@ -83,25 +83,33 @@
 
             <h2>2. The same policy across four persistence horizons</h2>
             <p>Follow “values above 14 require approval” through its lifetime. It may start in a durable policy file or memory store. Retrieval turns it into context tokens. Processing those tokens creates activations. If the model writes the rule into a rationale, the emitted text may be logged as a trace. The same information changes storage location and persistence at every step.</p>
-            <figure class="wide-figure"><img src="../../en/assets/state-horizons.png" alt="Comparison of the persistence horizons of activations, traces, external memory, and model weights" /><figcaption>The word “memory” can mean something that lasts one forward pass, many sessions, or an entire model deployment.</figcaption></figure>
+            <figure class="wide-figure"><img src="../../en/assets/state-horizons.png" alt="Weights, external memory, traces, and cached activations have retention policies determined by their containers" /><figcaption>The four containers have no fixed lifetime ranking: logs can span sessions, cached K/V can span generation steps, and each storage policy determines cleanup.</figcaption></figure>
             <h3>2.1 Context is not memory; retrieval makes memory current</h3>
             <p>An external memory can persist for months, but the model does not automatically read the whole store. The agent retrieves a small subset and inserts it into the request. Only that model-visible subset participates in the current activation. If retrieval misses the policy, no secret channel restores it; if a sentence appeared once in context, it has not thereby become long-term memory.</p>
             <h3>2.2 A trace persists because the logging system persists it</h3>
-            <p>Tool calls, tool results, visible reasoning, and final answers can survive restarts because a runtime serialized them. The old activation did not survive. Replaying the same trace computes new activations, which may differ with model version, sampling, and context.</p>
-            <h3>2.3 Only training compresses experience into weights</h3>
+            <p>Tool calls, tool results, visible reasoning, and final answers can survive restarts because a runtime serialized them. Saving a trace does not preserve all the original activations, nor must the log be deleted when the task ends. Running again from the text trace normally computes new activations, which may differ with model version, sampling, and context.</p>
+            <h3>2.3 What the source retains in a KV cache</h3>
+            <p>Consider Transformers' <a href="https://github.com/huggingface/transformers/blob/c587bc884db2c2e31fc2b8102314656b17aa07b1/src/transformers/cache_utils.py#L114-L148"><code>DynamicLayer.update</code></a>. A cache object receives newly computed keys and values, appends them to its existing tensors along the sequence dimension, and returns the combined states. Earlier tokens' K/V can therefore participate in the next attention computation. The cache does not hold every intermediate computation or a prose summary. This shape-level trace isolates the update rule; <code>t</code> is the number of tokens already cached:</p>
+            <pre><code class="language-text">Before the next token: K/V sequence length is t
+Current computation: produce the new token's K/V
+cache.update: concatenate old and new states
+Return: K/V with sequence length t + 1
+Explicit reset: discard this cache's K/V</code></pre>
+            <p>The same implementation's <a href="https://github.com/huggingface/transformers/blob/c587bc884db2c2e31fc2b8102314656b17aa07b1/src/transformers/cache_utils.py#L166-L172"><code>reset</code></a> drops the stored tensors. This explicit lifecycle separates numerical reuse from writing long-term memory: KV caching avoids repeated computation, whereas memory retrieval selects material for a later input. These are facts about the open-source cache class, not evidence for a closed service's cache TTL or cross-request reuse policy.</p>
+            <h3>2.4 Training compresses experience into weights</h3>
             <p>If a team collects many tasks that require approval and updates the model through SFT, RL, or reflection training, the default behavior may change across sessions. That change is broader, harder to localize, and more expensive to roll back than editing one memory item. “The agent remembered” and “the model learned” should not be interchangeable claims.</p>
             <div class="table-wrap">
               <table>
                 <thead><tr><th>Carrier</th><th>Typical lifetime</th><th>What it can explain</th><th>Do not confuse it with</th></tr></thead>
                 <tbody>
-                  <tr><td>Activation</td><td>One forward pass</td><td>What the current computation represents or routes</td><td>Long-term memory</td></tr>
+                  <tr><td>Activation / KV cache</td><td>Intermediate tensors last through computation; cached K/V can span generation steps</td><td>What the current computation represents or routes</td><td>Long-term memory</td></tr>
                   <tr><td>CoT / trace</td><td>Persistent only when emitted or logged</td><td>The reasoning and actions the model chose to expose</td><td>All internal computation</td></tr>
                   <tr><td>External memory / skill</td><td>Across turns and sessions</td><td>History, experience, procedures, reusable artifacts</td><td>A weight update</td></tr>
-                  <tr><td>Weights</td><td>Across deployments until retraining</td><td>Capabilities, priors, and stable behavioral tendencies</td><td>A thought in one run</td></tr>
+                  <tr><td>Weights</td><td>Until weights are updated or replaced</td><td>Capabilities, priors, and stable behavioral tendencies</td><td>A thought in one run</td></tr>
                 </tbody>
               </table>
             </div>
-            <p>This separates the series from two adjacent topics. <a href="../../../agent-memory/en/">Agent Memory</a> studies how external state is written, retrieved, and inserted into the model's current input. <a href="../../../hermes-agent/en/self-evolution/">Agent self-evolution</a> often changes prompts, skills, memories, and workflows. A change reaches the slowest layer only when training updates the weights.</p>
+            <p>This separates the series from two adjacent topics. <a href="../../../agent-memory/en/">Agent Memory</a> studies how external state is written, retrieved, and inserted into the model's current input. <a href="../../../hermes-agent/en/self-evolution/">Agent self-evolution</a> often changes prompts, skills, memories, and workflows. Experience reaches the parameter layer when training updates the weights.</p>
 
             <h2>3. Five chapters follow the same failure</h2>
             <p>The remaining chapters do not switch to unrelated examples. They ask which policy concepts are temporarily shared after retrieval; whether the visible rationale includes the evidence actually used; how an Assistant versus unconditional-compliance persona changes interpretation; and whether a suspicious direction should be steered, trained, or merely audited.</p>
@@ -125,7 +133,7 @@
             <p>If the rationale claims approval was requested but the trace contains no approval call, the runtime evidence must block the write. If execution is compliant while internal readouts repeatedly surface bypass-related patterns, route the sample to offline investigation rather than giving a probe permission to mutate production.</p>
             <h3>5.2 Split “self-evolution” into three state changes</h3>
             <p>Writing a memory or skill evolves an external artifact. Activation steering temporarily alters inference state. Reflection training changes behavioral tendencies in the weights. Each has a different rollback cost, validation method, and permission model.</p>
-            <p>A policy skill can be reverted as a file diff. An experimental honesty direction can be disabled to restore baseline behavior. A new checkpoint requires capability, safety, and out-of-distribution evaluation. Calling all three “learning” hides the checks each change must pass.</p>
+            <p>A policy skill can be reverted as a file diff. Disabling an experimental honesty direction and rerunning the same input provides an unsteered baseline; it does not undo file changes already produced. A new checkpoint requires capability, safety, and out-of-distribution evaluation. Calling all three “learning” hides the checks each change must pass.</p>
             <h3>5.3 Treat internal explanations as instrument readings</h3>
             <p>An instrument can be calibrated, compared, and used in counterfactual experiments; it is not the system's autobiography. The strongest case usually comes from readout, intervention, ablation, behavioral change, and cross-context replication converging on the same mechanism.</p>
 

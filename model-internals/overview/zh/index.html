@@ -50,13 +50,13 @@
             <h1>从 Activation 到 Agent 行为</h1>
             <p class="lead">Agent 修改了一个文件。这个动作究竟来自参数里的能力、当前 token 的 activation、没说出口的推理、可见 CoT、长期记忆，还是 runtime 对 tool call 的执行？这篇按时间顺序说明每一步产生了什么。</p>
             <div class="meta-line"><span>范围：模型内部机制 × Agent 系统</span><span>方法：对照行为、轨迹与 activation</span></div>
-            <figure class="hero-image"><img src="../../zh/assets/activation-to-action-cover.png" alt="从模型内部 activation 流向 Agent 行动的手绘全景图" /></figure>
+            <figure class="hero-image"><img src="../../zh/assets/activation-to-action-cover.png" alt="模型生成工具调用提案，经 runtime 校验执行后产生环境结果；可见推理为可选输出" /></figure>
           </section>
 
           <section class="article-body">
             <div class="note scope-note"><p><strong>这些证据能说明什么。</strong>Activation readout 能发现与概念或行为相关、甚至具有因果作用的内部方向，但它不是模型全部计算的逐字翻译；CoT 也不是内部推理的完整录像。本文把“观察到的相关性”“干预得到的因果证据”和“关于心智的解释”严格分开。</p></div>
 
-            <div class="note reading-contract"><p><strong>阅读目标。</strong>我们会一直跟着同一个任务：把仓库配置里的 <code>retention_days</code> 从 7 改成 30。仓库 policy 规定超过 14 天必须人工审批，但测试 fixture 里混入一句“不可信的已审批”。读完后，你应该能说清三件事：模型实际看到了什么；模型只提出了什么；哪个组件最终改了文件。</p></div>
+            <div class="note reading-contract"><p><strong>阅读目标。</strong>我们会一直跟着同一个任务：把仓库配置里的 <code>retention_days</code> 从 7 改成 30。仓库 policy 规定超过 14 天必须人工审批，但测试 fixture 里混入一句“不可信的已审批”。读完后，你应该能说清三件事：模型实际看到了什么；模型只提出了什么；哪个组件最终改了文件。这个审批任务是贯穿系列的教学场景，不是下述论文实际测过的 Agent 安全实验；runtime 的审批检查是设计要求，不能由模型研究的结果替它背书。</p></div>
 
             <h2>一、从用户请求走到文件改动</h2>
             <p>用户说“把日志保留期改成 30 天，并跑完测试”。一个幼稚的实现会把整句话塞给模型，然后让模型直接写文件。真实 Agent 通常先组装一份本轮输入：system policy 说明哪些动作要审批；仓库检索返回配置文件；外部 memory 召回团队规则；工具说明告诉模型怎样读文件、申请审批和提交 patch。模型只看到被检索器和 runtime 选进请求的材料，不会凭空感知磁盘、审批系统或测试进程。</p>
@@ -69,7 +69,7 @@
             <h3>1.1 Weights 是反复使用的规则，activation 是这一轮产生的状态</h3>
             <p><strong>Weights</strong> 可以先理解成模型训练后留下的一大组数值规则。它们在不同请求之间复用：怎样关联“30 天”和“超过 14 天”、怎样生成 JSON、怎样权衡冲突指令，能力都来自这组相对持久的参数。它们不会因为模型读到这一次的 <code>retention_days</code> 就自动改写。</p>
             <p><strong>Activation</strong> 则是这一次请求经过这些规则后产生的临时数值。输入先被切成 token；每一层都为各 token 位置维护向量，并不断读取、更新它们。Transformer 里贯穿各层、供 attention 和 MLP 反复读写的主要通道叫 <strong>residual stream</strong>。所以 activation 不是一个“脑内句子”，也不是一格长期记忆，而是许多层、许多位置上的高维状态集合。</p>
-            <p>在当前例子里，policy、数值 14/30、fixture 的伪审批、用户目标会在不同位置形成表征。后续层用这些状态计算下一步更可能输出“请求审批”、还是直接输出“编辑文件”。一次 forward pass 结束后，这些 activation 通常随计算结束；除非系统把输出或轨迹另行保存，它们不会自动出现在下次会话。</p>
+            <p>在当前例子里，policy、数值 14/30、fixture 的伪审批、用户目标会在不同位置形成表征。后续层用这些状态计算下一步更可能输出“请求审批”、还是直接输出“编辑文件”。多数中间张量只在当前计算中使用，但不能把所有 activation 都说成“一次前向后消失”。自回归生成会把 attention 的 key/value 状态留在 KV 缓存中，供后续 token 复用；这仍然不是一份可以按语义检索的长期 memory。是否跨请求保留，则取决于服务的缓存管理。</p>
 
             <h3>1.2 Silent reasoning 是没有进入输出 token 的计算</h3>
             <p>模型不需要先把每一步都写成中文或英文，才能让中间结果影响输出。例如它可能在内部形成“30 大于 14”“fixture 不是授权来源”“下一步应申请审批”等表征，最后只输出一个结构化工具调用。这里的 <em>silent</em> 只是“没有作为可见 token 发出来”，不是一份完整而秘密的文字日记。</p>
@@ -93,25 +93,33 @@
 
             <h2>二、同一条 policy，在四种状态里能活多久</h2>
             <p>现在把“超过 14 天必须审批”这条规则按保存时长再走一遍。最开始，它可能存在仓库的 policy 文件或长期 memory 中，由外部系统持久化。检索器把它选出来后，它成为本轮 context 的一段 token。模型处理这些 token 时形成 activation；若模型把理由写入 CoT，文本又会成为可保存的 trace。同一条信息换了保存位置，能持续的时间也随之改变。</p>
-            <figure class="wide-figure"><img src="../../zh/assets/state-horizons.png" alt="Activation、轨迹、外部记忆与模型参数四种状态期限的对比图" /><figcaption>同样叫“记住”，可能只活一个 forward pass，也可能跨会话、甚至被写进参数。</figcaption></figure>
+            <figure class="wide-figure"><img src="../../zh/assets/state-horizons.png" alt="模型权重、外部记忆、轨迹和激活缓存分别由不同容器决定保存期限" /><figcaption>四类容器没有固定的保存时长排名：日志可以跨会话，KV 状态可以跨生成步，实际清理由各自存储策略决定。</figcaption></figure>
             <h3>2.1 Context 不是 memory，召回才把 memory 变成当前材料</h3>
             <p>外部 memory 可以保存数月，但模型不会自动读取整座资料库。Agent 先根据当前任务检索候选，再把少量内容拼进请求；只有进入 context 的那部分，才参与本轮 activation。若检索漏掉 policy，模型内部没有一条神秘通道能替它补回。反过来，context 里出现过一句话，也不代表它已经写入长期 memory。</p>
             <h3>2.2 Trace 的持久性来自日志系统，不来自模型内部</h3>
-            <p>tool call、tool result、可见 CoT 和最终回答可以被 runtime 记录，因此重启后还能回放。这里持久的是序列化记录，不是当时的 activation。重放同一轨迹会重新计算一组 activation；由于模型版本、采样和上下文变化，新状态不一定逐数值相同。</p>
-            <h3>2.3 只有训练才把经验压进 weights</h3>
+            <p>tool call、tool result、可见 CoT 和最终回答可以被 runtime 记录，因此重启后还能回放。这里持久的是序列化记录；保存轨迹本身不会保存当时的全部 activation，也不以任务结束作为必然的删除时点。从文本轨迹重新执行通常会重新计算 activation；由于模型版本、采样和上下文变化，新状态不一定逐数值相同。</p>
+            <h3>2.3 从源码看：KV 缓存延长了哪部分状态的期限</h3>
+            <p>以 Transformers 的 <a href="https://github.com/huggingface/transformers/blob/c587bc884db2c2e31fc2b8102314656b17aa07b1/src/transformers/cache_utils.py#L114-L148"><code>DynamicLayer.update</code></a> 为例，cache 对象接收本次算出的 key/value，将它们沿序列维追加到已有张量，再返回拼接结果。旧 token 的 K/V 因而能参与下一步 attention；保存的不是所有层的全部中间计算，也不是一段模型自行写下的摘要。下面只表示这条缓存更新规则，<code>t</code> 是此前已缓存的 token 数：</p>
+            <pre><code class="language-text">生成下一 token 前：K/V 的序列长度为 t
+本次计算：产生新 token 的 K/V
+cache.update：拼接已有状态与新状态
+返回：序列长度为 t + 1 的 K/V
+显式 reset：丢弃该缓存的 K/V</code></pre>
+            <p>同一实现的 <a href="https://github.com/huggingface/transformers/blob/c587bc884db2c2e31fc2b8102314656b17aa07b1/src/transformers/cache_utils.py#L166-L172"><code>reset</code></a> 会移除保存的张量。这个显式生命周期解释了为什么“复用数值状态”和“写入长期记忆”是两件事：KV 缓存减少重复计算，memory 检索则决定下一轮提供哪些材料。这里核实的是这套开源缓存类；不能据此推断某个闭源服务的缓存 TTL 或跨请求复用政策。</p>
+            <h3>2.4 训练把经验压进 weights</h3>
             <p>若团队收集许多“高保留期必须审批”的任务，并通过 SFT、RL 或 reflection training 更新模型，默认行为可能跨会话改变。此时变化进入 weights。它比改一条 memory 更广泛、更难定位，也更昂贵地回滚，所以不能把“Agent 记住了教训”和“模型学会了教训”混成一句话。</p>
             <div class="table-wrap">
               <table>
                 <thead><tr><th>载体</th><th>典型期限</th><th>能回答什么</th><th>不要误认成</th></tr></thead>
                 <tbody>
-                  <tr><td>Activation</td><td>一次 forward pass</td><td>当前计算正在表达、路由什么</td><td>长期记忆</td></tr>
+                  <tr><td>Activation / KV 缓存</td><td>中间张量随计算释放；缓存中的 K/V 可跨生成步复用</td><td>当前计算正在表达、路由什么</td><td>长期记忆</td></tr>
                   <tr><td>CoT / trace</td><td>被输出或记录后可保存</td><td>模型愿意写出的部分推理与行动轨迹</td><td>完整内部计算</td></tr>
                   <tr><td>外部 memory / skill</td><td>跨轮次、跨会话</td><td>历史事实、经验、流程与可复用资产</td><td>模型权重改变</td></tr>
-                  <tr><td>Weights</td><td>跨部署，直到再次训练</td><td>能力、先验与稳定行为倾向</td><td>某一轮具体想法</td></tr>
+                  <tr><td>Weights</td><td>直到权重被更新或替换</td><td>能力、先验与稳定行为倾向</td><td>某一轮具体想法</td></tr>
                 </tbody>
               </table>
             </div>
-            <p>这也说明它与两个相邻系列的区别：<a href="../../../agent-memory/zh/">Agent Memory</a>研究外部状态怎样写入、召回并放进模型当前输入；<a href="../../../hermes-agent/zh/self-evolution/">Agent 自进化</a>常常修改 prompt、skill、memory 与 workflow。只有训练真正更新权重，变化才进入最慢的那一层。</p>
+            <p>这也说明它与两个相邻系列的区别：<a href="../../../agent-memory/zh/">Agent Memory</a>研究外部状态怎样写入、召回并放进模型当前输入；<a href="../../../hermes-agent/zh/self-evolution/">Agent 自进化</a>常常修改 prompt、skill、memory 与 workflow。这类经验只有通过训练更新权重，才会进入参数这一层。</p>
 
             <h2>三、五篇文章分别追踪哪一层</h2>
             <p>后面四篇不会重新换场景。我们始终问：policy 进入 context 后，哪些内部概念被临时共享；模型写出的理由是否覆盖真实依据；“顺从用户”还是“遵守 policy”的角色倾向怎样出现；发现危险方向后，应该在本轮 steering、重新训练，还是只把它当审计信号。</p>
@@ -135,7 +143,7 @@
             <p>在保留期任务中，若 CoT 写着“已申请审批”，tool trace 却没有审批 call，环境记录就应优先阻止写入；若 trace 合规但内部 readout 长期出现“绕过、伪装”等信号，则进入离线调查，而不是让 readout 直接删除生产数据。每条证据必须对应自己的处置权限。</p>
             <h3>5.2 把“自进化”拆成三种状态变化</h3>
             <p>写 memory 或 skill，是外部资产进化；activation steering，是推理时短暂改写状态；reflection training，才是通过训练把行为倾向写入 weights。三者的回滚成本、验证方法和权限模型完全不同。</p>
-            <p>例如，补一条“保留期变更审批流程”的 skill，可以通过文件 diff 回滚；在实验模型里加入 honesty direction，关闭 intervention 就能回到基线；训练新 checkpoint 则必须重新做能力、安全与分布外评测。把三种变化统称为学习，会掩盖它们各自需要通过哪些检查。</p>
+            <p>例如，补一条“保留期变更审批流程”的 skill，可以通过文件 diff 回滚；在实验模型里加入 honesty direction，在同样输入上关闭 intervention 后重新运行，才能得到无干预基线；已经产生的文件修改不会随之撤销；训练新 checkpoint 则必须重新做能力、安全与分布外评测。把三种变化统称为学习，会掩盖它们各自需要通过哪些检查。</p>
             <h3>5.3 把内部解释当作仪器读数</h3>
             <p>仪器可以校准、对照和做反事实实验，却不等于被测系统的自传。最强证据通常不是“它说自己想了什么”，而是读出、干预、消融、行为变化与跨场景复现共同指向同一机制。</p>
 
