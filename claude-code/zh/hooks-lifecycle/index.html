@@ -15,7 +15,7 @@
       content="Hooks 不是简单的 shell 回调；它们会在 prompt 提交、工具执行、回合结束和 compact 前后影响下一步行为。"
     />
     <meta property="og:type" content="article" />
-    <meta property="og:image" content="../assets/hook-lifecycle-cover.png" />
+    <meta property="og:image" content="../assets/hook-tool-gate.png" />
     <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/zh/hooks-lifecycle/" />
     <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/hooks-lifecycle/" />
     <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/claude-code/en/hooks-lifecycle/" />
@@ -119,13 +119,14 @@
             </div>
             <figure class="hero-image">
               <img
-                src="../assets/hook-lifecycle-cover.png"
-                alt="Claude Code hooks 生命周期总览图，展示 SessionStart、prompt gate、model loop、tool gates、compact 和 Stop gate 与 model context 的关系"
+                src="../assets/hook-tool-gate.png"
+                alt="Claude Code 工具 hook 执行图，展示初始校验、PreToolUse、权限决定与成功后的 PostToolUse"
               />
             </figure>
           </section>
 
           <section class="article-body">
+            <p>本文核对的是公开镜像的 <a href="https://github.com/Rememorio/claude-code/tree/5a774a2b62d7949c1d94e0b726281554d7893cfd">2026 年 3 月 31 日源码快照</a>。该镜像并非 Anthropic 官方源码发布；下文描述这一固定快照，不能据此断言当前发行版具有相同实现。官方文档用于说明产品或 API 合同。</p>
             <p>
               <a href="../subagents-fork/">上一篇</a>讲 subagent 时，已经碰到 <code>SubagentStart</code>、
               <code>SubagentStop</code> 这些名字。它们不是孤立功能，而是 hooks 系统的一部分。
@@ -154,7 +155,7 @@
 
             <p>
               本文的产品行为以 Claude Code
-              <a href="https://docs.anthropic.com/en/docs/claude-code/hooks">hooks 文档</a>为参考，源码行为来自
+              <a href="https://code.claude.com/docs/en/hooks">hooks 文档</a>为参考，源码行为来自
               <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
               本文只描述客户端公开源码可见的行为，不推断服务端如何调度模型或实现更深层安全策略。
             </p>
@@ -162,9 +163,9 @@
             <figure class="shape-example">
               <pre><code class="language-text">hook event
   -&gt; getMatchingHooks(settings, plugin, skill, session)
-  -&gt; execute matched commands
+  -&gt; execute matched hook handlers
   -&gt; parse stdout as protocol result
-  -&gt; { decision, additionalContext, modifiedInput? }
+  -&gt; { decision, additionalContext, updatedInput? }
 
 PreToolUse runs before permission/execution.
 PostToolUse runs after the tool result exists.
@@ -176,7 +177,7 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
             <p>
               Hooks 最容易被误读，是因为名字太像传统回调。回调通常让人想到“事件之后通知我一下”。
               但 Claude Code 的 hook 事件表不是一串通知名，而是覆盖了输入、工具、回合和会话等不同执行步骤。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/entrypoints/sdk/coreSchemas.ts#L355-L383"><code>HOOK_EVENTS</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/entrypoints/sdk/coreSchemas.ts#L355-L383"><code>HOOK_EVENTS</code></a>
               里同时有 <code>UserPromptSubmit</code>、<code>PreToolUse</code>、<code>PostToolUse</code>、
               <code>PermissionRequest</code>、<code>SessionStart</code>、<code>Stop</code>、
               <code>PreCompact</code>、<code>PostCompact</code>、<code>SubagentStart</code> 这些名字。
@@ -185,12 +186,12 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
 
             <p>
               输入 schema 也在强调这一点。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/entrypoints/sdk/coreSchemas.ts#L387-L410"><code>BaseHookInputSchema</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/entrypoints/sdk/coreSchemas.ts#L387-L410"><code>BaseHookInputSchema</code></a>
               会给每个 hook 带上 <code>session_id</code>、<code>transcript_path</code>、<code>cwd</code>、
               permission mode 和可选的 <code>agent_id</code> / <code>agent_type</code>。
               工具类 hook 再追加 <code>tool_name</code>、<code>tool_input</code>、<code>tool_use_id</code>；
               <code>SessionStart</code> 追加 <code>source</code>，<code>Stop</code> 追加 <code>last_assistant_message</code>，
-              <code>PreCompact</code> / <code>PostCompact</code> 追加 compact trigger 与 summary。
+              <code>PreCompact</code> 带触发原因与自定义指令，<code>PostCompact</code> 才带生成后的 summary。
             </p>
 
             <div class="table-wrap">
@@ -241,7 +242,7 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
             <h2>二、Hook 先被归并和匹配，才会执行</h2>
             <p>
               能不能跑 hook，第一步不是执行命令，而是归并配置。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1492-L1566"><code>getHooksConfig()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L1492-L1566"><code>getHooksConfig()</code></a>
               会从 snapshot、registered hooks、session hooks、session function hooks 里收集当前事件的候选项。
               policy 开启 managed-only 时，plugin hooks 和 session hooks 会被跳过，避免非受管 hook 绕过策略。
             </p>
@@ -249,7 +250,7 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
             <h3>2.1 匹配条件来自事件本身</h3>
             <p>
               归并后还要匹配。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1603-L1874"><code>getMatchingHooks()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L1603-L1874"><code>getMatchingHooks()</code></a>
               会先为不同事件提取 <code>matchQuery</code>：工具事件用 <code>tool_name</code>，
               <code>SessionStart</code> 用 <code>source</code>，compact 事件用 <code>trigger</code>，
               notification 用 <code>notification_type</code>，subagent 事件用 <code>agent_type</code>。
@@ -258,9 +259,9 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
 
             <p>
               matcher 本身支持精确字符串、管道分隔列表和正则。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1337-L1381"><code>matchesPattern()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L1337-L1381"><code>matchesPattern()</code></a>
               还会兼容 legacy tool name。
-              另外，<a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1385-L1422"><code>if</code> 条件</a>
+              另外，<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L1385-L1422"><code>if</code> 条件</a>
               只在工具相关事件里求值，例如 <code>Bash(git *)</code> 这种条件要靠工具的 permission matcher 才能判断。
             </p>
 
@@ -269,7 +270,7 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
               <code>getMatchingHooks()</code> 会按来源去重 command、prompt、agent 和 HTTP hooks；
               同一个命令在不同 plugin 或 skill 里不会被错误合并，同一来源里的重复项则会收敛。
               真正执行时，
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1952-L2013"><code>executeHooks()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L1952-L2013"><code>executeHooks()</code></a>
               还会先检查全局禁用、simple mode、workspace trust，再用主 session 或当前 <code>agentId</code> 查匹配列表。
               这说明 hook 不是绕开运行时的后门：全局开关、simple mode 和 workspace trust 仍会决定它能否执行。
             </p>
@@ -278,43 +279,38 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
             <p>
               工具路径最能说明 hooks 的真实位置。
               模型在流里吐出 <code>tool_use</code> 后，Claude Code 不是立刻调用工具。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L775-L862"><code>checkPermissionsAndCallTool()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L775-L862"><code>checkPermissionsAndCallTool()</code></a>
               会先准备一个给 hooks 和 permission 使用的输入副本，再执行 <code>runPreToolUseHooks()</code>。
               这个位置在权限决策之前，所以 PreToolUse 可以改输入、要求阻断、追加上下文，也可以给出一个权限行为候选。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/hook-tool-gate.png"
-                alt="Claude Code 工具调用关口图，展示 tool call 先经过 pre hooks、approval、sandbox、attempt、output，再写入 events 与 history"
-              />
-              <figcaption>PreToolUse 位于工具执行之前，PostToolUse 位于工具输出之后；两者都只能通过约定字段影响工具流程。</figcaption>
-            </figure>
+
 
             <h3>3.1 Hook allow 不会绕过 settings deny/ask</h3>
             <p>
               这里有个很容易误解的点：PreToolUse 返回 <code>allow</code>，不代表一定执行。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolHooks.ts#L321-L433"><code>resolveHookPermissionDecision()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolHooks.ts#L321-L433"><code>resolveHookPermissionDecision()</code></a>
               的注释直接写明了不变量：hook 的 allow 不会绕过 <code>settings.json</code> 里的 deny/ask 规则。
-              如果工具需要用户交互，或者运行时要求走 <code>canUseTool</code>，仍然会进入正常权限流；
-              如果规则检查命中 deny，deny 会覆盖 hook allow；如果命中 ask，仍然要弹权限询问。
+              如果工具需要用户交互且 hook 没有提供 <code>updatedInput</code> 来满足交互，或者运行时要求走 <code>canUseTool</code>，仍然会进入正常权限流；
+              如果规则检查命中 deny，deny 会覆盖 hook allow；如果命中 ask，就交给正常权限路径处理。否则 hook allow 可直接返回，不能把这条规则与工具检查快路画成必经完整权限栈。
             </p>
+            <p>这里的<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L1071-L1155"><code>checkRuleBasedPermissions()</code></a>仍会解析输入 schema 并运行 <code>tool.checkPermissions()</code>，保留工具级 deny、内容规则 ask 和 <code>safetyCheck</code> ask；它跳过的是完整的模式与默认放行流程，并非只匹配 settings。</p>
 
             <figure class="figure">
               <img
                 src="../assets/permission-decision-stack.png"
                 alt="Claude Code 权限决策栈图，展示 deny rule、ask rule、tool check、safety check、bypass mode、allow rule 和 final ask 的优先级"
               />
-              <figcaption>Hook 给的是权限候选，不是最终裁决。最终裁决还要经过权限规则栈。</figcaption>
+              <figcaption>图中是正常权限路径；hook allow 另有规则检查快路，仍保留 settings deny/ask，但不必重跑图中全部步骤。</figcaption>
             </figure>
 
             <h3>3.2 PostToolUse 可以补上下文，但替换输出只限 MCP</h3>
             <p>
-              工具执行结束后，<a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolHooks.ts#L39-L190"><code>runPostToolUseHooks()</code></a>
+              工具执行结束后，<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolHooks.ts#L39-L190"><code>runPostToolUseHooks()</code></a>
               会消费 <code>executePostToolHooks()</code> 的结果。它可以产出 blocking error、阻断后续继续、追加
               <code>hook_additional_context</code>。
               但 <code>updatedMCPToolOutput</code> 有一个明确限制：只有 <code>isMcpTool(tool)</code> 为真时才会生效。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L1481-L1541">工具执行层</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L1481-L1541">工具执行层</a>
               也在同一位置把 MCP 输出替换后再写入 tool result。
             </p>
 
@@ -326,25 +322,25 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
             <h2>四、输出协议：stdout 要先被解释</h2>
             <p>
               Hook 最后当然要输出东西。但 Claude Code 看的不是“stdout 里有什么字”，而是“stdout 能不能解析成约定输出”。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/types/hooks.ts#L49-L176"><code>syncHookResponseSchema</code> 和 <code>hookJSONOutputSchema</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/types/hooks.ts#L49-L176"><code>syncHookResponseSchema</code> 和 <code>hookJSONOutputSchema</code></a>
               定义了可被 runtime 识别的字段：<code>continue</code>、<code>stopReason</code>、
               <code>decision</code>、<code>systemMessage</code>，以及按事件区分的
               <code>hookSpecificOutput</code>。
             </p>
 
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L399-L451"><code>parseHookOutput()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L399-L451"><code>parseHookOutput()</code></a>
               的规则也很直白：stdout trim 后不是 <code>{</code> 开头，就按普通文本处理；
               是 JSON 才会走 schema 校验。
               校验后的结构进入
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L489-L737"><code>processHookJSONOutput()</code></a>，
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L489-L737"><code>processHookJSONOutput()</code></a>，
               再被翻译成 <code>HookResult</code>：阻断继续、permission behavior、updated input、
               additional context、MCP output replacement、retry 等都在这里生成。
             </p>
 
             <p>
               command hook 还有一个非 JSON 的阻断信号：
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L2499-L2697">执行结果处理</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L2499-L2697">执行结果处理</a>
               会先尝试解析 JSON；如果不是 JSON，状态码 0 走成功，状态码 2 表示 blocking feedback，
               其他非零状态码则作为 non-blocking error 展示给用户。
               也就是说，stdout 是载体，JSON 是主要的结构化协议，exit code 2 是命令 hook 的简洁阻断通道。
@@ -396,11 +392,17 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
 
             <p>
               多个 hooks 同时命中时，还要聚合。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L2743-L2885"><code>executeHooks()</code> 的结果归并</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L2743-L2885"><code>executeHooks()</code> 的结果归并</a>
               有一条关键优先级：permission behavior 按 <code>deny &gt; ask &gt; allow</code> 处理。
               所以 hooks 之间不是谁最后输出谁赢，而是运行时按风险优先级归并。
             </p>
 
+            <h3>4.1 异步接受、进程完成、进入模型是三件事</h3><p>耗时检查不一定要卡住当前回合。命令 hook 可以通过配置 <code>async</code>，或把 <code>{"async":true}</code> 写成 stdout 的第一行来请求后台运行；<code>forceSyncExecution</code> 会阻止这次转移。<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L995-L1033">返回的 <code>backgrounded: true</code> 和成功状态</a>只表示运行时已接管后台进程，不表示检查已经完成。</p><figure class="shape-example"><pre><code class="language-text">配置 async / 首行 {"async":true}
+  → 后台注册：当前步骤继续
+  → 进程 completed：才读取最终输出
+  → 后续主线程收集 attachment
+  → systemMessage / additionalContext 进入模型消息
+注册成功 ≠ 进程成功 ≠ 模型已收到结果</code></pre><figcaption>形状级状态序列：普通 async hook 的结果通过后续附件收集交付，不会回到已经结束的权限关口。</figcaption></figure><p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks/AsyncHookRegistry.ts#L121-L271">注册表</a>只在进程为 <code>completed</code> 时提取响应，跳过首行 async 标记，标记响应已被收集并移除条目；仍运行、被杀死或没有 stdout 的情况各自处理。注册表是进程内 Map，不是可跨进程恢复的持久任务队列。后续<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/attachments.ts#L3464-L3518">附件收集</a>生成 <code>async_hook_response</code>，<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/messages.ts#L4026-L4054">消息转换</a>只把 <code>systemMessage</code> 与 <code>additionalContext</code> 变成模型上下文，不会重新执行旧的 permission decision 或回滚工具。</p><p><code>asyncRewake</code> 是另一条明确分支：它绕过注册表，在进程结束且 exit code 为 2 时排入 task notification，从空闲状态唤醒模型或在忙碌时注入排队消息。不能把这种主动唤醒能力推广到普通 async hook。</p>
             <h2>五、Prompt、SessionStart、Stop、Compact 各自影响不同步骤</h2>
             <p>
               工具路径讲清楚后，再回头看非工具 hook，就更容易理解：它们不是工具钩子的旁支，
@@ -410,7 +412,7 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
             <h3>5.1 UserPromptSubmit 在查询前检查输入</h3>
             <p>
               用户输入先走基础解析，再进入
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/processUserInput/processUserInput.ts#L178-L264"><code>executeUserPromptSubmitHooks()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/processUserInput/processUserInput.ts#L178-L264"><code>executeUserPromptSubmitHooks()</code></a>。
               如果 hook 返回 blocking error，源码会返回一个 warning，并把本轮 <code>shouldQuery</code> 设成 false；
               如果返回 <code>preventContinuation</code>，它会保留原 prompt 在上下文里的位置，但停止查询；
               如果有 <code>additionalContext</code>，就转成 <code>hook_additional_context</code> message。
@@ -425,7 +427,7 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
             <p>
               <code>SessionStart</code> 的 source 有 <code>startup</code>、<code>resume</code>、
               <code>clear</code>、<code>compact</code>。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStart.ts#L34-L175"><code>processSessionStartHooks()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/sessionStart.ts#L34-L175"><code>processSessionStartHooks()</code></a>
               会加载 plugin hooks，执行 SessionStart hooks，然后收集 <code>additionalContext</code>、
               <code>initialUserMessage</code> 和 <code>watchPaths</code>。
               最后，额外上下文会变成一个 <code>hook_additional_context</code> attachment。
@@ -439,10 +441,10 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
             <h3>5.3 Stop hook 管的是回合结束，不是工具结束</h3>
             <p>
               <code>Stop</code> 发生在回合末尾。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query/stopHooks.ts#L65-L98"><code>handleStopHooks()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query/stopHooks.ts#L65-L98"><code>handleStopHooks()</code></a>
               会先构造 <code>REPLHookContext</code>，在主线程查询时保存 cache-safe params。
               后面它还会启动一些回合结束的后台 bookkeeping，然后调用 <code>executeStopHooks()</code>。
-              Stop hook 如果阻断继续，会生成 <code>hook_stopped_continuation</code>，并把 summary message 回到消息流里。
+              Stop hook 的 <code>continue: false</code> 会变成 <code>preventContinuation</code>，生成 <code>hook_stopped_continuation</code> 并终止查询。另一种 blocking error 则表示“还不能结束”：<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L1278-L1305">query loop</a>把反馈加入 messages，以 <code>stopHookActive: true</code> 继续请求模型。两种“阻断”对后续执行的影响相反。
             </p>
 
             <p>
@@ -455,20 +457,20 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
               Compact 更能说明 hook 的执行位置会改变它的作用。
               在 full compact 里，源码先发出 <code>pre_compact</code> progress，
               然后执行
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L406-L423"><code>executePreCompactHooks()</code></a>，
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L406-L423"><code>executePreCompactHooks()</code></a>，
               把 hook 产生的新指令合并进 custom instructions。
-              summary 生成完成、文件和工具相关 attachments 恢复后，
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L587-L594">它还会以 <code>compact</code> 为 source 执行 SessionStart hooks</a>。
+              summary 生成完成、文件和工具相关 attachments 准备好后，
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L587-L594">它还会以 <code>compact</code> 为 source 执行 SessionStart hooks</a>。
               最后再执行
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L719-L729"><code>PostCompact</code> hooks</a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L719-L729"><code>PostCompact</code> hooks</a>。此时替换消息的组成部分已经准备好，但 <code>compactConversation()</code> 尚未返回；query loop 会在随后接收结果并替换本轮消息。
             </p>
 
             <figure class="figure">
               <img
                 src="../assets/compact-recovery-loop.png"
-                alt="Claude Code compact 恢复循环图，展示 trigger、pre hooks、summary fork、ledger、restore files memory tools 和 next turn"
+                alt="Compact 按条件生成摘要，准备恢复材料与 SessionStart 结果，执行 PostCompact 后由 query 安装新消息"
               />
-              <figcaption>Compact 不是把旧历史一删了事。PreCompact、SessionStart(compact) 和 PostCompact 分别卡在压缩前、恢复后和收尾处。</figcaption>
+              <figcaption>PreCompact 在摘要生成前执行；SessionStart(compact) 结果加入恢复材料；PostCompact 完成后，query loop 才安装返回的新消息。</figcaption>
             </figure>
 
             <p>
@@ -500,7 +502,7 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
                   <tr>
                     <td>工具执行前做参数清洗或风险拦截。</td>
                     <td><code>PreToolUse</code>。</td>
-                    <td>updated input 要继续过工具 schema 和 permission。</td>
+                    <td>初始输入先过 schema/validate；改写后按分支做权限处理，不能假定完整语义校验必定重跑。</td>
                   </tr>
                   <tr>
                     <td>把某个工具输出变成下一轮可读提示。</td>
@@ -541,20 +543,20 @@ Stop and Compact run at turn or memory boundaries.</code></pre>
             <h2 id="sources">参考源码与文档</h2>
             <ul class="source-list">
               <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
-              <li><a href="https://docs.anthropic.com/en/docs/claude-code/hooks">Claude Code hooks 文档</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/entrypoints/sdk/coreSchemas.ts#L355-L383">coreSchemas.ts：HOOK_EVENTS</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/entrypoints/sdk/coreSchemas.ts#L387-L590">coreSchemas.ts：Hook input schemas</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/types/hooks.ts#L49-L176">types/hooks.ts：hook JSON output schema</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1337-L1422">hooks.ts：matcher and if condition matching</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1492-L1874">hooks.ts：hook config merge and matching</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/hooks.ts#L1952-L2885">hooks.ts：executeHooks and aggregation</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L775-L932">toolExecution.ts：PreToolUse before permission</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolHooks.ts#L321-L433">toolHooks.ts：resolveHookPermissionDecision</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolHooks.ts#L39-L190">toolHooks.ts：PostToolUse hooks</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/processUserInput/processUserInput.ts#L178-L264">processUserInput.ts：UserPromptSubmit hook path</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStart.ts#L34-L175">sessionStart.ts：SessionStart hooks</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query/stopHooks.ts#L65-L210">stopHooks.ts：Stop hook context and execution</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/compact/compact.ts#L406-L729">compact.ts：PreCompact, SessionStart(compact), PostCompact</a></li>
+              <li><a href="https://code.claude.com/docs/en/hooks">Claude Code hooks 文档</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/entrypoints/sdk/coreSchemas.ts#L355-L383">coreSchemas.ts：HOOK_EVENTS</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/entrypoints/sdk/coreSchemas.ts#L387-L590">coreSchemas.ts：Hook input schemas</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/types/hooks.ts#L49-L176">types/hooks.ts：hook JSON output schema</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L1337-L1422">hooks.ts：matcher and if condition matching</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L1492-L1874">hooks.ts：hook config merge and matching</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/hooks.ts#L1952-L2885">hooks.ts：executeHooks and aggregation</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L775-L932">toolExecution.ts：PreToolUse before permission</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolHooks.ts#L321-L433">toolHooks.ts：resolveHookPermissionDecision</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolHooks.ts#L39-L190">toolHooks.ts：PostToolUse hooks</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/processUserInput/processUserInput.ts#L178-L264">processUserInput.ts：UserPromptSubmit hook path</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/sessionStart.ts#L34-L175">sessionStart.ts：SessionStart hooks</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query/stopHooks.ts#L65-L210">stopHooks.ts：Stop hook context and execution</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L406-L729">compact.ts：PreCompact, SessionStart(compact), PostCompact</a></li>
             </ul>
           </section>
         </article>
