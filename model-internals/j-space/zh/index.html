@@ -41,6 +41,8 @@
         <section class="article-body">
           <div class="note evidence-note"><p><strong>先给结论。</strong>J-space 不是一个固定层、一个新 attention head，也不是全部 residual stream 的别名。它是每个位置上由少量 token-linked J-lens vectors 张成的稀疏 subframe，通常只解释不到 10% 的 activation 方差，却与需要灵活调用的、可报告概念有稳定关系。</p></div>
 
+          <p><strong>证据范围。</strong>功能性质与干预结果来自论文；下面的实现细节依据官方 <a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/README.md">jlens 参考实现</a>。该仓库明确不维护，公开了 lens 拟合、读取与可视化，以及实验提示词；它不是完整的 Claude 实验平台。保留期任务仅为教学类比。</p>
+
           <div class="note reading-contract"><p><strong>阅读目标。</strong>继续使用保留期任务：模型同时看到目标值 30、阈值 14、可信 policy 和 fixture 里的伪审批。读完后，你应该能从“一层某位置的 activation”开始，复述 J-lens 怎样得到 token-linked direction、J-space 怎样选择少量方向，以及 swap / ablation 为什么比一张漂亮的 readout 更接近因果证据。</p></div>
 
           <h2>一、先不讲 Jacobian：模型为什么需要一块“小黑板”</h2>
@@ -63,29 +65,29 @@
 
           <h2>二、普通 Logit Lens 看“像什么”，J-lens 看“会推动什么”</h2>
           <h3>2.1 先把四个基础对象说清楚</h3>
-          <p>在 transformer 的某一层、某一个 token 位置，都有一条 residual-stream 向量；这就是 lens 要检查的 <strong>activation</strong>。模型最后会把末层向量乘以 <strong>unembedding</strong> 矩阵，得到 vocabulary 中每个 token 的分数，也就是 <strong>logits</strong>。分数再归一化，才形成下一 token 的概率。</p>
+          <p>在 transformer 的某一层、某一个 token 位置，都有一条 residual-stream 向量；这就是 lens 要检查的 <strong>activation</strong>。模型最后会先归一化末层向量，再乘以 <strong>unembedding</strong> 矩阵，得到 vocabulary 中每个 token 的分数，也就是 <strong>logits</strong>。分数再归一化，才形成下一 token 的概率。</p>
           <p><strong>Logit lens</strong> 把中间层 activation 直接送进最终 unembedding，等于假设“中间层和最后一层使用同一套坐标”。它在晚层通常有用，但早期 activation 还会被许多 nonlinear layers 改写；直接解码可能像拿半成品套最终刻度，读出噪声或过早猜到答案。</p>
-          <p>Logit lens 把中间 residual activation 直接送入 unembedding，问“如果现在就解码，会像哪个 token”。问题是，中间层还没经过后续 nonlinear computation；一个 activation 对最终输出的作用，不一定沿着直接 unembedding 的方向传播。</p>
           <p><a href="https://transformer-circuits.pub/2026/workspace/index.html">Jacobian lens</a>改问一个更因果的问题：在某个中间位置轻推 activation，最终 residual 或 logits 会怎样变？研究者对后续网络的 Jacobian 做平均，把每个 vocabulary token 的输出方向反向映射到中间层，由此得到一组 token-linked directions。一个方向标着 “France”，意思不是该神经元就是法国，而是沿这个方向改变中间 activation，会以可预测方式推动最终的“France-like”输出。</p>
           <h3>2.2 平均 Jacobian 是怎样变成一副 lens 的</h3>
-          <p><strong>Jacobian</strong> 可以先理解成一张局部影响表：中间 activation 的每个方向若发生极小变化，最终状态的各方向会变化多少。论文不是只在当前 prompt 上算一次，而是在一千条接近预训练分布的 prompts 上，跨源位置和后续目标位置求平均。这样得到每层一个平均线性映射，试图保留“这个中间方向通常有怎样的可 verbalize 后果”，并淡化某一条 prompt 的偶然用法。</p>
+          <p><strong>Jacobian</strong> 可以先理解成一张局部影响表：中间 activation 的每个方向若发生极小变化，最终状态的各方向会变化多少。论文不是只在当前 prompt 上算一次，而是在一千条接近预训练分布的 prompts 上，汇总当前与后续目标位置的影响，再对源位置和 prompts 求平均。这样得到每层一个平均线性映射，试图保留“这个中间方向通常有怎样的可 verbalize 后果”，并淡化某一条 prompt 的偶然用法。</p>
           <ol>
             <li>选定第 <em>ℓ</em> 层、某个 token 位置的 activation。</li>
             <li>计算从这个位置到当前及未来位置的最终 residual state 的局部 Jacobian。</li>
-            <li>跨位置与校准 prompts 平均，得到该层的映射 <em>Jℓ</em>。</li>
+            <li>先对有效目标位置求和，再对有效源位置与校准 prompts 求平均，得到该层的映射 <em>Jℓ</em>。</li>
             <li>把 <em>Jℓ</em> 后接模型自己的 normalization 与 unembedding。</li>
             <li>对 vocabulary 排名：排名靠前的 token，是当前 activation 通常“准备在未来说出来”的方向。</li>
           </ol>
+          <p>参考实现把这一步落实为 <a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/jlens/fitting.py#L100-L213"><code>jacobian_for_prompt()</code></a>：一次 forward 后，对输出维度分批反向传播；每个批次同时向所有有效目标位置注入 cotangent，再对源位置梯度取均值。默认 <a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/jlens/fitting.py#L40-L72">跳过前 16 个位置和最后一个位置</a>，prompt 最多截到 128 tokens。因此它不是只看同一位置的 Jacobian，也不是对所有位置对等权平均。<a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/jlens/fitting.py#L330-L388"><code>fit()</code></a> 最后对成功处理的 prompts 等权平均；太短的输入会被跳过。</p>
           <p>“France direction”因此是一个<strong>与 token 绑定的向量方向</strong>，不是一个名叫 France 的神经元，也不保证模型在当前句子里真的会输出 France。它表达的是局部反事实影响：沿这个方向推 activation，哪些未来 token 倾向会提高。</p>
-          <figure class="wide-figure"><img src="assets/j-lens-read-write.png" alt="J-lens 从平均 Jacobian 构造 token-linked 方向，并在 J-space 中执行读出、写入和因果替换" /><figcaption>读出回答“哪些 token-linked directions 在场”；写入与 swap 检查这些方向是否真的参与下游计算。</figcaption></figure>
+          <figure class="wide-figure"><img src="assets/j-lens-read-write.png" alt="J-lens 读取概念的示意，以及 spider 换成 ant 后下游答案从 8 变为 6 的因果实验" /><figcaption>概念示意：读取识别 token-linked directions；swap 后的 8→6 是继续运行模型得到的下游答案，不是 lens 的词表读数。稀疏分解与干预属于论文方法，公开 apply() 接口只完成读取。</figcaption></figure>
 
           <h2>三、从海量 directions 到 J-space：只选当前真正活跃的少数</h2>
           <h3>3.1 为什么不能把全部 vocabulary directions 都叫工作区</h3>
           <p>每层都有一个 J-lens vector 对应每个 vocabulary token，数量多于 residual-stream 维度；它们是 <strong>overcomplete</strong> 的，甚至可能线性张成整个 activation space。如果不加限制，几乎任何 activation 都能用大量 J-lens vectors 拼出来，“属于 J-space”就失去区分力。</p>
           <p>研究者因此增加两个条件：只允许少量非零系数，并要求系数非负。给定当前 activation，优化器寻找最多约 <em>k</em> 个方向，使它们的加权和尽量接近原 activation。论文常取 <em>k ≤ 25</em>，因为经验上每个时刻真正强活跃的 J-lens directions 数量大致在这个范围；这不是自然常数，而是方法中的稀疏度选择。</p>
           <h3>3.2 “稀疏 subframe”比“固定 subspace”更准确</h3>
-          <p>在每个 token 位置，方法用非负稀疏重构选择少量 J-lens vectors，形成 J-space。实验常把稀疏度限制在 <em>k ≤ 25</em>。它更像当前计算临时搭起的概念坐标系：参与概念随 prompt、位置和层变化；方向由词汇可解释，但组合仍可能是“bag of concepts”，并不天然带有完整语法和关系结构。</p>
-          <p>严格地说，J-space 不是单一线性 subspace，而是许多由不同方向组合张成的锥体的并集。今天这个 token 位置可能由 <code>approval + threshold + untrusted</code> 近似，下一位置可能由 <code>patch + test + report</code> 近似。所谓 <strong>J-space component</strong>，只是原 activation 在这些稀疏组合中最接近的那一部分；剩余 residual component 仍包含大量无法用这副 vocabulary 坐标解释的计算。</p>
+          <p>这里要区分论文的稀疏分解与代码里的读取接口。<a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/jlens/lens.py#L195-L216"><code>JacobianLens.apply()</code></a> 捕获指定层的 block 输出，将 activation 乘以平均 Jacobian，再经模型的归一化与 unembedding 得到词表分数；它没有运行稀疏重构求解器，也没有返回一组已分离的 J-space 坐标。<strong>取 top-k 词表分数，不等于求得 k 个非负重构系数。</strong>下文的稀疏 component 和干预结论仍属于论文方法，不能仅凭调用 <code>apply()</code> 就宣称复现。</p>
+          <p>严格地说，J-space 不是单一线性 subspace，而是许多由不同方向组合张成的锥体的并集。今天这个 token 位置可能由 <code>approval + threshold + untrusted</code> 近似，下一位置可能由 <code>patch + test + report</code> 近似。所谓 <strong>J-space component</strong>，只是原 activation 在这些稀疏组合中最接近的那一部分；剩余 residual component 仍包含大量无法用这副 vocabulary 坐标解释的计算。少数概念的组合也不天然带有完整语法与关系结构。</p>
           <p>论文发现 J-space component 在各层解释的 activation 方差从未超过 10%。这不等于它“只有 10% 的作用”：方差是状态能量的统计占比，因果影响取决于后续 weights 是否专门读取该方向。一个很小的审批标志，也可能像控制位一样决定下一步走“请求审批”还是“直接写文件”。</p>
           <p>这解释了标题里的 silent reasoning。某些中间概念没有进入可见 CoT，却能被 J-lens 读出，并在后续计算中产生因果作用。“silent”只表示未被输出，不表示神秘的内在独白，更不表示研究者已经读取了模型的全部私密想法。</p>
 
@@ -105,13 +107,13 @@
             <thead><tr><th>性质</th><th>实验问题</th><th>观察</th></tr></thead>
             <tbody>
               <tr><td>Verbal report</td><td>读出的内部概念能否被模型报告？</td><td>J-lens 概念与模型随后给出的解释存在对应。</td></tr>
-              <tr><td>Directed modulation</td><td>沿概念方向写入会怎样？</td><td>能选择性提高相关回答，而非只造成随机扰动。</td></tr>
+              <tr><td>Directed modulation</td><td>指令能否让模型在另一任务中维持指定概念？</td><td>指定内容可以进入工作区，即使没有出现在表面输出里。</td></tr>
               <tr><td>Internal reasoning</td><td>它是否参与输出前的计算？</td><td>消融或替换会改变下游答案。</td></tr>
               <tr><td>Flexible generalization</td><td>改变一个概念，相关事实会否整体更新？</td><td>France→China 后，下游能灵活迁移到中国相关事实。</td></tr>
               <tr><td>Selectivity</td><td>所有计算都走这里吗？</td><td>不是；许多自动处理绕过 J-space。</td></tr>
             </tbody>
           </table></div>
-          <p>最直观的反事实实验是 concept swap：把题目中的 “spider” 表征换成 “ant”，模型的下游计算会从八条腿转向六条腿；把 France 换成 China，不只是复述国名，首都等相关知识也跟着变化。它说明被改动的不是最后一个词，而是供后续模块使用的中间变量。</p>
+          <p>官方 <a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/data/experiments/README.md">实验数据说明</a> 给出了 verbal report、directed modulation 和 flexible generalization 等任务的提示词、干预位置与评分约定，但 JSON 文件只包含 prompts。复现 swap 还需要实现指定层带的干预与续写评分，不能把下载了题目当作已经执行了因果实验。</p>
 
           <h2>五、沿层数看生命周期：从输入表征到 motor regime</h2>
           <p>J-space 也不是从第一层到最后一层保持同样形状。论文的 readout 在大约前段层数里通常嘈杂；随后在一段相对窄的层带中，稳定、抽象的可 verbalize 内容出现；最后几层又逐渐转向即将输出的 token，论文把这段称为 <strong>motor regime</strong>。因此，“某个概念在第几层被读到”是实验结果的一部分，不能只截取一层就概括整次推理。</p>
@@ -123,14 +125,14 @@
           <h3>6.1 对 Agent：tool call 前可能有一组共享的临时变量</h3>
           <p>J-space 可能暂时保存目标、实体、规则或角色视角，让多个后续计算读取，并最终影响 tool call。但工具是否执行，仍由 Agent runtime 决定。它解释的是“模型为什么偏向这个动作”的一部分，不是动作的权限系统。</p>
           <h3>6.2 对 Memory：它是工作集，不是存储层</h3>
-          <p>J-space activation 随一次 forward pass 消失。外部 memory 只有被召回、注入 context，并在推理中形成 activation，才可能进入这个工作集。用操作系统类比：长期 memory 更像磁盘，context 像已装载页面，J-space 更像当前被多个计算阶段共享的少量寄存器与工作区。</p>
+          <p>J-space 描述计算中的 activation 结构，本身没有跨会话的存储或检索接口。参考实现的 <a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/jlens/hf.py#L163-L164">forward 明确关闭 KV cache</a>；这不能推广成所有推理系统都不保留计算状态。外部 memory 只有被召回、注入 context，并在推理中形成 activation，才可能进入这个工作集。用操作系统类比：长期 memory 更像磁盘，context 像已装载页面，J-space 更像当前被多个计算阶段共享的少量寄存器与工作区。</p>
           <pre><code class="language-text">外部 policy（持久化）
   -> 检索并放入 context（本轮可见）
   -> forward pass 形成 activation
   -> 少量概念可能进入 J-space
   -> 下游计算生成 request_approval tool call
   -> runtime 校验并执行
-  -> 本轮 activation 消失，trace 可另行保存</code></pre>
+  -> trace 可另行保存；J-space 本身不负责持久化</code></pre>
           <p>这段过程也说明了三种不同故障：检索没取到 policy，是 memory/context 问题；取到了却没形成可用表示，可能是模型处理问题；模型生成正确审批 call 但 runtime 忽略，是 harness 问题。不能把三种故障都叫“模型忘了”。</p>
           <h3>6.3 对自进化：训练会改变默认视角和路由</h3>
           <p>论文发现 post-training 让 J-space 更靠近 Assistant perspective；后续的 reflection training 还能借助 workspace 中的 ethics/reflection directions 改变行为。这说明训练不仅增加知识，也可能改变哪些概念在内部被广播、怎样进入决策。系列第五篇会把这种 weight-level change 与外部 skill/memory 更新分开。</p>
@@ -146,12 +148,36 @@
               <tr><td>复现</td><td>换数值、措辞、仓库和模型层重新测试</td><td>只在一个 prompt 有效，不足以进入审计规则</td></tr>
             </tbody>
           </table></div>
-          <p>工程门槛也要说清：J-lens 需要白盒访问模型层 activation、对后续网络求 Jacobian，并用校准 prompts 计算平均映射。闭源 API 使用者通常无法直接运行它；他们仍可通过 tool trace、环境 diff、行为 eval 与可见 CoT 做外部审计。J-space 是研究工具带来的额外窗口，不是所有 Agent 部署天然拥有的 telemetry。</p>
+          <h3>7.1 先对照同一位置的三种读数</h3>
+          <p>下面是依据 <a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/walkthrough.ipynb">官方 walkthrough</a> 缩小的调用示例。前提是已加载同一 checkpoint 的 <code>hf_model</code> 与 <code>tokenizer</code>，并把为它拟合的 lens 保存为 <code>jacobian_lens.pt</code>。它比较同一层、同一末尾位置的 J-lens 和普通 logit lens，再查看模型真实的下一 token 分数；不预先承诺某个词一定排第一。</p>
+          <pre><code class="language-python">import jlens
+
+model = jlens.from_hf(hf_model, tokenizer)
+lens = jlens.JacobianLens.load("jacobian_lens.pt")
+prompt = "Fact: The currency used in the country shaped like a boot is"
+layer = lens.source_layers[len(lens.source_layers) // 2]
+readout, output, tokens = lens.apply(
+    model, prompt, layers=[layer], positions=[-1]
+)
+baseline, _, _ = lens.apply(
+    model, prompt, layers=[layer], positions=[-1], use_jacobian=False
+)
+
+def top5(scores):
+    return [tokenizer.decode([i]) for i in scores.topk(5).indices.tolist()]
+
+print("J-lens:", top5(readout[layer][0]))
+print("Logit lens:", top5(baseline[layer][0]))
+print("Next token:", top5(output[0]))</code></pre>
+          <p><a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/jlens/lens.py#L145-L176"><code>apply()</code></a> 返回三项：按层组织的 lens 分数、相同位置的模型最终 logits、token IDs。示例的两个分数矩阵形状均为 <code>[1, vocab_size]</code>，返回值没有文本续写，也没有 swap。<code>use_jacobian=False</code> 只跳过线性运输，仍使用相同的 normalization 与 unembedding。<a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/jlens/hf.py#L83-L114"><code>from_hf()</code></a> 会原地把模型置于 eval 模式并冻结参数，因此应使用专门用于分析的模型实例。</p>
+          <h3>7.2 复现的成本与边界</h3>
+          <p>已有 lens 的读取只需一次 forward；自行拟合则需要白盒 activation 与梯度访问。<a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/jlens/fitting.py#L11-L21">每条校准 prompt</a> 需要一次 forward 和 <code>ceil(d_model / dim_batch)</code> 次 backward；增大 <code>dim_batch</code> 会提高显存占用，不会减少总反向计算量。闭源 API 使用者通常不能自行拟合或读取它，仍需依靠 tool trace、环境 diff、行为 eval 与可见 CoT 做外部审计。</p>
+          <p>拟合中的 <a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/jlens/fitting.py#L279-L327">checkpoint</a> 保存累计 Jacobian 与进度；完成后还要调用 <a href="https://github.com/anthropics/jacobian-lens/blob/581d398613e5602a5af361e1c34d3a92ea82ba8e/jlens/lens.py#L52-L79"><code>lens.save()</code></a> 生成供 <code>load()</code> 读取的 lens 文件。二者格式不同。恢复拟合会校验部分参数，却不核验模型身份、语料内容与顺序；复现实验必须另行固定这些条件，不能把“断点恢复成功”当成实验条件一致。</p>
 
           <h2>八、来源与复现</h2>
           <ul>
             <li>Anthropic 概览：<a href="https://www.anthropic.com/research/global-workspace">A new lens on the global workspace of language models</a></li>
-            <li>完整论文：<a href="https://transformer-circuits.pub/2026/workspace/index.html">A Computational Framework for Global Workspace Theory</a></li>
+            <li>完整论文：<a href="https://transformer-circuits.pub/2026/workspace/index.html">Verbalizable Representations Form a Global Workspace in Language Models</a></li>
             <li>官方代码：<a href="https://github.com/anthropics/jacobian-lens">anthropics/jacobian-lens</a></li>
           </ul>
         </section>
