@@ -147,7 +147,7 @@
               We will answer those questions by following one request, not by memorizing runtime terms.
             </p>
             <div class="meta-line">
-              <span>Source: Go 1.26.0</span>
+              <span>Source: Go development snapshot</span>
               <span>Route: net/http → internal/poll → runtime</span>
               <span>Example: fetchd</span>
             </div>
@@ -178,7 +178,7 @@
 
             <p>
               First, the source scope. Direct source claims are pinned to the public
-              <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a>. Documented API behavior comes from the
+              <a href="https://github.com/golang/go/tree/f043823a99a4118989a34afec015d23b5d54d01e">Go development snapshot</a>, verified on September 20, 2026. Its implementation details are not promises made by released versions. Documented API behavior comes from the
               <a href="https://pkg.go.dev/net/http">net/http documentation</a>,
               <a href="https://pkg.go.dev/context">context documentation</a>, and
               <a href="https://go.dev/doc/diagnostics">Go diagnostics documentation</a>.
@@ -211,7 +211,7 @@
             <p>
               No single request object performs that whole story. Several components take turns: one creates state, another decides
               when its lifetime ends, and another may clean it up. Learn which code is responsible at each step; the type names in the
-              table are only Go 1.26.0's concrete implementation of this relay.
+              table are only the verified development snapshot's concrete implementation of this relay.
             </p>
             <p>
               One counterexample prevents a common mix-up: <strong>one connection is not one request.</strong> A client may open one TCP
@@ -354,7 +354,7 @@ for {
     go c.serve(connCtx)
 }</code></pre>
             <span class="source-caption">
-              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L3404-L3465">Server.Serve</a>.
+              Source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L3660-L3742">Server.Serve</a>.
             </span>
 
             <p>
@@ -390,10 +390,11 @@ for {
         return
     }
     c.setState(c.rwc, StateIdle, runHooks)
-    c.bufr.Peek(4) // wait for the next request to arrive
+    // Wait for the next request: probe briefly, return empty idle buffers,
+    // and reacquire them when data arrives; branches are explained below.
 }</code></pre>
             <span class="source-caption">
-              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L1994-L2114">the HTTP/1 loop in conn.serve</a>.
+              Source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L2139-L2306">the HTTP/1 loop in conn.serve</a>.
             </span>
 
             <p>
@@ -401,6 +402,25 @@ for {
               being produced, so another handler goroutine would add bookkeeping without useful protocol concurrency. Application code
               may create child goroutines as <code>fetchd</code> does, but the handler must limit their work,
               propagate cancellation, and collect results. HTTP/2 multiplexing follows a different path.
+            </p>
+
+            <h3>How an idle connection returns unused buffers</h3>
+            <p>
+              Keeping a connection alive need not keep its read and write buffers attached. After finishing a request and confirming reuse,
+              the current HTTP/1 loop first probes with buffers attached. <code>idleBufsReleaseDelay</code> is 50 milliseconds, shortened when the actual idle deadline is earlier.
+              A promptly arriving request reuses the buffers without pool churn. Only when the probe times out before the real idle deadline and both buffers are empty
+              does the loop return roughly 8 KiB to the pools, then wait for one byte through <code>waitReadable</code>.
+              When data arrives it reacquires buffers and feeds the stashed byte into the next read; a failed read ends the connection.
+            </p>
+            <figure class="figure">
+              <img src="../assets/idle-buffer-release.png" alt="Three moments on one HTTP/1 server connection: prompt arrivals retain buffers; eligible idle connections return empty buffers while staying open; arriving data triggers buffer reacquisition" />
+              <figcaption>Three moments on the same connection. Returning buffers is a conditional idle path, not a mandatory step after every request.</figcaption>
+            </figure>
+            <p>
+              The short probe timeout only means that the connection is idle. It must not cancel the connection context that parents subsequent requests.
+              <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L846-L902">Read-error handling</a> recognizes <code>probing</code> and ignores that expected timeout;
+              the <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L2252-L2305">full waiting branch</a> decides whether to keep waiting, reacquire buffers, or end the connection.
+              The 50-millisecond threshold and approximate buffer size are implementation choices in this snapshot, not API guarantees or replacements for <code>Server.IdleTimeout</code>.
             </p>
 
             <h3>Where the connection goroutine catches a handler panic</h3>
@@ -445,12 +465,12 @@ w = &amp;response{
     conn:      c,
     cancelCtx: cancelCtx,
     req:       req,
-    reqBody:   req.Body,
+    // reqBody is retained after its type is checked; omitted here.
     // ...
 }</code></pre>
             <span class="source-caption">
-              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L976-L1072">conn.readRequest</a> and
-              the connection cancel in <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L1966-L1995">conn.serve</a>.
+              Source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L1118-L1210">conn.readRequest</a> and
+              the connection cancel in <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L2101-L2140">conn.serve</a>.
             </span>
 
             <p>
@@ -463,7 +483,7 @@ w = &amp;response{
             <h3>Cancellation, request deadlines, and socket deadlines differ</h3>
             <p>
               <code>fetchd</code> adds a 1.5-second business deadline with <code>context.WithTimeout</code>.
-              <code>http.Server.ReadHeaderTimeout</code> and <code>WriteTimeout</code> are translated by <code>readRequest</code> into
+              The connection loop sets the header-read deadline from <code>http.Server.ReadHeaderTimeout</code>, while <code>readRequest</code> sets the response-write deadline from <code>WriteTimeout</code>, using
               <code>SetReadDeadline</code> and <code>SetWriteDeadline</code> on the connection. Those socket deadlines do not guarantee
               that <code>r.Context().Deadline()</code> exposes the same time.
             </p>
@@ -504,7 +524,7 @@ w = &amp;response{
             <h2>5. After the handler, outbound work enters <code>Transport</code></h2>
             <p>
               <code>serverHandler.ServeHTTP</code> is deliberately thin. It selects the configured <code>Server.Handler</code>, falls
-              back to <code>DefaultServeMux</code>, and calls <code>handler.ServeHTTP</code>. In <code>fetchd</code>, that enters our
+              back to <code>DefaultServeMux</code>, and calls <code>handler.ServeHTTP</code>. It also handles general <code>OPTIONS *</code> and cleans up multipart temporary files after the call. In <code>fetchd</code>, that enters our
               handler and eventually reaches <code>h.client.Do(req)</code>.
             </p>
             <pre><code class="language-text">worker calls client.Do
@@ -512,13 +532,14 @@ w = &amp;response{
   → otherwise queue a new dial
   → write the request once a connection arrives
   → wait for response headers and body
-  → read and close the body before the connection can return to the pool</code></pre>
+  → read and close the body so the connection can return to the pool</code></pre>
             <p>
               <code>RoundTrip</code>, <code>getConn</code>, and <code>persistConn</code> below are not three new stories. They are the
               standard-library names for those six steps.
             </p>
 
-            <pre><code class="language-go">func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
+            <pre><code class="language-go">// Ordinary handler selection; OPTIONS * and multipart cleanup are omitted.
+func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
     handler := sh.srv.Handler
     if handler == nil {
         handler = DefaultServeMux
@@ -526,13 +547,13 @@ w = &amp;response{
     handler.ServeHTTP(rw, req)
 }</code></pre>
             <span class="source-caption">
-              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L3302-L3312">serverHandler.ServeHTTP</a>.
+              Source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L3553-L3568">serverHandler.ServeHTTP</a>.
             </span>
 
             <h3><code>RoundTrip</code> gets a connection, then selects the protocol path</h3>
             <p>
               <code>Client.Do</code> owns redirects, cookies, and other higher-level behavior. One HTTP exchange reaches
-              <code>Transport.RoundTrip</code>. In Go 1.26 the exported method validates its receiver and enters <code>roundTrip</code>,
+              <code>Transport.RoundTrip</code>. In this snapshot the exported method validates its receiver and enters <code>roundTrip</code>,
               whose loop checks the request and context, computes the connection method, obtains a connection, then selects HTTP/2 or
               HTTP/1 <code>persistConn</code>.
             </p>
@@ -555,8 +576,8 @@ w = &amp;response{
     }
 }</code></pre>
             <span class="source-caption">
-              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/roundtrip.go#L22-L34">Transport.RoundTrip</a> and
-              <a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L590-L717">Transport.roundTrip</a>.
+              Source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/roundtrip.go#L22-L34">Transport.RoundTrip</a> and
+              <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L609-L729">Transport.roundTrip</a>.
             </span>
 
             <p>
@@ -579,6 +600,14 @@ w = &amp;response{
               connection loops.
             </p>
 
+            <p>
+              Applications should still consume the response they need and close its body, but early close no longer implies inevitable connection disposal.
+              The current HTTP/1 implementation can attempt a bounded drain within 50 milliseconds if the connection is alive, keep-alives are enabled,
+              and the declared body length is at most 256 KiB; unknown lengths can also qualify. Only EOF plus the remaining reuse conditions can return the connection to the pool.
+              <code>Close</code> may return before that drain and pool admission finish. This is an <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L2596-L2624">implementation recovery path</a>,
+              not a reuse guarantee for every body. <a href="../transport-http2-diagnostics/">Chapter eight</a> follows the branches and the <code>PutIdleConn</code> experiment.
+            </p>
+
             <h2 id="netpoll">6. Beneath blocking <code>Read</code>, the goroutine returns the thread</h2>
             <p>
               This is the part often compressed into “Go uses nonblocking I/O.” Application and standard-library code still use a
@@ -586,16 +615,16 @@ w = &amp;response{
               first attempts a nonblocking syscall. Only <code>EAGAIN</code> transfers the wait to the poller.
             </p>
             <p>
-              Keep following the same worker. When the kernel says “no data yet,” the runtime records which socket it is waiting for and
-              lets the thread run other work. When data arrives, the worker first becomes runnable; it resumes reading only after the
-              scheduler selects it again. <code>EAGAIN</code>, netpoll, and <code>runtime_pollWait</code> are implementation names for
+              Separate two goroutines here: the worker waits for a response inside <code>client.Do</code>, while the HTTP/1 connection
+              <code>readLoop</code> reads the socket. When the kernel says “no data yet,” the runtime records the reading goroutine’s socket wait
+              and lets the thread do other work. Readiness makes that goroutine runnable; it retries the read only after the scheduler selects it. <code>EAGAIN</code>, netpoll, and <code>runtime_pollWait</code> are implementation names for
               that pause-and-resume sequence.
             </p>
 
             <figure class="figure">
               <img
                 src="../assets/outbound-netpoll-path.png"
-                alt="Outbound Go HTTP source route to netpoll: Transport reaches persistConn, netFD, and syscall.Read; EAGAIN enters waitRead and runtime_pollWait, parks the goroutine, and netpoll readiness later makes it runnable"
+                alt="Pollable socket read loop: syscall.Read returns data or waits after EAGAIN; netpoll readiness makes the reading goroutine runnable, and scheduling lets it retry"
               />
             </figure>
 
@@ -617,8 +646,8 @@ w = &amp;response{
     return n, fd.eofError(n, err)
 }</code></pre>
             <span class="source-caption">
-              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/net/fd_posix.go#L67-L71">netFD.Read</a> and
-              <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/poll/fd_unix.go#L141-L173">internal/poll.FD.Read</a>.
+              Source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/fd_posix.go#L67-L71">netFD.Read</a> and
+              <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/poll/fd_unix.go#L145-L182">internal/poll.FD.Read</a>.
             </span>
 
             <p>
@@ -648,8 +677,8 @@ func poll_runtime_pollWait(pd *pollDesc, mode int) int {
     return pollNoError
 }</code></pre>
             <span class="source-caption">
-              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/internal/poll/fd_poll_runtime.go#L80-L100">pollDesc.wait</a> and
-              <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/netpoll.go#L336-L360">poll_runtime_pollWait</a>.
+              Source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/poll/fd_poll_runtime.go#L80-L100">pollDesc.wait</a> and
+              <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/netpoll.go#L336-L360">poll_runtime_pollWait</a>.
             </span>
 
             <p>
@@ -677,9 +706,9 @@ gp := list.pop()
 injectglist(&amp;list)
 casgstatus(gp, _Gwaiting, _Grunnable)</code></pre>
             <span class="source-caption">
-              Source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/netpoll_epoll.go#L91-L175">Linux netpoll</a>,
-              <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3486-L3510">nonblocking poll in findRunnable</a>, and
-              <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3738-L3772">blocking poll while idle</a>.
+              Source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/netpoll_epoll.go#L105-L188">Linux netpoll</a>,
+              <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L3502-L3526">nonblocking poll in findRunnable</a>, and
+              <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L3754-L3788">blocking poll while idle</a>.
             </span>
 
             <p>
@@ -853,24 +882,24 @@ casgstatus(gp, _Gwaiting, _Grunnable)</code></pre>
 
             <h2 id="sources">Source and documentation references</h2>
             <ul class="source-list">
-              <li><a href="https://go.dev/blog/go1.26">Go 1.26 release notes overview</a></li>
+              <li><a href="https://go.dev/doc/go1.27">Go 1.27 release notes</a></li>
               <li><a href="https://pkg.go.dev/net/http">net/http package documentation</a></li>
               <li><a href="https://pkg.go.dev/context">context package documentation</a></li>
               <li><a href="https://go.dev/doc/diagnostics">Diagnostics in the Go ecosystem</a></li>
               <li><a href="https://go.dev/blog/context">Go Concurrency Patterns: Context</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L3340-L3465">ListenAndServe and Server.Serve</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L1896-L2115">conn.serve</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L976-L1072">conn.readRequest</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/server.go#L3302-L3312">serverHandler.ServeHTTP</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/roundtrip.go#L22-L34">Transport.RoundTrip</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L590-L717">Transport.roundTrip</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L1512-L1645">getConn and dial queue</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/net/http/transport.go#L2813-L2891">persistConn.roundTrip</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/internal/poll/fd_unix.go#L141-L173">internal/poll.FD.Read</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/internal/poll/fd_poll_runtime.go#L80-L100">pollDesc.wait</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/netpoll.go#L336-L360">poll_runtime_pollWait</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/netpoll_epoll.go#L91-L175">Linux epoll netpoll implementation</a></li>
-              <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3385-L3510">findRunnable and nonblocking netpoll</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L3596-L3742">ListenAndServe and Server.Serve</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L2009-L2307">conn.serve</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L1118-L1210">conn.readRequest</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/server.go#L3553-L3568">serverHandler.ServeHTTP</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/roundtrip.go#L22-L34">Transport.RoundTrip</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L609-L729">Transport.roundTrip</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L1554-L1687">getConn and dial queue</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L2973-L3051">persistConn.roundTrip</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/poll/fd_unix.go#L145-L182">internal/poll.FD.Read</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/internal/poll/fd_poll_runtime.go#L80-L100">pollDesc.wait</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/netpoll.go#L336-L360">poll_runtime_pollWait</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/netpoll_epoll.go#L105-L188">Linux epoll netpoll implementation</a></li>
+              <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L3401-L3526">findRunnable and nonblocking netpoll</a></li>
             </ul>
 
             <nav class="article-pager" aria-label="Article navigation"><a href="../value-semantics/">Chapter II: value semantics →</a></nav>
