@@ -22,7 +22,7 @@
         <p class="lead">第一篇追完了一条消息，这一篇把视角拉到所有客户端：CLI、Web UI、桌面应用、手机节点和聊天渠道怎样读取同一份状态，又怎样被各自的权限限制？答案在 Gateway：它保持渠道连接、验证客户端身份、分发方法，并按权限推送运行事件。</p>
         <div class="meta-line"><span>系列 2 / 8</span><span>源码快照：e6b4264</span><span>主题：Gateway control plane</span><span>前置：消息主线</span></div>
         <nav class="series-strip"><a href="../overview/"><strong>01</strong> 消息主线</a><span class="series-current"><strong>02</strong> Gateway：协议、身份与控制</span><a href="../routing-sessions/"><strong>03</strong> 路由与会话</a></nav>
-        <figure class="hero-image"><img src="../assets/gateway-control-plane.png" alt="OpenClaw Gateway 控制平面：operator 与 node 通过 WebSocket 进入同一 Gateway，Gateway 管理 methods、events、schemas，并连接 ChannelPlugin、Agent Runtime 和持久状态" /></figure>
+        <figure class="hero-image"><img src="../assets/gateway-control-plane.png" alt="OpenClaw Gateway 控制平面：operator、node、worker 分别连接 Gateway，由 Gateway 协调消息渠道、Agent 运行与持久状态" /><figcaption>图示聚焦 WebSocket 角色与 Gateway 的通信关系，各角色独立授权。worker 使用受限入口；其他 HTTP 入口未展开。</figcaption></figure>
       </section>
       <section class="article-body">
         <p>设想一个很普通的操作现场。你在 macOS 菜单栏里看到 Gateway 在线，随后用 CLI 发起一次 <code>agent</code> 请求；Web UI 同时显示运行中的工具事件；手机节点提供相机能力；Telegram 连接仍在收消息。它们看起来像四个产品，实际上都围绕同一份运行状态工作。</p>
@@ -49,7 +49,7 @@
 
         <h2>二、连接怎样获得身份与可调用方法</h2>
         <h3>2.1 第一帧 connect 先证明客户端身份</h3>
-        <figure class="hero-image"><img src="../assets/gateway-handshake.png" alt="OpenClaw Gateway 握手：Gateway 发送 connect.challenge，客户端用 req connect 回应，检查 protocol、auth、device 和 scopes，成功返回 hello-ok，失败 error 并关闭；之后才使用 req、res、event 三类 frame" /></figure>
+        <figure class="hero-image"><img src="../assets/gateway-handshake.png" alt="OpenClaw 通用握手：Gateway 向客户端发送 connect.challenge；客户端提交 req connect；校验协议、身份和权限后返回 hello-ok，或拒绝并关闭" /><figcaption>图示聚焦 operator/node 通用握手，worker 使用单独的 worker-hello-ok。hello-ok 建立连接基线，不代表 Agent 任务完成。</figcaption></figure>
         <p>WebSocket upgrade 成功只表示 TCP/HTTP 层建立了双向通道。Gateway 还没有理由相信对方是谁。连接建立后，server 先发送 <code>event: connect.challenge</code>，其中的 nonce 与 timestamp 进入设备签名；客户端必须把普通 request frame 的 method 设为 <code>connect</code>，并携带 protocol range、client metadata、role、scopes、auth 和 device proof。</p>
         <p><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/gateway/server/ws-connection/message-handler.ts#L283-L300">message handler 的 pre-auth 分支</a> 明确验证：第一帧必须先满足 request frame schema，再满足 <code>method === "connect"</code>，最后通过 connect params schema。普通 <code>health</code> 请求即使结构正确，也不能抢在身份协商之前。</p>
         <pre><code class="language-typescript">if (!client) {
@@ -101,7 +101,7 @@
         <p>广播器还为每个 client 维护独立 <code>seq</code>。这是因为过滤后，不同客户端实际收到的事件集合不同；用一个全局序号会让权限过滤看起来像丢包。发给指定连接的 targeted event 也使用同一条 per-client 序列，因此连续两次定向发送之间的丢失同样可被发现。序号属于具体接收关系，而不是业务事件的宇宙编号。</p>
 
         <h3>3.2 事件通知发生了变化，读取 RPC 返回当前状态</h3>
-        <figure class="hero-image"><img src="../assets/gateway-live-events.png" alt="OpenClaw Gateway 实时事件与持久状态：客户端发现 seq 41、42、44 中缺少 43 后，不要求重播，而是发送 status 请求并用 snapshot 刷新；stateVersion 帮助识别状态版本" /></figure>
+        <figure class="hero-image"><img src="../assets/gateway-live-events.png" alt="OpenClaw 同一客户端的事件序列：seq 41、42、44 暴露缺少 43；客户端用 req status 查询，并收到当前状态，不重放缺失事件" /><figcaption>序号按客户端维护。status 在这里示意读取当前状态；不同事件域需要相应查询，响应不是缺失事件的重放。</figcaption></figure>
         <p>官方架构明确写着：events are not replayed，客户端遇到 gap 必须 refresh。图里 seq 43 缺失后，客户端用真实的读取方法 <code>status</code> 示意重新获取快照；具体事件域也可能需要 <code>health</code>、<code>config.get</code> 或 session 查询。重点不是某个万能 state API，而是恢复方式：<strong>事件告诉你“变了”，读取 RPC 告诉你“现在是什么”。</strong></p>
         <p><code>stateVersion</code> 让客户端比较 presence/health 等有版本状态，但它仍不是通用 event store offset。若需要完整审计或恢复 Agent transcript，应该读取保存该记录的持久存储，而不是依赖 WS 事件缓存。实时通知与持久记录分开以后，断线时该去哪里恢复也更清楚。</p>
 
