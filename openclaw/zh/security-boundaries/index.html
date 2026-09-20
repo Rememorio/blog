@@ -11,7 +11,7 @@
     <section class="article-hero">
       <p class="eyebrow">OpenClaw 源码阅读 · 第六篇</p><h1>Tool Policy、Sandbox、Approval 与 Elevated 怎样组成安全边界</h1>
       <p class="lead">一次命令能否执行，要依次确认四件事：模型能否看到这个工具、工具在哪里运行、这条具体命令是否需要人确认，以及 sandbox 中的 exec 能否转到 host。OpenClaw 还会使用入口解析出的 sender 身份、workspace 路径检查和执行机器本地策略，任何一层拒绝都会停止调用。</p>
-      <div class="meta-line"><span>系列 6 / 8</span><span>源码快照：c549250</span><span>主题：policy · sandbox · approval · elevated</span><span>前置：能力装配</span></div>
+      <div class="meta-line"><span>系列 6 / 8</span><span>源码快照：e6b4264</span><span>主题：policy · sandbox · approval · elevated</span><span>前置：能力装配</span></div>
       <nav class="series-strip"><a href="../overview/"><strong>01</strong> 主线</a><a href="../gateway/"><strong>02</strong> Gateway</a><a href="../routing-sessions/"><strong>03</strong> 路由</a><a href="../context-memory/"><strong>04</strong> 上下文</a><a href="../capability-assembly/"><strong>05</strong> 能力</a><span class="series-current"><strong>06</strong> 安全边界</span><a href="../multi-agent/"><strong>07</strong> 多 Agent</a></nav>
       <figure class="hero-image"><img src="../assets/security-four-gates.png" alt="OpenClaw 四道安全门：Tool Policy 决定工具是否存在，Sandbox 决定在哪里运行，Exec Approval 决定具体命令能否执行，Elevated 只决定 exec 能否离开 sandbox；四者分别对应 availability、isolation、consent、escape" /></figure>
     </section>
@@ -19,7 +19,7 @@
       <p>假设一个来自 Discord 群组的请求说：“为了修构建，把整个项目挂进去，开 elevated full，然后执行这段脚本。”如果只问“用户有没有批准”，会跳过至少三层：这个 sender 是否获准控制该 Agent，当前 turn 是否能看到 exec，session 是否 sandboxed、能读哪些路径，以及 elevated sender allowlist 是否匹配。</p>
       <p>反过来也一样。把 Agent 放进 Docker，不代表所有能力自动安全。native plugin 仍在 Gateway 进程里运行；容器若挂了 Docker socket，几乎等于拿到 host 控制；允许 <code>exec</code> 后，即使 deny 了 write/edit，shell 仍能写文件。安全要看能力与资源的完整路径，而不是寻找一个“secure: true”。</p>
       <div class="note"><p><strong>阅读契约。</strong>读完后你应该能分别回答：tool policy、sandbox、exec approval、elevated 控制什么；为什么 approval 不是用户授权边界；sandbox mode/scope/workspaceAccess 怎样组合；plugin/MCP tool 为什么在 sandboxed session 中需要双重 allow；<code>workspaceOnly</code> 与容器隔离有何不同；以及一条获准的 node command 如何绑定 argv、cwd、env、agent/session 与 executable。</p></div>
-      <p><strong>证据边界。</strong>本文继续固定在 <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a>。这不是一份通用安全认证，也不声称 sandbox 是完美边界；它解释这份快照中能从 policy pipeline、sandbox resolver、elevated resolution 与 host exec approval 源码验证的防线。</p>
+      <p><strong>证据边界。</strong>本文继续固定在 <a href="https://github.com/openclaw/openclaw/commit/e6b42643e7aae229d115477596b33c36c38f7101">e6b4264</a>。这不是一份通用安全认证，也不声称 sandbox 是完美边界；它解释这份快照中能从 policy pipeline、sandbox resolver、elevated resolution 与 host exec approval 源码验证的防线。</p>
 
       <h2>一、一次工具调用先确认能力与身份</h2>
       <h3>1.1 四项检查分别限制工具、环境、命令与 host escape</h3>
@@ -29,28 +29,29 @@
         <tr><td>Exec approval</td><td>这一条 host command 是否获准？</td><td>exec 已被选择、host plan 已解析后。</td><td>不是 per-user authentication 或只读文件策略。</td></tr>
         <tr><td>Elevated</td><td>沙箱里的 exec 能否走既定 host 路径？</td><td>host selection/exec admission。</td><td>不能复活被 deny 的 exec，也不能增加别的工具。</td></tr>
       </tbody></table></div>
-      <p>把它们画成串行四关只是帮助理解，源码里有些检查在构造期提前完成，有些在 call-time 重验。真正的不变量是：每道门只缩小 authority；没有任何后置 directive 应能把前置 deny 改成 allow。</p>
+      <p>把它们画成串行四关只是帮助理解，源码里有些检查在构造期提前完成，有些在 call-time 重验。工具 deny 与强制 sandbox 不能被后置 directive 覆盖。普通 host exec 还会取配置与执行机审批策略中更严格的结果；但管理员明确授予的 session <code>permissionMode="full"</code> 是 host approval-file 限制的例外，不能再把所有设置都概括为“只会收窄”。</p>
 
       <h3>1.2 sender 身份由入口解析，模型参数不能改写</h3>
       <p>senderId、accountId、channel、roleIds 与 <code>senderIsOwner</code> 在 channel/Gateway 入口解析后，作为 trusted requester context 绑定到 run 和 tool wrapper。模型可以生成 <code>{"target":"admin"}</code>，却不能通过工具参数把自己变成 owner。message action、elevated allowlist 与 owner-only control tool 都应读取 host-derived identity。</p>
       <p>缺失身份字段表示“未证明”，不是“可按默认信任”。要求 maintainer role 的 hook 若看不到 roleIds，应 fail closed；用显示名做 fallback 又会把可变的 sender-supplied text 当凭据。</p>
       <p>这也是为什么 route/session 隔离先于 tool policy。若多人 DM 先被错误折叠成 main session，后面的 policy 虽能限制工具，却无法抹掉已经混入 transcript 的私人上下文。</p>
 
-      <h3>1.3 Tool policy 在请求前移除不允许的工具</h3>
-      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/agent-tools.policy.ts"><code>agent-tools.policy.ts</code></a> 和 pipeline 将 profile、provider、global、agent、group、sender、sandbox 等策略逐层应用。<code>deny</code> 优先；非空 allowlist 把未列出的工具视为 blocked。被过滤的 descriptor 不会发送给模型，<code>/exec</code> directive 也不能覆盖一个被 deny 的 exec tool。</p>
+      <h3>1.3 Tool policy 在请求前移除不允许的普通工具</h3>
+      <p><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/agent-tools.policy.ts#L117"><code>agent-tools.policy.ts</code></a> 和 pipeline 将 profile、provider、global、agent、group、sender、sandbox 等策略逐层应用。<code>deny</code> 优先；非空 allowlist 把未列出的工具视为 blocked。被过滤的 descriptor 不会发送给模型，<code>/exec</code> directive 也不能覆盖一个被 deny 的 exec tool。</p>
       <p>policy 按工具名工作，不理解工具内部所有副作用。最重要的例子是 shell：deny <code>write</code>、<code>edit</code>、<code>apply_patch</code> 仍不能让允许的 <code>exec</code> 自动变成只读，因为 <code>sh -c 'echo x &gt; file'</code> 仍会写。只读 Agent 要同时 deny runtime group，或用 sandbox filesystem/OS permission 做资源层约束。</p>
-      <p>同理，允许 plugin group 不代表每个调用都合理；具体 params、sender 与资源可继续由 trusted policy 或 <code>before_tool_call</code> 阻断。build-time 减少模型误选，call-time 处理参数级风险。</p>
+      <p>这里的逐层过滤指普通配置工具；宿主按运行身份单独注入的系统工具另有授权路径，见<a href="../capability-assembly/">能力装配篇</a>，不能用 profile 推断它们的可用性。同理，允许 plugin group 不代表每个调用都合理；具体 params、sender 与资源可继续由 trusted policy 或 <code>before_tool_call</code> 阻断。build-time 减少模型误选，call-time 处理参数级风险。</p>
 
       <h2>二、Sandbox 怎样限制进程、文件与扩展</h2>
       <h3>2.1 工具进入 sandbox，Gateway 与 native plugin 留在 host</h3>
-      <figure class="hero-image"><img src="../assets/security-sandbox-host.png" alt="OpenClaw sandbox host cutaway：Gateway 与 Native Plugins 留在 host，exec/read/write/edit 等 sandboxed tools 在独立环境中运行，workspace access 可为 none/ro/rw，网络另受 policy；plugin tool 需 normal policy 与 sandbox policy 双重放行，elevated exec 走受控桥到 gateway 或已配置 node" /></figure>
+      <figure class="hero-image"><img src="../assets/security-sandbox-host.png" alt="沙箱会话的两类工具路径：原生插件经普通策略与沙箱策略双重放行后仍在宿主机执行，沙箱工具在隔离环境执行" /><figcaption>此图聚焦执行位置和插件双门；下方省略了沙箱工具同样适用的普通 tool policy，elevated 与强制 sandbox 的额外规则见正文。</figcaption></figure>
       <p>OpenClaw 的 Gateway 不会随 Agent turn 一起进入容器。sandbox backend 运行 exec 和文件工具（以及可选 browser）；Gateway、session 状态和 native plugin runtime 仍在 host 进程。容器隔离的是这些工具的进程与资源访问，不是整个 Gateway。</p>
       <p>因此 sandbox 主要降低模型出错的 blast radius：限制进程、文件、网络和 workspace 可见性。它不会把已加载的 native plugin 变成不受信代码；安装 plugin 等于允许代码在 Gateway trust boundary 中运行，必须在安装前审查。</p>
 
       <h3>2.2 Mode、Scope、Backend 分别决定启用范围、共享粒度和执行器</h3>
       <p><code>mode</code> 决定哪些 session sandbox：<code>off</code>、<code>non-main</code> 或 <code>all</code>。<code>non-main</code> 下，群组/channel session 不是 main，因此会进入 sandbox；“这是主 Agent”不代表它的每个 session key 都是 main。</p>
+      <p>此外，创建会话时由 operator role 记录的 <code>sandbox="required"</code> 是独立的强制要求。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/sandbox/runtime-status.ts#L199">runtime resolver</a> 会保留它，<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/sandbox/context.ts#L300">sandbox context</a> 把实际 workspaceAccess 的 rw 收窄到 ro；<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/bash-tools.exec-runtime.ts#L248">exec target resolver</a> 在 backend 不可用时拒绝运行，并拒绝 elevated、gateway 或 node escape。关闭 Agent 的普通 sandbox 配置并不会清除这份会话要求。</p>
       <p><code>scope</code> 决定 runtime 共享粒度：每 agent、每 session 或全体 shared。session scope 隔离最细、成本最高；shared 资源复用最多，也会让不同 session 更容易通过容器状态互相影响，而且会忽略 per-agent binds。scope 是隔离域设计，不是性能参数的别名。</p>
-      <p><code>backend</code> 决定执行器：Docker/Podman、SSH 或 OpenShell。不同 backend 对 network、browser、bind mount 与 workspace sync 的能力不同，配置不能假设容器 backend 的保护自动出现在 SSH 远端。</p>
+      <p><code>backend</code> 决定执行器：Docker/Podman、SSH、OpenShell，以及插件注册的其他执行器（如 Crabbox）。不同 backend 对 network、browser、bind mount 与 workspace sync 的能力不同，配置不能假设容器 backend 的保护自动出现在 SSH 远端。</p>
 
       <h3>2.3 workspaceAccess 与 bind mount 分别开放路径</h3>
       <p><code>workspaceAccess</code> 为 none/ro/rw，控制 Agent workspace 怎样进入 sandbox。none 通常用 sandbox 自己的 scratch workspace；ro 适合审查；rw 才允许工具修改实际工作区。它与额外 <code>docker.binds</code> 是两套入口。</p>
@@ -64,27 +65,32 @@
       <h3>2.5 workspaceOnly 只检查受控文件工具的路径</h3>
       <p><code>tools.fs.workspaceOnly</code> 给 read/write/edit/apply_patch 添加 host path boundary。实现不能只检查字符串前缀：需要解析 relative/absolute、symlink parent、final symlink 与 hardlink alias，避免一个“看起来在 workspace 内”的路径实际写到外面。</p>
       <p>即便这些检查完整，workspaceOnly 仍只保护受控文件工具。若 exec 在 host 上可用，shell 可以走自己的 filesystem API；若 plugin 自己接收路径，也要实现相应 guard。container/OS boundary、tool policy 与 library path guard 是 defense in depth，不该用其中一层替代另两层。</p>
+      <p><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/docs/gateway/permission-modes.md#L10">会话 permission mode</a> 进一步把受控文件工具限制在记录的 <code>sessionRoot</code>，没有记录时使用目标 Agent 的 canonical workspace。<code>read-only</code> 隐去写入工具并拒绝 exec；<code>guarded</code> 允许根目录内读写，allowlist 未命中时问人；<code>workspace</code> 允许根目录内读写，并把合格 exec 交给自动 reviewer；<code>full</code> 要求 <code>operator.admin</code>。managed worktree 会把根目录固定到 checkout，但创建 worktree 本身不会选择权限模式。它仍不是让任意 shell 自动遵守路径边界的替代品。</p>
 
       <h2>三、Host exec 怎样获得许可并防止命令漂移</h2>
       <h3>3.1 Elevated 只改变 sandbox 中 exec 的执行位置</h3>
       <p><code>/elevated on</code> 只在当前 session 已 sandboxed 时有意义：它让后续 exec 走 sandbox 外的 configured host path，默认 gateway；若 exec target 已配置为 node，则保持 node。unsandboxed session 的 exec 本来就在 host，elevated 基本是 no-op。</p>
       <p>可用性要求 global gate、per-agent gate 和 sender allowlist 全部通过。inline directive 只影响当前消息，session override 次之，global default 最后。缺少任何 gate 时应当显示 unavailable，而不是默默以 host exec 执行。</p>
-      <p><code>full</code> 只有在 requested exec policy 与 host-local approvals 都真正 permissive 时才跳过审批；host 仍为 ask always 时继续询问。Elevated 不改变 tool policy，不增加 read/browser/plugin tools，也不能把 <code>host=auto</code> 变成任意跨主机选择。</p>
+      <p>单独启用 <code>/elevated full</code> 不会获得管理员 full session 的例外：只有合并后的 exec policy 已是 full/off 才跳过审批；普通路径中的 host ask always 仍然要求询问。Elevated 不改变 tool policy，不增加 read/browser/plugin tools，也不能越过 required sandbox。当前 <a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/bash-tools.exec-runtime.ts#L221-L237">host resolver</a> 允许在没有可用 sandbox 且配置为 auto 时，用明确的 node 请求选择 node；有可用 sandbox 时会拒绝这种显式跨出请求。若配置已固定具体 host，则仍检查请求是否匹配，elevated 不是任意跨主机授权。</p>
 
       <h3>3.2 Exec Approval 检查一条具体 host 命令</h3>
-      <figure class="hero-image"><img src="../assets/security-approval-plan.png" alt="OpenClaw host exec 审批：Tool Policy 允许后检查 Elevated enabled 与 sender，再取 config 和 execution host 中更严格的 exec policy，经过 allowlist 或 ask 得到 allow once、allow always 或 deny；批准绑定 argv、cwd、env、agent、session、executable 的 sealed plan，plan drift 会被拒绝，approval 不等于 authorization" /></figure>
-      <p>host exec approval 是 Gateway host/node host 的 accidental-execution guardrail。执行条件是 tool policy、elevated gate（sandbox escape 时）、请求的 exec policy、host-local approvals、allowlist 与可能的人类决策共同同意。host policy 与 config 取更严格结果；远端 session 不能把执行机器本地的 deny/ask always 放宽。</p>
+      <figure class="hero-image"><img src="../assets/security-approval-plan.png" alt="host exec 先绑定执行计划，再进行所需审核，启动前重新核实计划与策略；变化会在执行前被拒绝" /><figcaption>此图聚焦需要审核的普通 host exec：绑定先于审核，复核先于启动。自动审核的资格、管理员 full session 例外以及 node 端绑定范围见正文。</figcaption></figure>
+      <p>host exec approval 是 Gateway host/node host 的 accidental-execution guardrail。执行条件是 tool policy、elevated gate（sandbox escape 时）、请求的 exec policy、host-local approvals、allowlist 与可能的人类决策共同同意。普通配置路径按更严格的 host policy 合并。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/exec-defaults.ts#L148">显式 full session</a> 则是经过管理员授权的例外：有效 security 仍为 full 时可跳过 host approval-file 下限；turn 只提高 ask 不会恢复这些下限，收紧 security 才会恢复。它仍不能复活被 tool policy deny 的工具，或取消 required sandbox。</p>
       <p>这套 approval 不是 per-user auth。Gateway authenticated operator 和 paired node 已经构成 trust relationship；approval 只让具体高风险命令再经过确认。一旦批准，命令仍能按 host filesystem permission 修改任何可达资源。真正的多用户边界仍在 ingress auth、sender policy、Agent isolation 与 OS/sandbox。</p>
+
+      <p>当前持久配置入口是 <code>tools.exec.mode</code>，不是把 security/ask 任意组合保存到 session。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/docs/tools/exec.md#L130">五种 exec mode</a> 分别是 deny、allowlist、ask、auto 与 full。auto 仅把符合绑定条件的 allowlist miss 送审；reviewer 的 allow 是一次性许可，deny 返回理由，ask 或审核失败才转人工。显式 ask=always 直接要求人工。下面是配置形状，不是对命令安全性的保证：</p>
+      <pre><code class="language-json">{ "tools": { "exec": { "mode": "auto", "strictInlineEval": true } } }</code></pre>
+      <p>自动 reviewer 接收带来源标记、脱敏且有界的对话材料；这些是判断用户意图的证据，不是新的指令。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/bash-tools.exec-host-gateway.ts#L987">执行器</a> 仍先判断命令是否可绑定；无法完整绑定的 dispatch chain 不会因为模型认为安全就执行。普通配置默认 host exec 为 full，因此不能把“没有配置审批”理解为“默认每条都会询问”。</p>
 
       <h3>3.3 Allowlist 绑定 executable，并尽量限制 argv</h3>
       <p>allowlist 是 per-agent。bare command name 只匹配经 PATH 调用的命令，不匹配 <code>./rg</code> 或 <code>/tmp/rg</code>；path glob 可限制可信 binary 位置。shell chain 的每个 top-level segment 都要满足规则，不能因为第一段是 git 就顺便放行后面的 curl。</p>
-      <p><code>argPattern</code> 能把同一 binary 收窄到特定 argv；approval 生成的 allow-always entry 使用 argv-bound representation。否则允许 <code>python3</code> 就等于允许它读取并执行任意脚本或 inline code。strictInlineEval 会让 <code>python -c</code>、<code>node -e</code> 等形式即使 binary allowlisted 也继续要求 review/approval。</p>
+      <p><code>argPattern</code> 能把同一 binary 收窄到特定 argv；approval 生成的 allow-always entry 同时绑定准确 argv 与 cwd。否则允许 <code>python3</code> 就等于允许它读取并执行任意脚本或 inline code。可选的 <code>strictInlineEval</code> 默认关闭；开启后会让 <code>python -c</code>、<code>node -e</code> 等形式即使 binary allowlisted 也继续要求 review/approval。</p>
       <p>safe bins 是额外的受限快路径，不应理解为“常见命令天然安全”。stdin-only、参数形态、路径解析和环境都会影响它能否走 fast path。</p>
 
       <h3>3.4 审批后的 executable、argv、cwd 与 env 不得漂移</h3>
       <p>node host 路径先生成 canonical <code>systemRunPlan</code>，审批记录保存 command/cwd/session 等绑定信息。真正转发 <code>system.run</code> 时复用这份 plan，而不是重新相信 caller 后来的字段。若 command、rawCommand、cwd、agentId 或 sessionKey 发生变化，Gateway 拒绝 mismatch。</p>
       <p>批准还尽量绑定 resolved executable path，以及 shell script/直接 interpreter 调用中的一个 concrete local file operand。文件在批准与执行之间变更会拒绝；如果无法识别唯一文件，就不伪装成已完整覆盖。best effort 的边界要明确写出，不能把一次点选夸大成对所有 runtime loader 的证明。</p>
-      <p>无 UI 或 timeout 时走 <code>askFallback</code>，默认 deny。allow once 只对本次 plan，allow always 生成可匹配的持久规则，deny 终止命令并把结果通过 session/system event 收敛，避免 Agent 永远等待缺失 tool result。</p>
+      <p>审批缺少 UI 或等待超时后走 <code>askFallback</code>，默认 deny。allow once 只对本次 plan，合格的 allow always 生成持久规则，inline-eval 不会成为持久 allow 规则。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/docs/tools/exec.md#L154">执行前复核</a> 还会在异步准备之后、真正创建进程之前重读已提交的 host approval policy；撤销可以阻止尚未启动的命令，却不会回滚已运行进程。node 端 executable 绑定覆盖本地策略评估到 dispatch，不能据此声称远端人工等待期间所有 shell 内层 executable 都已完整冻结。</p>
 
       <h2>四、怎样诊断安全配置并避免常见误配</h2>
       <h3>4.1 Prompt 与 Skill 提供建议，host code 执行限制</h3>
@@ -116,7 +122,7 @@ openclaw logs</code></pre>
         <li><strong>Sandbox 决定“在哪里”。</strong>Gateway 与 native plugin 仍在 host。</li>
         <li><strong>Approval 绑定“这一条计划”。</strong>它不能替代用户认证与 filesystem permission。</li>
         <li><strong>Elevated 只为 exec 提供受控 escape。</strong>它不是总权限模式。</li>
-        <li><strong>每层只允许单调收窄。</strong>host-local policy 可以比 config 严，不能被远端放宽。</li>
+        <li><strong>区分普通合并与显式授权。</strong>普通 exec 受 host 下限约束；管理员授予的 full session 是审批下限的例外，tool deny 与 required sandbox 仍然生效。</li>
         <li><strong>路径与命令都防 TOCTOU。</strong>解析 symlink/executable/script，并拒绝批准后的 plan drift。</li>
         <li><strong>说明是软约束，host code 才是硬边界。</strong>用 policy、sandbox、OS 和审批做 defense in depth。</li>
       </ol>
@@ -124,10 +130,10 @@ openclaw logs</code></pre>
 
       <h2 id="sources">参考源码与文档</h2>
       <ul>
-        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/agent-tools.policy.ts">agent-tools.policy.ts</a>、<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/tool-policy-pipeline.ts">tool-policy-pipeline.ts</a>：分层 tool availability。</li>
-        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/sandbox/context.ts">sandbox/context.ts</a>、<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/sandbox/tool-policy.ts">sandbox/tool-policy.ts</a>：runtime、workspace 与 sandbox tool gate。</li>
-        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/auto-reply/reply/reply-elevated.ts">reply-elevated.ts</a>：global/agent/sender elevated resolution。</li>
-        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/bash-tools.exec-host-gateway.ts">exec-host-gateway.ts</a>、<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/bash-tools.exec-host-node.ts">exec-host-node.ts</a>：host policy、allowlist、approval 与 bound plan。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/agent-tools.policy.ts#L117">agent-tools.policy.ts</a>、<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/tool-policy-pipeline.ts#L136">tool-policy-pipeline.ts</a>：分层 tool availability。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/sandbox/context.ts#L286">sandbox/context.ts</a>、<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/sandbox/tool-policy.ts#L157">sandbox/tool-policy.ts</a>：runtime、workspace 与 sandbox tool gate。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/auto-reply/reply/reply-elevated.ts#L178">reply-elevated.ts</a>：global/agent/sender elevated resolution。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/bash-tools.exec-host-gateway.ts#L467">exec-host-gateway.ts</a>、<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/bash-tools.exec-host-node.ts#L60">exec-host-node.ts</a>：host policy、allowlist、approval 与 bound plan。</li>
         <li><a href="https://docs.openclaw.ai/gateway/sandbox-vs-tool-policy-vs-elevated">Sandbox vs tool policy vs elevated</a>、<a href="https://docs.openclaw.ai/gateway/sandboxing">Sandboxing</a>、<a href="https://docs.openclaw.ai/tools/exec-approvals">Exec approvals</a>：官方边界与诊断。</li>
       </ul>
     </section>
