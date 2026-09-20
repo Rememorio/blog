@@ -9,7 +9,7 @@
     <meta property="og:title" content="Context is not just a summary | Rememorio Blog" />
     <meta property="og:description" content="A source-reading article on Claude Code context management: memory, model-visible selection, microcompact, auto compact, prompt cache, and recovery." />
     <meta property="og:type" content="article" />
-    <meta property="og:image" content="../assets/context-ledger-cover.png" />
+    <meta property="og:image" content="../assets/compact-recovery-loop.png" />
     <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/en/context-management/" />
     <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/context-management/" />
     <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/claude-code/en/context-management/" />
@@ -105,7 +105,7 @@
               <span>Scope: public mirror and official docs</span>
             </div>
             <figure class="hero-image">
-              <img src="../assets/context-ledger-cover.png" alt="Hand-drawn Claude Code context map with memory, model view, compact, cache, and resume records" />
+              <img src="../assets/compact-recovery-loop.png" alt="Conditional compact recovery with cache-sharing summary or streaming fallback, recovery material, hooks, and message installation" />
             </figure>
           </section>
 
@@ -113,30 +113,48 @@
 
             <p><a href="../overview/">Part I</a> followed one task through the runtime. <a href="../memory-layer/">Part II</a> separated long-lived memory files from transcript. This chapter starts after that split: the word <q>context</q> is overloaded. In Claude Code it can mean project memory, user instructions, repository status, visible conversation messages, hidden runtime metadata, compact summaries, or API request blocks. Reading the code becomes easier once those locations are separated.</p>
             <figure class="shape-example">
-              <pre><code class="language-text">type ContextSurfaces = {
-  durableTranscript: Message[]
-  baseContext: SystemContext | UserMemory
-  modelVisibleView: ProviderMessage[]
-  pressureRelief: "replacement" | "collapse" | "compact"
-  recoveryBoundary: "compact summary" | "resume replay"
-}</code></pre>
-              <figcaption>Source shape: context management is easier to read once durable history, base context, and the messages sent to the provider are treated as separate steps.</figcaption>
+              <pre><code class="language-text">durable transcript → evidence and resume records
+base context → cached system environment and user instructions
+model request → selected and normalized messages
+pressure relief → replacement, collapse, or compact
+recovery → installed summary and replay state</code></pre>
+              <figcaption>Conceptual reading map: durable history, base context, and provider messages are separate responsibilities, not a source type definition.</figcaption>
             </figure>
 
+            <div class="note reading-contract"><p><strong>Reading goal:</strong> follow one long coding session from durable history into the next model request. Track who selects messages, which conditions enable each pressure-relief path, how a summary becomes an installed recovery point, and what files or skills are restored afterward.</p></div>
+            <p>The evidence is the public mirror’s fixed March 31, 2026 snapshot, linked at one immutable commit. It is not Anthropic’s official source repository and does not establish behavior in later product versions. Visible client implementation, official API contracts, and provider-side inference remain separate. Missing feature modules are described only through their visible callers and recovery records.</p>
             <h2>1. Context starts before the chat history</h2>
-            <p>The initial user and system context are built outside the model loop. User memory can come from <code>CLAUDE.md</code> files and related memory sources. System context captures facts such as the working directory, git state, and environment details. Later, <code>appendSystemContext()</code> and <code>prependUserContext()</code> place those facts into the provider request in different positions.</p>
-            <figure class="figure"><img src="../assets/context-surfaces.png" alt="Different Claude Code context surfaces, including memory, system context, transcript, model view, and API request" /><figcaption>The key move is to stop treating every stored fact as something that must be sent to the model every time.</figcaption></figure>
-            <h2>2. The model-visible view is rebuilt every turn</h2>
-            <p>Inside <code>queryLoop()</code>, the runtime constructs the current API view. It does not blindly replay the whole transcript. It starts after the latest compact marker, applies the tool-result budget, lets <code>HISTORY_SNIP</code> lower historical pressure when that feature is present, runs microcompact, replaces committed Context Collapse spans with summaries, and only then asks whether auto compact must take over.</p>
+            <p>The initial user and system context are built outside the model loop. User memory can come from <code>CLAUDE.md</code> files and related memory sources. System context captures repository status at conversation start. Both builders are memoized: inserting their results each turn does not reread git or disk each turn. The date belongs to the cached user-context result as well.</p>
+
+            <h3>1.1 Insert the working environment in the correct place</h3>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/api.ts#L437-L474"><code>appendSystemContext()</code> and <code>prependUserContext()</code></a> place those facts in different positions. The former appends to the system prompt; the latter creates a meta user message with a <code>&lt;system-reminder&gt;</code> wrapper. The wrapper name does not change its message role.</p>
+            <figure class="shape-example"><pre><code class="language-text">shape-level:
+system = default system prompt + gitStatus + optional cacheBreaker
+messages = [
+  meta user: "&lt;system-reminder&gt; ... CLAUDE.md ... currentDate ...",
+  ...runtime-selected messages
+]</code></pre><figcaption>This is an abbreviated request shape, not a complete API payload or a literal user utterance.</figcaption></figure>
+            <h3>1.2 Stored history and the provider request have different jobs</h3>
+            <table><thead><tr><th>Location</th><th>Reader or transformation</th><th>What it preserves</th></tr></thead><tbody>
+              <tr><td>UI / REPL history</td><td>Display components</td><td>Human scrollback; not copied wholesale to the API.</td></tr>
+              <tr><td>Durable transcript</td><td>Session storage and resume</td><td>Evidence and recovery records, selected again when loaded.</td></tr>
+              <tr><td>Runtime view</td><td>Compact-boundary slicing, snip, collapse</td><td>The active working history for this request.</td></tr>
+              <tr><td>API view</td><td>Normalization and cache breakpoints</td><td>Provider-valid messages, tool-result pairing, and cache markers.</td></tr>
+            </tbody></table>
+            <p>The <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/commands/context/context.tsx#L12-L18"><code>/context</code> command</a> aims to report what the model actually sees. Before sending, <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/messages.ts#L1989-L2140"><code>normalizeMessagesForAPI()</code></a> also removes display-only virtual messages, filters system records, merges consecutive user messages, handles unavailable tool references, and removes problematic media blocks from affected meta messages after oversized-media errors. Human-readable wrappers need not be legal provider message parameters.</p>
+            <h2>2. The query loop rebuilds the model-visible view</h2>
+            <p>Inside <code>query()</code>, the runtime constructs the current API view. It does not blindly replay the whole transcript. It starts after the latest compact marker, applies the tool-result budget, lets <code>HISTORY_SNIP</code> lower historical pressure when that feature is present, runs microcompact, replaces committed Context Collapse spans with summaries, and only then asks whether auto compact must take over.</p>
             <p>That difference explains a common surprise: a message can be visible in local history, present in transcript storage, and still absent from the next API request. Context management is a selection problem.</p>
-            <h2>3. Pressure is layered</h2>
+            <h3>2.1 Pressure is handled in order</h3>
+            <figure class="shape-example"><pre><code class="language-text">active history → messages after latest compact boundary
+→ tool-result budget: evaluate new results
+→ snip (if enabled): filter selected middle UUIDs
+→ microcompact: time-based clear OR cached edits OR unchanged
+→ collapse (if enabled): substitute committed span summaries
+→ auto compact (if threshold reached) → assemble API request</code></pre><figcaption>This is an execution order with independent conditions. A compact boundary is not a permission gate, and microcompact is not semantic summarization.</figcaption></figure>
             <p>Context pressure arrives from multiple directions. Tool results can be large. Repeated edits can create bulky replacement state. Long reasoning chains add assistant blocks. System and memory context consume prefix space before the conversation even begins. The runtime therefore has several valves, not one big summarizer.</p>
-            <figure class="figure"><img src="../assets/query-pressure-stack.png" alt="Stack of context pressure sources: system prompt, memory, messages, tool results, replacement state, and compact marker" /><figcaption>When the request gets heavy, Claude Code can trim or replace different parts for different reasons.</figcaption></figure>
-            <h2>4. Compact creates a recovery point, not just shorter text</h2>
-            <p>A compact operation creates a marker in the conversation that says earlier detail has been replaced by a summary. From that point, later API requests can use that summary instead of replaying every earlier message. This is why compact metadata matters to resume and recovery. The runtime needs to know not only the summary text, but also where the old context ended and which local state still belongs to the session.</p>
-            <p>The summary is also a model request, not an editorial afterthought. The compact path builds a no-tools summary request, installs the resulting summary as a recovery message, and can share the parent prompt-cache prefix for that side path. That is the bridge to the final chapter: summary quality matters, but request shape still decides how expensive the handoff becomes.</p>
-            <figure class="figure"><img src="../assets/compact-recovery-loop.png" alt="Compact and recovery process from long transcript to compact marker and resumed state" /><figcaption>Compact changes how earlier work re-enters the model-visible view.</figcaption></figure>
-            <h2>5. Microcompact handles local pressure</h2>
+
+            <h3>2.2 Snip and microcompact handle local pressure</h3>
             <p>Microcompact is a smaller valve. It is used to control high-pressure parts of the prompt without forcing a full user-facing compact. The source separates three cases that are easy to blur together. <code>HISTORY_SNIP</code> runs before microcompact and returns a <code>tokensFreed</code> estimate so later auto-compact checks do not overcount the surviving assistant usage.</p>
             <p>What does snip do? It is not a clock-based deletion of the oldest prefix. If the first user message contains the task, constraints, and acceptance criteria, deleting from the beginning would lose the point of the session. Claude Code already has compact markers for prefix replacement. Snip is the smaller operation for selected middle ranges inside the active context.</p>
             <p>Who decides that a range is low-value? The public code shows that Claude Code conditionally registers <code>SnipTool</code>, adds stable <code>[id:...]</code> tags to API-bound user messages so Claude can reference exact messages, and injects a <code>context_efficiency</code> attachment after enough context growth without a snip. So <q>low-value</q> is not a visible timestamp heuristic in the public source. It is a model-participating context-retention decision: which middle messages are no longer critical for the task, file state, tool references, or user constraints, and can therefore leave the next model-visible view.</p>
@@ -152,7 +170,7 @@ Closer to the behavior visible in source:
 Local UI / JSONL:
   original messages remain; resume replays the same removedUuids deletion</code></pre><figcaption>The public source shows UUID-based removal from the model view, not age-based prefix truncation.</figcaption></figure>
             <p>The selector implementation behind the feature switch is not present in the public TypeScript tree, so the exact SnipTool prompt, scoring rule, threshold, and selector policy are not visible. The surrounding behavior is clear, though. Model-facing paths call <code>projectSnippedView()</code> after slicing at the compact marker, while UI rendering can pass <code>includeSnipped: true</code> so scrollback still shows the full local history. Resume code records <code>removedUuids</code> in the snip record, deletes those middle ranges on load, and relinks parent pointers across the gap. Source comments also say tool-reference-bearing messages are protected from snip. In other words, snip removes selected middle ranges from the next model-visible view; it does not rewrite old tool results into a placeholder and it does not erase the append-only transcript evidence.</p>
-            <p>Time-based microcompact is the path that replaces old tool results with <code>[Old tool result content cleared]</code>; its own comment says this fires when the server cache is already cold, so the next request would rewrite the prefix anyway. Cached microcompact is different again: when cache editing is available, local messages stay unchanged and Claude Code first records <code>pendingCacheEdits</code>. Later, <code>services/api/claude.ts</code>, the Anthropic API adapter inside Claude Code, translates those edits into a <code>cache_edits</code> block while building the provider payload.</p>
+            <p>Time-based microcompact is the path that replaces old tool results with <code>[Old tool result content cleared]</code>; the client treats a long gap as evidence that cache is cold and a rewrite is expected. That time heuristic does not verify eviction of an actual provider cache entry. Cached microcompact is different again: when cache editing is available, local messages stay unchanged and Claude Code first records <code>pendingCacheEdits</code>. Later, <code>services/api/claude.ts</code>, the Anthropic API adapter inside Claude Code, translates those edits into a <code>cache_edits</code> block while building the provider payload.</p>
             <p>This should not be confused with ordinary public prompt caching. Public Anthropic prompt caching is centered on <code>cache_control</code>, cache writes, and cache reads. The source path for cached microcompact additionally requires the feature switch, model support, a <code>firstParty</code> main-thread request, and a cache-editing beta header. So <code>cache_edits</code> is best read as a first-party beta cache-editing capability expressed through the Anthropic Messages API payload, not as a stable field available to every ordinary Messages API caller.</p>
             <figure class="shape-example"><pre><code class="language-text">shape-level payload fragment:
   {
@@ -170,29 +188,98 @@ Local UI / JSONL:
   }</code></pre><figcaption><code>cache_reference</code> names the cached old tool result; <code>cache_edits</code> asks the cache-editing path to delete that reference.</figcaption></figure>
             <p>The point of <code>cache_edits</code> is reference-based deletion. Claude Code marks cached-prefix <code>tool_result</code> blocks with <code>cache_reference</code>, usually the original <code>tool_use_id</code>. A <code>cache_edits</code> block then says to delete a specific <code>cache_reference</code>. The local transcript still keeps the full tool result, but the provider-side cache view can drop that old result. Inserted edits are pinned to the same user-message position and resent so the request prefix remains stable. The later <code>cache_deleted_input_tokens</code> usage field is used to report how many tokens the provider actually deleted. Snip can still change prompt-cache shape because the provider sees a shorter message sequence, but that is a shorter selected message list, not the placeholder path and not the cache-edit path.</p>
             <p>Context Collapse is another read-time replacement, not simply a synonym for full compact. The shape is: archived span summary from the collapse store plus the newer incremental messages after that span. The REPL history and recovery metadata remain outside the API payload. This can change prompt-cache shape when the provider first sees the shorter prefix, but it also creates a smaller stable prefix for subsequent turns and can avoid a more destructive auto compact.</p>
-            <h2>6. Recovery needs more than a summary</h2>
-            <p>Resume code loads conversation messages, file history, content replacement state, compact-collapse metadata, and session metadata. That is a stronger claim than <q>load the old transcript</q>. The runtime wants to rebuild a state that can continue making tool calls, checking permissions, and constructing the next request correctly.</p>
-            <figure class="figure"><img src="../assets/survival-map.png" alt="Claude Code context survival map showing which state is visible, stored, compacted, or recovered" /><figcaption>The useful question is not whether something is context, but where it survives and who can read it next.</figcaption></figure>
-            <h2>7. The invariant</h2>
-            <p>Context management is the art of preserving the right facts at the right layer. Memory influences the prefix. Transcript preserves evidence. Compact rewrites the route back into old work. Microcompact reduces local pressure. Prompt cache rewards stable request shape. Once those layers are separate, the code stops looking like a pile of special cases.</p>
-        
+            <h3>2.3 Collapse substitutes a committed summary at read time</h3>
+            <figure class="shape-example"><pre><code class="language-text">before:
+  active messages = M1 M2 M3 M4 M5 M6 M7 M8 M9 M10
+  collapse store = C1: summary(M2...M8)
+after read-time replacement:
+  API-bound view = M1 C1 M9 M10
+outside the request:
+  original REPL history, commit log, staged snapshot</code></pre><figcaption>The request uses a committed summary plus surviving messages. It does not turn the entire stored history into that summary.</figcaption></figure>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L428-L447"><code>applyCollapsesIfNeeded()</code></a> runs before auto compact when its feature is enabled. Summary messages belong to the collapse store rather than the raw REPL array. Replacing a detailed span changes the provider-visible prefix; subsequent turns may reuse a new shorter prefix. The selector module is absent from this snapshot, so the example describes the visible replacement contract, not an invented selection algorithm.</p>
+            <h3>2.4 Auto compact is conditional, with room left for recovery</h3>
+            <p>The <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/autoCompact.ts#L28-L90">default threshold</a> subtracts the lesser of the model’s maximum output and 20,000 summary tokens from its context window, then reserves a further 13,000 tokens. Environment overrides can lower the window or threshold. These are snapshot-specific client policies, not a fixed percentage of every model’s window. If compaction is disabled, the <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L592-L648">blocking check</a> can reject a nearly full request with a prompt-too-long error.</p>
+            <h3>2.5 A fork still sends its uncached task</h3>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L3062-L3211"><code>addCacheBreakpoints()</code></a> normally marks the final message. For a fire-and-forget fork using <code>skipCacheWrite</code>, it marks the penultimate message, at the end of the shared prefix. The fork-only instruction is still sent and processed as uncached input.</p>
+            <figure class="shape-example"><pre><code class="language-text">main turn:
+  S + M_last(cache_control) → read/write S + M_last
+side fork:
+  S(cache_control) + F      → read S, do not write the S + F tail
+example F:
+  the compact summary task instruction</code></pre><figcaption>The parent will not resume from this side task’s S + F tail. This describes client marker placement, not provider KV-cache internals.</figcaption></figure>
+
+            <h2>3. Compact creates a recovery point</h2>
+            <p>A compact operation writes a boundary and installs a summary user message plus limited recovery material. Manual <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/commands/compact/compact.ts#L40-L124"><code>/compact</code></a> first slices the active view and tries session-memory compaction when no custom instruction is present. Otherwise it microcompacts and calls <code>compactConversation()</code>. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/autoCompact.ts#L241-L350">Auto compact</a> checks pressure and consecutive failures, likewise tries session memory, then falls back to full compaction. Successful paths install a new context and perform cleanup.</p>
+            <figure class="figure"><img src="../assets/compact-recovery-loop.png" alt="Compact and recovery process from active history to a compact boundary, summary, and restored working material" /><figcaption>A summary must be installed with a boundary and recovery material before it changes continued execution.</figcaption></figure>
+            <h3>3.1 Summary generation has two alternative request paths</h3>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L387-L448"><code>compactConversation()</code></a> first runs PreCompact hooks and merges their instructions with the user’s custom instructions. The <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/prompt.ts#L12-L30">summary prompt</a> asks for text only: an <code>&lt;analysis&gt;</code> draft followed by <code>&lt;summary&gt;</code>. Summarizing should not create new tool side effects or more work to summarize.</p>
+            <p>No tool execution does not mean no tool schemas. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L1125-L1248"><code>streamCompactSummary()</code></a> normally tries a cache-sharing fork first. It preserves the parent’s system, tools, model, thinking configuration, and message prefix, then appends the summary task. <code>maxTurns: 1</code> bounds the run, <code>skipCacheWrite: true</code> avoids writing its tail, and <code>createCompactCanUseTool()</code> denies every tool execution. Keeping schemas stable does not authorize side effects. Errors or unavailable text lead to the regular streaming path.</p>
+            <figure class="shape-example"><pre><code class="language-text">cache-sharing fork:
+  parent system + tools + thinking + prefix S
+  + summary instruction F; all tool execution denied; at most one turn
+  read S from cache, avoid writing S + F
+
+gate disabled, or fork failure / no usable text → streaming summary:
+  summary-specific system; thinking disabled
+  active messages + instruction → filter reinjected attachments → replace media
+  retain Read schema; add ToolSearch / MCP schemas when tool search is enabled
+
+expected output: &lt;analysis&gt;...&lt;/analysis&gt; + &lt;summary&gt;...&lt;/summary&gt;
+installation: strip analysis draft, format summary, wrap in summary user message</code></pre><figcaption>The two request paths do not share the same content-rewriting step. Generated text still needs formatting and recovery-message installation.</figcaption></figure>
+            <h3>3.2 The fallback rewrites input; oversized summaries can retry</h3>
+            <p>Only the <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L1250-L1329">regular streaming path</a> explicitly calls <code>stripReinjectedAttachments()</code> and <code>stripImagesFromMessages()</code>. They remove skill discovery/listing attachments that will be regenerated and replace media with text markers. This path uses a summary-specific system prompt, disables thinking, and caps output. It retains Read and, when tool search is enabled, ToolSearch and relevant MCP schemas. It reads one streamed response without entering the normal tool-execution loop. Applying these rewrites to the shared fork would obscure why that fork can reuse the old prefix.</p>
+            <p>If the summary request itself is too long, the <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L457-L496">outer retry</a> drops some of the oldest API-round groups with <code>truncateHeadForPTLRetry()</code>. It updates both ordinary messages and <code>forkContextMessages</code>, so the path actually used receives the smaller input. Retries are bounded; empty summaries and API errors still fail. This fallback loses information. Before installation, <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/prompt.ts#L306-L331"><code>formatCompactSummary()</code></a> removes the analysis draft and formats the summary tags.</p>
+            <h3>3.3 Installation order is recovery order</h3>
+            <p>The <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L596-L624">successful compact</a> creates a boundary and summary. The summary wrapper explains that work continues from a longer conversation; it can include a transcript location and instructions to resume directly. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L325-L338"><code>buildPostCompactMessages()</code></a> then returns:</p>
+            <figure class="shape-example"><pre><code class="language-text">post compact messages =
+  boundaryMarker
+  + summaryMessages
+  + messagesToKeep?
+  + attachments
+  + hookResults</code></pre><figcaption>The optional preserved segment is not a promise to retain the entire old history.</figcaption></figure>
+            <p><code>hookResults</code> comes from <code>SessionStart(compact)</code> hooks after successful summary generation. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L719-L747">PostCompact</a> then receives the summary before the result is returned; its display message is not another set of model-injected hook results. The caller still installs the returned recovery material as active messages.</p>
+            <p>Paths retaining a suffix annotate its head, anchor, and tail in boundary metadata so resume can reconnect it. Back in <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L470-L535"><code>query()</code></a>, the runtime yields these messages and replaces <code>messagesForQuery</code> immediately. The current loop continues with the new context; it does not wait for another user turn.</p>
+
+            <h2>4. What survives, and what is loaded again</h2>
+
+            <h3>4.1 Runtime definitions and memory have independent lifetimes</h3>
+            <p>System prompts, tool schemas, MCP tools, and agent definitions are rebuilt from runtime inputs rather than rescued from chat history. Memory follows another path: <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/postCompactCleanup.ts#L31-L77"><code>runPostCompactCleanup()</code></a> clears the main thread’s outer <code>getUserContext</code> cache and resets memory-file caches. Clearing only the inner loader would let the outer memoized value hide the reload and its InstructionsLoaded hooks. Project instructions return because files are loaded again, not because the summary preserved them perfectly.</p>
+            <h3>4.2 File and skill restoration is bounded</h3>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L517-L585">Post-compact attachments</a> use the pre-compact file-read state and current tool state to restore selected files, asynchronous agent state, plan-mode material, and invoked skills. The <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/compact/compact.ts#L122-L130">snapshot’s limits</a> are:</p>
+            <table><thead><tr><th>Material</th><th>Limit</th><th>Consequence</th></tr></thead><tbody>
+              <tr><td>Restored files</td><td>At most 5</td><td>Previously read files are not all replayed.</td></tr>
+              <tr><td>One restored file</td><td>5,000 tokens</td><td>Large files may need later reads.</td></tr>
+              <tr><td>Post-compact file budget</td><td>50,000 tokens</td><td>This is a ceiling, not a target allocation.</td></tr>
+              <tr><td>Invoked skills</td><td>25,000 tokens</td><td>Used skill content is restored within budget.</td></tr>
+            </tbody></table>
+            <p>Cleanup preserves invoked skill content and does not reset sent skill names merely to emit the full listing again. Full listing reinjection would create cache-write cost; used-skill content and the available Skill tool serve a different purpose. Deferred tools, agent listings, and MCP instruction changes have their own reannouncement rules.</p>
+            <h2>5. Choose the smallest mechanism that preserves continued work</h2>
+            <table><thead><tr><th>Pressure</th><th>Mechanism</th><th>Limit or cost</th></tr></thead><tbody>
+              <tr><td>Old compact prefix</td><td>Boundary slicing</td><td>Older detail survives through summary or transcript.</td></tr>
+              <tr><td>Large tool output</td><td>Result budget / microcompact</td><td>Content may become a preview, placeholder, or provider cache deletion.</td></tr>
+              <tr><td>Selected historical span</td><td>Collapse summary</td><td>Feature-gated; missing selection code cannot establish policy.</td></tr>
+              <tr><td>Window nearly full</td><td>Auto or manual compact</td><td>Lossy summary and budgeted restoration.</td></tr>
+              <tr><td>One-off fork task</td><td>Shift the cache marker</td><td>The task still processes its uncached suffix.</td></tr>
+            </tbody></table>
+            <p>Context management separates original evidence from the input needed now. UI and transcript preserve history; runtime reloads instructions and definitions; API assembly selects and normalizes messages; compact installs a handoff when losses become necessary. The <a href="../tools/">next chapter</a> follows tool execution, where another set of records enters that same next-request construction.</p>
+
             <h2 id="sources">Sources</h2>
             <p>The source-code claims in this article are based on the public mirror and the linked official documentation. For server-side behavior and private feature switches, the article states only what the client sends or receives.</p>
             <ul>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts#L113-L188">Context builders</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts#L437-L474">API context insertion</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L365-L467">QueryLoop context selection</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools.ts#L123-L125">Conditional SnipTool registration</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messages.ts#L195-L204">Snip message ID tags</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/attachments.ts#L3957-L3983">Context efficiency snip nudge</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/messages.ts#L4631-L4655">Snip filtering in active message view</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1958-L1982">Snip removal replay on resume</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/toolSearch.ts#L537-L540">Tool-reference messages protected from snip</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1184-L1204">Cached microcompact switch and model support</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L1672-L1688">Cache editing beta header</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3062-L3210">Anthropic API adapter cache edits</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/conversationRecovery.ts#L456-L592">Conversation recovery</a></li>
-                <li><a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory docs</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/context.ts#L113-L188">Context builders</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/api.ts#L437-L474">API context insertion</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L365-L467">QueryLoop context selection</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools.ts#L123-L125">Conditional SnipTool registration</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/messages.ts#L195-L204">Snip message ID tags</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/attachments.ts#L3957-L3983">Context efficiency snip nudge</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/messages.ts#L4631-L4655">Snip filtering in active message view</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/sessionStorage.ts#L1958-L1982">Snip removal replay on resume</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/toolSearch.ts#L537-L540">Tool-reference messages protected from snip</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1184-L1204">Cached microcompact switch and model support</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L1672-L1688">Cache editing beta header</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L3062-L3210">Anthropic API adapter cache edits</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/conversationRecovery.ts#L456-L592">Conversation recovery</a></li>
+                <li><a href="https://code.claude.com/docs/en/memory">Claude Code memory docs</a></li>
                 <li><a href="https://mp.weixin.qq.com/s?__biz=MzUxODAzNDg4NQ==&amp;mid=2247557638&amp;idx=1&amp;sn=81cbd4fa599c9664a7eb6100cc26a3b2">Xiaolin Coding context compaction reference (Chinese)</a></li>
             </ul>
           </section>
