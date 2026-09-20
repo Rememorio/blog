@@ -11,15 +11,15 @@
     <section class="article-hero">
       <p class="eyebrow">OpenClaw 源码阅读 · 第四篇</p><h1>上下文、记忆与压缩怎样共同工作</h1>
       <p class="lead">Agent 明明保存了完整 transcript，为什么仍会“忘记”？因为每次模型请求只能看到其中一部分。OpenClaw 还会加入 system prompt、workspace 文件、工具 schema、结果与附件；memory 则单独保存可长期检索的事实。排查“忘记”之前，先确认哪份数据保存了内容、本轮又实际发送了什么。</p>
-      <div class="meta-line"><span>系列 4 / 8</span><span>源码快照：c549250</span><span>主题：context · memory · compaction</span><span>前置：路由与会话</span></div>
+      <div class="meta-line"><span>系列 4 / 8</span><span>源码快照：e6b4264</span><span>主题：context · memory · compaction</span><span>前置：路由与会话</span></div>
       <nav class="series-strip"><a href="../overview/"><strong>01</strong> 主线</a><a href="../gateway/"><strong>02</strong> Gateway</a><a href="../routing-sessions/"><strong>03</strong> 路由与会话</a><span class="series-current"><strong>04</strong> 上下文与记忆</span><a href="../capability-assembly/"><strong>05</strong> 能力装配</a></nav>
-      <figure class="hero-image"><img src="../assets/context-assembly.png" alt="OpenClaw 每轮上下文组装：system prompt、Project Context、session transcript、tool schemas、结果与附件进入 Context Engine，再形成有界的 Model Context；完整 SKILL.md 按需加载" /></figure>
+      <figure class="hero-image"><img src="../assets/context-assembly.png" alt="OpenClaw 本轮请求组装：ContextEngine 从会话消息选择本轮消息；运行时再合并系统提示、Project Context、Skills 目录与工具 Schema，形成模型请求" /><figcaption>图示聚焦请求的材料分工。ContextEngine 可额外返回 systemPromptAddition；图中未展开该可选输出。Skills 目录随系统提示进入，完整 SKILL.md 仍按需读取。</figcaption></figure>
     </section>
     <section class="article-body">
       <p>沿用上一篇的 Alice。她和 Agent 已经聊了两周，transcript 也一直存在。今天她问“照上周的决定继续”，Agent 却回答得像第一次听说。最直觉的判断是“历史丢了”，但也可能是历史还在、只是没有进入当前模型窗口；还可能是关键决定只留在长 transcript 里，没有写入长期 memory；或者 compaction 已经把旧对话概括成一份没有保留该细节的摘要。</p>
       <p>这些故障看起来都叫“忘记”，修法却完全不同。扩大窗口不能修复错误的 session route，给 prompt 加一句“请记住”也不能把数据变成持久状态，把全部 transcript 每轮塞进模型更会很快撞上成本和上限。要准确排查，必须先把 record、memory 和 runtime view 拆成三个不同的 owner。</p>
       <div class="note"><p><strong>阅读契约。</strong>读完后你应该能回答：哪些 workspace 文件默认进入 Project Context；system prompt 为什么每次运行重建；工具为什么有两份 token 成本；ContextEngine 的 ingest、assemble、compact、afterTurn 分别掌管什么；pruning 与 compaction 哪个改 transcript；以及 <code>MEMORY.md</code> 为什么不能与 context window 画等号。</p></div>
-      <p><strong>证据边界。</strong>本文固定在提交 <a href="https://github.com/openclaw/openclaw/commit/c549250bfae8ff40822099c9af93ed05ff540579">c549250</a>，以 workspace/bootstrap、system prompt、ContextEngine 与 compaction 源码为准。OpenClaw 后续 memory-core 已继续演进，因此这里集中解释这份快照可验证的 runtime 合同，而不把某个检索后端当成永恒实现。</p>
+      <p><strong>证据边界。</strong>本文固定在提交 <a href="https://github.com/openclaw/openclaw/commit/e6b42643e7aae229d115477596b33c36c38f7101">e6b4264</a>，以该快照中的 workspace/bootstrap、ContextEngine、内建运行时与 SQLite 会话实现为准。默认客户端摘要、provider checkpoint 与自定义 engine 分别有自己的行为；下面明确区分，不把一种压缩路径当作所有运行时的合同。</p>
 
       <h2>一、一次模型请求由哪些材料组成</h2>
       <h3>1.1 “上下文”包含本次请求的全部输入</h3>
@@ -35,7 +35,7 @@ transcript != model context</code></pre>
       <p>这里两个“不等于”比公式本身更重要。transcript 是可持久化的会话记录；memory 是跨轮次甚至跨会话保留的精选事实；model context 是一次运行临时形成的视野。前两者可以成为第三者的来源，但都不会自动、完整地等于第三者。</p>
 
       <h3>1.2 workspace 提供工作目录，sandbox 负责隔离</h3>
-      <p>每个 Agent 有一个 workspace，默认是工具相对路径和 bootstrap 文件的根目录。<a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/workspace.ts"><code>workspace.ts</code></a> 负责建立目录和初始文件；运行时再读取这些文件，作为 Project Context 注入 system prompt。</p>
+      <p>每个 Agent 有一个 workspace，默认是工具相对路径和 bootstrap 文件的根目录。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/workspace.ts"><code>workspace.ts</code></a> 负责建立目录和初始文件；运行时再读取这些文件，作为 Project Context 注入 system prompt。</p>
       <p>“工作目录”不能被误读成“文件系统边界”。如果工具没有 sandbox 约束，绝对路径仍可能访问 workspace 外部；真正的文件、网络和进程隔离属于第六篇的 sandbox/tool policy。workspace 解决的是默认归属与协作材料，不独自承担安全性。</p>
       <p>还要把 workspace 与 OpenClaw 自己的状态目录分开。前者保存 Agent 可编辑的说明、技能和记忆文件，后者保存配置、凭据、session store 等 runtime 状态。把 session 数据库放进 workspace，或把用户项目塞进 runtime state 目录，都会让备份、权限和迁移边界混乱。</p>
 
@@ -49,11 +49,11 @@ transcript != model context</code></pre>
         <tr><td><code>BOOTSTRAP.md</code></td><td>首次启动引导。</td><td>初始化完成后不应继续当永久上下文膨胀源。</td></tr>
         <tr><td><code>MEMORY.md</code></td><td>已存在时提供长期事实与决定。</td><td>shared session 会移除根 memory；它不是无条件公开的全局 prompt。</td></tr>
       </tbody></table></div>
-      <p>每个文件和总 bootstrap 都有容量上限；太长时会截断，并在注入内容里留下 truncation marker。缺失文件也会形成可观察标记，而不是静默伪装成空文本。这样的设计让“为什么模型没有看到后半段规则”可以从 context report 中诊断。</p>
+      <p>每个文件和总 bootstrap 都有容量上限；太长时会截断，并在注入内容里留下 truncation marker。缺失的常规文件会留下可观察标记，但未创建的 <code>USER.md</code>、<code>MEMORY.md</code> 会直接跳过。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/workspace.ts#L1223-L1290">会话过滤</a>还会让 subagent 只保留 <code>AGENTS.md</code>，cron 只保留 <code>AGENTS.md</code>、<code>SOUL.md</code>、<code>IDENTITY.md</code>、<code>USER.md</code>；两者都不加载根 memory。这些差异不能简单归因于截断。</p>
       <p><code>TOOLS.md</code>、<code>BOOT.md</code>、<code>HEARTBEAT.md</code> 各自有用途，但不能因此推断它们总在默认 Project Context 列表里。源码阅读时应追真实 bootstrap resolver，而不是只按文件名猜注入语义。</p>
 
       <h3>1.4 system prompt 每轮组合稳定规则与动态现场</h3>
-      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/system-prompt.ts#L795-L950"><code>buildAgentSystemPrompt</code></a> 不是安装时生成的一张静态模板。每轮运行都会根据当前工具、技能 metadata、workspace、runtime、时间、channel capability、sandbox 状态和 bootstrap 内容组合 system prompt。因此改完文件后不需要回写旧 transcript，下一轮构建就能看到新版本。</p>
+      <p><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/system-prompt.ts#L673-L743"><code>buildAgentSystemPrompt</code></a> 不是安装时生成的一张静态模板。每轮运行都会根据当前工具、技能 metadata、workspace、runtime、时间、channel capability、sandbox 状态和 bootstrap 内容组合 system prompt。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/bootstrap-cache.ts#L44-L66">bootstrap snapshot</a> 每轮重新读取文件，内容相同才复用旧数组；因此通过会话过滤和长度限制的文件修改会在下一轮构建中生效，不需要回写旧 transcript。</p>
       <p>这也意味着 prompt 必须分清稳定与动态。角色原则适合放 workspace 文件，当前时间、可用工具和沙箱状态应运行时生成；把所有动态信息持久化进 transcript 会制造过期事实，把所有稳定规则由 channel 每次拼接又会造成入口不一致。</p>
       <p>斜杠 directive 也属于前处理。<code>/think</code>、<code>/model</code>、<code>/queue</code> 等控制信息先更新 runtime/session 设置，再从送给模型的用户正文中剥离。模型看到的是处理后的请求，而不是 Gateway 用来控制本轮的全部协议文本。</p>
 
@@ -65,7 +65,7 @@ transcript != model context</code></pre>
       <h2>二、ContextEngine 怎样选择本轮消息并维护历史</h2>
       <h3>2.1 ContextEngine 组装模型输入，不自动替代 session store</h3>
       <p>默认的 <code>legacy</code> context engine 保留原有行为：ingest 和 afterTurn 基本不做额外工作，assemble 让现有 sanitize/validate/limit pipeline 处理消息，compact 委托内建总结。插件可以占用唯一的 <code>plugins.slots.contextEngine</code>，但它接管的是上下文生命周期，不自动成为 transcript 的唯一数据库。</p>
-      <p><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/context-engine/types.ts"><code>ContextEngine</code></a> 的核心生命周期可按时间读：</p>
+      <p><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/context-engine/types.ts"><code>ContextEngine</code></a> 的核心生命周期可按时间读：</p>
       <ol>
         <li><strong>ingest：</strong>消息进入 session 时，让 engine 保存、索引或观察它。</li>
         <li><strong>assemble：</strong>每次模型请求前，根据 token budget 返回有序 messages，并可附加 <code>systemPromptAddition</code>。</li>
@@ -73,7 +73,7 @@ transcript != model context</code></pre>
         <li><strong>afterTurn：</strong>成功运行结束后更新索引、持久状态或安排后台维护。</li>
         <li><strong>maintain（可选）：</strong>通过受控 rewrite API 做 transcript 维护，可配置后台执行。</li>
       </ol>
-      <p>assemble 返回的是本轮模型输入，不等于授权插件任意删改 durable record。需要重写 transcript 时必须走 runtime context 提供的安全接口。这个约束把“选择给模型看什么”与“改变历史真相”分开。</p>
+      <p><code>assemble</code> 返回的是本轮消息序列，并可增加 system prompt 片段；<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/harness/context-engine-lifecycle.ts#L174-L187">实际调用</a>给它 messages、预算、当前用户 prompt 与可用工具名集合，并不把完整 system prompt 和工具 JSON schema 都交给它重建。运行时另外组装这些材料，最终送给 provider。选择消息也不授权插件任意删改持久记录：重写 transcript 仍须走 runtime context 的安全接口。</p>
 
       <h3>2.2 turn fence 防止重试重复写入当前消息</h3>
       <p>一个 custom engine 可能把 transcript 同步进向量库，再按相关性组装上下文。真正危险的地方在 retry：同一个用户 turn 若第一次 provider 请求失败并重试，engine 不能把它提交两次，也不能在组装时一会儿看见当前消息、一会儿看不见。</p>
@@ -90,21 +90,34 @@ transcript != model context</code></pre>
       <h3>3.1 Pruning 只缩本轮输入，Compaction 写入持久摘要</h3>
       <figure class="hero-image"><img src="../assets/context-compaction-pruning.png" alt="OpenClaw pruning 与 compaction：pruning 只从本轮模型上下文移除较旧 tool results，不改完整 transcript；compaction 把旧消息压成持久 summary，并保留 recent messages" /></figure>
       <p>两者都让模型输入变小，但持久语义完全不同。Pruning 在组装时丢弃旧 tool result 的大块内容，只影响 in-memory prompt；磁盘 transcript 仍保留完整结果，之后可以审计或在不同策略下重新组装。它适合处理可复现、已失去即时价值的工具输出。</p>
-      <p>Compaction 则把旧 conversation 总结成一条 summary，并把这份摘要写入 transcript，最近消息保持原样。下一轮读取到的历史已经以 summary 代表被折叠区间。摘要因此是一种有损但持久的状态迁移，不只是缓存。</p>
+      <p>默认客户端 compaction 把旧 conversation 总结成摘要，并<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/sessions/session-manager-entries.ts#L412-L436">追加 compaction 记录</a>，其中 <code>firstKeptEntryId</code> 标出保留消息的起点。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/packages/agent-core/src/harness/session/session.ts#L13-L93">下次重建上下文</a>时，运行时用最新摘要加保留的近期消息继续推理。<strong>原始历史仍然保存在磁盘；有损的是摘要代表的模型视图，而不是压缩把旧记录直接抹掉。</strong>摘要与切分点持久化，因此其影响会延续到后续请求。</p>
       <div class="table-wrap"><table><thead><tr><th>机制</th><th>本轮 context</th><th>持久 transcript</th><th>适合解决</th></tr></thead><tbody>
         <tr><td>Pruning</td><td>移除较旧 tool results。</td><td>不改写。</td><td>工具输出占用过大，但仍需保留审计记录。</td></tr>
-        <tr><td>Compaction</td><td>summary + recent messages。</td><td>写入 summary，折叠旧区间。</td><td>对话本身长期增长，必须越过窗口边界。</td></tr>
+        <tr><td>Compaction</td><td>summary + recent messages。</td><td>追加 summary 与保留起点，原始历史仍在。</td><td>对话本身长期增长，必须越过窗口边界。</td></tr>
       </tbody></table></div>
-      <p>所以“context 里没看到”不能直接推出“数据被删除”；要先问是 assembly 没选中、pruning 只从视野拿走，还是 compaction 已经把细节不可逆地概括掉。</p>
+      <p>所以“context 里没看到”不能直接推出“数据被删除”：assembly 可能没有选中，pruning 可能只裁掉本轮结果，compaction 则可能让摘要漏掉了细节。下面是简化的状态形状，省略记录 id、父节点和时间；关键是追加压缩记录，而不是覆盖 Alice 原来的决定。</p>
 
-      <h3>3.2 Memory flush 在压缩前保存长期事实</h3>
-      <p>自动 compaction 前，OpenClaw 默认可以先跑一个静默 memory-flush turn，提醒 Agent 把重要事实追加到 memory 文件。它不是 compaction summary 的副本，而是一次“哪些信息值得跨会话保留”的独立判断。摘要服务于延续当前会话，memory 服务于更长期、可检索的知识。</p>
-      <p>flush 可以指定单独模型，但 override 是精确选择，不继承当前 session 的 fallback chain。写入路径也受限制，避免 housekeeping turn 借“保存记忆”任意改工作区。即便 flush 耗尽或失败，正常回复与 compaction 仍有降级路径；开启通知后，用户才能看到 degraded notice。</p>
-      <p>最可靠的实践仍是及时写 memory，而不是把所有希望押在临近窗口上限的一次抢救。越晚整理，模型越可能在要压缩的长历史里漏掉真正关键的决定。</p>
+      <pre><code class="language-text">持久历史：旧消息 … + 近期消息 …
+追加记录：{ type: "compaction", summary: "已确定方案 …",
+            firstKeptEntryId: "recent-user-entry", tokensBefore: 42000 }
+下轮输入：摘要 + 从 recent-user-entry 开始的保留消息
+原始历史：仍可从会话存储读取</code></pre>
+
+      <h3>3.2 Memory flush 与可选维护何时运行</h3>
+      <p>Memory flush 是一次静默 housekeeping turn，提醒 Agent 把值得长期复用的事实追加到 memory 文件。摘要延续当前会话，memory 服务更长期的检索，两者不互相替代。但“压缩前先 flush”并不等于每次用户提问都必须同步等待一次记忆整理。</p>
+      <p>内建运行时把<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/command/maintenance.ts#L125-L201">必要的推理前维护</a>与<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/session-maintenance/run.ts#L116-L255">可选的回复后维护</a>分开。需要先缩减历史才能推理时，前台仍执行必要 compaction，并可在它前面尝试 flush。持续运行的 Gateway 则把额外 flush/compaction 放到回复投递已结束、前台写入者已退出之后，使用独立会话写入许可和本轮剩余时间；一次性 <code>openclaw agent --local</code> 不启动这种返回后的可选工作。</p>
+      <p>例如 Alice 收到回复后马上发来下一条消息，<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/session-maintenance/coordinator.ts#L190-L229">前台协调器</a>会取消可抢占的维护，并等待它真正结束后才读取会话。取消信号不是“写入已经停止”的证明，也不会撤销已经提交的摘要。可选维护失败只记录故障，不能把已经完成的回复替换成失败。</p>
+
+      <div class="table-wrap"><table><thead><tr><th>时刻</th><th>谁执行</th><th>保证与限制</th></tr></thead><tbody>
+        <tr><td>模型请求前，历史必须缩减</td><td>前台运行</td><td>必要 compaction 成功后再推理；失败保留会话并报告。</td></tr>
+        <tr><td>回复投递与前台写入结束后</td><td>独立维护运行</td><td>有条件地 flush、compact；可能没有工作或剩余时间。</td></tr>
+        <tr><td>下一条消息到达</td><td>前台协调器</td><td>取消并等待维护结束，避免两个写入者同时改变历史。</td></tr>
+      </tbody></table></div>
+      <p>flush 的单独模型 override 是精确选择，不继承 session fallback chain。其工具只保留读和针对指定 memory 文件的 append-only 写入，之后仍须通过正常 tool policy；若写工具最终被移除，运行时会警告无法保存。最可靠的实践仍是及时记下决定，而不是依赖窗口将满时的一次抢救。</p>
 
       <h3>3.3 窗口溢出时仍要保留消息与工具结果的配对</h3>
-      <p>运行前会估算 prompt 是否接近 provider context window；运行中也可能从 provider 收到 overflow。legacy engine 可触发 compaction 并重试，拥有 compaction 的 custom engine 则负责自己的 compact 合同。无论哪条路径，都要保住 system/tool 配对、当前用户 turn 和可继续的 recent history。</p>
-      <p>如果 compaction 超时，runtime 还要决定能否安全回到 pre-compaction snapshot，而不能半写一份摘要后继续。对工具调用尤其如此：assistant tool call 与对应 result 不能被裁成孤儿，否则 provider 会拒绝结构，或模型误解外部动作是否发生。</p>
+      <p>运行前会估算 prompt 是否接近 provider context window；运行中也可能从 provider 收到 overflow。legacy engine 可触发 compaction 并重试，拥有 compaction 的 custom engine 则负责自己的 compact 合同。无论哪条路径，都要保住 tool call/result 配对、当前用户 turn 和可继续的 recent history。</p>
+      <p>compaction 受有限安全超时保护；取消整个运行后，运行时不能继续启动新的恢复工作，也不能把“停止等待”当作回滚已提交摘要。工具调用尤其需要保留配对：assistant tool call 与对应 result 不能裁成孤儿。<a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/docs/concepts/compaction.md#L39-L45">当前内建运行时</a>还能在工具结果已经落定后遇到 provider overflow 时，基于已记录结果压缩并继续，保留当前模型、账户和原请求，避免重新执行已经完成的外部动作；待执行工具、审批等待与取消不能借此路径继续。</p>
       <p>因此缩减上下文不只是 token 算术。系统还要修复 transcript 结构、满足 provider 约束，并保证重试不会打乱已经发生的工具副作用。</p>
 
       <h2>四、怎样确认 Agent 为什么“忘记”</h2>
@@ -140,10 +153,11 @@ transcript != model context</code></pre>
 
       <h2 id="sources">参考源码与文档</h2>
       <ul>
-        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/workspace.ts">workspace.ts</a> 与 <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/embedded-agent-helpers/bootstrap.ts">bootstrap.ts</a>：workspace 文件创建、加载、截断与 Project Context 注入。</li>
-        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/system-prompt.ts">system-prompt.ts</a>：工具、skills、runtime、workspace 与 bootstrap 的 system prompt 组装。</li>
-        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/context-engine/types.ts">context-engine/types.ts</a> 与 <a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/context-engine/registry.ts">registry.ts</a>：生命周期合同、slot 与 engine 注册。</li>
-        <li><a href="https://github.com/openclaw/openclaw/blob/c549250bfae8ff40822099c9af93ed05ff540579/src/agents/agent-hooks/compaction-safeguard.ts">compaction-safeguard.ts</a>：压缩前的安全保护。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/session-maintenance/run.ts">session-maintenance/run.ts</a> · <a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/session-maintenance/coordinator.ts">coordinator.ts</a> · <a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/agent-tools.ts#L665-L695">agent-tools.ts</a>：回复后维护、前台抢占与 memory-flush 工具限制。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/workspace.ts">workspace.ts</a> 与 <a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/embedded-agent-helpers/bootstrap.ts">bootstrap.ts</a>：workspace 文件创建、加载、截断与 Project Context 注入。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/system-prompt.ts">system-prompt.ts</a>：工具、skills、runtime、workspace 与 bootstrap 的 system prompt 组装。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/context-engine/types.ts">context-engine/types.ts</a> 与 <a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/context-engine/registry.ts">registry.ts</a>：生命周期合同、slot 与 engine 注册。</li>
+        <li><a href="https://github.com/openclaw/openclaw/blob/e6b42643e7aae229d115477596b33c36c38f7101/src/agents/agent-hooks/compaction-safeguard.ts">compaction-safeguard.ts</a>：压缩前的安全保护。</li>
         <li><a href="https://docs.openclaw.ai/concepts/context">Context</a>、<a href="https://docs.openclaw.ai/concepts/context-engine">Context engine</a>、<a href="https://docs.openclaw.ai/concepts/compaction">Compaction</a>、<a href="https://docs.openclaw.ai/concepts/memory">Memory</a>：官方语义与配置。</li>
       </ul>
     </section>
