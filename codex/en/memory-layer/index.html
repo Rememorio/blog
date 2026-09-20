@@ -100,8 +100,9 @@
             <figure class="hero-image">
               <img
                 src="../assets/memory-local-recall-layer.png"
-                alt="Codex Memory diagram showing rollout passing through idle checks, Phase 1, State DB, Phase 2, a memories folder, and read path into a future turn, with AGENTS.md as a separate rules source"
+                alt="Eligible past rollouts are extracted and consolidated into versioned memories, then selectively read for a future turn alongside separate AGENTS.md rules"
               />
+              <figcaption>The namespace is selected after consolidation. Dual writing is optional; a thread reads only its selected version. Forgetting polluted sources requires successful later consolidation.</figcaption>
             </figure>
           </section>
 
@@ -221,7 +222,7 @@
               The official docs start with the important default: Memories are
               off by default. The source matches that documented behavior. The feature spec
               for <code>Feature::MemoryTool</code> uses the key
-              <code>memories</code>, marks it Experimental, and sets
+              <code>memories</code>, marks it Stable, and sets
               <code>default_enabled</code> to <code>false</code>. Configuration
               therefore has two layers: the feature flag decides whether the
               system exists, while the <code>[memories]</code> table decides
@@ -232,6 +233,8 @@
 memories = true
 
 [memories]
+version = "v1"
+dual_write = false
 generate_memories = true
 use_memories = true
 disable_on_external_context = true</code></pre>
@@ -284,30 +287,15 @@ disable_on_external_context = true</code></pre>
             </div>
 
             <h2>3. Memory Writing Runs in the Background</h2>
-            <p>
-              Immediate summarization would be noisy. A thread may still be in
-              progress, the user may correct the agent, and an error may be
-              temporary rather than reusable. Codex moves memory writing to a
-              background path. After <code>turn/start</code> successfully submits
-              user input, app-server attempts to call
-              <code>start_memories_startup_task</code>. That function exits early
-              for ephemeral sessions, disabled feature flags, non-root agent
-              sessions, or missing state DB.
-            </p>
+            <p>Immediate summarization would include unfinished work, user corrections, and transient errors. Current app-server attempts <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs#L684-L698"><code>start_memories_startup_task</code></a> only when <code>turn/start</code> has nonempty user input, core starts a new turn, and the primary environment is configured. Steering an existing turn or submitting a standalone tool output does not trigger this branch. The background function then skips ephemeral sessions, disabled features, and non-root agents, and checks memory-store availability.</p>
 
-            <p>
-              Once running, the task creates the memories root, seeds extension
-              instructions, prunes stale data, checks rate limits, and then runs
-              Phase 1 followed by Phase 2. This is why the docs warn that
-              memories may not update immediately after a thread ends. The
-              writer is a maintenance path with idle windows, quota checks, and
-              state DB leases, not a synchronous tail attached to every answer.
-            </p>
+            <p>The background task normally runs the selected version; <code>dual_write = true</code> starts separate v1 and v2 pipelines. Each prepares its root and extension instructions, prunes, checks quotas, and runs Phase 1 then Phase 2. <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/memory_version.rs#L7-L23">Version roots</a> are <code>memories/</code> and <code>memories_v2/</code>, with v1 still the default. Dual writing does not inject both summaries: <code>version</code> selects one namespace for reading. The example also explicitly enables <code>disable_on_external_context</code>; its source default is false.</p>
 
-            <pre><code class="language-text">turn/start accepted
+            <pre><code class="language-text">turn/start: nonempty user input + new turn + primary environment ready
   -> start_memories_startup_task
   -> skip checks: ephemeral / feature off / sub-agent / no state DB
-  -> create memories root
+  -> selected version (or both when dual_write)
+  -> create version-specific memories root
   -> prune
   -> rate-limit guard
   -> Phase 1 extraction
@@ -357,7 +345,7 @@ disable_on_external_context = true</code></pre>
                   <tr>
                     <td>Phase 2</td>
                     <td>A workspace patch merged from several raw memories.</td>
-                    <td>An internal consolidation agent can only edit the memory workspace.</td>
+                    <td>An internal consolidation agent maintains its version’s workspace; isolation depends on the parent permission profile.</td>
                     <td><code>memory_summary.md</code>, <code>MEMORY.md</code>, summaries, or skills.</td>
                   </tr>
                   <tr>
@@ -371,14 +359,7 @@ disable_on_external_context = true</code></pre>
             </div>
 
             <h2>4. Phase 1 Turns Rollout into Raw Memory</h2>
-            <p>
-              Phase 1 extracts structured memory from a bounded set of recent,
-              idle, eligible rollouts. The state-layer claim query excludes
-              threads whose <code>memory_mode</code> is not <code>enabled</code>,
-              excludes the current thread, applies age and idle windows, and
-              bounds startup work through scan and claim limits. This is not
-              "summarize everything." It first narrows the candidate set.
-            </p>
+            <p>Phase 1 extracts structured memory from recent, sufficiently idle threads eligible for generation. The <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/state/src/runtime/memories.rs#L220-L259">candidate query</a> excludes the current thread and <code>memory_mode != enabled</code>, applies age, idle and source filters, and bounds scan/claim counts. It no longer requires <code>history_mode = legacy</code>; paginated history is eligible too. The example and file table below follow default v1. V2 uses a separate tiered-input serializer and extraction template, so their record shapes should not be conflated.</p>
 
             <p>
               The prompt template adds a second check. If a rollout has no
@@ -412,13 +393,7 @@ disable_on_external_context = true</code></pre>
               the workspace diff, and exit if nothing changed.
             </p>
 
-            <p>
-              When the workspace does change, Codex spawns an internal
-              consolidation agent. It runs with no approvals, no network, and
-              local write access only; collaboration is disabled to prevent
-              recursive delegation. The result is concrete: consolidation is
-              local state maintenance, not foreground project work.
-            </p>
+            <p>When the workspace changes, Codex spawns an internal consolidation agent with approvals, memory regeneration, and collaboration disabled. <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/write/src/phase2.rs#L295-L343">Permission inheritance branches</a>: a Codex-managed parent produces a memory-root write sandbox with no network; a <code>Disabled</code> or <code>External</code> parent retains that profile. Local-memory-only writes are therefore not an unconditional source guarantee. Completion must also pass artifact validation and a lock-ownership check before the new consolidation baseline is accepted.</p>
 
             <div class="table-wrap">
               <table>
@@ -460,13 +435,7 @@ disable_on_external_context = true</code></pre>
             </div>
 
             <h2>6. The Read Path Brings Memory Back into Future Turns</h2>
-            <p>
-              Reading is provided by an extension. <code>MemoriesExtensionConfig</code>
-              is enabled only when <code>Feature::MemoryTool</code> is enabled
-              and <code>memories.use_memories</code> is true. The thread context
-              contributor then builds memory developer instructions and injects
-              them as a developer-policy prompt fragment.
-            </p>
+            <p>The read extension injects instructions only when both <code>Feature::MemoryTool</code> and <code>memories.use_memories</code> are enabled, and a nonempty <code>memory_summary.md</code> exists in the selected namespace. <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/memories/src/extension.rs#L126-L169">Configuration updates</a> retain the version selected when the thread started, keeping its summary and retrieval tools in the same namespace. Dedicated memory tools are exposed only when <code>dedicated_tools</code> is also enabled.</p>
 
             <p>
               The read-path prompt does not tell the agent to open every memory
@@ -495,6 +464,7 @@ disable_on_external_context = true</code></pre>
               clean answer; the runtime learns which memories actually helped.
             </p>
 
+<p>The v2 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/memories/templates/memories/read_path_v2.md">read template</a> uses the injected summary directly. It opens a matching rollout summary only when extra evidence, chronology, or uncertainty could change the answer, and searches when a necessary route is missing. Memory is not proof of current behavior: changing claims may require fresh source checks. Cite only a read summary that informed the answer, not the injected summary itself. Explicit remember, forget, or correction requests append notes under <code>extensions/ad_hoc/notes/</code>; later consolidation applies them instead of directly editing generated files.</p>
             <h2>7. Why <code>polluted</code> Exists</h2>
             <p>
               The dangerous failure mode is not simply forgetting. It is
@@ -506,15 +476,7 @@ disable_on_external_context = true</code></pre>
               the thread as <code>polluted</code>.
             </p>
 
-            <p>
-              The Phase 1 state query only selects threads with
-              <code>memory_mode = 'enabled'</code> and
-              <code>history_mode = 'legacy'</code>. Once a thread is marked
-              <code>polluted</code>, it no longer looks like a normal memory
-              input. External context can still be useful for the current answer;
-              it simply should not become long-term preference or workflow memory
-              by default.
-            </p>
+            <p>Pollution also affects material consolidated earlier. <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/state/src/runtime/memories.rs#L624-L661"><code>mark_thread_memory_mode_polluted</code></a> schedules another consolidation when the thread participated in the last successful Phase 2 baseline, and subsequent selection excludes that source. This both prevents fresh extraction and allows the existing workspace to forget its contribution. <strong>Marking and enqueueing do not mean files have already been removed</strong>; successful background consolidation still has to happen.</p>
 
             <p>
               Compare it with the lesson above. "Keep matching language pages in
@@ -591,27 +553,27 @@ disable_on_external_context = true</code></pre>
               <li><a href="https://developers.openai.com/codex/memories">OpenAI Codex Memories docs: defaults, setup, storage, and per-thread control</a></li>
               <li><a href="https://developers.openai.com/codex/guides/agents-md">OpenAI Codex AGENTS.md docs: instruction discovery and layering</a></li>
               <li><a href="https://developers.openai.com/codex/memories/chronicle">OpenAI Codex Chronicle docs: opt-in screen context for memory building</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/features/src/lib.rs#L923-L932"><code>Feature::MemoryTool</code> feature spec and default-off state</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/config/src/types.rs#L280-L345"><code>MemoriesToml</code> / <code>MemoriesConfig</code> settings and defaults</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/tui/src/chatwidget.rs#L1076-L1101">TUI <code>/memories</code> popup and enable prompt</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/README.md#L8-L15"><code>memories/read</code> and <code>memories/write</code> crate responsibilities</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/src/start.rs#L20-L79">Background memory startup task: skip conditions, rate-limit guard, Phase 1 and Phase 2 order</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/app-server/src/request_processors/turn_processor.rs#L542-L551">app-server starts the memory startup task after turn submission</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L133-L149">Phase 1 startup claim candidate selection</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L218-L225">Phase 1 selects only <code>memory_mode = 'enabled'</code> legacy threads</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/stage_one_system.md#L1-L45">Phase 1 prompt: convert rollout into raw memory / rollout summary and allow no-op</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/stage_one_system.md#L48-L82">Phase 1 prompt: high-signal memory criteria</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/README.md#L79-L120">Phase 2 consolidation: input selection, file sync, git baseline, and internal agent</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/consolidation.md#L20-L35">Phase 2 memory folder structure</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/src/extension.rs#L40-L69">Read extension injects developer policy when feature and <code>use_memories</code> are enabled</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/templates/memories/read_path.md#L1-L41">Read path prompt: when to use memory, layout, and quick pass</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/templates/memories/read_path.md#L75-L123">Read path prompt: memory citation and ad-hoc update rules</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/protocol/src/memory_citation.rs#L6-L20"><code>MemoryCitation</code> / <code>MemoryCitationEntry</code> protocol structs</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/read/src/citations.rs#L6-L43">Memory citation parser for citation entries and rollout ids</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/stream_events_utils.rs#L79-L93">Streaming output strips hidden citation markup and parses memory citation</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/stream_events_utils.rs#L227-L295">Completed response items record memory usage and external-context pollution</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/mcp_tool_call.rs#L780-L798">MCP tool calls can mark thread memory pollution from server metadata</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L586-L615"><code>mark_thread_memory_mode_polluted</code> sets a thread to <code>polluted</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/features/src/lib.rs"><code>Feature::MemoryTool</code> feature spec and default-off state</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/config/src/types.rs"><code>MemoriesToml</code> / <code>MemoriesConfig</code> settings and defaults</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/tui/src/chatwidget.rs">TUI <code>/memories</code> popup and enable prompt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/README.md"><code>memories/read</code> and <code>memories/write</code> crate responsibilities</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/write/src/start.rs">Background memory startup task: skip conditions, rate-limit guard, Phase 1 and Phase 2 order</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs">app-server starts the memory startup task after turn submission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/state/src/runtime/memories.rs">Phase 1 startup claim candidate selection</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/state/src/runtime/memories.rs">Phase 1 selects enabled threads, including paginated history</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/write/templates/memories/stage_one_system.md">Phase 1 prompt: convert rollout into raw memory / rollout summary and allow no-op</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/write/templates/memories/stage_one_system.md">Phase 1 prompt: high-signal memory criteria</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/README.md">Phase 2 consolidation: input selection, file sync, git baseline, and internal agent</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/write/templates/memories/consolidation.md">Phase 2 memory folder structure</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/memories/src/extension.rs">Read extension injects developer policy when feature and <code>use_memories</code> are enabled</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/memories/templates/memories/read_path.md">Read path prompt: when to use memory, layout, and quick pass</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/memories/templates/memories/read_path.md">Read path prompt: memory citation and ad-hoc update rules</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/memory_citation.rs"><code>MemoryCitation</code> / <code>MemoryCitationEntry</code> protocol structs</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/read/src/citations.rs">Memory citation parser for citation entries and rollout ids</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/stream_events_utils.rs">Streaming output strips hidden citation markup and parses memory citation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/stream_events_utils.rs">Completed response items record memory usage and external-context pollution</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/mcp_tool_call.rs">MCP tool calls can mark thread memory pollution from server metadata</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/state/src/runtime/memories.rs"><code>mark_thread_memory_mode_polluted</code> sets a thread to <code>polluted</code></a></li>
             </ul>
           </section>
         </article>

@@ -98,8 +98,9 @@
             <figure class="hero-image">
               <img
                 src="../assets/memory-local-recall-layer.png"
-                alt="Codex Memory 记忆层图，展示 rollout 经过空闲门、Phase 1、State DB、Phase 2、memories 文件夹，再通过 read path 进入未来 turn；AGENTS.md 作为独立规则入口"
+                alt="旧 rollout 经资格筛选、抽取和合并进入按版本隔离的 memory，按需读取后与 AGENTS.md 分别进入未来 turn"
               />
+              <figcaption>图示合并后的命名空间选择；双写是可选配置，前台只读取该线程选定的版本。污染来源的移除需要后续合并成功。</figcaption>
             </figure>
           </section>
 
@@ -116,7 +117,7 @@
               <p>
                 Codex 会在后台从 eligible rollout 中抽取高价值经验，先写入 state DB，再合并到
                 <code>~/.codex/memories/</code> 下的文件化 workspace；未来 turn 读取这些文件时，
-                还会记录引用，并跳过受外部资料影响的 thread。它能减少重复说明，但不替代规则文件、
+                还会记录引用，并在配置启用隔离时跳过受外部资料影响的 thread。它能减少重复说明，但不替代规则文件、
                 rollout 恢复记录或上下文窗口。
               </p>
             </div>
@@ -132,7 +133,7 @@
 
             <div class="note">
               <p>
-                <strong>取材范围。</strong>
+                <strong>取材范围。</strong> 源码快照：<a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f"><code>5c5308fc9a9e</code></a>。
                 产品行为来自 OpenAI Codex Memories、AGENTS.md 和 Chronicle 官方文档；
                 feature switch、配置、读写 pipeline、citation 和污染隔离来自
                 <code>openai/codex</code> 公开源码。本文不读取或引用任何本机
@@ -202,7 +203,7 @@
             <p>
               官方文档第一句就把预期压住：Memories 默认关闭。源码里的 feature spec 也对应这一点：
               <code>Feature::MemoryTool</code> 的 key 是 <code>memories</code>，
-              stage 是 Experimental，<code>default_enabled</code> 为 <code>false</code>。
+              stage 是 Stable，<code>default_enabled</code> 为 <code>false</code>。
               所以配置要分两层看：外层 feature flag 决定有没有 Memories；内层
               <code>[memories]</code> 决定生成、使用、外部上下文隔离和模型选择。
             </p>
@@ -211,6 +212,8 @@
 memories = true
 
 [memories]
+version = "v1"
+dual_write = false
 generate_memories = true
 use_memories = true
 disable_on_external_context = true</code></pre>
@@ -259,25 +262,15 @@ disable_on_external_context = true</code></pre>
             </div>
 
             <h2>三、写入为什么要放到后台</h2>
-            <p>
-              如果每条回复结束后立刻总结，memory 会变得很吵：任务可能还没结束，用户可能马上纠正，
-              工具输出也可能只是临时失败。Codex 的写入路径把这件事放到后台。
-              app-server 在 <code>turn/start</code> 成功提交用户输入后，会尝试调用
-              <code>start_memories_startup_task</code>。这个函数先做几项检查：
-              ephemeral session、未开启 feature、非 root agent session、没有 state DB，都会直接跳过。
-            </p>
+            <p>如果每条回复结束后立刻总结，任务未完成、用户纠正和临时失败都会增加噪声。当前 app-server 只有在 <code>turn/start</code> 含非空用户输入、core 确实启动新 turn、且主环境已配置时，才尝试 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs#L684-L698"><code>start_memories_startup_task</code></a>。补充已有 turn 或提交独立工具输出不会走这个触发分支。后台函数再跳过 ephemeral、feature 关闭和非 root agent，并确认 memory store 可用。</p>
 
-            <p>
-              真正启动以后，后台 task 会创建 <code>memories</code> root，seed extension instructions，
-              先做 prune，再检查 rate limit。只有额度允许时才继续跑 Phase 1 和 Phase 2。
-              这解释了官方文档里那句“Memories may not update right away”：它不是同步尾巴，
-              而是一条带空闲时间、额度阈值和 state DB lease 的维护路径。
-            </p>
+            <p>后台默认只跑所选版本；<code>dual_write = true</code> 才分别启动 v1 与 v2 pipeline。每条 pipeline 先准备自己的 root 和 extension instructions，再 prune、检查额度，依次执行 Phase 1 和 Phase 2。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/memory_version.rs#L7-L23">版本目录</a> 分别是 <code>memories/</code> 与 <code>memories_v2/</code>；默认仍为 v1。双写不等于把两份摘要一起注入：读取仍由 <code>version</code> 选择一个命名空间。示例显式开启的 <code>disable_on_external_context</code> 也不是默认值；源码默认是 false。</p>
 
-            <pre><code class="language-text">turn/start accepted
+            <pre><code class="language-text">turn/start: nonempty user input + new turn + primary environment ready
   -> start_memories_startup_task
   -> skip checks: ephemeral / feature off / sub-agent / no state DB
-  -> create memories root
+  -> selected version (or both when dual_write)
+  -> create version-specific memories root
   -> prune
   -> rate-limit guard
   -> Phase 1 extraction
@@ -321,7 +314,7 @@ disable_on_external_context = true</code></pre>
                   <tr>
                     <td>Phase 2</td>
                     <td>多条 raw memory 合并后的 workspace patch。</td>
-                    <td>内部 consolidation agent 只能改 memory workspace。</td>
+                    <td>内部 consolidation agent 维护对应版本 workspace；实际隔离取决于父级权限配置。</td>
                     <td><code>memory_summary.md</code>、<code>MEMORY.md</code>、summary 文件或 skill。</td>
                   </tr>
                   <tr>
@@ -335,13 +328,7 @@ disable_on_external_context = true</code></pre>
             </div>
 
             <h2>四、Phase 1：先把 rollout 变成 raw memory</h2>
-            <p>
-              Phase 1 的任务很具体：从最近的、空闲足够久的、允许参与 memory 的 thread 中，
-              为每条 rollout 生成结构化输出。state 层的 claim 查询会排除
-              <code>memory_mode != 'enabled'</code> 的线程，排除当前 thread，
-              限制 age window 和 idle window，并用 scan / claim limit 控制启动时的工作量。
-              这不是“把所有历史都拿来总结”，而是先筛出值得处理的一小批候选。
-            </p>
+            <p>Phase 1 从最近、空闲足够久、允许生成 memory 的 thread 中抽取结构化经验。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/state/src/runtime/memories.rs#L220-L259">候选查询</a> 排除当前 thread 和 <code>memory_mode != enabled</code>，限制 age、idle、来源以及 scan / claim 数量；不再要求 <code>history_mode = legacy</code>，分页历史也可参与。以下示例和文件表先沿默认 v1 路线解释。v2 使用单独的分层输入序列化与抽取模板，不能把两条路径的记录形状混为一谈。</p>
 
             <p>
               模板里还有一个很重要的判断：如果一条 rollout 没有可复用洞察，
@@ -371,11 +358,7 @@ disable_on_external_context = true</code></pre>
               如果没有变化，就直接结束。
             </p>
 
-            <p>
-              有变化时，Codex 会启动一个内部 consolidation agent。它没有网络、没有 approval、
-              只写本地 memory workspace，并且关闭协作，避免递归委派。这个细节很能说明设计取向：
-              memory 合并不是前台 turn 的一部分，也不应该随便碰当前项目；它是一个本地状态维护任务。
-            </p>
+            <p>有变化时，Codex 启动内部 consolidation agent，关闭审批、memory 再生成及协作，避免递归提炼或委派。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/write/src/phase2.rs#L295-L343">它的权限继承有条件分支</a>：父级使用 Codex 管理的权限时，worker 限于 memory root 写入且禁用网络；父级为 <code>Disabled</code> 或 <code>External</code> 时保留该配置。因此“任何情况下都只有本地 memory 目录写权限”并不是源码保证。执行结束还要通过 artifact 校验并确认仍持有 lock，才接纳这次合并结果。</p>
 
             <div class="table-wrap">
               <table>
@@ -417,12 +400,7 @@ disable_on_external_context = true</code></pre>
             </div>
 
             <h2>六、读取路径：memory 怎样回到未来 turn</h2>
-            <p>
-              读取路径由 extension 提供。<code>MemoriesExtensionConfig</code> 只有在
-              <code>Feature::MemoryTool</code> 开启且 <code>memories.use_memories</code> 为真时才启用；
-              thread context contributor 随后调用 <code>build_memory_tool_developer_instructions</code>，
-              把 memory 读取规则作为 developer policy 片段注入。
-            </p>
+            <p>读取 extension 仅在 <code>Feature::MemoryTool</code> 和 <code>memories.use_memories</code> 都开启时注入规则，并从所选版本读取非空 <code>memory_summary.md</code>。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/memories/src/extension.rs#L126-L169">配置更新</a> 会保留该 thread 初始选定的版本，避免摘要和检索工具读取不同目录；只有 <code>dedicated_tools</code> 同时开启时才暴露专用 memory 工具。</p>
 
             <p>
               这段 read-path prompt 并不是“看到 memory 就全读”。它先要求判断任务是否需要 memory；
@@ -446,6 +424,7 @@ disable_on_external_context = true</code></pre>
               runtime 得到的是“哪条记忆真的被用上”的反馈。
             </p>
 
+<p>v2 的 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/memories/templates/memories/read_path_v2.md">读取模板</a> 更强调直接利用已注入摘要：仅当额外证据、时间顺序或不确定性会改变答案时，再读对应 rollout summary；缺少必要线索才搜索。它要求核实可能变化的事实，不把 memory 当作当前行为的证明。只有实际读取的 summary 参与回答时才附 citation，不引用摘要本身；用户明确要求记住、忘记或纠正时，写入 <code>extensions/ad_hoc/notes/</code>，由后续 consolidation 应用，不能直接改生成文件。</p>
             <h2>七、为什么要有 <code>polluted</code></h2>
             <p>
               memory 最大的风险不是“忘了”，而是把来源不稳定的东西记得太牢。
@@ -455,12 +434,7 @@ disable_on_external_context = true</code></pre>
               会把 thread 标记成 <code>polluted</code>。
             </p>
 
-            <p>
-              state 层筛选 Phase 1 job 时只选择 <code>memory_mode = 'enabled'</code>
-              且 <code>history_mode = 'legacy'</code> 的线程；一旦 thread 被标记为
-              <code>polluted</code>，后续就不会作为普通 memory 输入继续进入抽取路径。
-              这不是说外部上下文不能用，而是把“当下查询”与“长期保存”分开。
-            </p>
+            <p>污染标记还影响已经合并过的材料。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/state/src/runtime/memories.rs#L624-L661"><code>mark_thread_memory_mode_polluted</code></a> 在该 thread 曾参与最近一次成功 Phase 2 baseline 时，会安排新一轮合并；后续选择会排除这个来源。这样既阻止新抽取，也让已有 workspace 有机会移除失效依据。<strong>标记和排队不等于文件已经删除</strong>，忘记动作仍要等后台合并成功。</p>
 
             <p>
               还是用刚才的例子对比：<strong>“这个仓库的文章要中英文同步”</strong> 是稳定工作流，
@@ -531,27 +505,27 @@ disable_on_external_context = true</code></pre>
               <li><a href="https://developers.openai.com/codex/memories">OpenAI Codex Memories 官方文档：默认关闭、配置、存储和 per-thread 控制</a></li>
               <li><a href="https://developers.openai.com/codex/guides/agents-md">OpenAI Codex AGENTS.md 官方文档：规则文件的发现和层级</a></li>
               <li><a href="https://developers.openai.com/codex/memories/chronicle">OpenAI Codex Chronicle 官方文档：用屏幕上下文辅助 memory 的 opt-in preview</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/features/src/lib.rs#L923-L932"><code>Feature::MemoryTool</code> feature spec 与默认关闭</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/config/src/types.rs#L280-L345"><code>MemoriesToml</code> / <code>MemoriesConfig</code> 配置项和默认值</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/tui/src/chatwidget.rs#L1076-L1101">TUI <code>/memories</code> 入口和启用提示</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/README.md#L8-L15"><code>memories/read</code> 与 <code>memories/write</code> crate 分工</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/src/start.rs#L20-L79">后台 memory startup task 的跳过条件、rate-limit guard 与 Phase 1 / Phase 2 顺序</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/app-server/src/request_processors/turn_processor.rs#L542-L551">app-server 在 turn 提交后触发 memory startup task</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L133-L149">Phase 1 startup claim 的候选选择说明</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L218-L225">Phase 1 查询只选择 <code>memory_mode = 'enabled'</code> 的 legacy thread</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/stage_one_system.md#L1-L45">Phase 1 prompt：从 rollout 转成 raw memory / rollout summary，且允许 no-op</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/stage_one_system.md#L48-L82">Phase 1 prompt：高价值 memory 的判断标准</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/README.md#L79-L120">Phase 2 consolidation 的输入选择、文件同步、git baseline 和内部 agent</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/write/templates/memories/consolidation.md#L20-L35">Phase 2 memory folder 结构：summary、MEMORY、raw、skills、rollout_summaries</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/src/extension.rs#L40-L69">read extension 根据 feature 和 <code>use_memories</code> 注入 developer policy</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/templates/memories/read_path.md#L1-L41">read path prompt：什么时候使用 memory、memory layout 和 quick pass</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/ext/memories/templates/memories/read_path.md#L75-L123">read path prompt：memory citation 和 ad-hoc update 规则</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/protocol/src/memory_citation.rs#L6-L20"><code>MemoryCitation</code> / <code>MemoryCitationEntry</code> 协议结构</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/memories/read/src/citations.rs#L6-L43">memory citation parser 解析 citation entries 和 rollout ids</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/stream_events_utils.rs#L79-L93">流式输出剥离隐藏 citation 并解析 memory citation</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/stream_events_utils.rs#L227-L295">response item 完成后记录 memory citation usage，并标记外部上下文污染</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/core/src/mcp_tool_call.rs#L780-L798">MCP tool call 根据 server metadata 标记 thread memory pollution</a></li>
-              <li><a href="https://github.com/openai/codex/blob/aaa30f79c23e1c11a58394ff6edf1617d470c030/codex-rs/state/src/runtime/memories.rs#L586-L615"><code>mark_thread_memory_mode_polluted</code> 将 thread 置为 <code>polluted</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/features/src/lib.rs"><code>Feature::MemoryTool</code> feature spec 与默认关闭</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/config/src/types.rs"><code>MemoriesToml</code> / <code>MemoriesConfig</code> 配置项和默认值</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/tui/src/chatwidget.rs">TUI <code>/memories</code> 入口和启用提示</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/README.md"><code>memories/read</code> 与 <code>memories/write</code> crate 分工</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/write/src/start.rs">后台 memory startup task 的跳过条件、rate-limit guard 与 Phase 1 / Phase 2 顺序</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs">app-server 在 turn 提交后触发 memory startup task</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/state/src/runtime/memories.rs">Phase 1 startup claim 的候选选择说明</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/state/src/runtime/memories.rs">Phase 1 选择 enabled thread，包括分页历史</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/write/templates/memories/stage_one_system.md">Phase 1 prompt：从 rollout 转成 raw memory / rollout summary，且允许 no-op</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/write/templates/memories/stage_one_system.md">Phase 1 prompt：高价值 memory 的判断标准</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/README.md">Phase 2 consolidation 的输入选择、文件同步、git baseline 和内部 agent</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/write/templates/memories/consolidation.md">Phase 2 memory folder 结构：summary、MEMORY、raw、skills、rollout_summaries</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/memories/src/extension.rs">read extension 根据 feature 和 <code>use_memories</code> 注入 developer policy</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/memories/templates/memories/read_path.md">read path prompt：什么时候使用 memory、memory layout 和 quick pass</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/ext/memories/templates/memories/read_path.md">read path prompt：memory citation 和 ad-hoc update 规则</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/memory_citation.rs"><code>MemoryCitation</code> / <code>MemoryCitationEntry</code> 协议结构</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/memories/read/src/citations.rs">memory citation parser 解析 citation entries 和 rollout ids</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/stream_events_utils.rs">流式输出剥离隐藏 citation 并解析 memory citation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/stream_events_utils.rs">response item 完成后记录 memory citation usage，并标记外部上下文污染</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/mcp_tool_call.rs">MCP tool call 根据 server metadata 标记 thread memory pollution</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/state/src/runtime/memories.rs"><code>mark_thread_memory_mode_polluted</code> 将 thread 置为 <code>polluted</code></a></li>
             </ul>
           </section>
         </article>
