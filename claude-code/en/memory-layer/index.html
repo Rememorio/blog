@@ -140,8 +140,7 @@
 
             <div class="note key-point">
               <p>
-                The thesis is simple: <strong>Claude Code memory is a set of long-lived files read again for
-                each turn.</strong> It can affect prompt caching because inserted memory
+                The thesis is simple: <strong>Claude Code memory is long-lived files whose cached contents are reused across turns and reloaded after invalidation.</strong> It can affect prompt caching because inserted memory
                 becomes part of the API-bound request prefix. But "dynamic" does not mean "changed
                 every turn," and the visible source does not append this material to the system prompt.
               </p>
@@ -158,13 +157,11 @@
 
             <p>
               Evidence comes from the official
-              <a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory docs</a>,
+              <a href="https://code.claude.com/docs/en/memory">Claude Code memory docs</a>,
               Anthropic's
-              <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">prompt caching docs</a>,
+              <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">prompt caching docs</a>,
               and the public <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code mirror</a>.
-              The mirror is not Anthropic's official source repository, so this article treats visible
-              client code as direct evidence and describes feature-controlled or provider-internal behavior
-              only through the requests and responses we can observe.
+              This article verifies the mirror’s fixed March 31, 2026 snapshot; every source link points to the same commit. It is not Anthropic’s official source repository and does not establish behavior in later product versions. Visible client implementation, official API contracts, and provider-side inference remain separate; code behind a feature switch does not prove that a deployment enables it.
             </p>
 
             <h2>1. Start with one project rule</h2>
@@ -176,7 +173,7 @@
 
             <p>
               The visible source's
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/claudemd.ts#L1-L26"><code>claudemd.ts</code> header</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/claudemd.ts#L1-L26"><code>claudemd.ts</code> header</a>
               names four instruction-file layers: managed memory, user memory, project memory, and
               local memory. It also describes discovery from the current directory upward, plus
               <code>@include</code> support.
@@ -204,9 +201,9 @@ possible stores:
 
             <h3>1.1 <code>CLAUDE.md</code> is human-written memory</h3>
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/claudemd.ts#L790-L910"><code>getMemoryFiles()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/claudemd.ts#L790-L910"><code>getMemoryFiles()</code></a>
               loads managed and user files first, then walks project directories from root toward the
-              current working directory. A nearer rule can therefore override a broader monorepo rule.
+              current working directory. A nearer rule can add task-specific constraints, but this loader does not remove conflicting text or enforce deterministic rule overrides.
               This is not transcript replay; it is filesystem-backed instruction loading.
             </p>
 
@@ -219,32 +216,57 @@ possible stores:
 
             <h3>1.2 Auto memory is learned, but still restricted</h3>
             <p>
-              Auto memory is a different path. <a href="https://github.com/Rememorio/claude-code/blob/main/src/memdir/paths.ts#L22-L55"><code>isAutoMemoryEnabled()</code></a>
-              shows that it is enabled by default but disabled by simple mode, explicit environment
-              switches, missing remote persistence, or settings. <a href="https://github.com/Rememorio/claude-code/blob/main/src/memdir/paths.ts#L207-L230"><code>getAutoMemPath()</code></a>
+              Auto memory is a different path. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/memdir/paths.ts#L22-L55"><code>isAutoMemoryEnabled()</code></a>
+              shows that it is enabled by default but disabled by <code>--bare</code>, explicit environment
+              switches, missing remote persistence, or settings. <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/memdir/paths.ts#L207-L230"><code>getAutoMemPath()</code></a>
               resolves the durable directory for the project.
             </p>
 
             <p>
               The extraction path is not an inline mutation on every answer.
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/extractMemories/extractMemories.ts#L1-L14"><code>extractMemories.ts</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/extractMemories/extractMemories.ts#L1-L14"><code>extractMemories.ts</code></a>
               says it runs after a completed query loop with a final response and no further tool calls,
               using a forked agent that shares the parent's prompt cache. Its
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/extractMemories/extractMemories.ts#L166-L222"><code>createAutoMemCanUseTool()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/extractMemories/extractMemories.ts#L166-L222"><code>createAutoMemCanUseTool()</code></a>
               tool policy allows broad reads, read-only shell commands, and writes only inside the memory directory.
+            </p>
+
+            <p>
+              Enabling auto memory does not enable every background writer.
+              The <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/extractMemories/extractMemories.ts#L544-L584">extraction entry point</a>
+              also requires a separate feature gate whose fallback is <code>false</code>, the main agent, and a non-remote run.
+              If the foreground already wrote memory, extraction skips that range and advances its cursor.
+              If extraction is busy, another call only stores the latest context for one trailing run;
+              accepting the call does not mean that its files have been written.
+            </p>
+            <figure class="shape-example">
+              <pre><code class="language-text">Project rule: "run pnpm test"
+1. Foreground answer finishes → check extraction gate and execution mode.
+2. Foreground already wrote memory → skip; otherwise a restricted fork may run.
+3. Another call arrives while busy → coalesce the latest context for a trailing run.
+4. Fork returns successfully → advance the cursor; no new memory is a valid result.
+5. Fork throws → keep the cursor so later extraction reconsiders those messages.
+6. Saved content enters a later request → its read path and cache reload still decide when.</code></pre>
+              <figcaption>This is a simplified call and state trace. A completed answer, an extraction return, and a saved memory are distinct events.</figcaption>
+            </figure>
+            <p>
+              The <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/extractMemories/extractMemories.ts#L326-L540">extraction body</a>
+              caps the fork at five turns and skips its transcript. A run may return without finding anything durable to save.
+              The cursor advances only after a successful return; exceptions are logged as best-effort failures.
+              Actual writes still have to complete through tools, so scheduling extraction does not establish that memory was saved or is visible in the next turn.
             </p>
 
             <h3>1.3 Session memory and auto dream are side paths</h3>
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/SessionMemory/sessionMemory.ts#L1-L5"><code>SessionMemory</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/SessionMemory/sessionMemory.ts#L1-L5"><code>SessionMemory</code></a>
               maintains notes about the current conversation through a background fork. Its
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/SessionMemory/sessionMemory.ts#L134-L180"><code>shouldExtractMemory()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/SessionMemory/sessionMemory.ts#L134-L180"><code>shouldExtractMemory()</code></a>
               check uses token thresholds, tool-call counts, and whether the last assistant turn is
               at a natural break.
             </p>
 
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/autoDream/autoDream.ts#L1-L11"><code>autoDream</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/autoDream/autoDream.ts#L1-L11"><code>autoDream</code></a>
               is even more delayed: enough time and sessions must pass, and a lock must be available, before a
               forked agent consolidates multiple sessions. This is background maintenance, not a hidden
 	              model-side memory that rewrites the current answer.
@@ -258,9 +280,9 @@ possible stores:
 	              through <code>getMemoryFiles()</code>, <code>getUserContext()</code>, and
 	              <code>prependUserContext()</code> as a meta user message. Some feature modes replace the
 	              index injection with relevant-memory attachments. Auto memory's
-	              <a href="https://github.com/Rememorio/claude-code/blob/main/src/memdir/memdir.ts#L419-L506"><code>loadMemoryPrompt()</code></a>
+	              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/memdir/memdir.ts#L419-L506"><code>loadMemoryPrompt()</code></a>
 	              supplies the dynamic system-prompt section for write and search policy. Agent memory's
-	              <a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/agentMemory.ts#L138-L177"><code>loadAgentMemoryPrompt()</code></a>
+	              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/agentMemory.ts#L138-L177"><code>loadAgentMemoryPrompt()</code></a>
 	              is appended to the selected agent's prompt, not the parent turn's user context.
 	            </p>
 
@@ -296,14 +318,14 @@ possible stores:
 	              The common shorthand says memory is wrapped in a system reminder and inserted into the
 	              system prompt. If "memory" means the <code>CLAUDE.md</code> / rules user-context path,
 	              the direction is close, but the source does something more specific. The text is wrapped in
-	              <code>&lt;system-reminder&gt;</code>, but <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts#L449-L474"><code>prependUserContext()</code></a>
+	              <code>&lt;system-reminder&gt;</code>, but <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/api.ts#L449-L474"><code>prependUserContext()</code></a>
 	              creates a meta user message and prepends it to the message list.
 	            </p>
 
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts#L152-L188"><code>getUserContext()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/context.ts#L152-L188"><code>getUserContext()</code></a>
 	              loads filtered <code>CLAUDE.md</code> / rules files into <code>claudeMd</code> and adds the current date. Then
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L657-L664"><code>query()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L657-L664"><code>query()</code></a>
               calls the model with <code>messages: prependUserContext(messagesForQuery, userContext)</code>.
             </p>
 
@@ -344,7 +366,7 @@ messages:
             <p>
               Prompt caching rewards stable provider-visible prefixes. Because memory is prepended
               into API-bound messages, changed memory can change the prefix. The message-side marker
-              placement in <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/api/claude.ts#L3062-L3110"><code>addCacheBreakpoints()</code></a>
+              placement in <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/api/claude.ts#L3062-L3110"><code>addCacheBreakpoints()</code></a>
               makes this request-shape discipline explicit: one message-level <code>cache_control</code>
               marker is placed for the request.
             </p>
@@ -352,15 +374,15 @@ messages:
             <figure class="figure">
               <img
                 src="../assets/memory-cache-boundary.png"
-                alt="Claude Code memory and prompt cache relationship showing unchanged memory with a stable prefix and changed memory with a prefix break"
+                alt="Memory file reload preceding request-text comparison: unchanged text may reuse a prefix, changed text rebuilds its suffix, and provider conditions still govern hits"
               />
-              <figcaption>Dynamic memory matters only when the inserted text changes the visible request prefix.</figcaption>
+              <figcaption>A file write changes request text only after the read path picks it up. Stable text makes reuse possible; provider cache conditions still determine an actual hit.</figcaption>
             </figure>
 
             <p>
               That does not mean memory destroys cache. <code>getUserContext()</code> and
               <code>getMemoryFiles()</code> are cached, and
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/claudemd.ts#L1111-L1125"><code>clearMemoryFileCaches()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/claudemd.ts#L1111-L1125"><code>clearMemoryFileCaches()</code></a>
               is reserved for correctness events such as settings changes, dialogs, or reloads.
               If the inserted memory text is unchanged, the prefix can remain stable. If a memory file
               changes and is reloaded into the API view, the old prefix may need to be rewritten.
@@ -431,7 +453,7 @@ messages:
             </ol>
 
             <p>
-              In one sentence: Claude Code memory is a set of long-lived files read again for each turn.
+              In one sentence: Claude Code memory combines long-lived files, cached read results, and reloads after invalidation.
               Once that model is clear, context management becomes easier to read: compaction rewrites
               old view, transcript preserves evidence, memory reloads rules, and prompt cache rewards
               stable API-visible prefixes.
@@ -440,16 +462,16 @@ messages:
             <section id="sources">
               <h2>Sources</h2>
               <ul>
-                <li><a href="https://docs.anthropic.com/en/docs/claude-code/memory">Claude Code memory docs</a></li>
-                <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic prompt caching docs</a></li>
-	                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/claudemd.ts"><code>src/utils/claudemd.ts</code></a></li>
-	                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/memdir/memdir.ts"><code>src/memdir/memdir.ts</code></a></li>
-	                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/context.ts"><code>src/context.ts</code></a></li>
-	                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/api.ts"><code>src/utils/api.ts</code></a></li>
-	                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/tools/AgentTool/agentMemory.ts"><code>src/tools/AgentTool/agentMemory.ts</code></a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/extractMemories/extractMemories.ts"><code>src/services/extractMemories/extractMemories.ts</code></a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/SessionMemory/sessionMemory.ts"><code>src/services/SessionMemory/sessionMemory.ts</code></a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/autoDream/autoDream.ts"><code>src/services/autoDream/autoDream.ts</code></a></li>
+                <li><a href="https://code.claude.com/docs/en/memory">Claude Code memory docs</a></li>
+                <li><a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">Anthropic prompt caching docs</a></li>
+	                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/claudemd.ts"><code>src/utils/claudemd.ts</code></a></li>
+	                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/memdir/memdir.ts"><code>src/memdir/memdir.ts</code></a></li>
+	                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/context.ts"><code>src/context.ts</code></a></li>
+	                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/api.ts"><code>src/utils/api.ts</code></a></li>
+	                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/AgentTool/agentMemory.ts"><code>src/tools/AgentTool/agentMemory.ts</code></a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/extractMemories/extractMemories.ts"><code>src/services/extractMemories/extractMemories.ts</code></a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/SessionMemory/sessionMemory.ts"><code>src/services/SessionMemory/sessionMemory.ts</code></a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/autoDream/autoDream.ts"><code>src/services/autoDream/autoDream.ts</code></a></li>
                 <li><a href="https://mp.weixin.qq.com/s?__biz=MzUxODAzNDg4NQ==&amp;mid=2247558299&amp;idx=1&amp;sn=cf16eb429a2c530589b31b80c2ded866&amp;chksm=f98ca031cefb2927c43ad5dcfee1cb810fc1f1374455b5041b75c38d1159293d5614c8b5915c&amp;cur_album_id=4404340926102421504&amp;scene=190#rd">Xiaolin Coding reference article on Claude Code Memory</a></li>
               </ul>
             </section>
