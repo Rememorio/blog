@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Go Source Notes III: Where Does a Goroutine Actually Run?</title>
-    <meta name="description" content="Chapter III of Go from Request to Production follows fetchd's go h.fetch through Go 1.26.0 newproc, runqput, schedule, findRunnable, execute, gopark, ready, and sysmon to explain G/M/P, work stealing, preemption, and runnable latency." />
+    <meta name="description" content="Chapter III of Go from Request to Production follows fetchd's go h.fetch through Go development-branch newproc, runqput, schedule, findRunnable, execute, gopark, ready, and sysmon to explain G/M/P, work stealing, preemption, and runnable latency." />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Go Source Notes III: Where Does a Goroutine Actually Run?" />
     <meta property="og:description" content="Creating a goroutine creates a runnable G. Execution begins only when the scheduler matches it with an M and a P." />
@@ -50,7 +50,7 @@
             starts immediately. We first treat goroutines as task cards and threads as workers, then distinguish “waiting” from “ready
             but not yet chosen” before entering G, M, P, and scheduler source.
           </p>
-          <div class="meta-line"><span>Source: Go 1.26.0</span><span>Path: newproc → runq → schedule → execute</span><span>Lab: scheduler_lab_test.go</span></div>
+          <div class="meta-line"><span>Source: Go development branch</span><span>Path: newproc → runq → schedule → execute</span><span>Lab: scheduler_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/goroutine-scheduler-overview.png" alt="Go goroutine scheduling overview: go h.fetch passes through newproc to create a G in a run queue; the scheduler matches the G with an OS thread M and execution resources P before it becomes running" /></figure>
         </section>
 
@@ -58,12 +58,12 @@
           <div class="note route-note"><p><strong>Reading goal:</strong> you do not need to memorize G, M, and P. Begin by treating a goroutine as a task card and a thread as a worker who can execute one card. The first half explains why 1,000 goroutines do not mean 1,000 threads, and why “waiting” differs from “ready but not yet scheduled.”</p></div>
 
           <p>
-            The first half describes the observable scheduling story; the second maps it to <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0</a>, primarily
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go">runtime/proc.go</a> and
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go">runtime/runtime2.go</a>.
+            The first half describes the observable scheduling story; the second maps it to <a href="https://github.com/golang/go/tree/f043823a99a4118989a34afec015d23b5d54d01e">a fixed Go development snapshot</a>, primarily
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go">runtime/proc.go</a> and
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go">runtime/runtime2.go</a>.
             The official <a href="https://go.dev/src/runtime/HACKING">runtime HACKING guide</a> defines what G, M, and P store and how they interact;
             production observation uses <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a> and <a href="https://go.dev/doc/diagnostics">Diagnostics</a>.
-            This is the current gc runtime, not a required mapping for every Go implementation.
+            The source is a fixed snapshot of the official master development branch, not a released stable version. Its gc runtime mapping is not required of every Go implementation.
           </p>
 
           <h2>1. Eight Goroutines Are Not Eight Threads</h2>
@@ -102,7 +102,7 @@ created → runnable → running → waiting for the network
 
           <h3><code>GOMAXPROCS</code> limits parallel Go execution</h3>
           <p>
-            Go 1.26 has one P per current <code>GOMAXPROCS</code>. With 1,000 runnable Gs and <code>GOMAXPROCS=8</code>, at most roughly eight threads execute user Go code at once,
+            The verified snapshot has one P per current <code>GOMAXPROCS</code>. With 1,000 runnable Gs and <code>GOMAXPROCS=8</code>, at most roughly eight threads execute user Go code at once,
             while the remaining Gs wait in scheduler queues. Total threads may be higher because of syscalls, cgo, runtime work, and locked threads.
             Since Go 1.25 the default can respond to container CPU limits; explicit environment or API settings affect that automation. Diagnose the observed metric, not only host core count.
           </p>
@@ -151,7 +151,7 @@ func newproc(fn *funcval) {
         }
     })
 }</code></pre>
-          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5292-L5308">runtime.newproc</a>.</span>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L5332-L5348">runtime.newproc</a>.</span>
 
           <figure class="figure"><img src="../assets/go-statement-newproc.png" alt="Source path from a go statement to a runnable G: go h.fetch enters newproc and newproc1, which obtains a G, prepares its stack and goid, changes status to _Grunnable, and lets runqput use runnext, the local run queue, or global overflow" /></figure>
 
@@ -159,12 +159,13 @@ func newproc(fn *funcval) {
           <p>
             <code>newproc1</code> runs on the system stack. It first asks the current P's free-G pool through <code>gfget</code>; only if that fails does it call <code>malg(stackMin)</code>
             and publish a new G. It clears <code>g.sched</code>, sets the initial SP, a PC returning through <code>goexit</code>, the function entry, parent goid, and creation PC.
-            It then assigns a goid and changes the G from <code>_Gdead</code> to <code>_Grunnable</code>.
+            On the ordinary <code>go</code> path, it assigns a goid and changes the G from <code>_Gdead</code> to <code>_Grunnable</code>. The excerpt follows that path; internal callers can use <code>parked=true</code> to create a waiting G instead, and the caller remains responsible for adding it to the scheduler.
           </p>
 
           <pre><code class="language-go">newg := gfget(pp)
 if newg == nil {
     newg = malg(stackMin)
+    casgstatus(newg, _Gidle, _Gdead)
     allgadd(newg)
 }
 
@@ -175,7 +176,7 @@ newg.parentGoid = callergp.goid
 newg.gopc = callerpc
 newg.goid = pp.goidcache
 casgstatus(newg, _Gdead, _Grunnable)</code></pre>
-          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5310-L5424">runtime.newproc1</a>.</span>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L5350-L5478">runtime.newproc1</a>.</span>
 
           <p>
             Creation needs G metadata and an initial stack, but it commonly reuses an object and does not create a dedicated OS thread. The function body has not run yet:
@@ -184,7 +185,7 @@ casgstatus(newg, _Gdead, _Grunnable)</code></pre>
 
           <h3>3.2 Local Run Queue, <code>runnext</code>, and Global Run Queue</h3>
           <p>
-            A P currently contains a <code>[256]guintptr</code> local queue and a separate <code>runnext</code> slot. The size is a Go 1.26.0 implementation detail;
+            A P currently contains a <code>[256]guintptr</code> local queue and a separate <code>runnext</code> slot. The size is a verified-snapshot implementation detail;
             the useful model is that local queues preserve locality while the global queue supports overflow and fairness.
           </p>
 
@@ -206,7 +207,7 @@ casgstatus(newg, _Gdead, _Grunnable)</code></pre>
     return
 }
 runqputslow(pp, gp, h, t) // half the local Gs + new G → global</code></pre>
-          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L7473-L7559">runqput and runqputslow</a>; queue fields in <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L772-L818">runtime.p</a>.</span>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L7532-L7620">runqput and runqputslow</a>; queue fields in <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go#L774-L820">runtime.p</a>.</span>
 
           <h3 id="find-runnable">3.3 How <code>schedule</code> and <code>findRunnable</code> Locate Work</h3>
           <p>
@@ -219,9 +220,11 @@ runqputslow(pp, gp, h, t) // half the local Gs + new G → global</code></pre>
     // Spinning, GC worker, and locked-M handling omitted.
     execute(gp, inheritTime)
 }</code></pre>
-          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L4133-L4231">runtime.schedule</a>.</span>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L4149-L4247">runtime.schedule</a>.</span>
 
-          <figure class="figure"><img src="../assets/find-runnable-route.png" alt="The main Go findRunnable search loop checks timers, trace, and GC plus a global fairness check every 61 ticks, then the local queue, ordinary global queue, netpoll, and stealWork; before idle and park it rechecks work sources" /></figure>
+          <figure class="figure"><img src="../assets/find-runnable-route.png" alt="The main Go findRunnable search loop checks timers, trace, and GC plus a global fairness check every 61 ticks, then the local queue, ordinary global queue, netpoll, and stealWork; a hit returns a G for execute immediately, and the scheduler rechecks sources before parking M" /></figure>
+
+          <p>The figure focuses on the main search sources. A hit returns a G to <code>schedule</code> immediately rather than completing the loop. The fairness check is conditional on the tick, and netpoll and stealing have their own eligibility checks. Rechecks around parking prevent a wake-up race from leaving new work stranded.</p>
 
           <h4>This is not one FIFO</h4>
           <p>
@@ -253,7 +256,7 @@ gp.waitsince = 0
 gp.preempt = false
 // Trace, profiling, and time-slice work omitted.
 gogo(&amp;gp.sched)</code></pre>
-          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3322-L3383">runtime.execute</a>.</span>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L3338-L3399">runtime.execute</a>.</span>
 
           <p>
             Because G and M are associated here, ordinary application code must not assume a goroutine identity maps to one thread. Use <code>runtime.LockOSThread</code> only for real thread-local,
@@ -270,7 +273,7 @@ gogo(&amp;gp.sched)</code></pre>
           <pre><code class="language-go">casgstatus(gp, _Gwaiting, _Grunnable)
 runqput(mp.p.ptr(), gp, next)
 wakep()</code></pre>
-          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L445-L485">gopark and goready</a>, plus <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L1119-L1140">ready</a>.</span>
+          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L457-L497">gopark and goready</a>, plus <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L1133-L1154">ready</a>.</span>
 
           <p>
             Chapter I's socket path lands here: netpoll changes I/O-ready Gs from waiting to runnable and injects them into scheduling. Some M/P runs them later.
@@ -279,13 +282,13 @@ wakep()</code></pre>
 
           <h3>4.2 Preemption Offers a Chance, Not a Real-Time Deadline</h3>
           <p>
-            A G that does not block must not own a P forever. In Go 1.26, sysmon's <code>retake</code> watches each P's <code>schedtick</code>. If one tick persists beyond the internal
+            A G that does not block must not own a P forever. In the verified snapshot, sysmon's <code>retake</code> watches each P's <code>schedtick</code>. If one tick persists beyond the internal
             <code>forcePreemptNS = 10ms</code>, it requests <code>preemptone</code>. That sets <code>gp.preempt</code> and <code>stackguard0 = stackPreempt</code>;
             supported platforms also request asynchronous preemption through <code>preemptM</code>.
           </p>
 
           <p>
-            Ten milliseconds is an implementation threshold for requesting intervention, not a maximum run duration or latency SLO. Signal delivery, safe points, runtime critical sections,
+            Several Gs handed off through <code>runnext</code> can share one <code>schedtick</code>, so the check follows a continuously occupied time slice rather than granting every G a fresh 10 ms. Ten milliseconds is an implementation threshold for requesting intervention, not a maximum run duration or latency SLO. Signal delivery, safe points, runtime critical sections,
             platform support, cgo/syscalls, and OS scheduling affect the actual handoff. Preemption improves fairness; it does not make Go hard real time.
           </p>
 
@@ -295,7 +298,7 @@ wakep()</code></pre>
           <h3>What <code>/sched/latencies:seconds</code> measures</h3>
           <p>
             The internal <code>sched.timeToRun</code> comment defines a distribution of time from <code>_Grunnable</code> to <code>_Grunning</code>.
-            <code>runtime/metrics</code> exposes it as the cumulative histogram <code>/sched/latencies:seconds</code>. Time waiting for I/O, channels, or mutexes is outside that interval.
+            <code>runtime/metrics</code> exposes it as the cumulative histogram <code>/sched/latencies:seconds</code>. Time waiting for I/O, channels, or mutexes is outside that interval. <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L1326-L1396">State-transition accounting is sampled</a>, so it does not record an observation for every wake-up. For a monitoring window, subtract bucket counts between reads instead of treating a process-lifetime quantile as current latency.
           </p>
 
           <pre><code class="language-go">samples := []metrics.Sample{
@@ -305,12 +308,12 @@ wakep()</code></pre>
 }
 metrics.Read(samples)
 histogram := samples[2].Value.Float64Histogram()</code></pre>
-          <span class="source-caption">Metric definitions: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/metrics/description.go#L436-L475">scheduler metric descriptions</a>; internal histogram: <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L1015-L1018">sched.timeToRun</a>.</span>
+          <span class="source-caption">Metric definitions: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/metrics/description.go#L436-L475">scheduler metric descriptions</a>; internal histogram: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go#L1021-L1024">sched.timeToRun</a>.</span>
 
           <h3>Run the burst, trace, and handoff benchmark</h3>
           <p>
             <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/scheduler_lab_test.go">scheduler_lab_test.go</a>
-            starts 64 goroutines, waits until all are parked on a <code>release</code> channel, then closes that channel to make a visible runnable burst.
+            starts 64 goroutines, collects their ready notifications, then closes a <code>release</code> channel to release the batch. The notification precedes the receive on <code>release</code>, so it does not prove that every G was already waiting at close time. Use trace events to determine which Gs actually blocked and when they became runnable.
           </p>
 
           <pre><code class="language-bash">cd go-runtime/examples/fetchd
@@ -352,16 +355,16 @@ GODEBUG=schedtrace=1000,scheddetail=1 go test -run TestSchedulerBurst</code></pr
             <li><a href="https://go.dev/blog/container-aware-gomaxprocs">Container-aware GOMAXPROCS</a></li>
             <li><a href="https://pkg.go.dev/runtime/metrics">runtime/metrics package documentation</a></li>
             <li><a href="https://go.dev/doc/diagnostics">Diagnostics in the Go ecosystem</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L29-L72">G status definitions</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L473-L830">runtime g, m, and p structures</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5292-L5424">newproc and newproc1</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L7473-L7750">local run queues and work stealing</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3385-L3715">findRunnable</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L4133-L4231">schedule</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3322-L3383">execute</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L445-L485">gopark and goready</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L6626-L6698">sysmon retake and preemption threshold</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L6858-L6895">preemptone</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go#L29-L72">G status definitions</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go#L471-L836">runtime g, m, and p structures</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L5332-L5478">newproc and newproc1</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L7532-L7810">local run queues and work stealing</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L3401-L3814">findRunnable</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L4149-L4247">schedule</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L3338-L3399">execute</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L457-L497">gopark and goready</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L6684-L6756">sysmon retake and preemption threshold</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L6913-L6954">preemptone</a></li>
             <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/scheduler_lab_test.go">fetchd scheduler lab</a></li>
           </ul>
 

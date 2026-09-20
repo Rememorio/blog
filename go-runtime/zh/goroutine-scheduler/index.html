@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Go 源码阅读（三）：goroutine 到底跑在哪里</title>
-    <meta name="description" content="Go 从请求到生产现场系列第三篇：从 fetchd 的 go h.fetch 出发，沿 Go 1.26.0 的 newproc、runqput、schedule、findRunnable、execute、gopark、ready 与 sysmon，解释 G/M/P、工作窃取、抢占和 runnable latency。" />
+    <meta name="description" content="Go 从请求到生产现场系列第三篇：从 fetchd 的 go h.fetch 出发，沿 Go 开发分支的 newproc、runqput、schedule、findRunnable、execute、gopark、ready 与 sysmon，解释 G/M/P、工作窃取、抢占和 runnable latency。" />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Go 源码阅读（三）：goroutine 到底跑在哪里" />
     <meta property="og:description" content="创建 goroutine 只是创建一个 runnable G；真正执行还要匹配 M 与 P，并穿过调度器的工作搜索。" />
@@ -49,7 +49,7 @@
             写下 <code>go h.fetch(...)</code>，只是把一项新工作交给 Go，并不等于新建一条专属线程，也不保证它立刻开始。
             本篇先把 goroutine 想成待办卡、线程想成工人，讲清“正在等待”和“已经能跑但还没轮到”；再进入 G、M、P 与调度器源码。
           </p>
-          <div class="meta-line"><span>源码：Go 1.26.0</span><span>路径：newproc → runq → schedule → execute</span><span>实验：scheduler_lab_test.go</span></div>
+          <div class="meta-line"><span>源码：Go 开发分支</span><span>路径：newproc → runq → schedule → execute</span><span>实验：scheduler_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/goroutine-scheduler-overview.png" alt="Go goroutine 调度总览：go h.fetch 经 newproc 生成 G 并进入 runq；调度器将 G、OS 线程 M 和执行资源 P 匹配后进入 running" /></figure>
         </section>
 
@@ -57,12 +57,12 @@
           <div class="note route-note"><p><strong>阅读目标：</strong>不需要先背 G、M、P。先把 goroutine 想成“待办任务”，线程想成“真正干活的人”。读完前半篇，你应能解释为什么启动 1000 个 goroutine 不等于创建 1000 个线程，以及“正在等”和“已经能跑但还没轮到”为什么是两种问题。</p></div>
 
           <p>
-            前半篇先讲可观察的调度过程；后半篇再把它对应到 <a href="https://github.com/golang/go/tree/go1.26.0">Go 1.26.0 tag</a> 的
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go">runtime/proc.go</a> 与
-            <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go">runtime/runtime2.go</a>。
+            前半篇先讲可观察的调度过程；后半篇再把它对应到 <a href="https://github.com/golang/go/tree/f043823a99a4118989a34afec015d23b5d54d01e">Go 开发分支固定快照</a> 的
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go">runtime/proc.go</a> 与
+            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go">runtime/runtime2.go</a>。
             G/M/P 分别保存什么、怎样配合，参考官方 <a href="https://go.dev/src/runtime/HACKING">runtime HACKING</a>；生产观测参考
             <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a> 和 <a href="https://go.dev/doc/diagnostics">Diagnostics</a>。
-            本文讨论 gc runtime 的当前实现；别的 Go implementation 可以选择不同映射。
+            本文核实的是官方 master 的固定开发快照，并不把它当作已发布稳定版；这里讨论 gc runtime 的实现，别的 Go implementation 可以选择不同映射。
           </p>
 
           <h2>一、八个 goroutine 不等于八条线程</h2>
@@ -98,7 +98,7 @@
 
           <h3><code>GOMAXPROCS</code> 限制的是并行执行 Go 代码</h3>
           <p>
-            Go 1.26 中 P 的数量对应当前 <code>GOMAXPROCS</code>。若有 1000 个 runnable G 而 <code>GOMAXPROCS=8</code>，通常最多八条线程同时执行用户 Go 代码，
+            所核实快照中 P 的数量对应当前 <code>GOMAXPROCS</code>。若有 1000 个 runnable G 而 <code>GOMAXPROCS=8</code>，通常最多八条线程同时执行用户 Go 代码，
             其余 G 等在调度器。线程总数仍可能因 syscall、cgo、runtime 工作与锁线程而更高。Go 1.25 起默认值还会感知容器 CPU limit；显式设置环境变量或调用
             <code>runtime.GOMAXPROCS</code> 会改变自动更新行为，所以诊断时应读取实际 metric，而不是只看宿主机核心数。
           </p>
@@ -147,19 +147,20 @@ func newproc(fn *funcval) {
         }
     })
 }</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5292-L5308">runtime.newproc</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L5332-L5348">runtime.newproc</a>。</span>
 
           <figure class="figure"><img src="../assets/go-statement-newproc.png" alt="go 语句到 runnable G 的源码路径：go h.fetch 经 newproc 和 newproc1 获取 G、准备 stack/goid、切换到 _Grunnable，再由 runqput 放入 runnext、local runq 或溢出到 global runq" /></figure>
 
           <h3>3.1 <code>newproc1</code> 优先复用 G，再准备初始执行现场</h3>
           <p>
             <code>newproc1</code> 在 system stack 上执行。它先从当前 P 的 free G 池取一个 <code>gfget</code>；没有才用 <code>malg(stackMin)</code> 创建栈并把 G 加入全局集合。
-            随后清空 <code>g.sched</code>，设置初始 SP、返回到 <code>goexit</code> 的 PC、调用入口、parent goid 与创建 PC，最后分配 goid 并把状态从 <code>_Gdead</code> 切到 <code>_Grunnable</code>。
+            随后清空 <code>g.sched</code>，设置初始 SP、返回到 <code>goexit</code> 的 PC、调用入口、parent goid 与创建 PC，在普通 <code>go</code> 路径里分配 goid 并把状态从 <code>_Gdead</code> 切到 <code>_Grunnable</code>。下面只摘出这条路径；内部调用者也可用 <code>parked=true</code> 先创建 waiting G，入调度器的责任仍由调用者承担。
           </p>
 
           <pre><code class="language-go">newg := gfget(pp)
 if newg == nil {
     newg = malg(stackMin)
+    casgstatus(newg, _Gidle, _Gdead)
     allgadd(newg)
 }
 
@@ -170,7 +171,7 @@ newg.parentGoid = callergp.goid
 newg.gopc = callerpc
 newg.goid = pp.goidcache
 casgstatus(newg, _Gdead, _Grunnable)</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5310-L5424">runtime.newproc1</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L5350-L5478">runtime.newproc1</a>。</span>
 
           <p>
             这里有两个容易混淆的事实。第一，创建 goroutine 需要 G 元数据和初始栈，但通常会复用对象，不等于每次向 OS 创建线程。第二，函数体此时还没有执行；
@@ -179,7 +180,7 @@ casgstatus(newg, _Gdead, _Grunnable)</code></pre>
 
           <h3>3.2 local runq、runnext 与 global runq</h3>
           <p>
-            当前 P 持有一个 <code>[256]guintptr</code> 的 local runq 和一个单独的 <code>runnext</code> 槽。数组长度是 Go 1.26.0 实现细节，
+            当前 P 持有一个 <code>[256]guintptr</code> 的 local runq 和一个单独的 <code>runnext</code> 槽。数组长度是所核实快照的实现细节，
             但“局部队列优先保持 locality、全局队列负责溢出与公平”是理解路径的关键。
           </p>
 
@@ -201,7 +202,7 @@ casgstatus(newg, _Gdead, _Grunnable)</code></pre>
     return
 }
 runqputslow(pp, gp, h, t) // 一半 local G + 新 G → global runq</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L7473-L7559">runqput 与 runqputslow</a>；P 的队列字段见 <a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L772-L818">runtime.p</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L7532-L7620">runqput 与 runqputslow</a>；P 的队列字段见 <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go#L774-L820">runtime.p</a>。</span>
 
           <h3 id="find-runnable">3.3 <code>schedule</code> 与 <code>findRunnable</code> 怎样找到下一份工作</h3>
           <p>
@@ -214,9 +215,11 @@ runqputslow(pp, gp, h, t) // 一半 local G + 新 G → global runq</code></pre>
     // spinning、GC worker、locked M 等处理省略
     execute(gp, inheritTime)
 }</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L4133-L4231">runtime.schedule</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L4149-L4247">runtime.schedule</a>。</span>
 
-          <figure class="figure"><img src="../assets/find-runnable-route.png" alt="Go findRunnable 主搜索环：先处理 timers、trace 和 GC，以及每 61 tick 的全局公平检查，再查 local runq、普通 global runq、netpoll 与 stealWork；无工作时 idle/park，并在停放前重查来源" /></figure>
+          <figure class="figure"><img src="../assets/find-runnable-route.png" alt="Go findRunnable 主搜索环：先处理 timers、trace 和 GC，以及每 61 tick 的全局公平检查，再查 local runq、普通 global runq、netpoll 与 stealWork；任一来源找到 G 就返回 execute，未找到才继续；停放 M 前重查来源" /></figure>
+
+          <p>图中只展开主要搜索来源：任一来源找到 G 就返回给 <code>schedule</code>，不会继续绕完整个环。全局公平检查有 tick 条件；<code>netpoll</code> 和窃取也各有执行条件。停放前后的重查则保证新工作不会因为唤醒竞争被遗留。</p>
 
           <h4>这不是一条简单 FIFO</h4>
           <p>
@@ -248,7 +251,7 @@ gp.waitsince = 0
 gp.preempt = false
 // trace、profiling 与时间片处理省略
 gogo(&amp;gp.sched)</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3322-L3383">runtime.execute</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L3338-L3399">runtime.execute</a>。</span>
 
           <p>
             因为 G 与 M 在这里才绑定，普通业务不应依赖 goroutine identity 对应固定线程。只有确有 thread-local/GUI/cgo 要求时才考虑
@@ -265,7 +268,7 @@ gogo(&amp;gp.sched)</code></pre>
           <pre><code class="language-go">casgstatus(gp, _Gwaiting, _Grunnable)
 runqput(mp.p.ptr(), gp, next)
 wakep()</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L445-L485">gopark 与 goready</a>、<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L1119-L1140">ready</a>。</span>
+          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L457-L497">gopark 与 goready</a>、<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L1133-L1154">ready</a>。</span>
 
           <p>
             第一篇的 socket 路径正好落在这里：netpoll 把 I/O 就绪的 G 从 waiting 转成 runnable 并注入队列；某个 M/P 以后才会执行它。
@@ -274,13 +277,13 @@ wakep()</code></pre>
 
           <h3>4.2 抢占保证机会，不保证硬实时</h3>
           <p>
-            长时间不阻塞的 G 不能永远占住 P。Go 1.26 的 sysmon 在 <code>retake</code> 中观察 P 的 <code>schedtick</code>；同一 tick 超过内部
+            长时间不阻塞的 G 不能永远占住 P。所核实快照的 sysmon 在 <code>retake</code> 中观察 P 的 <code>schedtick</code>；同一 tick 超过内部
             <code>forcePreemptNS = 10ms</code> 会请求 <code>preemptone</code>。它设置 <code>gp.preempt</code> 与 <code>stackguard0 = stackPreempt</code>，
             支持的平台还会通过 <code>preemptM</code> 请求异步抢占。
           </p>
 
           <p>
-            10ms 是当前实现触发检查的阈值，不是 goroutine 的最大运行时，也不是延迟 SLA。信号投递、安全点、runtime 临界区、平台支持、cgo/syscall 与 OS 调度都会影响实际交接。
+            连续经 <code>runnext</code> 交接的多个 G 可以共享同一个 <code>schedtick</code>，因此检查的是持续占用的时间片，不是每个 G 各自获得一份新的 10ms。10ms 是当前实现触发检查的阈值，不是 goroutine 的最大运行时，也不是延迟 SLA。信号投递、安全点、runtime 临界区、平台支持、cgo/syscall 与 OS 调度都会影响实际交接。
             抢占提供公平机会，不能把 Go 变成硬实时系统。
           </p>
 
@@ -290,7 +293,7 @@ wakep()</code></pre>
           <h3><code>/sched/latencies:seconds</code> 测量什么</h3>
           <p>
             runtime 内部 <code>sched.timeToRun</code> 的注释把它定义为 G 在 <code>_Grunnable</code> 到 <code>_Grunning</code> 之间的时间分布；
-            <code>runtime/metrics</code> 以累计直方图 <code>/sched/latencies:seconds</code> 暴露。它不包含 G 在 I/O、channel 或 mutex 上的 waiting 时间。
+            <code>runtime/metrics</code> 以累计直方图 <code>/sched/latencies:seconds</code> 暴露。它不包含 G 在 I/O、channel 或 mutex 上的 waiting 时间。<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L1326-L1396">状态转换统计采用采样</a>，并非为每次唤醒记录一个观测值；做窗口告警时应比较两次读取的 bucket 计数差，而不是把进程启动以来的累计分位数当作当前延迟。
           </p>
 
           <pre><code class="language-go">samples := []metrics.Sample{
@@ -300,12 +303,12 @@ wakep()</code></pre>
 }
 metrics.Read(samples)
 histogram := samples[2].Value.Float64Histogram()</code></pre>
-          <span class="source-caption">metric 定义：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/metrics/description.go#L436-L475">scheduler metrics descriptions</a>；内部直方图：<a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L1015-L1018">sched.timeToRun</a>。</span>
+          <span class="source-caption">metric 定义：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/metrics/description.go#L436-L475">scheduler metrics descriptions</a>；内部直方图：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go#L1021-L1024">sched.timeToRun</a>。</span>
 
           <h3>运行 burst、trace 与 handoff benchmark</h3>
           <p>
             <a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/scheduler_lab_test.go">scheduler_lab_test.go</a>
-            先启动 64 个 goroutine，让它们全部在 <code>release</code> channel 上 waiting；关闭 channel 会一次唤醒它们，形成清晰的 runnable burst。
+            先启动 64 个 goroutine，收齐它们的就绪通知后关闭 <code>release</code> channel，集中释放这批工作。通知发生在接收 <code>release</code> 之前，所以它不保证关闭时所有 G 都已 waiting；哪些 G 实际阻塞、何时变成 runnable，应以 trace 中的事件为准。
           </p>
 
           <pre><code class="language-bash">cd go-runtime/examples/fetchd
@@ -347,16 +350,16 @@ GODEBUG=schedtrace=1000,scheddetail=1 go test -run TestSchedulerBurst</code></pr
             <li><a href="https://go.dev/blog/container-aware-gomaxprocs">Container-aware GOMAXPROCS</a></li>
             <li><a href="https://pkg.go.dev/runtime/metrics">runtime/metrics package documentation</a></li>
             <li><a href="https://go.dev/doc/diagnostics">Diagnostics in the Go ecosystem</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L29-L72">G status definitions</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/runtime2.go#L473-L830">runtime g, m, and p structures</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L5292-L5424">newproc and newproc1</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L7473-L7750">local run queues and work stealing</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3385-L3715">findRunnable</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L4133-L4231">schedule</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L3322-L3383">execute</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L445-L485">gopark and goready</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L6626-L6698">sysmon retake and preemption threshold</a></li>
-            <li><a href="https://github.com/golang/go/blob/go1.26.0/src/runtime/proc.go#L6858-L6895">preemptone</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go#L29-L72">G status definitions</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go#L471-L836">runtime g, m, and p structures</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L5332-L5478">newproc and newproc1</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L7532-L7810">local run queues and work stealing</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L3401-L3814">findRunnable</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L4149-L4247">schedule</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L3338-L3399">execute</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L457-L497">gopark and goready</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L6684-L6756">sysmon retake and preemption threshold</a></li>
+            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L6913-L6954">preemptone</a></li>
             <li><a href="https://github.com/Rememorio/blog/blob/main/go-runtime/examples/fetchd/scheduler_lab_test.go">fetchd scheduler lab</a></li>
           </ul>
 
