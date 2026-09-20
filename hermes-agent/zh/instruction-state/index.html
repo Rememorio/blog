@@ -63,7 +63,7 @@
             </p>
             <div class="meta-line">
               <span>系列 2 / 7</span>
-              <span>源码快照：fa1a5c0</span>
+              <span>核实日期：2026-09-20</span>
               <span>主题：instruction &amp; state</span>
               <span>范围：公开源码能观察到的步骤</span>
             </div>
@@ -102,8 +102,8 @@
             </div>
 
             <p>
-              这里仍然使用 Hermes Agent 的固定源码快照 <code>fa1a5c0</code>。这个快照很重要，因为最新实现已经调整了 system prompt 的层级：
-              Skill 索引现在位于更靠后的 <code>volatile</code> 区，而不是稳定前缀。本文以当前源码为准，不沿用旧文章或旧提交里的排列。
+              本文根据 2026 年 9 月 20 日核实的固定源码解释实际读写行为。三层 system prompt、会话快照和真实历史是实现事实；
+              文中的信息分类方法是根据这些机制整理出的使用判断。工具指导规定哪些事实应该写入，不代表文件存储能自动证明事实的长期价值。
             </p>
 
             <h2>一、先别急着选文件：先判断这条信息是做什么的</h2>
@@ -159,7 +159,7 @@
 
             <p>
               Hermes 的
-              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/system_prompt.py#L152-L178"><code>build_system_prompt_parts</code></a>
+              <a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/system_prompt.py#L659-L707"><code>build_system_prompt_parts</code></a>
               先把材料放进三个有顺序的层级，再一次性连接。这里的顺序不是“谁更重要”的排名，而是“谁更可能跨会话保持不变”的排名。
             </p>
 
@@ -175,15 +175,15 @@
             </p>
 
             <p>
-              <code>context</code> 放当前工作区相关的材料，例如 coding workspace snapshot、调用方传入的 system message，以及项目 Context 文件。
+              <code>context</code> 放当前工作区相关的材料，依次包括调用方传入的 system message、项目 Context 文件，再接 coding workspace snapshot 与工作区指导。
               它不像身份那样跨所有会话稳定，但在一次项目会话里通常不会每轮变化。把它单列出来，也能看清一条规则究竟来自用户调用方还是仓库文件。
             </p>
 
             <p>
               <code>volatile</code> 放“下一次重建时更可能变化”的内容：Skill 索引、<code>MEMORY.md</code>、<code>USER.md</code>、外部 memory provider block、
-              会话日期与标识。源码把它放在最后，因此即使重建时尾部改变，前面的稳定前缀仍有机会被复用。注意：<strong>volatile 不等于每轮刷新</strong>。
-              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/system_prompt.py#L468-L567"><code>build_system_prompt</code></a>
-              会把完整结果缓存在当前 <code>AIAgent</code> 上，通常一场会话只构建一次，压缩或恢复路径才会重建。
+              冻结的插件段、会话起始时间与运行环境提示。源码把它放在最后，因此即使重建时尾部改变，前面的稳定前缀仍有机会被复用。注意：<strong>volatile 不等于每轮刷新</strong>。
+              <a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/system_prompt.py#L708-L752"><code>build_system_prompt</code></a>
+              会把完整结果缓存在当前 <code>AIAgent</code> 上，通常一场会话只构建一次；压缩使缓存失效时会重新读取 Memory，<a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/conversation_loop.py#L659-L711">恢复时则优先复用持久化的 prompt 字节</a>，只有兼容性检查要求时才重建。
             </p>
 
             <pre><code class="language-python">return {
@@ -197,39 +197,42 @@
               这是有意的快照语义，不是写入失败。长期状态的“磁盘真相”和当前模型正在使用的“会话快照”是两份不同生命周期的数据。
             </p>
 
-            <h3>2.2 项目 Context 为什么只能有一个优先来源</h3>
+            <h3>2.2 项目 Context 先选类别，再合并目录规则</h3>
             <p>
-              项目规则也不能把所有候选文件一起拼上。假设仓库同时存在 <code>HERMES.md</code>、<code>AGENTS.md</code> 和 <code>CLAUDE.md</code>，
-              三份文件可能对测试命令或生成文件给出冲突要求。Hermes 的
-              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/prompt_builder.py#L2132-L2206"><code>build_context_files_prompt</code></a>
-              因此使用“第一个命中者获胜”的优先级：先找 <code>.hermes.md/HERMES.md</code>，再找当前目录的 <code>AGENTS.md</code>，然后是
-              <code>CLAUDE.md</code>，最后才是 Cursor rules。<code>SOUL.md</code> 是独立的身份来源，不参加这场项目规则竞争。
+              仓库同时存在 <code>HERMES.md</code>、<code>AGENTS.md</code> 和 <code>CLAUDE.md</code> 时，Hermes 仍只选择第一个有内容的项目规则类别：
+              先找 <code>.hermes.md/HERMES.md</code>，再找 AGENTS 目录链，然后是当前目录的 <code>CLAUDE.md/claude.md</code>，最后是 Cursor rules。
+              <a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/prompt_builder.py#L1718-L1745"><code>build_context_files_prompt</code></a> 的 <code>or</code> 链限制的是类别，并不承诺只读一个文件；
+              用户配置目录中的 <code>SOUL.md</code> 仍是独立身份来源。
             </p>
-
-            <pre><code class="language-python">project_context = (
-    load_hermes_md(cwd)
-    or load_agents_md(cwd)
-    or load_claude_md(cwd)
-    or load_cursorrules(cwd)
-)</code></pre>
-
             <p>
-              这个 <code>or</code> 链保护的是<strong>单一权威来源</strong>。如果“不要改生成文件”确实是仓库约定，最自然的归宿就是选中的项目 Context 文件；
-              它会随仓库进入 system prompt，也能由代码评审检查。把同一条规则写进用户 Memory，反而会让无关仓库也受它约束。
+              选中 AGENTS 类别后，<a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/prompt_builder.py#L1587-L1612">目录发现逻辑</a> 从 Git 根目录走到当前目录，按根到深层顺序合并规则。
+              每个目录优先取首个非空且可读取的 <code>AGENTS.override.md</code>、<code>AGENTS.md</code> 或 <code>agents.md</code>；重复内容去重，并保留来源标签。
+              没有 Git 根目录时只检查当前目录，避免把任意父目录文件变成项目指令。
+            </p>
+            <pre><code class="language-text">仓库根目录 AGENTS.md：不要直接修改生成文件
+packages/api/AGENTS.override.md：本目录运行 schema 生成器
+当前目录：packages/api
+
+未命中 HERMES 规则 → 选中 AGENTS 类别
+根目录规则 → api 目录规则 → 合成项目 Context
+同目录的 AGENTS.md 被非空 override 文件遮蔽；CLAUDE 类别不再加载</code></pre>
+            <p>
+              这个例子保护的是“共享规则在前，局部规则随后补充”的目录关系。仓库约定应留在选中的项目 Context 中，随代码评审；
+              不应复制进每场会话都加载的用户 Memory。这里的合并是文本组装，实际是否遵守规则仍取决于模型及工具执行约束。
             </p>
 
             <h3>2.3 turn-only 为什么不属于第四层 system prompt</h3>
             <p>
               修测试时，外部 memory provider 可能临时找回一条相关记录，插件也可能给当前请求补一段上下文。这些材料只服务本轮判断。
               Hermes 没有给 system prompt 增加“第四层”，而是由
-              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_context.py#L53-L88"><code>compose_user_api_content</code></a>
+              <a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/turn_context.py#L81-L95"><code>compose_user_api_content</code></a>
               把它们附到当前 user message 的 API 副本上。
             </p>
 
             <p>
               存储里的用户原话仍然是“修复失败测试”；发送给模型的副本可以是“修复失败测试 + 本轮召回”。Hermes 还把实际发送的字节保存为
               <code>api_content</code> sidecar，后续重放时使用同一份内容，相关写入在
-              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_context.py#L1182-L1241">回合准备尾部</a>。
+              <a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/turn_context.py#L815-L859">回合准备尾部</a>。
               这样既保住真实 transcript，也避免同一条历史消息在下一轮以另一组临时材料重新渲染。
             </p>
 
@@ -251,20 +254,21 @@
 
             <h3>3.1 Memory：小、稳定、进入下一份会话快照的事实</h3>
             <p>
-              Hermes 的内置 Memory 不是无限向量库，而是两份有字符预算、可直接审计的文件。<code>MEMORY.md</code> 保存 agent 对环境和项目的短事实，
-              <code>USER.md</code> 保存用户偏好与沟通方式。默认预算分别只有 2200 和 1375 个字符，说明这里追求的是精炼事实，不是堆积整段对话。
+              Hermes 的内置 Memory 不是无限向量库，而是两份有字符预算、可直接审计的文件。<code>MEMORY.md</code> 保存跨任务的环境事实和长期约定，
+              <code>USER.md</code> 保存用户偏好与沟通方式。默认预算仍分别为 2200 和 1375 个字符。当前 <a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/tools/memory_tool.py#L265-L283">工具指导</a> 进一步要求：事实应适用于每场会话，而不只是“以后可能有用”。
+              某类任务的偏好、纠正与踩坑经验应进入对应 Skill；用户身份、跨任务的稳定环境事实和没有更具体归属的长期约定，才适合 Memory。
             </p>
 
             <p>
-              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/memory_tool.py#L148-L244"><code>MemoryStore</code></a>
+              <a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/tools/memory_tool_store.py#L67-L143"><code>MemoryStore</code></a>
               同时维护 live entries 与 frozen snapshot。会话开始时，磁盘条目经过威胁模式扫描后形成 snapshot；system prompt 读取 snapshot。
               本轮 <code>add</code> 或 <code>replace</code> 修改 live entries 并落盘，但不会偷偷改动已经交给模型的 snapshot。
             </p>
 
             <p>
-              写入的拒绝条件也很明确：空内容、注入或泄露模式、重复条目、字符超限、文件读取失败都会被拒绝；<code>replace</code> 遇到多个不同匹配时不会猜。
+              写入的拒绝条件也很明确：空内容、注入或泄露模式、字符超限、文件读取失败都会被拒绝；重复添加返回成功但不重复写入；<code>replace</code> 遇到多个不同匹配时不会猜。
               这些保护集中在
-              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/memory_tool.py#L390-L485"><code>add</code> 与 <code>replace</code></a>。
+              <a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/tools/memory_tool_store.py#L243-L307"><code>add</code> 与 <code>replace</code></a>。
               长期事实越小，写入越保守，日后越容易看懂它为什么存在。
             </p>
 
@@ -275,29 +279,37 @@
             </p>
 
             <p>
-              discovery 路径先调用 <code>db.search_messages</code>，再按 session lineage 去重，并把命中消息附近的窗口与首尾 bookends 一起返回；见
-              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/session_search_tool.py#L690-L770"><code>_discover</code></a>。
-              这让读者能够回答“证据在哪一轮、前后发生了什么”，而不只得到一个脱离上下文的关键词片段。
+              discovery 路径先调用 <code>db.search_messages</code>，再按 session lineage 去重。默认 <code>detail="adaptive"</code> 只为最高排名结果展开完整窗口与首尾 bookends，其他结果保持紧凑；<code>detail="full"</code> 才全部展开。见
+              <a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/tools/session_search_tool.py#L329-L430"><code>_discover</code></a>。
+              紧凑结果保留 <code>match_message_id</code>，可以继续用 <code>around_message_id</code> 定位上下文。当前仍在模型上下文里的同谱系记录通常被排除；已经压缩归档或因会话重置离开当前上下文的记录仍可被找回。
             </p>
 
             <h3>3.3 Skills：保存以后怎样做，而不是过去做过什么</h3>
             <p>
               如果这次修复让 agent 学会了“生成文件出错时，先修改 schema，再运行生成器，最后验证 diff”，这已经不再是一条事实，而是一套步骤。
-              Skills 就是 Hermes 的程序性记忆：system prompt 只放简短索引，模型判断匹配后再用 <code>skill_view</code> 加载完整正文，避免每次都携带所有流程。
+              Skills 就是 Hermes 的程序性记忆：普通 Skill 在 system prompt 中只放简短索引，模型判断匹配后再用 <code>skill_view</code> 加载完整正文，避免每次都携带所有流程；显式预加载的固定 Skill 是例外。
             </p>
 
             <p>
               最新的
-              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/prompt_builder.py#L1602-L1629"><code>build_skills_system_prompt</code></a>
-              有进程内 LRU 与磁盘 snapshot 两层索引缓存；这只是“怎样快速构造 Skill 目录”，不是按 LRU 淘汰 Skill 内容。
+              <a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/prompt_builder.py#L1252-L1295"><code>build_skills_system_prompt</code></a>
+              通过<a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/prompt_builder.py#L1401-L1478">进程内 LRU 与磁盘 snapshot</a> 两层缓存构造索引；这只是“怎样快速构造 Skill 目录”，不是按 LRU 淘汰 Skill 内容。
               Skill 的生命周期与 Curator 会在下一篇解释，这里只要记住：LRU 管的是 prompt 索引缓存，不是知识价值排序。
             </p>
 
             <p>
-              <a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/skill_manager_tool.py#L1513-L1607"><code>skill_manage</code></a>
-              支持 create、edit、patch、delete 和支持文件操作。成功后会清掉 Skill 索引缓存，让后续 prompt 构建看见新目录；但它不会把当前会话已经缓存的 system prompt
-              每次写入后都强行重排。当前任务知道自己刚改了什么，未来会话则从新索引重新发现它。
+              <a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/tools/skill_manager_tool.py#L751-L804"><code>skill_manage</code></a>
+              向模型公开 <code>operations</code> 数组：create、patch、delete，以及支持文件的 write_file/remove_file；普通写操作失败会回滚触及的 Skill；delete 必须是本次调用唯一操作。旧的单操作参数仍为历史记录和待审批重放保留兼容，完整重写可以使用 patch 的 content 形式。成功后清掉索引缓存，但不会每次写入都强行重排当前会话 prompt。
             </p>
+
+            <p>假设生成流程正文和配套检查说明必须一起更新，可以提交一组操作。下面是有效的调用形状，省略已有 Skill 的其他内容；写之前仍应读取目标文件。</p>
+            <pre><code class="language-json">{
+  "operations": [
+    {"action": "patch", "name": "regenerate-api", "old_string": "运行生成器", "new_string": "修改 schema 后运行生成器"},
+    {"action": "write_file", "name": "regenerate-api", "file_path": "references/verification.md", "file_content": "检查生成 diff，并运行 API 测试。"}
+  ]
+}</code></pre>
+            <p>如果第二项失败，第一项也不应留下半次更新。<a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/tools/skill_manager_batch.py#L184-L267">批量写入实现</a> 持有全部目标锁直到提交或回滚；若文件系统导致回滚失败，会保留快照供恢复，因此仍要检查错误结果。审批开启时暂存也不等于内容已经写入。Memory 同样支持<a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/tools/memory_tool_store.py#L328-L367">按最终字符预算检查的原子 operations 批</a>，便于一次替换旧事实并添加新事实。</p>
 
             <h2>四、把同一句话放进五个位置，行为会怎样改变</h2>
             <p>
@@ -394,22 +406,21 @@
 
             <p>
               不过，知道经验应该落进哪本账，还没有解释它怎样从一次已经完成的任务里被提炼出来。
-              <a href="../runtime-learning/">下一篇</a>会从 finalizer 开始，按 background review、nudge 与 Curator 的调用顺序追踪交付后学习，
-              并回答为什么这些步骤不能抢在用户答案之前运行。
+              <a href="../runtime-learning/">下一篇</a>会从 finalizer 开始，区分 background review、nudge 与周期 Curator 的触发与写入时机，并解释后台工作怎样与前台回答分开。
             </p>
 
             <h2 id="sources">参考源码</h2>
             <ul class="source-list">
-              <li><a href="https://github.com/NousResearch/hermes-agent/tree/fa1a5c0485a6a912517ef2ded76e39907aa26087">NousResearch/hermes-agent 固定源码快照</a></li>
-              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/system_prompt.py#L152-L178">system prompt 三层组装逻辑</a></li>
-              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/system_prompt.py#L468-L567">context、volatile 与最终拼装</a></li>
-              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/prompt_builder.py#L2132-L2206">项目 Context 文件优先级</a></li>
-              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/turn_context.py#L53-L129">turn-only api_content 组装与重放</a></li>
-              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/memory_tool.py#L148-L244">Memory live state 与冻结快照</a></li>
-              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/memory_tool.py#L390-L485">Memory 写入保护</a></li>
-              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/session_search_tool.py#L690-L770">SessionDB FTS5 discovery</a></li>
-              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/agent/prompt_builder.py#L1602-L1629">Skill 索引两层缓存</a></li>
-              <li><a href="https://github.com/NousResearch/hermes-agent/blob/fa1a5c0485a6a912517ef2ded76e39907aa26087/tools/skill_manager_tool.py#L1513-L1607">skill_manage 写入与索引失效</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/tree/40bfcbda34ab3cea5d85107551d6edd3f6089edc">NousResearch/hermes-agent 固定源码快照</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/system_prompt.py#L659-L707">system prompt 三层组装逻辑</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/system_prompt.py#L708-L752">context、volatile 与最终拼装</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/prompt_builder.py#L1587-L1745">项目 Context 文件优先级</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/turn_context.py#L81-L116">turn-only api_content 组装与重放</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/tools/memory_tool_store.py#L67-L143">Memory live state 与冻结快照</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/tools/memory_tool_store.py#L243-L307">Memory 写入保护</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/tools/session_search_tool.py#L329-L430">SessionDB FTS5 discovery</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/agent/prompt_builder.py#L1252-L1295">Skill 索引两层缓存</a></li>
+              <li><a href="https://github.com/NousResearch/hermes-agent/blob/40bfcbda34ab3cea5d85107551d6edd3f6089edc/tools/skill_manager_tool.py#L751-L804">skill_manage 写入与索引失效</a></li>
             </ul>
           </section>
         </article>
