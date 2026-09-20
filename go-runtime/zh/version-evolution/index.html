@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go 源码阅读（九）：升级 Go，究竟改变了什么</title>
+    <meta name="description" content="从 Go 1.22 循环变量出发，区分工具链、模块语言版本与兼容默认，沿 Go 1.18–1.27 的泛型、Timer、容器调度、GC 与 HTTP 变化，建立可验证的升级方法。" />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Go 源码阅读（九）：升级 Go，究竟改变了什么" />
+    <meta property="og:description" content="同一份源码为何会有不同结果？用确定性实验理解循环变量与版本门控，再判断运行时优化、兼容开关和新 API 应当怎样进入升级流程。" />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/version-evolution-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/zh/version-evolution/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/version-evolution/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/version-evolution/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.route-note { border-color: rgba(31, 119, 123, 0.32); background: rgba(31, 119, 123, 0.1); }
+      .note.route-note strong { color: var(--rose); }
+      .article-body pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .source-caption { display: block; margin: -10px 0 24px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+      .article-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line); }
+      .article-pager a { color: var(--teal); font-weight: 800; text-decoration: none; }
+      @media (max-width: 760px) {
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+        .article-pager { flex-direction: column; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="文章快捷入口"><a href="../">Go 系列</a><a href="#versions">版本控制</a><a href="#loops">循环变量</a><a href="#timers">Timer</a><a href="#upgrade">升级验证</a><a href="#sources">参考资料</a></nav>
+      <nav class="site-actions" aria-label="站点操作"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="语言切换"><a class="active" href="./" lang="zh-CN" aria-current="page">中文</a><a href="../../en/version-evolution/" lang="en">English</a></span></nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero">
+          <p class="eyebrow">Go 从请求到生产现场 · 第九篇</p>
+          <h1 class="long-title">升级 Go，究竟改变了什么</h1>
+          <p class="lead">把构建镜像换成新版 Go，改高 go.mod 的版本，再顺手采用几个新 API，看起来像一次升级，实际改变了不同的东西。本篇从循环里保存的三个闭包开始，追踪语言语义、兼容默认和运行时实现各由谁决定，再把 Go 1.18–1.27 中值得重新验证的变化放回本系列的请求路径。</p>
+          <div class="meta-line"><span>版本范围：Go 1.18–1.27</span><span>稳定实现：Go 1.27.1</span><span>实验：versionlab</span></div>
+          <figure class="hero-image"><img src="../assets/version-evolution-cover.png" alt="Go 升级路线：从工具链与 go.mod 走向程序行为验证" /></figure>
+        </section>
+        <section class="article-body">
+          <p>前八篇沿一条 <code>fetchd</code> 请求解释了值、调度、同步、类型、取消、内存和网络。那些文章核实的是 <a href="https://github.com/golang/go/tree/f043823a99a4118989a34afec015d23b5d54d01e">Go 开发分支的固定快照</a>，属于 Go 1.28 开发周期，不能笼统称为“基于 Go 1.27”。本篇改用历版发布说明回答“何时上线”，用规范回答“程序可以依赖什么”，涉及当前稳定实现时引用 <a href="https://github.com/golang/go/tree/862c888e612ac346c7c4d99c9392bdfd265f33b0">Go 1.27.1 的固定源码</a>。截至 2026 年 9 月 20 日，官方最新稳定版为 <a href="https://go.dev/doc/devel/release#go1.27.1">Go 1.27.1</a>。</p>
+
+          <h2>一、同一个编译器，三个闭包为什么读出不同的值</h2>
+          <p>假设请求里有三个任务。我们先保存“稍后读取任务编号”的函数，循环结束后才调用。这里不用 goroutine，避免把变量语义和调度先后混在一起：</p>
+          <pre><code class="language-go">var reads []func() int
+for _, v := range []int{1, 2, 3} {
+    reads = append(reads, func() int { return v })
+}
+for _, read := range reads {
+    fmt.Println(read())
+}</code></pre>
+          <p>在旧语言语义下，循环反复给同一个 <code>v</code> 赋值，三个闭包保留的是同一个变量；等循环结束，读到的都是 3。Go 1.22 的新语义让每次迭代拥有自己的声明变量，因此三个闭包依次读到 1、2、3。变化发生在<strong>变量何时建立</strong>，并不是编译器在函数调用时猜出了开发者的意图。</p>
+          <p>更容易误判的是：即使实际运行 Go 1.27.1 工具链，声明 <code>go 1.21</code> 的模块仍可保留旧语言语义。仓库里的 <a href="https://github.com/Rememorio/blog/tree/main/go-runtime/examples/versionlab">versionlab 实验目录</a> 用同一工具链编译两个独立小模块，分别声明 <code>go 1.21</code> 和 <code>go 1.22</code>，得到如下对照。它隔离了模块语言版本这个变量，无需依赖旧编译器恰好如何调度 goroutine。</p>
+          <pre><code class="language-text">循环内声明 v 的闭包：
+go 1.21 → [3 3 3]
+go 1.22 → [1 2 3]
+
+循环外声明、循环内用 = 赋值：两者仍为 [3 3 3]
+迭代值含有共享 slice：两者仍可修改同一底层数组</code></pre>
+          <p>这也解释了为什么“Go 1.22 修好了 for range，所以闭包问题都消失了”不够准确：它修正了一类长期容易出错的默认语义，仍然保留显式共享变量，也没有改变值拷贝和共享内存的规则。要知道一个程序实际采用哪套规则，需要先拆开版本这个词。</p>
+
+          <h2 id="versions">二、升级时，哪些东西由哪个版本决定</h2>
+          <p>一次构建至少要分清三件事。工具链是实际工作的编译器、链接器、runtime 和标准库；模块语言版本告诉编译器，这个模块的源码按哪一代语言解释；兼容默认则决定部分标准库或运行时行为是否暂时沿用旧方式。它们有关联，却不是同一个开关。</p>
+          <figure class="figure"><img src="../assets/version-controls.png" alt="同一次 Go 构建的三个控制位置：实际工具链提供实现，模块及文件版本决定语言语义，主模块或工作区版本和显式 GODEBUG 决定部分兼容行为" /></figure>
+          <pre><code class="language-go">module example.com/version-demo
+
+go 1.21.0
+toolchain go1.27.1</code></pre>
+          <p>这份用于说明版本控制的假设 <code>go.mod</code> 表示模块至少要求 Go 1.21.0，并建议在它作为主模块时使用 Go 1.27.1 工具链。选择到新版工具链之后，源码并不会因此自动变成 Go 1.27 语言。依赖模块也保有各自的 <code>go</code> 行，主模块升到 1.22，不等于把所有依赖的循环一并改写。</p>
+          <p>从 <a href="https://go.dev/doc/go1.21#tools">Go 1.21</a> 起，<code>go</code> 行是严格的最低版本要求；工具链自动选择是否允许查找或下载，还取决于 <code>GOTOOLCHAIN</code> 配置。<a href="https://go.dev/doc/toolchain">工具链文档</a> 也规定了文件级例外：蕴含至少 Go 1.21 最低版本的 <code>//go:build go1.N</code> 约束可以调整该文件的语言版本。因此定位语义时，要看实际构建的模块和文件，不能只看终端上一次执行的 <code>go version</code>。</p>
+          <div class="table-wrap"><table><thead><tr><th>你改变了什么</th><th>主要影响</th><th>不能由此推出</th></tr></thead><tbody>
+            <tr><td>实际构建工具链</td><td>编译器、runtime、标准库实现及可用能力</td><td>每个模块自动采用最新语言语义</td></tr>
+            <tr><td>模块的 <code>go</code> 行</td><td>最低工具链要求、模块语言版本；主模块还参与兼容默认选择</td><td>依赖的源码语义全部同步升级</td></tr>
+            <tr><td><code>GODEBUG</code> / <code>godebug</code></td><td>文档列出的具体兼容行为</td><td>可以永久恢复任意旧版本实现</td></tr>
+            <tr><td><code>GOEXPERIMENT</code></td><td>构建时选择仍存在的实验或实现回退</td><td>实验 API 已获得长期稳定承诺</td></tr>
+          </tbody></table></div>
+          <p><a href="https://go.dev/doc/godebug">GODEBUG 兼容机制</a> 的目的，是给特定行为变化留下迁移时间。默认值通常由工作区或主模块的版本参与决定，显式环境设置可以覆盖；但开关会有自己的生命周期。保留旧 <code>go</code> 行，也不能把新版工具链变回旧 runtime。后面 Timer 在 1.27 删除旧模式，就是这个边界的实际例子。</p>
+
+          <h2 id="loops">三、Go 1.22 改的是迭代变量，不是所有共享关系</h2>
+          <h3>3.1 <code>:=</code> 声明新变量，<code>=</code> 继续赋值旧变量</h3>
+          <p><a href="https://go.dev/ref/spec#For_statements">语言规范</a> 把边界写得很明确：在 range 子句用 <code>:=</code> 声明的迭代变量，每轮都有新变量；如果变量原先已经存在，range 只做赋值。这段写法在 Go 1.22 之后依然共享 <code>v</code>：</p>
+          <pre><code class="language-go">var v int
+var reads []func() int
+for _, v = range []int{1, 2, 3} {
+    reads = append(reads, func() int { return v })
+}
+// 循环结束后调用 reads：仍然得到 3、3、3。</code></pre>
+          <p>这不是遗漏。代码明确选择了外部变量，循环结束后也可能还需要读取它。编译器不能为了修复闭包而擅自抹掉这个共享意图。在 <a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/src/cmd/compile/internal/noder/writer.go#L1640-L1655">循环语义选择逻辑</a> 中，文件语言版本参与决定迭代变量是否独立；实际转换还区分循环是否声明了变量。理解这两层，比无条件保留或删除所有 <code>v := v</code> 更可靠。</p>
+          <figure class="figure"><img src="../assets/loopvar-ownership.png" alt="同一工具链下，go 1.21 模块的三个闭包读取同一个 v=3；go 1.22 模块中 := 使各闭包分别读取 v1=1、v2=2、v3=3；变量独立不等于底层数据独立" /></figure>
+          <h3>3.2 <code>&amp;v</code> 指向拷贝，修改原元素仍要用索引</h3>
+          <pre><code class="language-go">type Job struct{ Attempts int }
+jobs := []Job{{Attempts: 1}, {Attempts: 2}}
+var copies []*Job
+for _, v := range jobs {
+    copies = append(copies, &amp;v)
+}
+copies[0].Attempts = 99
+fmt.Println(jobs[0].Attempts) // 仍为 1
+
+for i := range jobs {
+    jobs[i].Attempts++       // 直接修改原元素
+}</code></pre>
+          <p>在新语义下，保存的两个指针分别指向两轮迭代变量，但这些变量仍接收了元素的值拷贝。新语义没有把 <code>&amp;v</code> 改成 <code>&amp;jobs[i]</code>。反过来，如果 <code>Job</code> 内部含有 slice、map 或指针字段，复制结构体也不会递归复制它们指向的数据；两个独立变量仍可能读写同一对象。这与<a href="../value-semantics/">值语义篇</a>的结论完全一致。</p>
+          <pre><code class="language-go">shared := []int{0}
+items := [][]int{shared, shared}
+for _, item := range items {
+    item[0]++ // item 独立，不代表底层数组独立
+}
+fmt.Println(shared[0]) // 2</code></pre>
+          <p>因此升级后可以去掉某些为了隔离迭代变量而写的额外拷贝，却不能顺便删除保护共享数组的锁，也不能认定并发闭包都已安全。保存变量地址还可能改变对象的逃逸和分配方式；正确性和分配量应分别验证。</p>
+          <h3>3.3 三段式 <code>for</code> 也改变了，循环体仍能影响下一轮</h3>
+          <p>变化不限于 range。<code>for i := 0; i &lt; n; i++</code> 中由初始化语句声明的变量，也按迭代分开。第一轮使用初始化语句建立的变量；后续轮次在执行 post 语句之前建立新变量，值取自上一轮变量当时的值。这既让闭包保留各轮的变量，又保留了循环体修改 <code>i</code> 对后续迭代的影响。</p>
+          <pre><code class="language-go">var reads []func() int
+for i := 0; i &lt; 3; i++ {
+    reads = append(reads, func() int { return i })
+}
+// 循环结束后调用：旧语义为 3、3、3；新语义为 0、1、2。</code></pre>
+          <p>从旧代码迁移时，最值得检查的是保存地址、保存闭包，以及依赖同一个循环变量跨轮通信的少数写法。普通按值调用函数的循环通常不需要改动。<a href="https://go.dev/blog/loopvar-preview">官方迁移说明</a> 也解释了为什么采用模块级选择：旧模块保持旧含义，维护者可以逐步采用新语义，而不是让整个依赖树在更换编译器后一起改变。</p>
+
+          <h2>四、把版本变化放回请求路径，而不是背一张功能表</h2>
+          <p>循环变量属于语言语义变化；更多版本改进是可主动采用的 API，或不改调用方式的实现替换。下面只保留会影响本系列阅读和升级判断的变化。表里的版本是正式引入或默认启用的节点，不表示此前不存在实验版本，也不表示这一版只有这些功能。</p>
+          <div class="table-wrap"><table><thead><tr><th>版本</th><th>值得关注的变化</th><th>在服务里重新确认什么</th></tr></thead><tbody>
+            <tr><td><a href="https://go.dev/doc/go1.18">1.18</a></td><td>泛型函数、泛型类型和类型集约束</td><td>用类型参数表达复用；性能仍比较真实实例，不能默认优于接口</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.19">1.19</a></td><td><code>GOMEMLIMIT</code> 与 <code>debug.SetMemoryLimit</code></td><td>给 Go 管理的内存留软预算，同时给外部内存和突发留余量</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.20">1.20</a></td><td><code>context.WithCancelCause</code> / <code>Cause</code></td><td>记录取消原因，同时继续等待实际工作结束</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.21">1.21</a></td><td>工具链选择；<code>slices</code>、<code>maps</code>、<code>log/slog</code>；<code>WithoutCancel</code>、<code>AfterFunc</code></td><td>明确构建版本；采用通用 API 时保留共享数据与任务回收责任</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.22">1.22</a></td><td>循环声明变量逐轮独立、range 整数；ServeMux 方法和通配符路由</td><td>查模块语言版本；回归带花括号、转义路径及冲突的路由</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.23">1.23</a></td><td>range 函数迭代器；Timer/Ticker 新实现</td><td>迭代器在 yield 返回 false 后停止；排查依赖旧 timer 缓冲与时序的代码</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.24">1.24</a></td><td>泛型类型别名；内建 map 使用 Swiss Tables</td><td>别名支持迁移类型 API；map 仍无序，存在并发写入时仍须同步</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.25">1.25</a></td><td><code>WaitGroup.Go</code>、<code>testing/synctest</code>、<code>reflect.TypeAssert</code>；容器感知 GOMAXPROCS</td><td>显式采用新 API；检查容器配额、语言版本与手工并行度配置</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.26">1.26</a></td><td>Green Tea GC 默认启用；<code>new(expr)</code></td><td>重测 GC CPU 和尾延迟；表达式创建指针不等于一定堆分配</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.27">1.27</a></td><td>方法自身类型参数；移除 timer 旧模式；HTTP/1 有界排空；尺寸专用分配例程默认启用</td><td>清理失效兼容假设；验证连接复用与分配性能，不把实现优化当合同</td></tr>
+          </tbody></table></div>
+          <p>表中几个相邻版本尤其容易串错：range 函数在 1.22 是实验，1.23 才正式支持；泛型类型别名在 1.23 是受限实验，1.24 才完整支持；<code>synctest</code> 在 1.24 实验，1.25 正式可用且 API 有调整；Green Tea 在 1.25 实验，1.26 默认启用。<code>reflect.TypeAssert</code> 则是 <a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/api/go1.25.txt#L85">1.25 新增的 API</a>，不能因为在 1.26 源码里读到它，就称为 1.26 特性。</p>
+          <p>Go 1.27 的泛型方法也有精确边界：普通类型的方法可以声明自己的类型参数；<strong>接口方法仍不能声明类型参数，泛型方法也不能用来实现接口方法</strong>。它让泛型操作更自然地放到类型命名空间下，没有把接口变成另一套运行时泛型分派机制。</p>
+
+          <h2 id="timers">五、Timer 展示了兼容窗口如何开始，也如何结束</h2>
+          <p>假设一个 worker 复用同一个 <code>time.Timer</code> 等待下一批任务。旧实现的 timer channel 有一个缓冲位置：超时值可能已经进入缓冲，随后 Reset 并不能简单抹掉所有旧观察。Stop、排空与 Reset 的组合必须考虑是否已有接收者，粗略复制一段“Stop 返回 false 就再读一次”的代码，本来就可能卡住。</p>
+          <p><a href="https://go.dev/doc/go1.23#timer-changes">Go 1.23</a> 改变了这个模型。基于 channel 的 Timer 和 Ticker 对程序表现为同步通道，Stop 或 Reset 返回之后，不会再收到调用前安排的旧值；程序不再引用的 Timer/Ticker 也可以被 GC 回收。这里改变的是计时器实现和相关保证，业务是否还需要停止等待、释放其他资源，仍由应用负责。</p>
+          <figure class="figure"><img src="../assets/timer-version-boundary.png" alt="Timer 兼容窗口：Go 1.23 至 1.26 按主模块 go 版本与 GODEBUG 选择旧异步或新同步语义；1.27 移除旧路径，只保留同步 timer channel；不包括 AfterFunc 或所有 channel" /></figure>
+          <div class="table-wrap"><table><thead><tr><th>实际工具链</th><th>决定 timer channel 行为的条件</th><th>升级时的检查</th></tr></thead><tbody>
+            <tr><td>1.22 及更早</td><td>旧缓冲实现</td><td>检查 Stop/Reset、排空及并发接收是否协调</td></tr>
+            <tr><td>1.23–1.26</td><td>默认随主模块 <code>go</code> 版本选择；<code>asynctimerchan=0/1</code> 可显式选择新/旧行为</td><td>分别运行新旧模式，找出依赖缓冲和调度延迟的测试</td></tr>
+            <tr><td>1.27 起</td><td>旧模式已移除，timer channel 始终同步</td><td>旧 <code>go</code> 行或旧环境值都不能恢复旧模式</td></tr>
+          </tbody></table></div>
+          <p>在兼容窗口内，主模块声明 <code>go 1.23</code> 或更高版本，默认采用新行为；旧主模块默认保留旧行为。到了 <a href="https://go.dev/doc/go1.27#runtime">Go 1.27</a>，<code>asynctimerchan</code> 被永久移除。如果在 <code>go.mod</code> 的 <code>godebug</code> 或 <code>//go:debug</code> 中继续指定已删除的旧值，构建会报错；环境里保留旧值也不会恢复旧实现。兼容开关应当带着退出计划使用。</p>
+          <h3>5.1 测试应该等待什么</h3>
+          <p>一个已经可读的 channel 与一个极短 timer 进入同一个 select 时，旧实现的额外延迟常让前者获胜。新实现让两者更可能同时就绪，select 就可以随机选中任意一项。<a href="https://go.dev/wiki/Go123Timer">官方 Timer 迁移指南</a> 将此列为需要修正的测试假设：不能把“以前经常这样”写成优先级合同，也不要用 <code>len(t.C)</code> 判断下一次接收是否安全。</p>
+          <p><a href="https://pkg.go.dev/testing/synctest">testing/synctest</a> 可以让一组测试 goroutine 在隔离环境中使用虚拟时钟，等待它们进入无法由外部事件解除的阻塞状态，再推进时间。只有 bubble 内所有 goroutine 都满足这种持久阻塞条件，虚拟时间才可能推进；<code>synctest.Wait</code> 等待其他 goroutine 到达该状态，本身不等同于推进时钟。它适合验证超时和取消流程，但真实网络 I/O、外部进程或任意 mutex 等待不会自动变成可控时间。它也不穷举全部调度；仍需用 channel 等同步手段证明状态，并运行 race 检查。</p>
+
+          <h2>六、实现更快了，哪些推理仍然成立</h2>
+          <h3>6.1 容器里的并行度与内存预算，回答的是两个问题</h3>
+          <p><a href="https://go.dev/doc/go1.25#runtime">Go 1.25</a> 让 Linux 默认 GOMAXPROCS 考虑 cgroup CPU 带宽限制，并引入周期更新。它参考的是 CPU limit，而不是 Kubernetes CPU request。<a href="https://pkg.go.dev/runtime#GOMAXPROCS">当前文档</a> 同时说明：主模块语言版本不高于 1.24 时，相关兼容默认保留旧行为；通过环境变量或调用 <code>runtime.GOMAXPROCS</code> 手工指定值，也会禁用自动更新。</p>
+          <p>因此升级时先查服务是否已经使用手动值或第三方自动配置，再在真实容器里观测并行度和限流。不能只从宿主机核数推断有效并行度，也不能把 quota 简单当作线程硬上限。当前实现还涉及向上取整、CPU affinity 和通常至少 2 的选择，这些细节应与负载一起验证。</p>
+          <p><code>GOMEMLIMIT</code> 解决的是另一种压力：从 1.19 起，它为 Go runtime 管理的内存提供软预算，协同 GC 调整回收。它不是进程 RSS 上限，也不会统计全部 C 分配和外部映射。把它设成容器内存上限，不能推出不会 OOM；设得低于长期存活数据，又可能把 CPU 消耗在反复回收上。预算应留出 Go 之外的用量和突发，具体机制见<a href="../escape-allocation-gc/">内存与 GC 篇</a>。</p>
+          <h3>6.2 Swiss map、Green Tea 和分配器改变成本，不改所有权</h3>
+          <p>1.24 的 Swiss map 改善查找等操作的实现；1.26 默认启用的 Green Tea 改善 GC 标记与扫描的局部性；1.27 的尺寸专用分配例程减少部分小对象分配的开销。它们值得重新测量吞吐、GC CPU 和尾延迟，却没有让 map 的迭代变得有序，没有使并发写 map 自动安全，也没有消除指针共享、逃逸或 GC 暂停。</p>
+          <p>同样，<code>new(expr)</code> 只是更简洁地创建并初始化变量，是否需要堆分配仍由逃逸等分析决定；<code>reflect.TypeAssert</code> 可以避开某些不必要的中间分配，但不能保证所有反射路径零分配。发布说明中的基准收益属于测量结果，不能直接替换成“我们的服务会快同样百分比”。沿<a href="../abstraction-boundaries/">接口、泛型与反射篇</a>的实验方法，用同一数据形状与调用路径重新比较才有意义。</p>
+          <h3>6.3 HTTP/1 提前关闭之后，仍需证明连接真的回池</h3>
+          <p><a href="https://go.dev/doc/go1.27#net/http">Go 1.27</a> 为 HTTP/1 响应体的提前 Close 加入保守的有界排空，给连接复用多一次机会。在 <a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/src/net/http/transport.go#L2417-L2441">稳定版实现</a> 中，这次尝试受 256 KiB 和 50ms 预算限制；<a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/src/net/http/transport.go#L2603-L2620">入口判断</a>还查看响应声明的 ContentLength，并不是只看剩余多少字节。这些数字和条件属于具体实现。</p>
+          <p>应用仍应关闭响应体，能合理读完时读到真实 EOF。提前 Close 返回只说明调用方释放了响应体，并不证明排空成功或连接已经回池；观测下一次复用前，应区分回池事件与调用返回。稳定版在未观察到 body EOF 且 ContentLength 不大于上限时尝试排空；前一篇的<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L2607-L2616">开发快照</a>还把连接存活、keep-alive 开启放进排空前置条件。这恰好说明为什么源码链接需要固定版本。<a href="../transport-http2-diagnostics/">网络诊断篇</a>的可迁移结论仍成立：用 <code>httptrace</code> 记录实际请求阶段，再解释复用率变化。</p>
+
+          <h2 id="upgrade">七、把一次升级拆成三个可以独立验证的变化</h2>
+          <h3>7.1 先换工具链，记录实际构建条件</h3>
+          <p>先保持业务修改、依赖版本和模块语言版本不变，在目标受支持工具链上构建、测试和重放代表性负载。记录实际 Go 版本、<code>go.mod</code>、工作区、<code>GOTOOLCHAIN</code>、<code>GODEBUG</code>、<code>GOEXPERIMENT</code> 及容器 CPU/内存配置。这样才能把实现变化与业务改动分开；保持旧语言版本也只是减少变量，不保证所有旧兼容行为永久保留。如果新的依赖要求更高的最低 Go 版本，就需要相应提高主模块的 go 行；下面的步骤是在能够拆开时减少变量，不是要求每次升级都能完全分离。</p>
+          <h3>7.2 再提高语言版本，运行能区分新旧语义的实验</h3>
+          <p>接着调整 <code>go</code> 行，检查保存闭包与地址的循环、版本约束文件、ServeMux 路由和依赖兼容默认的测试。可以先运行本篇的<a href="https://github.com/Rememorio/blog/tree/main/go-runtime/examples/versionlab">完整对照实验</a>：</p>
+          <pre><code class="language-bash">cd go-runtime/examples/versionlab
+go run .</code></pre>
+          <p>实验说明模块版本如何改变循环含义，不声称模拟全部历史 runtime。若要验证 1.23–1.26 的 Timer 兼容路径，需要在仍提供两种模式的工具链上分别运行；仅在 1.27 上设置旧环境值，不能算完成了旧模式对照。容器调度也应在相应 Linux 配额环境中验证，而不是用桌面运行结果代替。</p>
+          <h3>7.3 最后采用新 API，并为性能变化设验收条件</h3>
+          <p>当基础升级稳定之后，再按实际收益采用 <code>WaitGroup.Go</code>、<code>TypeAssert</code>、迭代器或泛型方法。每次替换都保留原来的责任：WaitGroup.Go 不负责传播错误或取消，回调不得 panic；WithoutCancel 不替你管理新任务寿命；AfterFunc 的停止函数也不等待已开始的回调结束。</p>
+          <div class="table-wrap"><table><thead><tr><th>要接受的变化</th><th>最小验收证据</th></tr></thead><tbody>
+            <tr><td>语言语义正确</td><td>闭包、地址与共享对象反例；对应模块和文件版本</td></tr>
+            <tr><td>取消、超时和完成正确</td><td>证明状态先后的同步测试、超时边界测试、race 运行</td></tr>
+            <tr><td>资源行为可接受</td><td>相同负载下的有效并行度、内存峰值、分配量、GC CPU</td></tr>
+            <tr><td>用户可见表现改善</td><td>相同流量下的吞吐、P99、超时率、连接复用及回退条件</td></tr>
+          </tbody></table></div>
+          <p>真正值得长期保留的不是一张“用过哪些新特性”的清单，而是解释变化的能力：这一处由语言规则保证，另一处由兼容开关暂时保留，还有一处只是当前实现的优化。把它们分开，就能既采用新版工具链的改进，也知道哪一个实验足以证明自己的服务已经适应了变化。</p>
+
+          <h2 id="sources">参考源码与文档</h2>
+          <ul class="source-list">
+            <li><a href="https://go.dev/doc/devel/release">Go 发布历史与支持政策</a>；<a href="https://go.dev/doc/toolchain">工具链选择</a>；<a href="https://go.dev/doc/godebug">GODEBUG 兼容机制</a></li>
+            <li><a href="https://go.dev/ref/spec#For_statements">for 语句规范</a>；<a href="https://go.dev/blog/loopvar-preview">Go 1.22 循环变量迁移说明</a></li>
+            <li><a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/src/cmd/compile/internal/noder/writer.go#L1640-L1655">稳定版编译器的循环语言版本选择</a></li>
+            <li><a href="https://go.dev/wiki/Go123Timer">Go 1.23 Timer 迁移指南</a>；<a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/src/internal/godebugs/table.go#L84-L110">Go 1.27 移除的兼容开关</a></li>
+            <li><a href="https://pkg.go.dev/runtime#GOMAXPROCS">GOMAXPROCS 合同与当前实现说明</a>；<a href="https://go.dev/doc/gc-guide">GC 指南</a>；<a href="https://go.dev/blog/swisstable">Swiss map 实现介绍</a></li>
+            <li><a href="https://pkg.go.dev/testing/synctest">testing/synctest</a>；<a href="https://pkg.go.dev/sync#WaitGroup.Go">WaitGroup.Go</a>；<a href="https://pkg.go.dev/reflect#TypeAssert">reflect.TypeAssert</a></li>
+            <li><a href="https://go.dev/doc/go1.27">Go 1.27 发布说明</a>；<a href="https://github.com/Rememorio/blog/tree/main/go-runtime/examples/versionlab">可运行的版本语义对照实验</a></li>
+          </ul>
+          <nav class="article-pager" aria-label="文章翻页"><a href="../transport-http2-diagnostics/">← 第八篇：网络与联合诊断</a><a href="../">返回系列目录 →</a></nav>
+        </section>
+      </article></main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body"); const toc = document.querySelector("#toc"); if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => { const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim()); table.querySelectorAll("tbody tr").forEach((row) => Array.from(row.children).forEach((cell, index) => { if (headers[index]) cell.dataset.label = headers[index]; })); });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4")); if (!headings.length) return;
+        const counts = new Map(); const slugify = (value) => value.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "") || "section";
+        const list = document.createElement("ol"); list.className = "toc-list"; const links = []; const lastItems = new Map();
+        const childListFor = (item) => { let child = item.querySelector(":scope > ol"); if (!child) { child = document.createElement("ol"); child.className = "toc-sublist"; item.appendChild(child); } return child; };
+        const parentListFor = (level) => { if (level === 2) return list; if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2)); if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3)); if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2)); return list; };
+        headings.forEach((heading, index) => { if (!heading.id) { const base = slugify(heading.textContent.trim()); const seen = counts.get(base) || 0; counts.set(base, seen + 1); heading.id = seen === 0 ? base : base + "-" + (seen + 1); } const level = Number(heading.tagName.slice(1)); const item = document.createElement("li"); const link = document.createElement("a"); link.href = "#" + heading.id; link.textContent = heading.textContent.trim(); link.className = "toc-link toc-level-" + level; if (index === 0) link.classList.add("active"); item.appendChild(link); parentListFor(level).appendChild(item); lastItems.set(level, item); if (level <= 2) lastItems.delete(3); if (level <= 3) lastItems.delete(4); links.push(link); });
+        toc.appendChild(list); const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === "#" + id));
+        const observer = new IntersectionObserver((entries) => { const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top); if (visible[0]) activate(visible[0].target.id); }, { rootMargin: "-20% 0px -72% 0px", threshold: 0 }); headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+  <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>

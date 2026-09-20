@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reading Go Source, Part 9: What Actually Changes When You Upgrade Go?</title>
+    <meta name="description" content="Start with Go 1.22 loop variables, separate toolchain, module language version, and compatibility defaults, then build a verifiable upgrade process around Go 1.18–1.27 changes to generics, timers, scheduling, GC, and HTTP." />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Reading Go Source, Part 9: What Actually Changes When You Upgrade Go?" />
+    <meta property="og:description" content="Why can identical source produce different results? Use deterministic experiments to understand loop semantics and version selection, then evaluate runtime improvements, compatibility settings, and new APIs." />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/version-evolution-cover.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/go-runtime/en/version-evolution/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/go-runtime/zh/version-evolution/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/go-runtime/en/version-evolution/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/go-runtime/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong { color: var(--navy); font-weight: 900; }
+      .note.route-note { border-color: rgba(31, 119, 123, 0.32); background: rgba(31, 119, 123, 0.1); }
+      .note.route-note strong { color: var(--rose); }
+      .article-body pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .source-caption { display: block; margin: -10px 0 24px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+      .article-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line); }
+      .article-pager a { color: var(--teal); font-weight: 800; text-decoration: none; }
+      @media (max-width: 760px) {
+        .site-header .local-nav { flex-wrap: wrap; gap: 5px; overflow-x: visible; justify-content: center; }
+        .site-header .local-nav a { padding-inline: 6px; font-size: 11px; }
+        .article-pager { flex-direction: column; }
+      }
+    </style>
+    <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="Article shortcuts"><a href="../">Go series</a><a href="#versions">Versions</a><a href="#loops">Loop variables</a><a href="#timers">Timers</a><a href="#upgrade">Upgrade checks</a><a href="#sources">Sources</a></nav>
+      <nav class="site-actions" aria-label="Site actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="Language switcher"><a href="../../zh/version-evolution/" lang="zh-CN">中文</a><a class="active" href="./" lang="en" aria-current="page">English</a></span></nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero">
+          <p class="eyebrow">Go, from a request to production · Part 9</p>
+          <h1 class="long-title">What Actually Changes When You Upgrade Go?</h1>
+          <p class="lead">Replacing the build image, raising the version in go.mod, and adopting a few new APIs can look like one upgrade. They change different things. Starting with three closures saved inside a loop, this chapter follows the controls for language semantics, compatibility defaults, and runtime implementation, then puts selected Go 1.18–1.27 changes back into the request path explored throughout this series.</p>
+          <div class="meta-line"><span>Versions: Go 1.18–1.27</span><span>Stable implementation: Go 1.27.1</span><span>Experiment: versionlab</span></div>
+          <figure class="hero-image"><img src="../assets/version-evolution-cover.png" alt="A Go upgrade route from the toolchain and go.mod to verification of program behavior" /></figure>
+        </section>
+        <section class="article-body">
+          <p>The first eight chapters followed a <code>fetchd</code> request through values, scheduling, synchronization, types, cancellation, memory, and networking. They examined a <a href="https://github.com/golang/go/tree/f043823a99a4118989a34afec015d23b5d54d01e">fixed snapshot of Go's development branch</a> in the Go 1.28 development cycle. Calling all of that “Go 1.27” would be misleading. This chapter uses release notes to establish when a change shipped, specifications to establish what programs may rely on, and <a href="https://github.com/golang/go/tree/862c888e612ac346c7c4d99c9392bdfd265f33b0">fixed Go 1.27.1 source</a> for details of the current stable implementation. As of September 20, 2026, the latest official stable release is <a href="https://go.dev/doc/devel/release#go1.27.1">Go 1.27.1</a>.</p>
+
+          <h2>1. One compiler, three closures, different results</h2>
+          <p>Suppose a request contains three jobs. First we save functions that will read each job number later, then call those functions after the loop. There are no goroutines here: the example separates variable semantics from scheduling.</p>
+          <pre><code class="language-go">var reads []func() int
+for _, v := range []int{1, 2, 3} {
+    reads = append(reads, func() int { return v })
+}
+for _, read := range reads {
+    fmt.Println(read())
+}</code></pre>
+          <p>Under the old language semantics, the loop repeatedly assigns to the same <code>v</code>. All three closures retain that variable, whose final value is 3. Go 1.22 gives each iteration its own declared variable, so the closures read 1, 2, and 3. What changed is <strong>when a variable is created</strong>; the compiler is not guessing the programmer's intent when a function is called.</p>
+          <p>The less obvious part is that a module declaring <code>go 1.21</code> can retain the old language semantics even when built by Go 1.27.1. The repository's <a href="https://github.com/Rememorio/blog/tree/main/go-runtime/examples/versionlab">versionlab experiment</a> uses one toolchain to build two separate small modules, declaring <code>go 1.21</code> and <code>go 1.22</code>. The comparison below isolates the module language version, without depending on how an old compiler happened to schedule goroutines.</p>
+          <pre><code class="language-text">Closures over v declared by the loop:
+go 1.21 → [3 3 3]
+go 1.22 → [1 2 3]
+
+v declared outside and assigned with =: both still produce [3 3 3]
+Iteration values containing a shared slice: both can modify the same array</code></pre>
+          <p>That is why “Go 1.22 fixed for-range, so closure problems are gone” is too broad. The release improved a frequently troublesome default. It preserved explicit variable sharing and did not change the rules for copying values or sharing memory. To know which rules a program uses, we first need to separate the meanings of “version.”</p>
+
+          <h2 id="versions">2. Which version controls which part of an upgrade?</h2>
+          <p>A build has at least three distinct controls. The toolchain supplies the actual compiler, linker, runtime, and standard library. The module language version tells the compiler which language rules to apply to that module. Compatibility defaults decide whether selected library or runtime behaviors temporarily retain an older form. These controls interact, but they are not a single switch.</p>
+          <figure class="figure"><img src="../assets/version-controls.png" alt="Three controls in one Go build: the actual toolchain supplies the implementation, module and file versions select language semantics, and the main module or workspace version plus explicit GODEBUG settings select certain compatibility behaviors" /></figure>
+          <pre><code class="language-go">module example.com/version-demo
+
+go 1.21.0
+toolchain go1.27.1</code></pre>
+          <p>This hypothetical <code>go.mod</code>, used to explain version selection, declares Go 1.21.0 as the module's minimum requirement and suggests Go 1.27.1 when working with it as the main module. Selecting that toolchain does not automatically turn the source into Go 1.27 language. Dependencies retain their own <code>go</code> lines too: raising the main module to 1.22 does not rewrite every dependency's loops.</p>
+          <p>Since <a href="https://go.dev/doc/go1.21#tools">Go 1.21</a>, the <code>go</code> line is a strict minimum requirement. Whether toolchain selection may locate or download another version also depends on <code>GOTOOLCHAIN</code>. The <a href="https://go.dev/doc/toolchain">toolchain documentation</a> describes a file-level exception: a <code>//go:build go1.N</code> constraint implying a minimum version of at least Go 1.21 can adjust that file's language version. When investigating semantics, inspect the module and file actually being built, not just the last <code>go version</code> printed in a terminal.</p>
+          <div class="table-wrap"><table><thead><tr><th>What you change</th><th>Main effect</th><th>What does not follow</th></tr></thead><tbody>
+            <tr><td>Actual build toolchain</td><td>Compiler, runtime, library implementation, and available capabilities</td><td>Every module automatically adopts the latest language rules</td></tr>
+            <tr><td>A module's <code>go</code> line</td><td>Minimum toolchain requirement and module language version; the main module also affects compatibility defaults</td><td>Dependency source semantics all advance together</td></tr>
+            <tr><td><code>GODEBUG</code> / <code>godebug</code></td><td>Specific documented compatibility behaviors</td><td>Any older implementation can be restored indefinitely</td></tr>
+            <tr><td><code>GOEXPERIMENT</code></td><td>Build-time selection of experiments or implementation fallbacks that still exist</td><td>An experimental API has a long-term stability guarantee</td></tr>
+          </tbody></table></div>
+          <p>The <a href="https://go.dev/doc/godebug">GODEBUG compatibility mechanism</a> provides migration time for specific behavior changes. Defaults are generally influenced by the workspace or main module version, and explicit environment settings can override them. Each setting has its own lifetime, however. Keeping an older <code>go</code> line cannot turn a newer toolchain back into an older runtime. The removal of the old timer mode in 1.27 is a concrete example.</p>
+
+          <h2 id="loops">3. Go 1.22 changed iteration variables, not every shared relationship</h2>
+          <h3>3.1 <code>:=</code> declares variables; <code>=</code> assigns existing ones</h3>
+          <p>The <a href="https://go.dev/ref/spec#For_statements">language specification</a> draws a precise line. Iteration variables declared by a range clause with <code>:=</code> are new for each iteration. If the variables already exist, range assigns to them. This form still shares <code>v</code> in Go 1.22 and later:</p>
+          <pre><code class="language-go">var v int
+var reads []func() int
+for _, v = range []int{1, 2, 3} {
+    reads = append(reads, func() int { return v })
+}
+// Calling reads after the loop still produces 3, 3, 3.</code></pre>
+          <p>This is deliberate. The code explicitly chooses an outer variable, which may also be needed after the loop. Fixing closures cannot silently remove that sharing. The compiler's <a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/src/cmd/compile/internal/noder/writer.go#L1640-L1655">loop-semantics selection</a> uses the file language version to help decide whether iteration variables are distinct; the transformation also distinguishes loops that declare variables. Understanding both conditions is more reliable than unconditionally keeping or removing every <code>v := v</code>.</p>
+          <figure class="figure"><img src="../assets/loopvar-ownership.png" alt="With the same toolchain, three closures in a go 1.21 module read one v=3; a go 1.22 module using := gives each closure its own v1=1, v2=2, or v3=3; separate variables can still share underlying data" /></figure>
+          <h3>3.2 <code>&amp;v</code> points to a copy; use an index to modify the element</h3>
+          <pre><code class="language-go">type Job struct{ Attempts int }
+jobs := []Job{{Attempts: 1}, {Attempts: 2}}
+var copies []*Job
+for _, v := range jobs {
+    copies = append(copies, &amp;v)
+}
+copies[0].Attempts = 99
+fmt.Println(jobs[0].Attempts) // Still 1.
+
+for i := range jobs {
+    jobs[i].Attempts++       // Modifies the original element.
+}</code></pre>
+          <p>With the new semantics, the two saved pointers refer to different iteration variables. Those variables still received copies of the elements. The change did not turn <code>&amp;v</code> into <code>&amp;jobs[i]</code>. Conversely, if a <code>Job</code> contains a slice, map, or pointer field, copying the struct does not recursively copy the referenced data. Two distinct variables can still access the same object. The conclusions of the <a href="../value-semantics/">value-semantics chapter</a> remain intact.</p>
+          <pre><code class="language-go">shared := []int{0}
+items := [][]int{shared, shared}
+for _, item := range items {
+    item[0]++ // Distinct item variables still share the backing array.
+}
+fmt.Println(shared[0]) // 2</code></pre>
+          <p>An upgrade may let you remove copies introduced only to isolate iteration variables. It does not justify removing a lock protecting a shared array or assuming all concurrent closures are now safe. Keeping variable addresses can also change escape and allocation behavior. Check correctness and allocation cost separately.</p>
+          <h3>3.3 Three-clause <code>for</code> loops changed too</h3>
+          <p>The change is not limited to range. Variables declared by the initializer in <code>for i := 0; i &lt; n; i++</code> are also distinct across iterations. The first iteration uses the variable created by the initializer. Before the post statement of each subsequent iteration, a new variable is created and initialized from the previous iteration's value at that moment. Closures can retain their iteration's variable while changes to <code>i</code> in the loop body still affect later iterations.</p>
+          <pre><code class="language-go">var reads []func() int
+for i := 0; i &lt; 3; i++ {
+    reads = append(reads, func() int { return i })
+}
+// Called after the loop: old semantics give 3, 3, 3; new ones give 0, 1, 2.</code></pre>
+          <p>During migration, focus on loops that retain addresses or closures, and the less common code that deliberately communicates across iterations through one variable. Ordinary loops passing values directly to functions usually need no change. The <a href="https://go.dev/blog/loopvar-preview">official migration discussion</a> explains the module-level choice: old modules retain their meaning, allowing maintainers to adopt the new semantics gradually instead of changing an entire dependency tree by replacing its compiler.</p>
+
+          <h2>4. Put version changes back into the request path</h2>
+          <p>Loop variables are a language-semantics change. Many other improvements are APIs you can explicitly adopt or implementation replacements that require no call-site change. The table keeps only changes useful for understanding this series and planning an upgrade. Each version marks a formal introduction or default enablement, not the absence of earlier experiments or the complete contents of that release.</p>
+          <div class="table-wrap"><table><thead><tr><th>Version</th><th>Relevant change</th><th>What to check in a service</th></tr></thead><tbody>
+            <tr><td><a href="https://go.dev/doc/go1.18">1.18</a></td><td>Generic functions, generic types, and type-set constraints</td><td>Express reuse through type parameters; benchmark real instantiations rather than assuming they beat interfaces</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.19">1.19</a></td><td><code>GOMEMLIMIT</code> and <code>debug.SetMemoryLimit</code></td><td>Budget Go-managed memory while leaving room for external memory and bursts</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.20">1.20</a></td><td><code>context.WithCancelCause</code> / <code>Cause</code></td><td>Record why work was canceled, and still wait for the work to finish</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.21">1.21</a></td><td>Toolchain selection; <code>slices</code>, <code>maps</code>, <code>log/slog</code>; <code>WithoutCancel</code>, <code>AfterFunc</code></td><td>Make build versions explicit; retain responsibility for shared data and task cleanup when adopting APIs</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.22">1.22</a></td><td>Distinct loop-declared variables, integer range; ServeMux methods and wildcard routes</td><td>Check module language versions and regress routes with braces, escaped paths, or conflicting patterns</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.23">1.23</a></td><td>Range over iterator functions; new Timer/Ticker implementation</td><td>Stop iteration when yield returns false; find dependencies on old timer buffering and timing</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.24">1.24</a></td><td>Generic type aliases; builtin maps use Swiss Tables</td><td>Use aliases to migrate type APIs; map iteration remains unordered; concurrent access involving writes still needs synchronization</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.25">1.25</a></td><td><code>WaitGroup.Go</code>, <code>testing/synctest</code>, <code>reflect.TypeAssert</code>; container-aware GOMAXPROCS</td><td>Adopt APIs explicitly; check container quotas, language versions, and manual parallelism settings</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.26">1.26</a></td><td>Green Tea GC enabled by default; <code>new(expr)</code></td><td>Remeasure GC CPU and tail latency; creating a pointer does not necessarily allocate on the heap</td></tr>
+            <tr><td><a href="https://go.dev/doc/go1.27">1.27</a></td><td>Methods with their own type parameters; old timer mode removed; bounded HTTP/1 draining; size-specialized allocation enabled by default</td><td>Remove obsolete compatibility assumptions; measure reuse and allocation performance without treating optimizations as contracts</td></tr>
+          </tbody></table></div>
+          <p>Several adjacent releases are easy to confuse. Range over functions was experimental in 1.22 and became official in 1.23. Generic type aliases were a restricted experiment in 1.23 and fully supported in 1.24. <code>synctest</code> was experimental in 1.24 and generally available in 1.25 with API changes. Green Tea was experimental in 1.25 and enabled by default in 1.26. <code>reflect.TypeAssert</code> was <a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/api/go1.25.txt#L85">added in 1.25</a>; encountering it in 1.26 source does not make it a 1.26 feature.</p>
+          <p>Generic methods in Go 1.27 also have a precise limit: a method on a concrete type may declare its own type parameters, but <strong>interface methods may not declare type parameters, and generic methods cannot implement interface methods</strong>. The feature places generic operations more naturally in a type's namespace. It does not introduce a separate runtime generic-dispatch mechanism for interfaces.</p>
+
+          <h2 id="timers">5. Timers show how a compatibility window opens and closes</h2>
+          <p>Consider a worker reusing a <code>time.Timer</code> while waiting for the next batch. In the old implementation, a timer channel had one buffered slot. A timeout value might already be queued, and a subsequent Reset could not simply erase every stale observation. Coordinating Stop, draining, and Reset required accounting for concurrent receivers. Blindly copying “receive once whenever Stop returns false” could already leave a program blocked.</p>
+          <p><a href="https://go.dev/doc/go1.23#timer-changes">Go 1.23</a> changed the model. Channel-based timers and tickers behave synchronously: after Stop or Reset returns, receives do not deliver stale values arranged before that call. Timers and tickers no longer referenced by the program can also be garbage-collected. These changes affect timer implementation and guarantees. The application still decides when its business operation stops waiting and when other resources are released.</p>
+          <figure class="figure"><img src="../assets/timer-version-boundary.png" alt="Timer compatibility window: main module go version and GODEBUG select old asynchronous or new synchronous semantics in Go 1.23–1.26; 1.27 removes the old path; this concerns timer channels, not AfterFunc or all channels" /></figure>
+          <div class="table-wrap"><table><thead><tr><th>Actual toolchain</th><th>What selects timer-channel behavior</th><th>Upgrade check</th></tr></thead><tbody>
+            <tr><td>1.22 and earlier</td><td>Old buffered implementation</td><td>Check coordination of Stop/Reset, draining, and concurrent receivers</td></tr>
+            <tr><td>1.23–1.26</td><td>Default follows the main module's <code>go</code> version; <code>asynctimerchan=0/1</code> explicitly selects new/old behavior</td><td>Run both modes to find dependencies on buffering and scheduling delays</td></tr>
+            <tr><td>1.27 onward</td><td>Old mode removed; timer channels are always synchronous</td><td>Neither an old <code>go</code> line nor an old environment value restores the old mode</td></tr>
+          </tbody></table></div>
+          <p>During the compatibility window, a main module declaring <code>go 1.23</code> or later selects the new default, while an older main module retains the old one. In <a href="https://go.dev/doc/go1.27#runtime">Go 1.27</a>, <code>asynctimerchan</code> was removed permanently. Specifying an obsolete value through a <code>godebug</code> entry in <code>go.mod</code> or a <code>//go:debug</code> directive now causes a build error. Leaving the old value in the environment cannot restore the implementation either. Compatibility settings should come with a plan to stop using them.</p>
+          <h3>5.1 What should a test wait for?</h3>
+          <p>When an already-readable channel and a very short timer enter one select, the old timer implementation's additional delay often let the first channel win. The new implementation makes it more likely that both are ready, allowing select to choose either. The <a href="https://go.dev/wiki/Go123Timer">official timer migration guide</a> identifies this as a test assumption to correct. “It usually happened first” is not a priority guarantee. Nor should <code>len(t.C)</code> decide whether the next receive is safe.</p>
+          <p><a href="https://pkg.go.dev/testing/synctest">testing/synctest</a> lets a group of test goroutines use a virtual clock inside an isolated bubble. Time advances when the goroutines are blocked in ways that cannot be resolved by outside events. Every goroutine in the bubble must be durably blocked before virtual time can advance. <code>synctest.Wait</code> waits for the other goroutines to reach that state; returning from Wait and advancing the clock are not the same action. It is useful for timeout and cancellation tests, but real network I/O, external processes, and arbitrary mutex waits do not automatically become controlled time. It does not explore every scheduling order either. Continue to prove states with synchronization such as channels, and run race checks.</p>
+
+          <h2>6. Which reasoning survives a faster implementation?</h2>
+          <h3>6.1 Container parallelism and memory budgets answer different questions</h3>
+          <p><a href="https://go.dev/doc/go1.25#runtime">Go 1.25</a> made the default GOMAXPROCS on Linux consider cgroup CPU bandwidth limits and introduced periodic updates. It considers a CPU limit, not a Kubernetes CPU request. The <a href="https://pkg.go.dev/runtime#GOMAXPROCS">current documentation</a> also states that the compatibility defaults preserve old behavior for a main module language version of 1.24 or earlier. Setting a manual value through the environment or <code>runtime.GOMAXPROCS</code> disables automatic updates.</p>
+          <p>Before upgrading, check whether the service already sets a manual value or uses a third-party automatic configuration library. Then observe effective parallelism and throttling in a real container. Host CPU count alone does not explain effective parallelism, and a quota is not a simple hard limit on threads. The current implementation also considers upward rounding, CPU affinity, and a usual minimum of 2. Evaluate these details with the actual workload.</p>
+          <p><code>GOMEMLIMIT</code> addresses a different pressure. Since 1.19 it has supplied a soft budget for memory managed by the Go runtime, influencing GC behavior. It is not a process RSS limit and does not include all C allocations or external mappings. Setting it equal to the container's memory limit does not guarantee protection from OOM; setting it below the long-lived data can instead consume CPU in repeated collection. Leave room for non-Go usage and bursts. The <a href="../escape-allocation-gc/">memory and GC chapter</a> explains the underlying mechanism.</p>
+          <h3>6.2 Swiss maps, Green Tea, and allocation routines change cost, not ownership</h3>
+          <p>Swiss maps in 1.24 improved the implementation of operations such as lookup. Green Tea, enabled by default in 1.26, improved locality in GC marking and scanning. Size-specialized allocation routines in 1.27 reduced some small-object allocation costs. These are reasons to remeasure throughput, GC CPU, and tail latency. They did not make map iteration ordered, make concurrent map writes safe, or remove pointer sharing, escape, and GC pauses.</p>
+          <p>Likewise, <code>new(expr)</code> is a concise way to create and initialize a variable; escape analysis and related decisions still determine whether it needs heap allocation. <code>reflect.TypeAssert</code> can avoid some unnecessary intermediate allocations, but it does not guarantee zero allocations on every reflection path. A release-note benchmark result is a measurement, not a promise of the same percentage improvement in your service. Follow the experiments in the <a href="../abstraction-boundaries/">interfaces, generics, and reflection chapter</a>, using the same data shapes and call paths for comparison.</p>
+          <h3>6.3 After closing an HTTP/1 body, still prove the connection returned to the pool</h3>
+          <p><a href="https://go.dev/doc/go1.27#net/http">Go 1.27</a> added conservative, bounded draining after an early Close of an HTTP/1 response body, giving connection reuse another chance. In the <a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/src/net/http/transport.go#L2417-L2441">stable implementation</a>, the attempt has a 256 KiB and 50ms budget. Its <a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/src/net/http/transport.go#L2603-L2620">entry condition</a> also examines the response's declared ContentLength, rather than merely the remaining bytes. These numbers and conditions are implementation details.</p>
+          <p>The application must still close response bodies and should read to real EOF when that is reasonable. An early Close returning means the caller has relinquished the body; it does not prove that draining succeeded or the connection is already idle. Distinguish the pooling event from the method return before testing subsequent reuse. The stable release tries draining when body EOF has not been observed and ContentLength is within the limit. The preceding chapter’s <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L2607-L2616">development snapshot</a> additionally requires a live connection and enabled keep-alives before attempting the drain. This demonstrates why source references need a fixed version. The transferable lesson from the <a href="../transport-http2-diagnostics/">network-diagnostics chapter</a> remains: record actual request phases with <code>httptrace</code>, then explain changes in reuse.</p>
+
+          <h2 id="upgrade">7. Separate an upgrade into three independently verifiable changes</h2>
+          <h3>7.1 Change the toolchain first, and record the actual build conditions</h3>
+          <p>Keep business changes, dependency versions, and module language versions fixed initially. Build, test, and replay representative workloads with the target supported toolchain. Record the actual Go version, <code>go.mod</code>, workspace, <code>GOTOOLCHAIN</code>, <code>GODEBUG</code>, <code>GOEXPERIMENT</code>, and container CPU/memory configuration. This separates implementation changes from application changes. Retaining an older language version only reduces variables; it does not preserve every compatibility behavior forever. If a new dependency requires a higher minimum Go version, the main module’s go line must rise accordingly. These steps isolate changes when possible; not every upgrade allows them to be separated completely.</p>
+          <h3>7.2 Raise the language version, then run experiments that distinguish the semantics</h3>
+          <p>Next adjust the <code>go</code> line. Check loops retaining closures and addresses, version-constrained files, ServeMux routes, and tests relying on compatibility defaults. Start with this chapter's <a href="https://github.com/Rememorio/blog/tree/main/go-runtime/examples/versionlab">complete comparison experiment</a>:</p>
+          <pre><code class="language-bash">cd go-runtime/examples/versionlab
+go run .</code></pre>
+          <p>The experiment demonstrates how module versions change loop meaning; it does not claim to simulate every historical runtime. Testing the 1.23–1.26 timer compatibility paths requires a toolchain that still provides both modes. Setting an old environment value on 1.27 is not a test of the old mode. Similarly, validate container scheduling with the relevant Linux quotas rather than substituting a desktop run.</p>
+          <h3>7.3 Adopt new APIs last, with explicit performance acceptance criteria</h3>
+          <p>Once the underlying upgrade is stable, adopt <code>WaitGroup.Go</code>, <code>TypeAssert</code>, iterators, or generic methods where they help. Preserve the responsibilities of the original code in each replacement. WaitGroup.Go does not propagate errors or cancel work, and its callback must not panic. WithoutCancel does not manage the lifetime of a newly independent task. The stop function returned by AfterFunc does not wait for an already-started callback to finish.</p>
+          <div class="table-wrap"><table><thead><tr><th>Change to accept</th><th>Minimum evidence</th></tr></thead><tbody>
+            <tr><td>Correct language semantics</td><td>Closure, address, and shared-object counterexamples; the relevant module and file versions</td></tr>
+            <tr><td>Correct cancellation, timeout, and completion</td><td>Synchronized tests proving event order, timeout-boundary tests, and race runs</td></tr>
+            <tr><td>Acceptable resource behavior</td><td>Effective parallelism, peak memory, allocations, and GC CPU under the same workload</td></tr>
+            <tr><td>Improved user-visible behavior</td><td>Throughput, P99, timeout rate, connection reuse, and rollback conditions under comparable traffic</td></tr>
+          </tbody></table></div>
+          <p>The durable result is an ability to explain a change: this behavior is guaranteed by language rules, that one is temporarily preserved by a compatibility setting, and another is an optimization in the current implementation. Keeping those distinctions clear lets you adopt a newer toolchain's improvements while knowing which experiment can show that your service has adapted.</p>
+
+          <h2 id="sources">Sources and further reading</h2>
+          <ul class="source-list">
+            <li><a href="https://go.dev/doc/devel/release">Go release history and support policy</a>; <a href="https://go.dev/doc/toolchain">toolchain selection</a>; <a href="https://go.dev/doc/godebug">GODEBUG compatibility</a></li>
+            <li><a href="https://go.dev/ref/spec#For_statements">For statement specification</a>; <a href="https://go.dev/blog/loopvar-preview">Go 1.22 loop-variable migration</a></li>
+            <li><a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/src/cmd/compile/internal/noder/writer.go#L1640-L1655">Loop language-version selection in the stable compiler</a></li>
+            <li><a href="https://go.dev/wiki/Go123Timer">Go 1.23 timer migration</a>; <a href="https://github.com/golang/go/blob/862c888e612ac346c7c4d99c9392bdfd265f33b0/src/internal/godebugs/table.go#L84-L110">Compatibility settings removed in Go 1.27</a></li>
+            <li><a href="https://pkg.go.dev/runtime#GOMAXPROCS">GOMAXPROCS contract and implementation notes</a>; <a href="https://go.dev/doc/gc-guide">GC guide</a>; <a href="https://go.dev/blog/swisstable">Swiss map implementation</a></li>
+            <li><a href="https://pkg.go.dev/testing/synctest">testing/synctest</a>; <a href="https://pkg.go.dev/sync#WaitGroup.Go">WaitGroup.Go</a>; <a href="https://pkg.go.dev/reflect#TypeAssert">reflect.TypeAssert</a></li>
+            <li><a href="https://go.dev/doc/go1.27">Go 1.27 release notes</a>; <a href="https://github.com/Rememorio/blog/tree/main/go-runtime/examples/versionlab">Runnable version-semantics comparison</a></li>
+          </ul>
+          <nav class="article-pager" aria-label="Article pagination"><a href="../transport-http2-diagnostics/">← Part 8: Networking and joint diagnosis</a><a href="../">Back to the series →</a></nav>
+        </section>
+      </article></main>
+    </div>
+
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body"); const toc = document.querySelector("#toc"); if (!article || !toc) return;
+        document.querySelectorAll("table").forEach((table) => { const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent.trim()); table.querySelectorAll("tbody tr").forEach((row) => Array.from(row.children).forEach((cell, index) => { if (headers[index]) cell.dataset.label = headers[index]; })); });
+        const headings = Array.from(article.querySelectorAll("h2, h3, h4")); if (!headings.length) return;
+        const counts = new Map(); const slugify = (value) => value.toLowerCase().trim().replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-+|-+$/g, "") || "section";
+        const list = document.createElement("ol"); list.className = "toc-list"; const links = []; const lastItems = new Map();
+        const childListFor = (item) => { let child = item.querySelector(":scope > ol"); if (!child) { child = document.createElement("ol"); child.className = "toc-sublist"; item.appendChild(child); } return child; };
+        const parentListFor = (level) => { if (level === 2) return list; if (level === 3 && lastItems.get(2)) return childListFor(lastItems.get(2)); if (level === 4 && lastItems.get(3)) return childListFor(lastItems.get(3)); if (level === 4 && lastItems.get(2)) return childListFor(lastItems.get(2)); return list; };
+        headings.forEach((heading, index) => { if (!heading.id) { const base = slugify(heading.textContent.trim()); const seen = counts.get(base) || 0; counts.set(base, seen + 1); heading.id = seen === 0 ? base : base + "-" + (seen + 1); } const level = Number(heading.tagName.slice(1)); const item = document.createElement("li"); const link = document.createElement("a"); link.href = "#" + heading.id; link.textContent = heading.textContent.trim(); link.className = "toc-link toc-level-" + level; if (index === 0) link.classList.add("active"); item.appendChild(link); parentListFor(level).appendChild(item); lastItems.set(level, item); if (level <= 2) lastItems.delete(3); if (level <= 3) lastItems.delete(4); links.push(link); });
+        toc.appendChild(list); const activate = (id) => links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === "#" + id));
+        const observer = new IntersectionObserver((entries) => { const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top); if (visible[0]) activate(visible[0].target.id); }, { rootMargin: "-20% 0px -72% 0px", threshold: 0 }); headings.forEach((heading) => observer.observe(heading));
+      })();
+    </script>
+  <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+  <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>
