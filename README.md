@@ -87,7 +87,6 @@ stay stable as new essays are added.
 │   ├── assets/                 # Neutral gateway visual
 │   ├── zh/                     # Chinese route map, chapters, and localized figures
 │   └── en/                     # English route map, chapters, and localized figures
-├── temporal/                   # Compatibility redirects to the migrated Temporal chapter
 ├── agent-memory/               # Agent memory series map
 │   ├── index.html              # Series language gateway
 │   ├── zh/
