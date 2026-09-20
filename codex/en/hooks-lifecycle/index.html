@@ -100,12 +100,15 @@
             <figure class="hero-image">
               <img
                 src="../assets/hook-lifecycle-slots.png"
-                alt="Codex hook execution timeline showing session start, prompt hooks, tool hooks, compact, stop, events, and model context"
+                alt="Selected hook trigger points, conditional compaction, Stop continuation, and Interrupt/SessionEnd notifications"
               />
+            <figcaption>The figure highlights selected trigger points rather than all twelve events. Tools, approval, and compaction are conditional; see the text for SubagentStop and other events. Stop continuation does not apply to interruption or shutdown.</figcaption>
             </figure>
           </section>
 
           <section class="article-body">
+            <p>Reading contract. Track trigger times, synchronous decisions, async results, and events; separate continuation from end notifications. Verified on 2026-09-20 against public source <a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">the fixed public source snapshot</a>; private service behavior is outside scope.</p>
+
             <p>
               Start with one ordinary turn. The user submits a prompt. Codex may
               prepare context, call the model, run shell commands, edit files,
@@ -132,7 +135,7 @@
                 Each hook has a <code>HookEventName</code>, request schema, and
                 event-specific result parser. <code>hook_runtime</code> invokes it
                 at the corresponding stage, emits <code>HookStarted</code> and
-                <code>HookCompleted</code>, and returns the outcome to the turn.
+                <code>HookCompleted</code>, and handles the result according to the event and execution mode. End notifications and async results do not decide the current synchronous action.
               </p>
             </div>
 
@@ -158,16 +161,9 @@
             </ol>
 
             <h2>1. Put Hooks Back on the Timeline</h2>
-            <p>
-              The first source-level object is not a config file; it is the
-              event name. The protocol-level <code>HookEventName</code> enum
-              lists <code>PreToolUse</code>, <code>PermissionRequest</code>,
-              <code>PostToolUse</code>, <code>PreCompact</code>,
-              <code>PostCompact</code>, <code>SessionStart</code>,
-              <code>UserPromptSubmit</code>, <code>SubagentStart</code>,
-              <code>SubagentStop</code>, and <code>Stop</code>. Read in order,
-              those names form a turn lifecycle.
-            </p>
+
+            <p><code>HookEventName</code> now has twelve events: <code>PreToolUse</code>, <code>PermissionRequest</code>, <code>PostToolUse</code>, <code>PreCompact</code>, <code>PostCompact</code>, <code>SessionStart</code>, <code>SessionEnd</code>, <code>UserPromptSubmit</code>, <code>SubagentStart</code>, <code>SubagentStop</code>, <code>Stop</code>, and <code>Interrupt</code>. These are conditional trigger points, not a mandatory pipeline traversed every turn.</p>
+
 
             <div class="table-wrap">
               <table>
@@ -202,7 +198,7 @@
                     <td><code>PermissionRequest</code></td>
                     <td>Inside the approval path, before Guardian or user UI.</td>
                     <td>Return <code>Allow</code>, <code>Deny</code>, or no decision.</td>
-                    <td><code>permission_request.rs</code> and the tool orchestrator.</td>
+                    <td><code>permission_request.rs</code> and the Session::request_approval.</td>
                   </tr>
                   <tr>
                     <td><code>PostToolUse</code></td>
@@ -222,7 +218,7 @@
                     <td>Stop, continue, or add continuation fragments for another model pass.</td>
                     <td><code>stop.rs</code> and <code>run_turn_stop_hooks</code>.</td>
                   </tr>
-                </tbody>
+                <tr><td>Interrupt</td><td>After a root-thread turn has been interrupted and detached.</td><td>Notification and events; cannot restart that turn.</td><td>run_turn_interrupt_hooks.</td></tr><tr><td>SessionEnd</td><td>Root session shutdown.</td><td>Bounded notification without continuation.</td><td>run_session_end_hooks.</td></tr></tbody>
               </table>
             </div>
 
@@ -236,15 +232,15 @@
 
             <p>
               A shell command makes the separation concrete. If the model wants
-              to run <code>npm test</code>, the command reaches three adjacent
-              hooks:
+              to run <code>npm test</code>, three hooks may act along its execution
+              path; policy and review mode decide whether approval is requested:
             </p>
 
-            <pre><code class="language-text">tool call: shell("npm test")
+            <pre><code class="language-text">tool call: exec_command("npm test")
   -> PreToolUse sees tool name and input; may block or add context
-  -> PermissionRequest sees the approval payload; may allow or deny
-  -> ShellRuntime executes under the selected sandbox
-  -> PostToolUse sees the result; may add feedback for the next model step</code></pre>
+  -> [if approval is requested] PermissionRequest may allow or deny
+  -> [if allowed] UnifiedExecRuntime executes with the selected isolation
+  -> [after a result] PostToolUse may add feedback for the next model step</code></pre>
 
             <p>
               That is why a hook should not be read as one universal
@@ -261,15 +257,7 @@
               being runnable. Codex separates discovery from execution.
             </p>
 
-            <p>
-              <code>ClaudeHooksEngine::new</code> receives hook enablement,
-              trust bypass state, the config layer stack, plugin hook sources,
-              plugin hook load warnings, and the command shell. When hooks are
-              enabled, it calls <code>discover_handlers</code>. The discovery
-              result has two different representations: <code>HookListEntry</code> for
-              user-visible metadata and <code>ConfiguredHandler</code> for
-              runtime execution.
-            </p>
+            <p><code>ClaudeHooksEngine</code> combines feature switches, configuration layers, plugin sources, trust settings, and execution dependencies. Discovery still separates visible <code>HookListEntry</code> records from runnable <code>ConfiguredHandler</code> values, whose kind now distinguishes a command from an MCP call.</p>
 
             <div class="table-wrap">
               <table>
@@ -288,22 +276,16 @@
                   </tr>
                   <tr>
                     <td><code>ConfiguredHandler</code></td>
-                    <td>Event, matcher, command, timeout, source path, source, display order, env.</td>
+                    <td>Event, matcher, timeout, source path, source, display order, and command/MCP kind.</td>
                     <td>The runtime only keeps handlers that may execute in this session.</td>
                   </tr>
                 </tbody>
               </table>
             </div>
 
-            <p>
-              The filter is explicit. Discovery reads config layers and plugin
-              sources, validates matchers, skips empty commands and unsupported
-              async hooks, computes a command hook hash, then combines enablement
-              with <code>HookTrustStatus</code>. Managed hooks can run as managed.
-              Non-managed hooks become runnable only when the current hash
-              matches a trusted hash, unless the runtime has been told to bypass
-              trust.
-            </p>
+
+            <p>Discovery reads config layers and plugin sources, validates matchers, enablement, and trust hashes, then builds runnable handlers. <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/discovery.rs#L479-L650">Both command and MCP tool handlers are supported</a>. Commands may run asynchronously; MCP hooks name a server, tool, and input template. SessionEnd is an exception: async commands are forced synchronous and MCP handlers are rejected. Visibility in the list does not grant execution authority.</p>
+
 
             <div class="note key-point">
               <p>
@@ -319,7 +301,7 @@
               When a hook event fires, Codex does not run the command silently.
               Each event module follows the same broad shape: preview matching
               handlers, convert them into
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1455-L1488"><code>HookRunSummary</code></a>, execute the
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs"><code>HookRunSummary</code></a>, execute the
               commands, then parse stdout, stderr, exit code, or JSON output into
               an event-specific outcome.
             </p>
@@ -362,6 +344,13 @@
                 unexplained runtime pause.
               </p>
             </div>
+
+            <h3>3.1 Separate Synchronous Decisions from Async Notifications</h3>
+            <p>The <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/dispatcher.rs#L114-L185">dispatcher</a> runs matching synchronous handlers concurrently with <code>FuturesUnordered</code>, then returns results in configured order. Async commands enter session-owned background tasks and do not participate in the immediate decision. <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/command_runner.rs#L108-L164">Async completion handling</a> retains context, warnings, and errors, but drops Stop and Feedback entries. HookStarted therefore proves only that execution began; an asynchronous result cannot retroactively block a side effect.</p>
+
+            <p>If several synchronous PreToolUse handlers return <code>updated_input</code>, the last completed update wins. If any result blocks, the update is discarded. Input selection follows completion order, while decision aggregation follows the event rules; the last configured hook does not automatically win.</p>
+
+            <p>MCP hook arguments preserve types for complete placeholders. For example, <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/mcp_runner.rs#L90-L107">the template</a> <code>{"count":"${tool_input.count}"}</code> becomes <code>{"count":3}</code> when the event supplies the number 3. Embedded placeholders become strings, and missing fields fail the hook.</p>
 
             <h2>4. UserPromptSubmit Runs Before Input Becomes History</h2>
             <p>
@@ -414,13 +403,9 @@
             </p>
 
             <h3>5.2 PermissionRequest: A First Answer in the Approval Path</h3>
-            <p>
-              <code>PermissionRequest</code> fires later. When policy requires
-              approval and this path evaluates permission hooks, the tool
-              orchestrator calls <code>run_permission_request_hooks</code>. This
-              hook does not rewrite input. It returns an approval verdict:
-              <code>Allow</code>, <code>Deny</code>, or no verdict.
-            </p>
+
+            <p><code>Session::request_approval</code> now invokes PermissionRequest centrally. NeedsApproval reaches this entry; strict auto-review can also route a policy-stage Skip into review. Hooks receive the action’s approval payload and return Allow, Deny, or no verdict before the central module selects Guardian or user review.</p>
+
 
             <p>
               The fold rule is conservative. Any <code>Deny</code> wins. If no
@@ -484,6 +469,11 @@
                 with specific inputs and results.
               </p>
             </div>
+
+            <h3>6.1 Interruption and Shutdown Notify Without Continuing</h3>
+            <p>By the time <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/hook_runtime.rs#L493-L540"><code>run_turn_interrupt_hooks</code></a> runs, the active turn has been detached. It reuses discovery from the last executing step rather than creating another working step. SessionEnd runs during root-session shutdown. Both exclude subagents, which use SubagentStart / SubagentStop instead.</p>
+
+            <p>These notifications default to a one-second timeout, capped at three seconds. SessionEnd runs after MCP runtime shutdown, so it supports only synchronous commands. Its outcome and Interrupt’s outcome record completion events; neither accepts Stop-style continuation. Treating a user interruption as Stop would incorrectly suggest that a hook can resume the model.</p>
 
             <h2>7. Common Misreadings</h2>
             <p>
@@ -554,37 +544,21 @@
 
             <h2 id="sources">Source References</h2>
             <ul class="source-list">
-              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">Pinned openai/codex source snapshot</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1164-L1361">EventMsg includes HookStarted and HookCompleted</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1363-L1376">HookEventName event list</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1453-L1488">HookRunSummary, HookStartedEvent, and HookCompletedEvent</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/mod.rs#L42-L138">ConfiguredHandler, HookListEntry, and ClaudeHooksEngine</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/mod.rs#L144-L266">Hook engine preview and run entry points</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/discovery.rs#L63-L150">discover_handlers reads config and plugin hook sources</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/discovery.rs#L441-L540">append_matcher_groups, trust status, and runnable handler filtering</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/dispatcher.rs#L36-L110">Handler selection, running summary, and concurrent execution</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/engine/dispatcher.rs#L142-L153">HookScope for thread and turn events</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L139-L360">Hook call sites inside run_turn</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/turn.rs#L430-L456">run_hooks_and_record_inputs checks hooks before recording input</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L101-L154">run_pending_session_start_hooks</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L162-L218">run_pre_tool_use_hooks</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L224-L260">run_permission_request_hooks</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L263-L294">run_post_tool_use_hooks</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L297-L364">run_turn_stop_hooks</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L367-L425">pre/post compact hooks</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/hook_runtime.rs#L557-L650">run_context_injecting_hook, record_additional_contexts, and hook events</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/session_start.rs#L22-L216">SessionStart and SubagentStart request/outcome</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/user_prompt_submit.rs#L22-L190">UserPromptSubmit request/outcome</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/pre_tool_use.rs#L22-L162">PreToolUse request/outcome and updated input resolution</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/permission_request.rs#L1-L168">PermissionRequest hook input, output, and deny-wins fold</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/post_tool_use.rs#L22-L143">PostToolUse request/outcome</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/stop.rs#L23-L199">Stop and SubagentStop request/outcome</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/hooks/src/events/stop.rs#L347-L407">Stop hook continuation fragment aggregation</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/registry.rs#L494-L638">Tool registry pre/post hook integration</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/tools/orchestrator.rs#L501-L540">Tool orchestrator gives permission-request hooks first answer</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/compact_remote_v2.rs#L129-L164">Hook calls around remote compact</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/manifest.rs#L8-L24">PluginManifest paths include hooks</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/plugin/src/load_outcome.rs#L108-L184">PluginLoadOutcome exposes effective plugin hook sources</a></li>
+              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">openai/codex · 5c5308fc9a9e</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L1579-L1592">HookEventName</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/discovery.rs#L479-L650">command / MCP discovery</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/discovery.rs#L740-L761">Interrupt / SessionEnd timeout</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/dispatcher.rs#L114-L185">concurrent and async dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/command_runner.rs#L108-L164">async result handling</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/mcp_runner.rs#L23-L107">MCP hook templates</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/hook_runtime.rs">runtime hook slots</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/handlers.rs#L295-L318">SessionEnd during shutdown</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/events/pre_tool_use.rs#L129-L167">updated_input completion ordering</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/approvals.rs#L473-L549">central permission hook routing</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/registry.rs#L600-L790">tool hook integration</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/events/stop.rs">Stop continuation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/events/interrupt.rs">Interrupt notification</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/events/session_end.rs">SessionEnd notification</a></li>
             </ul>
           </section>
         </article>
