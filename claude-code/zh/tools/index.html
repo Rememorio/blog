@@ -125,6 +125,7 @@
           </section>
 
           <section class="article-body">
+            <p>本文核对的是公开镜像的 <a href="https://github.com/Rememorio/claude-code/tree/5a774a2b62d7949c1d94e0b726281554d7893cfd">2026 年 3 月 31 日源码快照</a>。该镜像并非 Anthropic 官方源码发布；下文描述这一固定快照，不能据此断言当前发行版具有相同实现。官方文档用于说明产品或 API 合同。</p>
             <p>
               <a href="../context-management/">上一篇</a>讲上下文时，我们反复说“模型下一轮看见什么”。
               工具调用就是最容易改变这件事的地方。模型先说“我想读这个文件”或者“我想执行这条命令”，
@@ -151,14 +152,14 @@
               <p>
                 <strong>阅读目标：</strong>这篇只追三组问题：模型提出 <code>tool_use</code> 后，客户端什么时候真的产生副作用；
                 多个工具调用什么时候并发、什么时候串行；UI 进度消息、transcript 记录和 API-bound <code>tool_result</code> 分别写到哪里。
-                读完应该能回答：为什么模型不能“直接执行命令”，为什么读操作可以并发而编辑类动作要串行，以及为什么工具失败也要回填成一条可见结果。
+                读完应该能回答：为什么模型不能“直接执行命令”，为什么并发安全要按工具输入判断，以及为什么工具失败也要回填成一条可见结果。
               </p>
             </div>
 
             <p>
               取材范围也先说清楚。产品层的工具调用格式来自
-              <a href="https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview">Anthropic tool use 文档</a>
-              和 <a href="https://docs.anthropic.com/en/api/messages">Messages API</a>；
+              <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview">Anthropic tool use 文档</a>
+              和 <a href="https://platform.claude.com/docs/en/api/messages">Messages API</a>；
               源码层来自
               <a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a>。
               这个镜像不是 Anthropic 官方源码仓库，所以本文只把可见客户端源码写成直接事实；权限分类器、provider 内部工具提示词和服务端缓存行为，不从客户端代码里硬推。
@@ -176,14 +177,14 @@
             <h2>一、模型看到的是工具 schema，不是本地执行权</h2>
             <p>
               先从进入模型之前看起。普通交互回合在 REPL 里装配上下文。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2392-L2425"><code>getToolUseContext()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/screens/REPL.tsx#L2392-L2425"><code>getToolUseContext()</code></a>
               会从当前 store 里 fresh 读取工具、MCP clients、MCP resources、权限上下文和主循环模型。
               这里特意不用闭包里旧的 <code>tools</code> / <code>mcpClients</code>，因为 MCP server 可能在渲染之后才连上，工具列表必须以当前 store 为准。
             </p>
 
             <p>
               同一处返回的 <code>ToolUseContext</code> 很厚。
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/Tool.ts#L158-L235">类型定义</a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/Tool.ts#L158-L235">类型定义</a>
               里能看到，里面不只有 <code>options.tools</code>，还有 abort controller、file cache、app state getter/setter、
               MCP 连接、commands、thinking config、进度更新、通知、内容替换状态、已发现技能等字段。
               换句话说，工具不是一组裸函数；工具调用时会带着一份“这一轮运行环境”。
@@ -191,7 +192,7 @@
 
             <p>
               真正进入主循环前，REPL 会先取系统提示词、用户上下文和系统上下文，再调用
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2746-L2803"><code>query()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/screens/REPL.tsx#L2746-L2803"><code>query()</code></a>。
               这一步把 <code>messages</code>、<code>systemPrompt</code>、<code>userContext</code>、<code>canUseTool</code>
               和 <code>toolUseContext</code> 一起交进去。模型能看到的是工具 schema 和说明；本地执行权仍在 runtime 手里。
             </p>
@@ -218,23 +219,17 @@ runtime-only state =
             <p>
               进入 <code>query()</code> 后，工具调用不会靠一个“模型说要用工具”的总开关来判断。
               源码在每轮 setup 里先建立三个容器：
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L545-L568"><code>assistantMessages</code>、<code>toolResults</code>、<code>toolUseBlocks</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L545-L568"><code>assistantMessages</code>、<code>toolResults</code>、<code>toolUseBlocks</code></a>。
               注释还专门提醒：<code>stop_reason === 'tool_use'</code> 不可靠；真正的 loop-exit 信号，是流式 assistant message 里是否出现
               <code>tool_use</code> content block。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/tool-query-loop.png"
-                alt="Claude Code query loop 工具调用图，展示 call model、assistant stream、collect tool_use、execute、append tool_result 和 next query"
-              />
-              <figcaption><code>query()</code> 不把一次模型响应当终点；只要 assistant 内容里出现 <code>tool_use</code>，工具结果就会成为下一轮输入。</figcaption>
-            </figure>
+
 
             <h3>2.1 流式阶段：先产出 assistant，再记下申请单</h3>
             <p>
               流式响应回来时，
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L823-L845"><code>query()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L823-L845"><code>query()</code></a>
               先把 assistant message yield 给上层，再从 <code>message.message.content</code> 里筛出所有
               <code>tool_use</code> block，放进 <code>toolUseBlocks</code>，并把 <code>needsFollowUp</code> 置为 true。
               如果 streaming tool execution 打开，同一段代码还会把这些 block 交给 <code>StreamingToolExecutor</code>。
@@ -249,7 +244,7 @@ runtime-only state =
             <p>
               模型流结束后，如果没有需要 follow-up 的工具调用，<code>query()</code> 就可以完成这一轮。
               但只要 <code>toolUseBlocks</code> 非空，它会进入工具执行段：
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L1360-L1408"><code>query_tool_execution_start</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L1360-L1408"><code>query_tool_execution_start</code></a>。
               这里有两条路径：如果启用了 streaming executor，就消费 <code>getRemainingResults()</code>；否则把所有
               <code>toolUseBlocks</code> 交给 <code>runTools()</code>。
             </p>
@@ -285,21 +280,21 @@ next API view:
             <h2>三、<code>runTools()</code> 先判断能不能并发</h2>
             <p>
               多个工具调用不等于一个个按顺序跑。<code>runTools()</code> 的第一件事，是调用
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolOrchestration.ts#L19-L82"><code>partitionToolCalls()</code></a>
-              把 <code>tool_use</code> 列表切成 batch。每个 batch 要么是多个连续的 concurrency-safe 调用，要么是一个非 read-only 的单独调用。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolOrchestration.ts#L19-L82"><code>partitionToolCalls()</code></a>
+              把 <code>tool_use</code> 列表切成 batch。每个 batch 要么是一组连续的 concurrency-safe 调用，要么是一个非并发安全的单独调用；批次仍按原顺序推进，后面的读不能越过中间的编辑。
             </p>
 
             <figure class="figure">
               <img
                 src="../assets/tool-batch-routing.png"
-                alt="Claude Code runTools 分批图，展示 Read、Grep、LS 并发，Bash 和 Edit 串行，再进入新的 Read 批次"
+                alt="Claude Code runTools 分批图，展示按输入判断并发安全，连续安全调用成批，编辑完成后才进入下一读批次"
               />
-              <figcaption><code>runTools()</code> 保护的是副作用顺序：读类工具可以合并成并发批，可能改变状态的工具必须单独串行。</figcaption>
+              <figcaption><code>runTools()</code> 保护的是副作用顺序：连续且声明并发安全的调用可以合成一批；不安全的调用各自成批，前一批完成后才开始后一批。</figcaption>
             </figure>
 
             <h3>3.1 并发只给“连续且安全”的工具</h3>
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolOrchestration.ts#L91-L116"><code>partitionToolCalls()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolOrchestration.ts#L91-L116"><code>partitionToolCalls()</code></a>
               会先按工具名找工具，再用该工具的 input schema 解析输入，最后调用工具自己的
               <code>isConcurrencySafe(parsedInput.data)</code>。只有解析成功、工具声明安全、并且前一个 batch 也是安全 batch 时，
               当前调用才会被塞进同一个并发组。
@@ -307,27 +302,32 @@ next API view:
 
             <p>
               这个逻辑比“Read/Grep 就并发，Bash/Edit 就串行”更稳一点：并发安全是工具按输入判断的，不是一个全局名字表。
-              如果 <code>isConcurrencySafe</code> 自己抛错，源码也会保守地把它当作不安全。
+              例如 <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/tools/BashTool/BashTool.tsx#L434-L440">Bash 的实现</a>会把命令交给只读约束检查，通过时也可并发。如果 <code>isConcurrencySafe</code> 抛错，源码会保守地把它当作不安全。
             </p>
 
+            <figure class="shape-example"><pre><code class="language-text">输入顺序：Read A, Grep B, Edit C, Read D
+批次 1：A || B → 按 A、B 顺序应用 modifier
+批次 2：C      → 立即应用 modifier
+批次 3：D      → 读取 C 之后的状态
+不能把 D 提到 C 之前。</code></pre><figcaption>形状级示例：并发只发生在一批内部，不会把所有读操作提前执行。</figcaption></figure>
             <h3>3.2 并发批会延后合并 context modifier</h3>
             <p>
               并发批内部通过
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolOrchestration.ts#L152-L176"><code>runToolsConcurrently()</code></a>
-              调用 <code>all(..., getMaxToolUseConcurrency())</code>，默认最大并发来自环境变量，不设置时是 10。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolOrchestration.ts#L152-L176"><code>runToolsConcurrently()</code></a>
+              调用 <code>all(..., getMaxToolUseConcurrency())</code>，并发上限读取 <code>CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY</code>，未设置或解析为无效值、0 时回退到 10。这个上限属于 <code>runTools()</code> 分批路径，不宜直接套到 streaming executor。
               但并发执行不等于同时改 runtime context。
               源码会把每个工具产生的 <code>contextModifier</code> 先按 <code>toolUseID</code> 排队，等整个并发 batch 结束后，再按 block 顺序依次应用。
             </p>
 
             <p>
               这是很典型的 agent runtime 设计：耗时的读可以并发，状态变更的提交顺序仍然要稳定。
-              如果一个并发 Read 和另一个并发 Grep 都带回读文件状态，最终合并必须可重放，而不是谁先返回谁先改。
+              这里能保证的是返回的 context modifier 按稳定顺序应用；工具内部通过共享 store 或文件系统直接产生的变化，不因此获得事务隔离或自动回滚。
             </p>
 
             <h3>3.3 串行批就是一边执行一边更新 context</h3>
             <p>
               非并发安全的 batch 会走
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolOrchestration.ts#L118-L149"><code>runToolsSerially()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolOrchestration.ts#L118-L149"><code>runToolsSerially()</code></a>。
               它对每个 <code>toolUse</code> 标记 in-progress，调用 <code>runToolUse()</code>，收到
               <code>contextModifier</code> 就立即更新当前 context，最后再把这个 toolUse id 从 in-progress 集合里移除。
             </p>
@@ -361,16 +361,16 @@ next API view:
               </table>
             </div>
 
-            <h2>四、单个工具调用要经过六项检查</h2>
+            <h2>四、单个工具调用怎样通过执行前检查</h2>
             <p>
               真正执行单个工具的是
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L337-L490"><code>runToolUse()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L337-L490"><code>runToolUse()</code></a>。
               这段代码很适合说明“模型提出，runtime 决定”：它做的第一件事不是调用工具，而是用工具名在当前可见工具池里找工具。
             </p>
 
             <figure class="figure">
               <img
-                src="../assets/tool-call-gates.png"
+                src="../assets/hook-tool-gate.png"
                 alt="Claude Code 单个工具调用检查图，展示 find tool、schema、PreToolUse、permission、tool.call、wrap 到 success 或 is_error tool_result"
               />
               <figcaption>单个 <code>tool_use</code> 只有穿过查找、schema、hook、权限和执行包装，才会成为真实本地动作。</figcaption>
@@ -381,7 +381,7 @@ next API view:
               <code>runToolUse()</code> 先在 <code>toolUseContext.options.tools</code> 里找工具。
               如果找不到，还会在基础工具集合里查一次 deprecated alias；但只有 alias 命中才会回退。
               如果最终没有工具，源码会创建一条 user message，里面放
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L368-L410"><code>is_error: true</code> 的 <code>tool_result</code></a>，
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L368-L410"><code>is_error: true</code> 的 <code>tool_result</code></a>，
               告诉模型“没有这个工具”。
             </p>
 
@@ -393,21 +393,21 @@ next API view:
             <h3>4.2 schema 和工具自身校验先挡住坏输入</h3>
             <p>
               找到工具后，<code>checkPermissionsAndCallTool()</code> 会先用工具的
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L599-L680"><code>inputSchema.safeParse(input)</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L599-L680"><code>inputSchema.safeParse(input)</code></a>
               做 Zod 校验。失败时同样返回 error <code>tool_result</code>。
               如果 deferred tool 的 schema 没有被送进模型视图，还会构造一个 schema-not-sent hint，让模型先通过 tool search 重新加载工具。
             </p>
 
             <p>
               schema 通过之后，工具自己的
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L682-L733"><code>validateInput()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L682-L733"><code>validateInput()</code></a>
               还能继续做语义级校验。也就是说，工具输入要检查两次：先检查通用结构，再检查工具自己的业务规则。
             </p>
 
             <h3>4.3 PreToolUse hook 在权限之前改变或阻断调用</h3>
             <p>
               在真正问权限之前，Claude Code 会先跑
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L795-L862"><code>runPreToolUseHooks()</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L795-L862"><code>runPreToolUseHooks()</code></a>。
               hook 可以发进度消息，可以提供额外 context，可以给出 permission result，可以更新 input，也可以直接 stop。
               如果 hook stop，runtime 会把这次调用包装成一个停止型 <code>tool_result</code> 返回。
             </p>
@@ -421,9 +421,9 @@ next API view:
             <p>
               权限判断本身留到下一篇细拆，这里先看它在工具执行过程里的位置。
               <code>checkPermissionsAndCallTool()</code> 在 hook 之后调用
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L916-L946"><code>resolveHookPermissionDecision(...)</code></a>，
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L916-L946"><code>resolveHookPermissionDecision(...)</code></a>，
               最终得到 <code>allow</code>、<code>deny</code> 或 <code>ask</code> 的结果。
-              REPL 侧的 <a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L93"><code>useCanUseTool()</code></a>
+              REPL 侧的 <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/useCanUseTool.tsx#L27-L93"><code>useCanUseTool()</code></a>
               会在同一个函数里处理配置规则、自动模式、交互弹窗和权限队列。
             </p>
 
@@ -432,6 +432,8 @@ next API view:
               拒绝不是异常退出，而是会回到模型可见的结果里，成为下一步推理的事实。
             </p>
 
+            <h3>4.5 Hook 改写的输入与展示副本要分开</h3><p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L775-L792">工具执行层</a>会保留原始 <code>callInput</code>，另建浅拷贝供 hook 和权限观察派生字段。单纯补全路径不会改写工具结果里记录的原始路径；hook 或权限明确返回新的 <code>updatedInput</code> 时，才沿后续分支改变实际调用输入。初始 schema 与 <code>validateInput()</code> 发生在 PreToolUse 之前；不能把它写成每次改写之后必定重跑完整语义校验。</p><p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolHooks.ts#L340-L433">hook allow 的解析</a>保留 settings deny/ask，但在满足交互条件且未设置 <code>requireCanUseTool</code> 时可走保留规则与工具检查的快路。权限允许后才进入 <code>tool.call()</code>；这不意味着所有工具都会经过同一个沙箱，也不意味着失败会自动重试。</p>
+            <p>这里的<a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L1071-L1155"><code>checkRuleBasedPermissions()</code></a>仍会解析输入 schema 并运行 <code>tool.checkPermissions()</code>，保留工具级 deny、内容规则 ask 和 <code>safetyCheck</code> ask；它跳过的是完整的模式与默认放行流程，并非只匹配 settings。</p>
             <h2>五、<code>tool_result</code> 是配对事实，不是终端输出</h2>
             <p>
               工具执行完成后，Claude Code 要把结果写回两类读者：人类要在 UI 里看到进度、附件、错误和摘要；
@@ -439,32 +441,25 @@ next API view:
               这两个读者不能混成一个“stdout 字符串”。
             </p>
 
-            <figure class="figure">
-              <img
-                src="../assets/tool-result-pairing.png"
-                alt="Claude Code tool_result 配对图，展示 assistant 的 tool_use A/B、runtime progress 与 attachment，以及 API view 中 tool_use 和 tool_result 按 id 配对"
-              />
-              <figcaption><code>tool_result</code> 的核心不是显示格式，而是和 <code>tool_use_id</code> 配对后进入下一轮 API view。</figcaption>
-            </figure>
+
 
             <h3>5.1 进度消息可以很多，API 结果必须配对</h3>
             <p>
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L492-L570"><code>streamedCheckPermissionsAndCallTool()</code></a>
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L492-L570"><code>streamedCheckPermissionsAndCallTool()</code></a>
               用一个 stream 把工具进度和最终结果合成同一个 async iterable。工具执行中可以不断产生 progress message，
               UI 可以即时显示；但最终进入 API 的，仍然要经过 <code>normalizeMessagesForAPI()</code> 过滤成 user message。
             </p>
 
             <p>
               <code>query()</code> 在接收 tool update 时也把 UI 更新和 API 消息分开处理：
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L1384-L1408">先 yield update.message 给 UI，再 normalize 进 <code>toolResults</code></a>。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L1384-L1408">先 yield update.message 给 UI，再 normalize 进 <code>toolResults</code></a>。
               所以别把屏幕上看到的每一条进度都理解成模型下一轮能看到的内容。UI view 和 API view 仍然分层。
             </p>
 
             <h3>5.2 成功和失败都要成为下一轮事实</h3>
             <p>
               未知工具、abort、schema 错误、工具自身校验失败、hook stop、执行异常，源码里都倾向于生成
-              <code>tool_result</code>。成功时结果也会被包装成 <code>tool_result</code>；如果工具返回图片，代码还会把文本型
-              <code>tool_result</code> 和 image block 分开处理，避免带 <code>is_error</code> 的工具结果里混入非文本 block。
+              <code>tool_result</code>。成功时结果也会被包装成 <code>tool_result</code>。在拒绝结果附带图片的路径，代码把图片放到顶层 content，与文本型错误 <code>tool_result</code> 并列；这不能推广成所有成功图片结果都会被拆出。
             </p>
 
             <p>
@@ -475,7 +470,7 @@ next API view:
             <h3>5.3 工具摘要是补充，不替代 <code>tool_result</code></h3>
             <p>
               工具 batch 完成后，<code>query()</code> 还有一段可选的
-              <a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L1411-L1457">tool use summary</a> 逻辑。
+              <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L1411-L1457">tool use summary</a> 逻辑。
               它会在功能开关启用、未 abort、非 subagent 等条件满足时，提取工具 id 和工具信息，生成给 UI 或后续处理使用的摘要。
               但摘要不是 provider 要求的工具结果。真正让下一轮模型知道工具发生了什么的，仍然是与
               <code>tool_use_id</code> 配对的 <code>tool_result</code>。
@@ -539,23 +534,23 @@ next API view:
             <h2 id="sources">参考源码与文档</h2>
             <ul class="source-list">
               <li><a href="https://github.com/Rememorio/claude-code">Rememorio/claude-code 公开镜像</a></li>
-              <li><a href="https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview">Anthropic tool use overview</a></li>
-              <li><a href="https://docs.anthropic.com/en/api/messages">Anthropic Messages API</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2392-L2425">REPL.tsx：getToolUseContext</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L2746-L2803">REPL.tsx：turn setup and query call</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/Tool.ts#L158-L235">Tool.ts：ToolUseContext</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L545-L568">query.ts：tool loop setup</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L823-L845">query.ts：collect tool_use blocks</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L1360-L1408">query.ts：execute tool updates</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/query.ts#L1411-L1457">query.ts：tool use summary</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolOrchestration.ts#L19-L82">toolOrchestration.ts：runTools</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolOrchestration.ts#L91-L176">toolOrchestration.ts：partition and execution paths</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L337-L490">toolExecution.ts：runToolUse</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L492-L570">toolExecution.ts：streamed tool execution</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L599-L733">toolExecution.ts：schema and input validation</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/services/tools/toolExecution.ts#L795-L946">toolExecution.ts：PreToolUse 和权限决定</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useCanUseTool.tsx#L27-L93">useCanUseTool.tsx：权限处理函数</a></li>
-              <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/permissions/permissions.ts#L473-L525">permissions.ts：permission mode transformation</a></li>
+              <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview">Anthropic tool use overview</a></li>
+              <li><a href="https://platform.claude.com/docs/en/api/messages">Anthropic Messages API</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/screens/REPL.tsx#L2392-L2425">REPL.tsx：getToolUseContext</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/screens/REPL.tsx#L2746-L2803">REPL.tsx：turn setup and query call</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/Tool.ts#L158-L235">Tool.ts：ToolUseContext</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L545-L568">query.ts：tool loop setup</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L823-L845">query.ts：collect tool_use blocks</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L1360-L1408">query.ts：execute tool updates</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/query.ts#L1411-L1457">query.ts：tool use summary</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolOrchestration.ts#L19-L82">toolOrchestration.ts：runTools</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolOrchestration.ts#L91-L176">toolOrchestration.ts：partition and execution paths</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L337-L490">toolExecution.ts：runToolUse</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L492-L570">toolExecution.ts：streamed tool execution</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L599-L733">toolExecution.ts：schema and input validation</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/services/tools/toolExecution.ts#L795-L946">toolExecution.ts：PreToolUse 和权限决定</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/useCanUseTool.tsx#L27-L93">useCanUseTool.tsx：权限处理函数</a></li>
+              <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/permissions/permissions.ts#L473-L525">permissions.ts：permission mode transformation</a></li>
             </ul>
           </section>
         </article>
