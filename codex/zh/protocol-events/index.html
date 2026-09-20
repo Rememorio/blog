@@ -98,8 +98,9 @@
             <figure class="hero-image">
               <img
                 src="../assets/protocol-event-stream.png"
-                alt="Codex protocol 与事件流总览图，展示 client、TurnStart、Submission、Op、Session、EventMsg、v2 view、rollout 和 resume 的关系"
+                alt="Codex 从 turn/start 启动或补充 turn，core 事件经 app-server 转成通知和审批请求，另一路筛选保存到 rollout 供恢复"
               />
+              <figcaption>图中 turn/start 表示经 app-server 解析后的输入；审批回复先回 app-server，再转交 core；虚线表示后续恢复。成功接收输入、turn 完成与记录落盘是三个不同阶段。</figcaption>
             </figure>
           </section>
 
@@ -127,7 +128,7 @@
 
             <div class="note">
               <p>
-                <strong>取材范围。</strong>
+                <strong>取材范围。</strong> 源码快照：<a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f"><code>5c5308fc9a9e</code></a>。
                 OpenAI 的 App Server 文章说明产品关系：App Server 位在客户端和 Codex harness 之间，
                 负责接住客户端请求，并把 harness event stream 整理成客户端通知。公开源码里能直接验证的是协议类型、
                 事件类型和映射函数。源码链接固定到同一个公开快照。文中把“任务单”“运行时事件”“客户端通知”当作阅读辅助词，
@@ -198,14 +199,14 @@
             <h2>二、输入侧：客户端先交一张有类型的任务单</h2>
             <p>
               app-server v2 的客户端请求不是散装 JSON。源码通过宏生成
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L177-L210"><code>ClientRequest</code></a>，
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs"><code>ClientRequest</code></a>，
               每个 request 都有固定的 <code>params</code> 和 <code>response</code> 类型。其中
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L787-L792"><code>turn/start</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs"><code>turn/start</code></a>
               对应 <code>TurnStartParams</code>。
             </p>
 
             <p>
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L125"><code>TurnStartParams</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/turn.rs"><code>TurnStartParams</code></a>
               里最直观的是 <code>thread_id</code> 和 <code>input</code>，但它还带着很多“本轮怎么运行”的参数：
               client metadata、additional context、environment、cwd、workspace roots、approval policy、
               sandbox policy、permissions、model 和 service tier。也就是说，发起 turn 的请求不是一句话，
@@ -213,26 +214,18 @@
             </p>
 
             <p>
-              进入 app-server 的 <code>turn_start_inner</code> 后，这张任务单会被整理成 core 能理解的
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L505-L518"><code>Op::UserInput</code></a>。
-              源码先把 v2 input 转成 core input，解析 cwd 和环境选择，再把 approval、sandbox、permissions、
-              model 等字段收进 thread settings overrides；随后创建 <code>Op::UserInput</code>，
-              调用
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L427-L479"><code>submit_user_input_with_client_user_message_id</code></a>。
+              进入 app-server 的 <code>turn_start_inner</code> 后，v2 input 被转换成 <code>TurnInput</code>，运行参数整理成 settings overrides，再封装为 <code>TurnInputRequest</code>。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs#L640-L682"><code>start_or_steer_turn</code></a> 把决定交给 core：空闲时启动新 turn，已有可接收输入的 turn 时补充到该 turn；不能提交时返回拒绝原因。客户端不需要先读状态再猜测该走哪个分支。
             </p>
 
             <div class="note key-point">
               <p>
-                这一段最关键的细节是：<strong><code>turn/start</code> 返回的 <code>turn_id</code>，
-                其实来自 core submission id。</strong>
-                源码注释直接写着“提交用户输入，并把 submission id 作为 turn_id 返回”。
-                这让后续事件可以用同一个 id 回到这轮任务上。
-              </p>
+              <strong><code>turn/start</code> 的成功响应表示 core 已接受输入，并不表示执行完成，也不保证创建了新 turn。</strong>新建分支返回新 turn id；补充分支返回正在运行的 turn id。后续通知应关联响应里的 <code>turn.id</code>，不能把每个 JSON-RPC request id 或 submission id 都当成一轮新执行。
+            </p>
             </div>
 
             <p>
               同一层还有一个很实用的设计：
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L520-L527"><code>Op::ThreadSettings</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs"><code>Op::ThreadSettings</code></a>
               不启动 turn，但走同一条 submission queue。源码注释说得很直接：这样 app-server 可以保留
               thread settings mutation 和 turn start 之间的调用顺序。读到这里，就能理解为什么 settings
               不是在旁边随手改全局变量，而是被放进同一条有序队列。
@@ -240,20 +233,11 @@
 
             <h2>三、core 对外只暴露一对队列</h2>
             <p>
-              app-server 把请求整理成 <code>Op</code> 之后，core 的交互接口非常小。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L380-L390"><code>Codex</code></a>
-              结构体的注释说它是一个 queue pair：发送 submission，接收 event。结构体里对应两根管道：
-              <code>tx_sub: Sender&lt;Submission&gt;</code> 和 <code>rx_event: Receiver&lt;Event&gt;</code>。
+              目前对外的线程对象是 <code>CodexThread</code>；它把运行状态留给 <code>Session</code>，把提交和接收端点放进 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L402-L418"><code>SessionIo</code></a>。其中仍有两根管道：<code>tx_sub: Sender&lt;Submission&gt;</code> 和 <code>rx_event: Receiver&lt;Event&gt;</code>。分开端点与状态，使发送端全部释放后可以结束 session loop，并让调用方等待统一的关闭结果。
             </p>
 
             <p>
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L693-L742"><code>submit</code></a>
-              会生成一个 UUID，把 <code>Op</code> 包成
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L154-L165"><code>Submission</code></a>，
-              再送进 <code>tx_sub</code>。<code>Submission</code> 自己只有几件事：唯一 id、payload op、
-              可选的 client user message id、可选 trace。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L767-L774"><code>next_event</code></a>
-              则从 <code>rx_event</code> 取出下一条 <code>Event</code>。
+              普通 <code>submit</code> 给 <code>Op</code> 分配唯一 id，包成 <code>Submission</code> 后送入队列；任务单现在保存 id、op、trace，以及多 agent 因果关联的 <code>parent_turn_id</code> / <code>root_turn_id</code>。用户消息 id 属于 <code>TurnInput::UserInput</code>，不再是任务单上的独立字段。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L998-L1024"><code>submit_turn_input</code></a> 还携带一次性回复通道，只等待 core 的启动、补充或拒绝决定；它不等待模型完成。<code>next_event</code> 则继续读取异步运行事件。
             </p>
 
             <div class="table-wrap">
@@ -269,12 +253,12 @@
                   <tr>
                     <td><code>Op</code></td>
                     <td>用户或客户端想让运行时做什么。</td>
-                    <td>输入不再只是文本，还包括中断、审批回复、compact、rollback、review 等操作。</td>
+                    <td>输入不再只是文本，还包括中断、审批回复、compact、review 等操作。</td>
                   </tr>
                   <tr>
                     <td><code>Submission</code></td>
                     <td>带 id 的任务单。</td>
-                    <td>给后续事件提供关联 id，也让 trace 和 client message id 有位置可放。</td>
+                    <td>给后续事件提供关联 id，也携带 trace 和父级、根 turn 的因果关联。</td>
                   </tr>
                   <tr>
                     <td><code>Event</code></td>
@@ -292,14 +276,14 @@
 
             <p>
               接口虽小，但后面的设计都靠它对齐：
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1149-L1156"><code>Event</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs"><code>Event</code></a>
               也带一个 id，注释写的是“与 submission id 关联”。这就是客户端看到“第几轮 turn 在更新”的基础。
             </p>
 
             <h2>四、输出侧：EventMsg 记录运行时发生了什么</h2>
             <p>
               接下来读
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1158-L1325"><code>EventMsg</code></a>。
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs"><code>EventMsg</code></a>。
               它不是一个小枚举，而是一份很长的运行时事实清单，并且用 <code>#[serde(tag = "type", rename_all = "snake_case")]</code>
               固定 wire shape。也就是说，事件不是靠字符串约定偷偷传，而是以 tagged enum 的形式序列化。
             </p>
@@ -345,8 +329,8 @@
 
             <p>
               这里要注意一件事：<code>EventMsg</code> 的粒度比最终 UI 更底层。
-              比如 <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L3355-L3358"><code>TurnDiffEvent</code></a>
-              只关心统一 diff 文本；<a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2020-L2024"><code>TokenCountEvent</code></a>
+              比如 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs"><code>TurnDiffEvent</code></a>
+              只关心统一 diff 文本；<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs"><code>TokenCountEvent</code></a>
               只携带 token usage 和 rate limit 快照。客户端再自行决定怎样排版、折叠和突出显示。
             </p>
 
@@ -357,7 +341,7 @@
               说明了产品关系：client 通过 JSON-RPC 接入 Codex harness，服务端把请求转成 core operation，
               也把 harness event stream 整理成客户端稳定消费的通知。
               源码里，这件事首先表现为用宏生成
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1318-L1338"><code>ServerNotification</code></a>，
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs"><code>ServerNotification</code></a>，
               并显式列出 wire method：<code>turn/started</code>、<code>turn/completed</code>、
               <code>item/started</code>、<code>item/completed</code>、<code>turn/diff/updated</code>、
               <code>thread/tokenUsage/updated</code> 等。
@@ -365,15 +349,15 @@
 
             <p>
               v2 视图里最重要的两个容器是 <code>Turn</code> 和 <code>ThreadItem</code>。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L25-L33"><code>TurnStatus</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/turn.rs"><code>TurnStatus</code></a>
               只暴露客户端关心的状态：completed、interrupted、failed、in progress。
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/item.rs#L209-L250"><code>ThreadItem</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/item.rs"><code>ThreadItem</code></a>
               则把用户消息、assistant 消息、plan、reasoning、工具调用等整理成客户端列表项。
             </p>
 
             <p>
               真正的翻译发生在两处。第一处是
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L136-L198"><code>apply_bespoke_event_handling</code></a>：
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs"><code>apply_bespoke_event_handling</code></a>：
               它拿到 core <code>Event { id, msg }</code> 后，按 <code>EventMsg</code> 分支处理。
               <code>TurnStarted</code> 会变成 <code>TurnStartedNotification</code>，
               <code>TurnComplete</code> 会收尾并发送完成通知；审批请求会变成需要客户端响应的 server request；
@@ -382,7 +366,7 @@
 
             <p>
               第二处是
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L35"><code>item_event_to_server_notification</code></a>。
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/event_mapping.rs"><code>item_event_to_server_notification</code></a>。
               这个 helper 只覆盖“单个 core event 到单个 v2 notification”的无状态转换，
               例如 assistant 文本 delta、plan delta、reasoning delta、item started/completed、
               exec output delta 等。需要检查状态、清理 pending request 或抑制 legacy event 的场景，
@@ -434,7 +418,7 @@
             </div>
 
             <p>
-              把它连成一段数据流，一次需要审批的命令大致会依次经过：
+              以下只画新建 turn 且命令需要审批的一条路径；补充已有 turn 不会再生成一轮新的 started，命令事件也可能与文本 delta 交错：
             </p>
 
             <pre><code class="language-text">turn/start request
@@ -447,36 +431,32 @@
 
             <p>
               这一层还有很多“克制”的细节。例如
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L901-L904"><code>ContextCompacted</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs"><code>ContextCompacted</code></a>
               在 v2 里被压下，因为 v2 客户端会收到 canonical 的 context compaction item；
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1081-L1093"><code>PatchApplyBegin/End</code> 和部分 exec legacy item</a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs"><code>PatchApplyBegin/End</code> 和部分 exec legacy item</a>
               也会为了避免重复渲染而被抑制。也就是说，app-server 不是“有事件就全发”，它会维护客户端视图的一致性。
             </p>
 
             <h2>六、rollout 与恢复：保存能重建的事实</h2>
             <p>
-              到这里，实时客户端已经能持续看到 turn 状态。但刷新、恢复、fork 又从哪里来？
-              答案在 rollout。protocol 里
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2890"><code>RolloutItem</code></a>
-              可以保存 <code>SessionMeta</code>、<code>ResponseItem</code>、<code>Compacted</code>、
-              <code>TurnContext</code> 和 <code>EventMsg</code>。它保存的不是屏幕长什么样，而是足够重建历史的材料。
+              持久化 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/policy.rs#L9-L25"><code>RolloutItem</code></a> 包括 session metadata、response items、turn context、压缩记录、token usage，以及选定的运行事件。持久化规则按历史模式分支：legacy 保留对应旧消息事件，paginated 主要保存完成后的 <code>TurnItem</code>；中间 delta、审批请求和 <code>ItemStarted</code> 不会全量落盘。旧 <code>ThreadRolledBack</code> 标记仍用于历史重建，但当前请求枚举已不再提供 <code>thread/rollback</code>。
             </p>
 
             <p>
               这也是为什么
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2368-L2440"><code>InitialHistory</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs"><code>InitialHistory</code></a>
               提供 <code>get_event_msgs()</code>：恢复和 fork 时，可以从 rollout 里筛出 <code>RolloutItem::EventMsg</code>。
               core 层的
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L1222-L1285"><code>record_initial_history</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs"><code>record_initial_history</code></a>
               会应用 rollout reconstruction，并从最后持久化的 <code>TokenCount</code> 事件种下 usage 状态，
               让 UI 在恢复后能立刻看到 token 快照。
             </p>
 
             <p>
               app-server 还有一层专门的历史 reducer：
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L74-L84"><code>build_turns_from_rollout_items</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/thread_history.rs"><code>build_turns_from_rollout_items</code></a>
               会把持久化的 <code>RolloutItem</code> 转成一组 <code>Turn</code>。内部的
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L166-L245"><code>ThreadHistoryBuilder</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/thread_history.rs"><code>ThreadHistoryBuilder</code></a>
               逐条处理 <code>EventMsg</code>、compacted item、response item 和 turn context；
               遇到 <code>TurnStarted</code> 会打开新 turn，遇到 <code>TurnComplete</code> 会关闭它。
             </p>
@@ -485,9 +465,8 @@
               形状上可以这样理解：
             </p>
 
-            <pre><code class="language-text">rollout items:
+            <pre><code class="language-text">rollout items (simplified persisted records):
   EventMsg(TurnStarted)
-  EventMsg(ItemStarted(exec))
   EventMsg(ItemCompleted(exec))
   EventMsg(TurnComplete)
 
@@ -529,7 +508,7 @@ ThreadHistoryBuilder:
                     <td><code>Op</code></td>
                     <td>这是哪种运行时操作？</td>
                     <td>只追 <code>UserInput</code>。</td>
-                    <td>把 interrupt、approval response、compact、rollback、review 都纳入同一输入面。</td>
+                    <td>把 interrupt、approval response、compact、review 都纳入同一输入面。</td>
                   </tr>
                   <tr>
                     <td><code>EventMsg</code></td>
@@ -561,27 +540,27 @@ ThreadHistoryBuilder:
 
             <h2 id="sources">参考源码与文档</h2>
             <ul class="source-list">
-              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">openai/codex 固定源码快照</a></li>
+              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">openai/codex 固定源码快照</a></li>
               <li><a href="https://openai.com/index/unlocking-the-codex-harness/">OpenAI：Unlocking the Codex harness: how we built the App Server</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L177-L210">ClientRequest 宏生成</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L787-L792">turn/start request 定义</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L125">TurnStartParams</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L427-L479">turn_start_inner 转成 Op::UserInput</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L154-L165">Submission</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L477-L635">Op</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L380-L390">Codex queue pair</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L693-L742">submit / submit_with_id</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L767-L774">next_event</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1149-L1325">Event / EventMsg</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1318-L1338">ServerNotification 宏生成</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L136-L198">apply_bespoke_event_handling</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L35">item_event_to_server_notification</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L511-L565">审批请求映射</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1607-L1633">TokenCount 映射</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1278-L1291">TurnDiff 映射</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2890">RolloutItem</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L74-L84">build_turns_from_rollout_items</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L166-L245">ThreadHistoryBuilder</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs">ClientRequest 宏生成</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs">turn/start request 定义</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/turn.rs">TurnStartParams</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs">turn_start_inner 构造 TurnInputRequest 并启动或补充 turn</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs">Submission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs">Op</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs">SessionIo submission/event endpoints</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs">submit / submit_with_id</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs">next_event</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs">Event / EventMsg</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs">ServerNotification 宏生成</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs">apply_bespoke_event_handling</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/event_mapping.rs">item_event_to_server_notification</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs">审批请求映射</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs">TokenCount 映射</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs">TurnDiff 映射</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs">RolloutItem</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/thread_history.rs">build_turns_from_rollout_items</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/thread_history.rs">ThreadHistoryBuilder</a></li>
             </ul>
           </section>
         </article>

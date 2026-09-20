@@ -98,8 +98,9 @@
             <figure class="hero-image">
               <img
                 src="../assets/protocol-event-stream.png"
-                alt="Overview of Codex protocol and event stream from client to TurnStart, Submission, Op, Session, EventMsg, v2 view, rollout, and resume"
+                alt="Codex starts or steers a turn, maps core events to app-server notifications and approval requests, and separately persists selected rollout records for recovery"
               />
+              <figcaption>The turn/start envelope represents input parsed by app-server; approval replies return through app-server to core; the dashed arrow represents later recovery. Input acceptance, turn completion, and durable writes are separate stages.</figcaption>
             </figure>
           </section>
 
@@ -199,35 +200,25 @@
             <h2>2. Input Side: A Typed Work Order</h2>
             <p>
               app-server v2 requests are not loose JSON blobs. The protocol macro generates
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L177-L210"><code>ClientRequest</code></a>,
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs"><code>ClientRequest</code></a>,
               where each request has fixed <code>params</code> and <code>response</code> types.
               The
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L787-L792"><code>turn/start</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs"><code>turn/start</code></a>
               request uses <code>TurnStartParams</code>.
             </p>
 
             <p>
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L125"><code>TurnStartParams</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/turn.rs"><code>TurnStartParams</code></a>
               includes the obvious <code>thread_id</code> and <code>input</code>, but it also carries
               runtime boundaries: client metadata, additional context, environment selection, cwd,
               workspace roots, approval policy, sandbox policy, permissions, model, and service tier.
               Starting a turn is therefore more like submitting a typed work order than sending chat text.
             </p>
 
-            <p>
-              In <code>turn_start_inner</code>, app-server maps v2 input into core input, resolves cwd
-              and environment selections, builds thread-settings overrides, creates
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L505-L518"><code>Op::UserInput</code></a>,
-              and submits it through
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L427-L479"><code>submit_user_input_with_client_user_message_id</code></a>.
-            </p>
+            <p>In <code>turn_start_inner</code>, app-server converts v2 input into <code>TurnInput</code>, collects settings overrides, and builds a <code>TurnInputRequest</code>. <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs#L640-L682"><code>start_or_steer_turn</code></a> lets core decide whether to start an idle thread, steer an active turn that can accept input, or decline the submission. The caller does not need to read state and race that decision.</p>
 
             <div class="note key-point">
-              <p>
-                The important line: <strong><code>turn/start</code> returns the core submission id
-                as <code>turn_id</code></strong>. That gives later events a stable id to point back
-                to the turn.
-              </p>
+              <p><strong>A successful <code>turn/start</code> response means that core accepted the input; execution is not complete, and a new turn is not guaranteed.</strong> Starting returns a new turn id; steering returns the active turn id. Correlate later notifications with the response’s <code>turn.id</code>, rather than assuming that every JSON-RPC request or submission creates another turn.</p>
             </div>
 
             <p>
@@ -237,23 +228,9 @@
             </p>
 
             <h2>3. Core exposes a queue pair</h2>
-            <p>
-              Once app-server has an <code>Op</code>, the core interface becomes very small. The
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L380-L390"><code>Codex</code></a>
-              struct is documented as a queue pair: send submissions, receive events. Its fields
-              are the two channels: <code>tx_sub: Sender&lt;Submission&gt;</code> and
-              <code>rx_event: Receiver&lt;Event&gt;</code>.
-            </p>
+            <p>The public thread object is now <code>CodexThread</code>. Runtime state lives in <code>Session</code>, while <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L402-L418"><code>SessionIo</code></a> holds the submission and event endpoints: <code>tx_sub: Sender&lt;Submission&gt;</code> and <code>rx_event: Receiver&lt;Event&gt;</code>. Separating the endpoints allows the session loop to terminate when all senders disappear and gives callers a shared shutdown completion future.</p>
 
-            <p>
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L693-L742"><code>submit</code></a>
-              generates a UUID, wraps the <code>Op</code> in
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L154-L165"><code>Submission</code></a>,
-              and sends it to <code>tx_sub</code>. <code>next_event</code> reads the next
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1149-L1156"><code>Event</code></a>
-              from <code>rx_event</code>. The event id is documented as correlated with the
-              submission id.
-            </p>
+            <p>Ordinary <code>submit</code> allocates a unique id, wraps an <code>Op</code> in a <code>Submission</code>, and enqueues it. The envelope contains id, op, trace, and causal <code>parent_turn_id</code> / <code>root_turn_id</code> fields for multi-agent work. The client user-message id belongs to <code>TurnInput::UserInput</code>. <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L998-L1024"><code>submit_turn_input</code></a> also includes a one-shot reply channel: it waits for core’s start, steer, or decline decision, not model completion. <code>next_event</code> independently consumes runtime events.</p>
 
             <div class="table-wrap">
               <table>
@@ -268,12 +245,12 @@
                   <tr>
                     <td><code>Op</code></td>
                     <td>What the runtime is being asked to do.</td>
-                    <td>Includes user input, interrupt, approvals, compact, rollback, review, and more.</td>
+                    <td>Includes user input, interrupt, approvals, compact, review, and more.</td>
                   </tr>
                   <tr>
                     <td><code>Submission</code></td>
                     <td>A work order with an id.</td>
-                    <td>Gives later events a correlation id and carries trace/client message metadata.</td>
+                    <td>Gives later events a correlation id and carries trace and parent/root turn causality.</td>
                   </tr>
                   <tr>
                     <td><code>Event</code></td>
@@ -291,7 +268,7 @@
 
             <h2>4. Output Side: EventMsg Is the Fact List</h2>
             <p>
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1158-L1325"><code>EventMsg</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs"><code>EventMsg</code></a>
               is a long tagged enum with <code>#[serde(tag = "type", rename_all = "snake_case")]</code>.
               That wire shape matters: runtime facts are structured variants, not informal strings.
             </p>
@@ -351,7 +328,7 @@
               operations, and converts the harness event stream into stable
               client notifications. In source, app-server v2 defines those
               notifications through
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1318-L1338"><code>ServerNotification</code></a>.
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs"><code>ServerNotification</code></a>.
               The method list includes <code>turn/started</code>, <code>turn/completed</code>,
               <code>item/started</code>, <code>item/completed</code>,
               <code>turn/diff/updated</code>, and <code>thread/tokenUsage/updated</code>.
@@ -360,14 +337,14 @@
             <p>
               The v2 view is built around <code>Turn</code> and <code>ThreadItem</code>. A turn
               exposes status such as completed, interrupted, failed, and in progress. A
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/item.rs#L209-L250"><code>ThreadItem</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/item.rs"><code>ThreadItem</code></a>
               turns user messages, assistant messages, plans, reasoning, and tool calls into
               client list items.
             </p>
 
             <p>
               The main translation point is
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L136-L198"><code>apply_bespoke_event_handling</code></a>.
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs"><code>apply_bespoke_event_handling</code></a>.
               It receives core <code>Event { id, msg }</code>, matches on <code>EventMsg</code>,
               and emits v2 notifications or server requests. Turn lifecycle events become turn
               notifications; approval requests become server requests that need a client response;
@@ -376,7 +353,7 @@
 
             <p>
               Stateless one-to-one item mappings live in
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L35"><code>item_event_to_server_notification</code></a>.
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/event_mapping.rs"><code>item_event_to_server_notification</code></a>.
               That helper covers assistant message deltas, plan deltas, reasoning deltas,
               item started/completed, exec output deltas, and similar direct mappings. Anything that
               needs state checks, pending request cleanup, or legacy-event suppression stays in the
@@ -428,7 +405,7 @@
             </div>
 
             <p>
-              Connected end to end, a command that needs approval follows this sequence:
+              This example starts a new turn and reaches a command requiring approval. Steering an existing turn does not open another turn; command events and text deltas may interleave:
             </p>
 
             <pre><code class="language-text">turn/start request
@@ -446,38 +423,30 @@
             </p>
 
             <h2>6. Rollout Rebuilds Turns From Facts</h2>
-            <p>
-              Realtime notifications explain what connected clients see. Reload and resume require a
-              durable source. Protocol
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2890"><code>RolloutItem</code></a>
-              can store <code>SessionMeta</code>, <code>ResponseItem</code>, <code>Compacted</code>,
-              <code>TurnContext</code>, and <code>EventMsg</code>. It stores rebuildable material,
-              not a screen snapshot.
-            </p>
+            <p>The <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/policy.rs#L9-L25"><code>RolloutItem</code> policy</a> persists session metadata, response items, turn context, compaction and token-usage records, plus selected runtime events. Legacy history retains corresponding older message events; paginated history primarily stores completed <code>TurnItem</code> records. Intermediate deltas, approval requests, and <code>ItemStarted</code> are not all persisted. Historical <code>ThreadRolledBack</code> markers still participate in reconstruction, but the current request enum no longer exposes <code>thread/rollback</code>.</p>
 
             <p>
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2368-L2440"><code>InitialHistory</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs"><code>InitialHistory</code></a>
               exposes <code>get_event_msgs()</code> for resumed and forked histories by extracting
               <code>RolloutItem::EventMsg</code>. Core
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L1222-L1285"><code>record_initial_history</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs"><code>record_initial_history</code></a>
               applies rollout reconstruction and seeds token usage from the last persisted
               <code>TokenCount</code>.
             </p>
 
             <p>
               app-server has a dedicated reducer too:
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L74-L84"><code>build_turns_from_rollout_items</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/thread_history.rs"><code>build_turns_from_rollout_items</code></a>
               converts persisted rollout items into <code>Turn</code> values. Its
-              <a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L166-L245"><code>ThreadHistoryBuilder</code></a>
+              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/thread_history.rs"><code>ThreadHistoryBuilder</code></a>
               handles persisted event messages, compacted items, response items, and turn context.
               <code>TurnStarted</code> opens a turn; <code>TurnComplete</code> closes it.
             </p>
 
             <p>At shape level, the reduction looks like this:</p>
 
-            <pre><code class="language-text">rollout items:
+            <pre><code class="language-text">rollout items (simplified persisted records):
   EventMsg(TurnStarted)
-  EventMsg(ItemStarted(exec))
   EventMsg(ItemCompleted(exec))
   EventMsg(TurnComplete)
 
@@ -512,7 +481,7 @@ ThreadHistoryBuilder:
                   <tr>
                     <td><code>Op</code></td>
                     <td>What runtime operation is being submitted?</td>
-                    <td>Include approvals, interrupts, compact, rollback, and review, not only user input.</td>
+                    <td>Include approvals, interrupts, compact and review, not only user input.</td>
                   </tr>
                   <tr>
                     <td><code>EventMsg</code></td>
@@ -542,27 +511,27 @@ ThreadHistoryBuilder:
 
             <h2 id="sources">Sources</h2>
             <ul class="source-list">
-              <li><a href="https://github.com/openai/codex/tree/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0">Pinned openai/codex source snapshot</a></li>
+              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">Pinned openai/codex source snapshot</a></li>
               <li><a href="https://openai.com/index/unlocking-the-codex-harness/">OpenAI: Unlocking the Codex harness: how we built the App Server</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L177-L210">ClientRequest macro</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L787-L792">turn/start request definition</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L66-L125">TurnStartParams</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/request_processors/turn_processor.rs#L427-L479">turn_start_inner mapping to Op::UserInput</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L154-L165">Submission</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L477-L635">Op</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L380-L390">Codex queue pair</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L693-L742">submit / submit_with_id</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/core/src/session/mod.rs#L767-L774">next_event</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L1149-L1325">Event / EventMsg</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/common.rs#L1318-L1338">ServerNotification macro</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L136-L198">apply_bespoke_event_handling</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/event_mapping.rs#L25-L35">item_event_to_server_notification</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L511-L565">Approval request mapping</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1607-L1633">TokenCount mapping</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server/src/bespoke_event_handling.rs#L1278-L1291">TurnDiff mapping</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/protocol/src/protocol.rs#L2882-L2890">RolloutItem</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L74-L84">build_turns_from_rollout_items</a></li>
-              <li><a href="https://github.com/openai/codex/blob/267eacfca2de761b2c1aa79b51b6b2bbdad4fab0/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L166-L245">ThreadHistoryBuilder</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs">ClientRequest macro</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs">turn/start request definition</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/v2/turn.rs">TurnStartParams</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/request_processors/turn_processor.rs">turn_start_inner mapping to Op::TurnInput</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs">Submission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs">Op</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs">SessionIo submission/event endpoints</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs">submit / submit_with_id</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs">next_event</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs">Event / EventMsg</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/common.rs">ServerNotification macro</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs">apply_bespoke_event_handling</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/event_mapping.rs">item_event_to_server_notification</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs">Approval request mapping</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs">TokenCount mapping</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server/src/bespoke_event_handling.rs">TurnDiff mapping</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs">RolloutItem</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/thread_history.rs">build_turns_from_rollout_items</a></li>
+              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/app-server-protocol/src/protocol/thread_history.rs">ThreadHistoryBuilder</a></li>
             </ul>
           </section>
         </article>
