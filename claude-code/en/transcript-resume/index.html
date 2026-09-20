@@ -9,7 +9,7 @@
     <meta property="og:title" content="Resume rebuilds runtime state | Rememorio Blog" />
     <meta property="og:description" content="A source-reading article on Claude Code transcript and resume: UI messages, durable transcript rows, conversation recovery, session restore, and content replacement state." />
     <meta property="og:type" content="article" />
-    <meta property="og:image" content="../assets/resume-surfaces-cover.png" />
+    <meta property="og:image" content="../assets/resume-write-targets.png" />
     <link rel="canonical" href="https://rememorio.github.io/blog/claude-code/en/transcript-resume/" />
     <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/claude-code/zh/transcript-resume/" />
     <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/claude-code/en/transcript-resume/" />
@@ -100,16 +100,17 @@
             <h1>Resume rebuilds runtime state</h1>
             <p class="lead">Resume is easy to underestimate. If it only pasted old chat back into the terminal, it would be a convenience feature. Claude Code does more: it reloads transcript evidence and reconstructs enough runtime state for the next turn to behave correctly.</p>
             <div class="meta-line">
-              <span>Project: Rememorio/claude-code</span>
+              <span>Project: Claude Code</span>
               <span>Topic: transcript and resume</span>
               <span>Scope: public mirror and official docs</span>
             </div>
             <figure class="hero-image">
-              <img src="../assets/resume-surfaces-cover.png" alt="Hand-drawn resume surfaces showing UI, transcript, runtime state, API view, and recovery loader" />
+              <img src="../assets/resume-write-targets.png" alt="Normal resume adopts the original transcript; fork resume copies messages and replacements into a new file without owning the original worktree" />
             </figure>
           </section>
 
           <section class="article-body">
+            <p>This implementation analysis is limited to the <a href="https://github.com/Rememorio/claude-code/tree/5a774a2b62d7949c1d94e0b726281554d7893cfd">public mirror snapshot dated March 31, 2026</a>. The mirror is not an official Anthropic source repository and does not establish behavior in later product releases. Source links are pinned to that commit; official documentation supplies product concepts, while feature gates and missing modules are identified separately.</p>
 
             <p>The same session exists in several forms. The screen shows messages and progress. The transcript persists message relationships and recovery records. The client holds active session state. The provider receives a validated request assembled for the next turn. Resume has to reconnect all four.</p>
             <div class="note route-note">
@@ -122,55 +123,67 @@
   -&gt; run SessionStart resume hooks
   -&gt; processResumedConversation()
   -&gt; restore AppState, session pointer, worktree, agent, replacement state</code></pre>
-              <figcaption>Source shape: resume reads persistent records, repairs the message tail, and reinstalls state used by the next model request and tool call.</figcaption>
+              <figcaption>Source shape for a log-backed CLI resume: repair the message tail, then reinstall available state. Worktree, replacement, and gated collapse records depend on the loaded log and selected path.</figcaption>
             </figure>
 
             <h2>1. The screen, transcript, runtime, and API request differ</h2>
             <p>The UI may collapse tool output or hide progress records because its job is to present the current interaction. The transcript stores message ids, parent ids, sidechain entries, metadata, file-history snapshots, content replacements, and compaction records. Active runtime state adds the selected session, worktree, agent, caches, and tool-related state. Finally, the API request contains only provider-valid messages and tool schemas.</p>
-            <figure class="figure"><img src="../assets/context-ledger-cover.png" alt="Session data moving from transcript through restored runtime state into a provider request" /><figcaption>A transcript is a recovery source, not a provider prompt copied verbatim.</figcaption></figure>
 
+
+            <div class="table-wrap"><table><thead><tr><th>Representation</th><th>Responsibility</th><th>Recovery risk</th></tr></thead><tbody>
+<tr><td>UI</td><td>Messages, progress and input state.</td><td>A restored screen can hide incomplete runtime restoration.</td></tr>
+<tr><td>Transcript</td><td>Message chain and persisted auxiliary entries.</td><td>Duplicate messages, unresolved tails and incorrect parent links.</td></tr>
+<tr><td>Runtime</td><td>Session id, worktree, agent, history and replacements.</td><td>Records may refer to the wrong session or working directory.</td></tr>
+<tr><td>API request</td><td>Provider-valid messages and tool schemas.</td><td>Unpaired tools, orphaned thinking or oversized outputs.</td></tr>
+</tbody></table></div>
             <h2>2. Transcript writing preserves message relationships</h2>
-            <p><code>useLogMessages()</code> observes the current messages. Because normal updates append to the list, it usually sends only the new tail to <code>recordTranscript()</code>. If the first message changes after compaction or <code>/clear</code>, the recorder performs full deduplication and recalculates parent relationships.</p>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/useLogMessages.ts#L19-L115"><code>useLogMessages()</code></a> observes the current messages. Because normal updates append to the list, it usually sends only the new tail to <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/sessionStorage.ts#L1400-L1449"><code>recordTranscript()</code></a>. If the first message changes after compaction or <code>/clear</code>, the recorder performs full deduplication and recalculates parent relationships.</p>
 
             <p><code>recordTranscript()</code> cleans messages for logging, checks which ids already exist, and decides which existing message is the parent of a newly written row. It treats compaction carefully: a new compact marker and summary at the front must not make older retained messages appear to be the new parent.</p>
 
             <p>The same storage module writes records that are not ordinary chat messages, including sidechain activity, queue operations, file-history and attribution snapshots, and content replacements. When the query loop replaces an oversized tool result to fit its budget, it persists that replacement. A resumed session can then keep using the reduced result instead of unexpectedly sending the full output again.</p>
 
             <h2>3. Loading repairs interrupted conversations</h2>
-            <p><code>loadConversationForResume()</code> can find the latest session for <code>--continue</code>, resolve a session id for <code>--resume</code>, or accept an already loaded log or transcript file. It copies plan and file-history data, checks consistency, and then deserializes the message records.</p>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/conversationRecovery.ts#L456-L595"><code>loadConversationForResume()</code></a> can find the latest session for <code>--continue</code>, resolve a session id for <code>--resume</code>, or accept an already loaded log or transcript file. For a <code>LogOption</code>, it copies the plan, starts copying file history, and checks consistency. A direct JSONL path instead obtains messages and a session id through <code>loadMessagesFromJsonlPath()</code>; this function returns auxiliary records through <code>log?.…</code>, so the file-path branch does not establish the same metadata, replacement, or file-history restoration as the log branch. When background-session support is enabled and live-session discovery succeeds, <code>--continue</code> also skips running non-interactive sessions.</p>
 
-            <p><code>deserializeMessagesWithInterruptDetection()</code> does more than <code>JSON.parse</code>. It migrates legacy attachment types, removes invalid permission modes, and filters unresolved tool calls, thinking-only assistant messages, and empty assistant text. If a turn was interrupted, it adds a meta user message asking the model to continue. If the final valid message is from the user, it inserts a synthetic assistant sentinel so the recovered conversation has a valid sequence.</p>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/conversationRecovery.ts#L154-L245"><code>deserializeMessagesWithInterruptDetection()</code></a> does more than <code>JSON.parse</code>. It migrates legacy attachment types, removes invalid permission modes, and filters unresolved tool calls, thinking-only assistant messages, and empty assistant text. If a turn was interrupted, it adds a meta user message asking the model to continue. If the final valid message is from the user, it inserts a synthetic assistant sentinel so the recovered conversation has a valid sequence. This repairs protocol structure, not an interrupted process stack, and deserialization does not re-execute tools. If Bash changed a file before its tool result was persisted, removing the unresolved call does not undo that file change: the next turn must inspect actual files and task status. Before deserialization, the loader also restores Skill state from <code>invoked_skills</code> attachments so it can survive further compaction.</p>
 
             <p>After loading messages, the resume path runs <code>SessionStart</code> hooks with <code>source: resume</code> and appends their messages. Resume is a new execution starting point, so session-level hooks get another chance to supply required context.</p>
 
             <h2>4. processResumedConversation restores active session state</h2>
-            <p>CLI <code>--continue</code> and the different <code>--resume</code> sources converge on <code>processResumedConversation()</code>. For a normal resume, it switches to the old session id and handles cross-directory transcript paths. It then restores cost state, session metadata, worktree information, compaction state, agent definition, content replacements, and the initial application state passed to the REPL.</p>
-            <figure class="figure"><img src="../assets/survival-map.png" alt="Persistent, reloaded, and event-triggered session data returning before the next turn" /><figcaption>Messages, files, agent selection, worktree, and compact state return through different storage and initialization code.</figcaption></figure>
+            <p>CLI <code>--continue</code> and the different <code>--resume</code> sources converge on <a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/sessionRestore.ts#L409-L551"><code>processResumedConversation()</code></a>. For a normal resume, it switches to the old session id and handles cross-directory transcript paths. It restores cost state, metadata, and worktree information, then passes agent state and loaded replacement records into the next runtime. The context-collapse restore call is conditional on <code>CONTEXT_COLLAPSE</code>; the invoked module is absent from this snapshot. The visible call proves only that commit entries and a staged snapshot are its inputs, not how the missing implementation replays them or that every session enables it.</p>
 
-            <p><code>adoptResumedSessionFile()</code> makes the original transcript the write target. This matters even if the user exits before sending another message: cleanup still needs to save updated metadata such as the session name, tags, or agent. Without adoption, those updates could remain only in memory.</p>
+
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/sessionStorage.ts#L1501-L1534"><code>adoptResumedSessionFile()</code></a> makes the original transcript the write target. This matters even if the user exits before sending another message: cleanup still needs to save updated metadata such as the session name, tags, or agent. Without adoption, those updates could remain only in memory.</p>
 
             <h2>5. Interactive /resume performs a live session switch</h2>
-            <p><code>REPL.resume()</code> runs inside an already active interface. Before switching, it executes <code>SessionEnd</code> hooks for the current session. It then deserializes the target, runs its <code>SessionStart(resume)</code> hooks, restores file history, attribution, agent state, read-file state, metadata, worktree, remote tasks, and content replacements, and finally replaces the visible messages.</p>
+            <p><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/screens/REPL.tsx#L1735-L1945"><code>REPL.resume()</code></a> runs inside an already active interface. It first deserializes the target. Before switching sessions, it executes <code>SessionEnd</code> hooks for the current session, then runs the target's <code>SessionStart(resume)</code> hooks, restores file history, attribution, agent state, read-file state, metadata, worktree, remote tasks, and content replacements, and finally replaces the visible messages.</p>
 
-            <p>The resume picker is only the selection interface. Its loader still checks cross-project sessions, restores cost and agent data, rebuilds compaction state, and passes initial messages, file-history snapshots, and replacement records to the REPL. The session list progressively enriches lightweight log entries so it can filter and present sessions that are actually resumable.</p>
+            <p>The resume picker is only the selection interface. Its loader still checks cross-project sessions, restores cost and agent data, conditionally invokes the context-collapse restore interface, and passes initial messages, file-history snapshots, and replacement records to the REPL. The session list progressively enriches lightweight log entries so it can filter and present sessions that are actually resumable.</p>
 
             <h2>6. Fork resume must write a new transcript</h2>
-            <p>A normal resume continues the original session: it reuses the session id and adopts the existing transcript. <code>--fork-session</code> derives a new session instead. It keeps the fresh session id, does not adopt the original file, and writes later messages through <code>recordTranscript()</code> into a new transcript.</p>
-            <figure class="figure"><img src="../assets/compact-recovery-loop.png" alt="Compaction records and restored context feeding a resumed or forked next turn" /><figcaption>Both compact and resume preserve enough structure for a later request to continue, but a fork keeps its new history separate.</figcaption></figure>
+            <p>A normal resume continues the original session: it reuses the session id and adopts the existing transcript. <code>--fork-session</code> derives a new session instead. It keeps the fresh session id, does not adopt the original file, and writes messages through <code>recordTranscript()</code> into a new transcript. Metadata restoration removes <code>worktreeSession</code>, and the fork does not restore or take ownership of the original worktree. Otherwise an exit-time removal could delete a worktree still referenced by the original session. A fork session is not automatically an isolated filesystem; separate worktree isolation is still needed for independent file changes.</p>
+
 
             <p>Content replacements need special handling in a fork. The replacement entries are written into the new session so its tool-use ids can still resolve to the reduced results. Otherwise the fork could restore an oversized tool output that the original session had already replaced.</p>
 
-            <p>Resume is therefore state reconstruction, not chat replay. Messages are only one input alongside file history, content replacements, compact records, metadata, agent selection, worktree state, hooks, and the transcript chosen for future writes.</p>
-        
+            <div class="table-wrap"><table><thead><tr><th>Path</th><th>Session id</th><th>Write target</th><th>Reason</th></tr></thead><tbody>
+<tr><td>Normal --continue / --resume</td><td>Reuse the restored id.</td><td>Adopt the original transcript.</td><td>New records continue the original chain.</td></tr>
+<tr><td>Interactive /resume</td><td>Switch to the selected id.</td><td>Adopt the selected transcript.</td><td>End the current session before installing the target runtime.</td></tr>
+<tr><td>--fork-session</td><td>Keep the fresh id.</td><td>Write a new transcript.</td><td>Derived messages must not modify the original history.</td></tr>
+<tr><td>Fork with replacements</td><td>Keep the fresh id.</td><td>Seed replacement entries in the new session.</td><td>Retain reduced tool outputs when the fork is resumed again.</td></tr>
+</tbody></table></div>
+            <p>Resume is therefore state reconstruction, not chat replay. Messages are only one input alongside file history, content replacements, compact records, metadata, agent selection, worktree state, hooks, and the transcript chosen for future writes. Which auxiliary state is available depends on the loading source, persisted records, and feature gates.</p>
+
             <h2 id="sources">Sources</h2>
             <p>The source-code claims in this article are based on the public mirror and the linked official documentation. Server-side session storage is not inferred from client-side recovery code.</p>
             <ul>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/hooks/useLogMessages.ts#L19-L115">Incremental transcript logging</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionStorage.ts#L1400-L1534">Transcript recording, replacement records, and file adoption</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/conversationRecovery.ts#L154-L595">Message cleanup and conversation recovery</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/utils/sessionRestore.ts#L99-L550">Session-state restoration</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/REPL.tsx#L1735-L1945">Interactive resume</a></li>
-                <li><a href="https://github.com/Rememorio/claude-code/blob/main/src/screens/ResumeConversation.tsx#L180-L305">Resume picker and target loading</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/hooks/useLogMessages.ts#L19-L115">Incremental transcript logging</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/sessionStorage.ts#L1400-L1534">Transcript recording, replacement records, and file adoption</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/conversationRecovery.ts#L154-L595">Message cleanup and conversation recovery</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/utils/sessionRestore.ts#L99-L551">Session-state restoration</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/screens/REPL.tsx#L1735-L1945">Interactive resume</a></li>
+                <li><a href="https://github.com/Rememorio/claude-code/blob/5a774a2b62d7949c1d94e0b726281554d7893cfd/src/screens/ResumeConversation.tsx#L180-L305">Resume picker and target loading</a></li>
             </ul>
           </section>
         </article>
