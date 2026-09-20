@@ -1001,14 +1001,19 @@ For any article change:
 2. Render generated HTML from Markdown sources when the article package uses a
    renderer.
 3. Keep filenames stable unless the semantic role of a figure changes.
-4. Update `og:image` if the cover changes.
+4. If the cover changes, trace its incoming references: home cards, series
+   cards, language gateways, and `og:image`. Compare their resolved assets with
+   the article cover in each language. A separate site/series overview may keep
+   its own image when that image still represents its stated scope.
 5. Check the generated table of contents after heading changes.
 6. For series additions, removals, or reordering, verify that overview pages,
    route-map figures, cover images, alt text, chapter numbers, navigation
    tabs, favicon links, home cards, README entries, and language gateways all
    expose the same sequence and publication identity.
 7. Verify desktop and mobile widths for overflow, cramped figures, and broken
-   code/table scrolling.
+   code/table scrolling. Inspect covers inside actual home and series cards,
+   not only the article: a correct asset can still lose labels and arrows when
+   a fixed-height frame uses `object-fit: cover`. Preserve the full diagram.
 8. Keep the README public index current for new public entry points.
 
 Treat the blog home as an explicit publication inventory, not an accidental
@@ -1031,9 +1036,15 @@ sample. Choose one exposure mode per series and keep it consistent:
   chapter slug and replace the root with the route page. Update canonicals,
   language siblings, home cards, series cards, previous/next links, assets, and
   route-map references as one navigation graph.
-- Keep standalone articles in the post inventory rather than the series shortcut
-  shelf. Add them to a shortcut shelf only after a real topic landing page
-  exists for that destination.
+- Keep standalone articles in the post inventory, separate from series
+  shortcuts. A clearly labeled standalone-article navigation group may link
+  directly to them; do not invent a series landing page just to expose one.
+- Verify discoverability from the default home state, not merely the presence
+  of a link in HTML. When the list is folded or limited to a first batch, ensure
+  readers can find every published article through clear navigation or search.
+  Search must cover the full inventory. Check both languages, desktop and
+  mobile, a title beyond the initial batch, no results, clearing the query, and
+  keyboard/IME input; counts and selected display controls must match the list.
 - When the home hero represents the newest chapter, update its visible cover
   and `og:image` together. If it deliberately represents the stable series
   overview instead, keep both surfaces aligned to that identity.
