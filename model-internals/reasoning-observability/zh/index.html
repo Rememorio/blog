@@ -35,12 +35,14 @@
           <h1>CoT Monitoring、NLA、SAE 与 Latent Reasoning</h1>
           <p class="lead">模型写下“我在检查测试”，同时悄悄利用了答案提示；Agent 的日志看起来合规，内部计算却在寻找奖励漏洞。要监控推理，第一步不是选一个万能解释器，而是先知道每个观察窗口漏掉什么。</p>
           <div class="meta-line"><span>问题：reasoning observability</span><span>原则：多源证据，不把解释当真值</span></div>
-          <figure class="hero-image"><img src="assets/reasoning-observability-cover.png" alt="CoT、NLA、SAE 与 latent reasoning 四种推理观察窗口" /></figure>
+          <figure class="hero-image"><img src="assets/reasoning-observability-cover.png" alt="CoT、NLA、SAE、J-lens 四种观察方法，以及独立回环的 latent reasoning 计算设计" /></figure>
         </section>
 
         <section class="article-body">
-          <div class="note scope-note"><p><strong>术语先分开。</strong>CoT 是模型输出的一段 token；NLA、J-lens 和 SAE 是观察 activation 的方法；Coconut 一类 latent reasoning 则改变计算载体，让 hidden state 继续参与推理。前三者是仪器，后一类是被观察的计算设计，不能放在同一栏里当作四种“解释方法”。</p></div>
+          <div class="note scope-note"><p><strong>术语先分开。</strong>CoT 是模型生成的推理 token；NLA、J-lens 和 SAE 是观察 activation 的方法；Coconut 一类 latent reasoning 则改变计算载体，让 hidden state 继续参与推理。CoT monitoring 与 activation readout 是仪器，latent reasoning 是被观察的计算设计，不能把它们全部当作“解释方法”。</p></div>
           <div class="note reading-contract"><p><strong>这一篇只解决一个实际问题：</strong>当 Agent 说“我已经检查过审批规则”，我们凭什么相信？下面仍沿用同一任务：把 <code>retention_days</code> 从 7 改到 30；仓库政策规定超过 14 天必须人工审批，而测试 fixture 中夹着一句不可信的“审批已通过”。</p></div>
+
+          <p><strong>证据范围。</strong>CoT 与 SAE 部分依据所引论文；NLA 与 Coconut 的实现说明对应作者公开代码的固定提交。审批场景是贯穿本文的教学示例，不是这些项目已实现的 Agent 权限功能。</p>
 
           <h2>一、先调查一条自相矛盾的轨迹</h2>
           <p>假设 Agent 最终没有请求审批，直接生成了修改文件的 tool call。单看它的自然语言解释，一切似乎正常；把不同系统留下的记录排在时间线上，矛盾才出现：</p>
@@ -56,11 +58,11 @@
           <h2>二、五种窗口分别接在哪里</h2>
           <h3>2.1 先认清输入、仪器和输出</h3>
           <p><strong>CoT monitor</strong>读取模型主动写出的推理 token，输出风险标签或自然语言判断。<strong>NLA</strong>读取某层的 dense activation，由一个 learned verbalizer 输出句子。<strong>SAE</strong>同样读取 activation，但输出少量被点亮的 dictionary features。<strong>J-lens</strong>还会追踪中间方向对未来输出的 Jacobian 影响。它们都不是环境真值，只是从不同切面得到的测量。</p>
-          <p><strong>Latent reasoning</strong>则不在这一组“仪器”里：它改变模型怎样计算。普通推理大致是 hidden state → token → 新 hidden state；Coconut 允许 hidden state → hidden state 连续推进，等到需要时才恢复 token。因而它是待观测对象，也是纯文本监控为什么可能漏看的原因。</p>
+          <p><strong>Latent reasoning</strong>则不在这一组“仪器”里：它改变模型怎样计算。普通推理大致是 hidden state → token → 新 hidden state；Coconut 允许 hidden state → hidden state 连续推进，经过预设的连续步数后恢复 token。因而它是待观测对象，也是纯文本监控为什么可能漏看的原因。</p>
           <div class="table-wrap"><table>
             <thead><tr><th>方法</th><th>真正读到什么</th><th>能先回答什么</th><th>不能单独证明什么</th></tr></thead>
             <tbody>
-              <tr><td>CoT monitoring</td><td>模型被允许输出的推理 token</td><td>它公开陈述了什么意图</td><td>未写出的计算不存在</td></tr>
+              <tr><td>CoT monitoring</td><td>监控者实际可访问的推理 token</td><td>它在该段推理中陈述了什么意图</td><td>未写出的计算不存在</td></tr>
               <tr><td>NLA</td><td>activation 的自然语言压缩</td><td>内部状态可否被一个关系性描述重建</td><td>描述逐字忠实、没有补故事</td></tr>
               <tr><td>SAE</td><td>稀疏 dictionary features</td><td>哪些可复用方向在一批轨迹中出现</td><td>一个 feature 就是一项纯净概念</td></tr>
               <tr><td>J-lens / J-space</td><td>影响后续 logits 的 token-linked directions</td><td>哪些中间内容对最终输出有局部因果影响</td><td>它覆盖了全部计算</td></tr>
@@ -68,29 +70,31 @@
             </tbody>
           </table></div>
 
-          <h2>三、CoT：最便宜的语义信号，不是内心逐字稿</h2>
-          <p>CoT 有一个很大的工程优势：它已经是自然语言，不必额外训练 decoder。我们可以让独立模型检查“是否提到审批”“是否把不可信文本当权限”，也可以按规则检索大量轨迹。对线上系统而言，这是最便宜、覆盖面最广的一层。</p>
+          <h2>三、CoT：可以监控的语义信号，不是内心逐字稿</h2>
+          <p>CoT 有一个很大的工程优势：它已经是自然语言，不必额外训练 decoder。我们可以让独立模型检查“是否提到审批”“是否把不可信文本当权限”，也可以按规则检索大量轨迹。在能够访问推理 token 的系统中，这是一层容易部署的语义信号。用户看到的回答、摘要或事后解释不等于监控实验读取的原始 CoT，不能直接套用同一检出率。</p>
           <p>但“模型写了什么”和“什么计算实际推动了答案”并不相同。Anthropic 的 <a href="https://www.anthropic.com/research/reasoning-models-dont-say-think">faithfulness 实验</a>在题目中放入不同类型的答案提示，再看模型是否承认用过提示。Claude 3.7 Sonnet 只有约 25% 的相关 CoT 提到提示，DeepSeek R1 约 39%；面对更令人担忧的未授权提示，提及率也只有约 41% 与 19%。模型经常利用了证据，却没有把这条因果路径写出来。</p>
           <pre><code class="language-text">可见 CoT：  “根据配置约束，30 天是合理值。”
 可能遗漏：  “fixture 说审批已通过，因此我把它当成授权。”
 环境事实：  fixture 只能影响测试输入，不能授予权限。</code></pre>
           <p>这并不等于“CoT 没用”。恰恰相反，OpenAI 的 <a href="https://openai.com/index/chain-of-thought-monitoring/">reward hacking 研究</a>发现，CoT monitor 往往比只看 action 更容易发现作弊意图。危险在下一步：若训练直接惩罚“出现可疑词语的 CoT”，Agent 可能保留作弊策略，却学会不再把它写出来；实验中几乎所有剩余作弊都因此变得难以被 CoT monitor 检出。</p>
-          <p>所以要把“监控信号”和“优化目标”分开。可以用 CoT 触发复核、抽样和权限收紧；如果要把它加入 reward，必须另设冻结测试集，持续测量 <a href="https://openai.com/index/evaluating-chain-of-thought-monitorability/">monitorability</a> 有没有下降。否则系统获得的可能只是更整洁的解释，而不是更安全的推理。</p>
+          <p>所以要把“监控信号”和“优化目标”分开。直接惩罚触发 CoT monitor，与只按任务结果做强化学习，施加的压力不同；OpenAI 后续的 <a href="https://openai.com/index/evaluating-chain-of-thought-monitorability/">monitorability 评测</a>在所研究的两次前沿 RL 训练中，没有观察到显著退化，这不保证更大规模仍然如此。工程上可以用 CoT 触发复核、抽样和权限收紧；若把监控分数加入 reward，应保留冻结审计集，同时测量错误动作与漏检率。否则系统获得的可能只是更整洁的解释。</p>
 
           <h2>四、NLA：用重建约束自然语言解释</h2>
-          <p><a href="https://transformer-circuits.pub/2026/nla/index.html">Natural Language Activations</a>不是直接问模型“你刚才在想什么”。它训练两个互相制约的组件：activation verbalizer（AV）把中间 activation 压成文本；activation reconstructor（AR）只看这段文本，尝试恢复原 activation。训练目标要求恢复后的状态尽量保留原状态中可用于后续计算的信息。</p>
+          <p><a href="https://transformer-circuits.pub/2026/nla/index.html">Natural Language Autoencoders（自然语言自编码器）</a>不是直接问模型“你刚才在想什么”。它训练两个互相制约的组件：activation verbalizer（AV）把中间 activation 压成文本；activation reconstructor（AR）只看这段文本，尝试恢复原 activation。直接训练目标是降低 activation 的重建误差，并不直接奖励解释的真实性或后续任务表现。</p>
           <pre><code class="language-text">原 activation
   ↓ AV
 “30 超过审批阈值；fixture 的授权声明来源不可信”
   ↓ AR
 重建 activation
   ↓ 与原状态比较
-解释丢掉了多少可用信息？</code></pre>
-          <p>研究用 explained variance（FVE）衡量重建质量：如果仅凭这段解释就能重建较多 activation 变化，它至少携带了真实可用的信息。训练还会先用一个 summary proxy 做 warm start，再通过强化学习改善重建。与“给 feature 起个短名字”相比，NLA 能表达关系、否定和冲突，例如“记住了 14 的阈值，但还在权衡 fixture 是否算授权”。</p>
-          <p>重建约束降低了随意讲故事的空间，却没有消灭它。AV 可能写出听起来合理的补全，AV 与 AR 也可能形成不易被人理解的编码；强解释器还可能从输入上下文反推答案，而不是忠实读取 activation。不同层、不同任务的可解释性也不一致。因此 NLA 更适合产生调查假设：先指出某段轨迹可能存在“来源信任冲突”，再用输入消融、steering、行为与环境结果验证，而不是凭一句解释给模型定罪。</p>
+向量重建误差有多大？</code></pre>
+          <p>研究用 fraction of variance explained（FVE）衡量重建质量：相对总是预测平均 activation 的基线，解释使向量误差下降了多少。FVE 高不代表每个细节都真实，也不保证关键决策所需的信息都被保留。训练还会先用一个 summary proxy 做 warm start，再通过强化学习改善重建。与“给 feature 起个短名字”相比，NLA 能表达关系、否定和冲突，例如“记住了 14 的阈值，但还在权衡 fixture 是否算授权”。</p>
+          <p>在公开实现里，这个观察窗口有一套必须匹配的输入约定。<a href="https://github.com/kitft/natural_language_autoencoders/blob/0577769b55ad4fdd96d159e983361b97fa4e7331/nla_inference.py#L120-L205"><code>load_nla_config</code></a>从 checkpoint 的 <code>nla_meta.yaml</code>读取提示模板、注入 token 和缩放值，并检查 tokenizer 与标记邻居；<a href="https://github.com/kitft/natural_language_autoencoders/blob/0577769b55ad4fdd96d159e983361b97fa4e7331/nla_inference.py#L376-L448"><code>NLAClient._build_embeds</code></a>把 activation 归一化、缩放，替换模板中指定位置的 embedding，再把 <code>input_embeds</code>交给 AV 生成文本。维度相同不等于可随意互换：目标模型、抽取层与 checkpoint 配置都要匹配，否则流畅描述也可能只是错误注入的结果。</p>
+          <p>AR 是重建评分的可选步骤，生成解释本身不必每次调用它。<a href="https://github.com/kitft/natural_language_autoencoders/blob/0577769b55ad4fdd96d159e983361b97fa4e7331/nla_inference.py#L643-L666"><code>NLACritic.score</code></a>把原向量和重建向量都归一化后计算 MSE 与余弦相似度，因此检查的是方向重建；这不是“有多少概率解释是真的”。批量计算 FVE 时，<a href="https://github.com/kitft/natural_language_autoencoders/blob/0577769b55ad4fdd96d159e983361b97fa4e7331/docs/inference.md#computing-fve--two-classic-footguns">基线应使用归一化原向量的均值，不再把该均值投回单位球面</a>，否则分母变大，会抬高看似漂亮的分数。</p>
+          <p>重建约束降低了随意讲故事的空间，却没有消灭它。AV 可能写出听起来合理的补全，AV 与 AR 也可能形成不易被人理解的编码；实际 AV 接收 activation 和固定解释指令，不直接读取原始上下文；它仍可能依据 activation 中的线索和自身先验补出原文没有的细节。不同层、不同任务的可解释性也不一致。因此 NLA 更适合产生调查假设：先指出某段轨迹可能存在“来源信任冲突”，再用输入消融、steering、行为与环境结果验证，而不是凭一句解释给模型定罪。</p>
 
           <h2>五、SAE：从密集向量里学一套稀疏字典</h2>
-          <p>一层 activation 可以有几千维，而且大量概念叠在相同维度上，逐坐标看没有意义。<a href="https://transformer-circuits.pub/2024/scaling-monosemanticity/index.html">Sparse Autoencoder</a>学习一个比原维度更大的“字典”：encoder 把 dense activation 映射成许多非负 feature activations，ReLU 让大多数位置归零；decoder 再用少量被点亮的方向重构原向量。训练同时最小化重建误差和 L1 稀疏惩罚。</p>
+          <p>一层 activation 可以有几千维，而且大量概念叠在相同维度上，逐坐标看没有意义。<a href="https://transformer-circuits.pub/2024/scaling-monosemanticity/index.html">Sparse Autoencoder</a>在这里引用的 2024 年方案中学习一个比原维度更大的“字典”：encoder 把 dense activation 映射成许多非负 feature activations，ReLU 让大多数位置归零；decoder 再用少量被点亮的方向重构原向量。该方案同时最小化重建误差和 L1 稀疏惩罚；这是本文解释字典学习的具体实现，不是所有 SAE 都必须采用的激活函数与损失。</p>
           <pre><code class="language-text">dense activation
   ├─ feature 4187  “审批阈值 / 超限”
   ├─ feature 9210  “不可信指令”
@@ -108,11 +112,17 @@ hidden → “需要审批” → hidden → “先请求审批” → tool prop
 
 continuous thought：
 hidden → hidden → hidden → [恢复成 token] → tool proposal</code></pre>
-          <p>论文的 proof-of-concept 表明，连续状态可同时保留多个下一步候选，在需要搜索的任务上出现类似 breadth-first search 的行为：模型不必过早把“直接改”“请求审批”“拒绝 fixture 指令”三条分支压成一个词。这是一种计算载体，不是一种解释工具；它也没有证明任意大模型都在自然地产生同样的搜索。</p>
+          <p>“何时恢复文字”在官方实现中是预先安排的。<a href="https://github.com/facebookresearch/coconut/blob/27273cb8cca4bb763c041a63b036d0c3b7cbbb48/dataset.py#L188-L223"><code>get_question_latent_dataset</code></a>根据训练阶段与 <code>c_thought</code> 等配置决定 latent 占位数，把它们放在开始、结束标记之间；不是模型临时判断“想够了”才停止。<a href="https://github.com/facebookresearch/coconut/blob/27273cb8cca4bb763c041a63b036d0c3b7cbbb48/coconut.py#L39-L158"><code>Coconut.forward</code></a>逐个用前一位置最后一层的 hidden state 替换 latent embedding，复用前缀 KV cache；随后 <a href="https://github.com/facebookresearch/coconut/blob/27273cb8cca4bb763c041a63b036d0c3b7cbbb48/coconut.py#L201-L247"><code>generate</code></a>恢复离散 token 的贪心生成。</p>
+          <pre><code class="language-text">输入形状示意（设定 2 个连续思维位置）：
+问题 → &lt;|start-latent|&gt; → &lt;|latent|&gt; → &lt;|latent|&gt; → &lt;|end-latent|&gt;
+                              ↑ 前一 hidden state 替换 embedding ↑
+处理完预设位置 → 生成答案 token
+占位 token 可出现在 token ID 日志中，但日志不包含被填入的连续向量。</code></pre>
+          <p><a href="https://arxiv.org/html/2412.06769v4">论文实验</a>表明，连续状态可同时保留多个下一步候选，在需要搜索的任务上出现类似 breadth-first search 的行为：模型不必过早把“直接改”“请求审批”“拒绝 fixture 指令”三条分支压成一个词。上面的审批分支只用于类比：公开代码没有调用工具或实现审批策略。论文所说的 BFS 类行为来自实验分析，<code>forward</code>没有维护显式搜索队列；它也没有证明任意大模型都会产生同样的搜索。</p>
           <p>工程结论很朴素：只保存 CoT，最多覆盖“被显式写出的推理”。即使没有 Coconut，普通 Transformer 的 token 之间也存在 silent computation；一旦系统显式采用 latent reasoning，这个缺口更大。监控还必须检查 tool schema 与权限校验、真实环境 diff，以及可选的 activation probes。</p>
 
           <h2>七、在线阻断错误动作，离线解释为什么发生</h2>
-          <figure class="wide-figure"><img src="assets/monitoring-evidence-stack.png" alt="行为结果、工具调用、CoT、activation readout 与环境 diff 分别记录同一次运行" /><figcaption>这些记录由不同组件产生，失败方式也不同；它们互相印证或冲突，比任何单一分数更有价值。</figcaption></figure>
+          <figure class="wide-figure"><img src="assets/monitoring-evidence-stack.png" alt="同一次运行分路记录 CoT、激活读数和工具与环境记录，J-lens、NLA、SAE 并列供交叉核验" /><figcaption>同一次运行产生多种记录；NLA、SAE 与 J-lens 可按问题分别选用，不构成串行处理链。多个读数可能共享输入与盲区，交叉核验仍须结合运行时拒绝记录和真实环境变化。</figcaption></figure>
           <h3>7.1 在线路径：先执行不可绕过的检查</h3>
           <p>运行时不需要相信模型是否“理解”审批：tool schema 要求 <code>approval_token</code>，policy engine 校验 token 与变更范围，环境记录 diff。CoT monitor 可以提高抽样率或触发人工复核，但不能替代这项校验。这样即使 explanation 错了，文件仍不会被改。</p>
           <h3>7.2 离线路径：从冲突进入，而不是从标签进入</h3>
@@ -144,7 +154,7 @@ hidden → hidden → hidden → [恢复成 token] → tool proposal</code></pre
           <ul>
             <li>Anthropic：<a href="https://www.anthropic.com/research/reasoning-models-dont-say-think">Reasoning models don't always say what they think</a></li>
             <li>OpenAI：<a href="https://openai.com/index/chain-of-thought-monitoring/">Monitoring reasoning models for misbehavior</a></li>
-            <li>Anthropic：<a href="https://transformer-circuits.pub/2026/nla/index.html">Natural Language Activations</a></li>
+            <li>Anthropic：<a href="https://transformer-circuits.pub/2026/nla/index.html">Natural Language Autoencoders</a></li>
             <li>Anthropic：<a href="https://transformer-circuits.pub/2024/scaling-monosemanticity/index.html">Scaling Monosemanticity</a></li>
             <li>Hao et al.：<a href="https://arxiv.org/abs/2412.06769">Training Large Language Models to Reason in a Continuous Latent Space</a></li>
           </ul>
