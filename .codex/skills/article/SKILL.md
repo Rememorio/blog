@@ -995,26 +995,45 @@ wide comparison tables in standalone HTML articles:
 
 ## Update Protocol
 
-For any article change:
+Treat a revision as a change to both the article and what its entry points
+promise. A working URL, matching chapter count, or unchanged title does not
+prove that the navigation still describes the article accurately.
 
-1. Update the source article first when a source package exists.
-2. Render generated HTML from Markdown sources when the article package uses a
-   renderer.
-3. Keep filenames stable unless the semantic role of a figure changes.
-4. If the cover changes, trace its incoming references: home cards, series
-   cards, language gateways, and `og:image`. Compare their resolved assets with
-   the article cover in each language. A separate site/series overview may keep
-   its own image when that image still represents its stated scope.
-5. Check the generated table of contents after heading changes.
-6. For series additions, removals, or reordering, verify that overview pages,
-   route-map figures, cover images, alt text, chapter numbers, navigation
-   tabs, favicon links, home cards, README entries, and language gateways all
-   expose the same sequence and publication identity.
-7. Verify desktop and mobile widths for overflow, cramped figures, and broken
-   code/table scrolling. Inspect covers inside actual home and series cards,
-   not only the article: a correct asset can still lose labels and arrows when
-   a fixed-height frame uses `object-fit: cover`. Preserve the full diagram.
-8. Keep the README public index current for new public entry points.
+1. Identify what changed in the page's question, scope, mechanism, evidence
+   boundary, title, reading order, or figures. For a retrospective audit, use
+   recent commits to find affected chapters, then compare their current public
+   pages with the entries that describe them.
+2. Update the source article first when a source package exists, then render
+   generated HTML before judging the public result.
+3. Follow incoming entries from both language homes, series directories,
+   language gateways, overview reading routes, and neighboring chapter links.
+   Check their titles, summaries, labels, and image descriptions against the
+   revised article; also check the article's own description and Open Graph
+   metadata. Update README entries when the published scope changes, even if
+   no URL is added. Search for the old wording as well as the destination URL
+   so repeated descriptions are not missed.
+4. Keep entry copy concise, but preserve qualifications that change the reader's
+   expectation: archived versus current implementations, local versus hosted
+   backends, opt-in versus default behavior, independent execution paths, and
+   produced versus validated or adopted output. A card must not turn a bounded
+   reminder into a guarantee or connect two paths that the article separates.
+   Short titles and different summaries are fine when they retain the same
+   subject and limits; do not require verbatim copies. Leave accurate entries
+   unchanged after checking them.
+5. For additions, removals, or reordering, reconcile the route inventory and
+   chapter numbers as well as the copy. Overview pages, route maps, navigation
+   tabs, previous/next links, home cards, README entries, and language gateways
+   must expose the same publication order in both languages.
+6. Run the visual impact pass against that same scope. Keep figure filenames
+   stable unless their teaching role changes. If a cover changes, trace home
+   cards, series cards, language gateways, and `og:image`, comparing resolved
+   assets with the article cover in each language. A site or series overview
+   may keep its own image when it still represents its stated scope.
+7. Check the generated TOC after heading changes and verify affected pages at
+   desktop and mobile widths. Inspect revised titles and summaries inside the
+   actual home and series cards, together with figure framing and code/table
+   scrolling. A fixed-height frame using `object-fit: cover` can hide labels
+   and arrows even when it points to the correct asset; preserve the diagram.
 
 Treat the blog home as an explicit publication inventory, not an accidental
 sample. Choose one exposure mode per series and keep it consistent:
@@ -1098,7 +1117,11 @@ For language-structure changes, also verify:
 Before committing public article changes, run the smallest relevant validation
 that covers the edit:
 
-- Check asset references exist and every public image has non-empty alt text.
+- Check that entry links and asset references resolve and every public image
+  has non-empty alt text. Validate navigation meaning separately from link
+  reachability: compare touched entry titles, summaries, metadata, and image
+  descriptions with the final article in each language, not just with another
+  index that may carry the same stale copy.
 - Search for private leakage: local absolute paths, local file URLs, temporary
   paths, unfinished editorial markers, hidden process language, private request
   text, or private rationale.
