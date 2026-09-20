@@ -1,85 +1,88 @@
 <!doctype html><html lang="zh-CN"><head>
-  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>DeepSeek Harness 源码笔记（七）：当 Agent 能改写自己的运行时</title>
-  <meta name="description" content="从七个 cordis_* 工具、只读 Inspect Provider、不可变 Package、Host/Client 双端执行、审批与进程内生命周期，读懂 DeepSeek Harness 的自指运行时边界。" />
-  <meta property="og:title" content="DeepSeek Harness 源码笔记（七）：当 Agent 能改写自己的运行时" /><meta property="og:type" content="article" /><meta property="og:image" content="../assets/cordis-self-referential-route.png" />
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>DeepSeek Harness 源码笔记（七）：当 Agent 能扩展自己的运行时：从只读 Inspect 到持久化插件</title>
+  <meta name="description" content="从两个只读 Inspect 工具与 plugin_manager，读懂持久 Bundle、profile 权限、安装恢复、HMR 激活和浏览器验收边界。" />
+  <meta property="og:title" content="DeepSeek Harness 源码笔记（七）：当 Agent 能扩展自己的运行时：从只读 Inspect 到持久化插件" /><meta property="og:type" content="article" /><meta property="og:image" content="../assets/cordis-persistent-extension-route.png" />
   <link rel="canonical" href="https://rememorio.github.io/blog/deepseek-harness/zh/self-referential-runtime/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/deepseek-harness/zh/self-referential-runtime/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/deepseek-harness/en/self-referential-runtime/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/deepseek-harness/" />
   <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
 </head><body id="top"><header class="site-header"><a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">DSH 系列</a><a href="../multi-agent-runtime/">上一篇</a><a href="#sources">参考源码</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./">中文</a><a href="../../en/self-referential-runtime/">English</a></span></nav></header>
 <div class="article-shell"><aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
-<section class="article-hero"><p class="eyebrow">DeepSeek Harness 源码笔记 · 第七篇</p><h1>当 Agent 能改写自己的运行时：Cordis 动态插件的能力与边界</h1>
-  <p class="lead">DSH 的“自指”不是让模型偷偷修改仓库，而是给当前进程增加一条受生命周期约束的临时扩展路径：先检查真实能力，再定义不可变 Package，经必要审批后把 Host/Client 半边装进 Cordis Fiber，最后可停止、回滚或永久移除。</p>
-  <div class="meta-line"><span>系列 7 / 7</span><span>源码快照：b150a55</span><span>主题：自指运行时</span><span>核心：Inspect → Define → Approve → Run → Dispose</span></div>
-  <nav class="series-strip"><a href="../runtime-route/"><strong>01</strong> 运行主线</a><a href="../cordis-composition/"><strong>02</strong> Cordis</a><a href="../event-sourced-session/"><strong>03</strong> 事件会话</a><a href="../governed-effects/"><strong>04</strong> 副作用</a><a href="../compaction-reconstruction/"><strong>05</strong> 压缩</a><a href="../multi-agent-runtime/"><strong>06</strong> 多 Agent</a><span class="series-current"><strong>07</strong> 自指</span><a href="../"><strong>路线图</strong></a></nav>
-  <figure class="hero-image"><img src="../assets/cordis-self-referential-route.png" alt="Cordis 自指运行时工坊：Agent 从能力目录检查接口，在制图桌登记不可变 Package，经用户审批后依次启动 Host 与 Client Fiber，再选择 stop 保留版本或 undefine 完全移除" /></figure>
-</section><section class="article-body">
-  <p>普通工具把一次调用交给预先存在的实现；动态 Cordis 插件允许模型临时创造实现本身。它可以消费 Service、监听 Event、注册新工具，也可以在浏览器 Slot 中加入 UI。于是问题不再只是“代码能不能跑”，而是：模型依据什么接口写代码；哪一个版本正在尝试；谁批准浏览器半边；失败后指针和旧运行怎样处理；重启以后还有没有这段能力。</p>
-  <div class="note"><p><strong>阅读契约。</strong>读完以后，你应该能解释七个 <code>cordis_*</code> 工具为什么分成三类 Inspect、四个生命周期动作；<code>pluginId</code>、<code>packageId</code>、<code>pluginRunId</code> 与两个版本指针各自代表什么；为什么 <code>cordis_define</code> 成功不等于代码已执行；Host-only 与 Client-bearing Package 的审批差异；以及 <code>cordis_stop</code> 和 <code>cordis_undefine</code> 为什么不能互换。</p></div>
-  <p><strong>证据边界。</strong>本文固定在提交 <a href="https://github.com/deepseek-ai/deepseek-harness/commit/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"><code>b150a55</code></a>。这一快照里，<a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/tool-cordis/README.md">包级 README</a> 的开头仍描述旧的五工具接口，但同一提交中<a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/tool-cordis/src/index.ts">实际注册工具的源码</a>与 freshness-gated 的生成工具目录已经是七工具协议。下文以可执行源码和生成契约为准，并把这种漂移本身视为源码阅读时必须交叉验证的信号。</p>
+<section class="article-hero"><p class="eyebrow">DeepSeek Harness 源码笔记 · 第七篇</p><h1>当 Agent 能扩展自己的运行时：从只读 Inspect 到持久化插件</h1><p class="lead">当前 Creator 让 Agent 先查真实接口，再编写普通 Bundle，通过 Plugin Manager 安装到当前 profile。配置跨会话、跨重启保留，因此安装、授权、运行激活和页面验收必须分别回答。</p><div class="meta-line"><span>系列 7 / 7</span><span>源码快照：ddefc45</span><span>Inspect → Bundle → Profile → 验收</span></div><nav class="series-strip"><a href="../runtime-route/"><strong>01</strong> 运行主线</a><a href="../cordis-composition/"><strong>02</strong> Cordis</a><a href="../event-sourced-session/"><strong>03</strong> 事件会话</a><a href="../governed-effects/"><strong>04</strong> 副作用</a><a href="../compaction-reconstruction/"><strong>05</strong> 压缩</a><a href="../multi-agent-runtime/"><strong>06</strong> 多 Agent</a><span class="series-current"><strong>07</strong> 持久插件</span><a href="../"><strong>路线图</strong></a></nav><figure class="hero-image"><img src="../assets/cordis-persistent-extension-route.png" alt="从只读 Host/Client 接口检查到编写 Bundle，经权限检查和 plugin_manager 写入 profile，再分别检查 HMR 或重启后的激活" /></figure></section><section class="article-body">
+  <p>设想你要给 DSH 页面加一个团队状态面板。Agent 必须先知道哪里可以放 UI、哪些 Service 能读取状态，再把代码包装成可安装的插件。真正困难的部分是安装后的责任：它影响哪几个会话，重启是否还在，配置保存后什么时候算可用，失败又保留了哪些文件。</p>
+  <div class="note"><p><strong>阅读契约。</strong>本文跟随这一个面板从接口检查走到安装、启用和移除。读完后，你应能区分两个只读 Inspect 工具与 <code>plugin_manager</code> 的六种 action，说明 Bundle、profile 配置和运行中 Fiber 的关系，并根据 <code>changed</code> 与 <code>application</code> 判断结果，而不是把“已安装”报告成“页面已可用”。</p></div>
+  <p><strong>证据边界。</strong>本文固定于 <a href="https://github.com/deepseek-ai/deepseek-harness/commit/ddefc45fbc7f8e46dd73185e68295696d1297887"><code>ddefc45</code></a>。当前 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/extensions/tool-cordis/src/index.ts#L19-L83">工具注册源码</a>只提供 <code>cordis_inspect_list</code> 和 <code>cordis_inspect_query</code>；Creator 的持久变更经过 Plugin Manager。动态 Host/Client runner 仍有程序化调用者与浏览器控制，但不能再把其中的 define/run/stop/undefine 当成当前模型工具。</p>
 
-  <h2>一、七个工具不是七个任意入口</h2>
-  <h3>1.1 Inspect 先建立可写代码的真实边界</h3>
-  <figure class="hero-image"><img src="../assets/cordis-inspect-providers.png" alt="Cordis Inspect 阅览室：Host 与 Client Provider 目录进入 list 和 query 的只读 JSON 路径，另一侧 self ledger 分层保存当前 Session 的 Plugin、Package、源码和诊断" /></figure>
-  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/tool-cordis/src/index.ts"><code>cordis_inspect_list</code></a> 返回 Provider manifest，而不是扫描一个随意可调用的对象。Host 内建 <code>Service</code>、<code>Event</code>、<code>Builtin</code>、<code>Tool</code>；Client 同步最近一份 <code>Service</code>、<code>Event</code>、<code>Builtin</code>、<code>Slots</code>、<code>Theme</code> 目录。每个 Provider 明确声明只读 method 及输入输出 JSON Schema。</p>
-  <p><code>cordis_inspect_query</code> 只能使用 list 返回的 platform、provider 和 method。Host query 在本地执行；Client query 广播到页面，等待第一个通过 schema 验证的回答，直到页面回答或 tool call 被取消。它描述能力、签名、Slot 树和 token，不会替模型调用业务 Service。这个分离阻止“反射目录”悄悄变成一个万能写接口。</p>
-  <p><code>cordis_inspect_self</code> 看的是当前 Session 自己创建的动态对象：无 ID 只列 Plugin 摘要；给出 <code>pluginId</code> 才看到 Packages、版本指针和最近 Run；再给出 <code>packageId</code> 才返回那份不可变源码与运行诊断。外部能力目录与自身生命周期状态因此是两条独立的只读路径。</p>
+  <h2>一、先把真实接口读清楚，再写插件</h2>
+  <h3>1.1 Inspect 返回契约，不调用业务能力</h3>
+  <p><code>cordis_inspect_list</code> 返回 Provider manifest，而不是扫描一个随意可调用的对象。Host 目录包含 Service、Event、Builtin 和 Tool；Client 同步 Service、Event、Builtin、Slots 和 Theme 等目录。每个 Provider 声明只读 method 及输入输出 JSON Schema。面板作者应先选出目录中的真实名字，再请求精确签名。</p>
+  <p><code>cordis_inspect_query</code> 的 platform、provider、method 必须来自目录。<a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/extensions/cordis-host-runner/src/inspect-registry.ts#L98-L190">Host 查询在本地执行；Client 查询等待第一个有效页面回答</a>，没有页面时继续等待，直到回答或工具取消。返回 Service 签名不等于调用那个 Service；返回 Slot 的 props 和注册要求，也不等于已经创建 UI。</p>
+  <p>仍以状态面板为例：先无参数浏览 Slots 的紧凑树，再给出精确 root 读取该 Slot 的完整要求。若 root 是 Factory，回答的是其身份、scope 与注册者，不能把它误当普通 Slot 的完整 props。然后查询面板依赖的 Service 和 Theme，才能确定数据读取与视觉容器。这保留了旧设计中最有价值的一点：反射目录只提供事实，不悄悄变成万能写接口。</p>
 
-  <h3>1.2 “Inspect before define”是正确性协议，不是提示词礼貌</h3>
-  <p>动态代码没有 TypeScript、JSX、import 或 bundler 转换。Host 与 Client 各自只拿到明确提供的 builtins 和经 <code>inject</code> 声明的 Service；Client UI 还必须注册到真实存在的 Slot。若模型猜测 API，最乐观的结果是 guard 报错，最糟的结果是把错误依赖写进一个等待中的 Fiber。先读紧凑目录、再读精确契约，是把运行时事实转成可执行源码的必要步骤。</p>
+  <h3>1.2 当前入口是普通 Bundle</h3>
+  <p>Bundle 是带 <code>dsh.bundle.patch</code> 的包；该字段指向一份插入或覆盖 Loader 条目的 YAML。它与进程内动态 Package 是两种对象。前者用普通文件和包依赖保存，后者由 runner 的内存 Registry 保存。当前 Creator 把 Inspect 与 Plugin Manager 放进<a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/preset/agent-presets/presets/cordis/agent.cordis.yml#L258-L283">同一个 Agent preset</a>，因此可以检查运行接口、编写包，再安装到当前 profile。</p>
+  <p>下面是 Bundle 声明的最小示意，省略面板的 Host/Client 实现与 Client 打包元数据；它说明配置怎样连到包，不代表仅写 manifest 就会出现面板。</p>
+  <pre><code class="language-json">{
+  "name": "@example/status-panel",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": { ".": "./index.js" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}</code></pre>
+  <pre><code class="language-yaml">- insert:
+    - id: status-panel
+      name: '@example/status-panel'</code></pre>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/boot/plugin-manager/src/index.ts#L333-L386">安装器会校验包确实声明 Bundle 并解析 patch</a>，再将包加入当前 profile 的依赖与选择列表。纯配置 Bundle 也可以只插入已有插件，例如 MCP 客户端；不必为每一次配置都生成新的 Host 执行代码。</p>
 
-  <h2>二、Plugin 是身份，Package 是不可变版本</h2>
-  <h3>2.1 Define 只编译语法并登记源码</h3>
-  <figure class="hero-image"><img src="../assets/cordis-version-approval.png" alt="Cordis 版本工作台：稳定 pluginId 下陈列 pkg-1 和 pkg-2 两个不可变 Package，currentPackageId 与 nextPackageId 分别标记成功版本和目标版本，用户审批后由 run 或 update 产生 pluginRunId" /></figure>
-  <p><code>cordis_define</code> 的 new 模式只接受 3–6 个小写英文字母作为语义前缀，Host 再分配稳定 <code>pluginId</code>；existing 模式必须命中当前 Session 已有的精确 ID。每次 define 都追加一个新的 <code>packageId</code>，至少包含 Host 或 Client 一半源码。旧 Package 不会被覆盖，修改等于追加版本。</p>
-  <p>define 会 trim 元数据，并把两半源码编译成函数体做语法预检；它不调用 <code>apply</code>，不请求审批，不改变 <code>currentPackageId</code>。所以对话里的 define card 只表示“这份源码已登记且尚未运行”，不是部署回执，也不能让进程重启后自动恢复定义。</p>
+  <h2>二、管理操作跨会话保存，权限也随之扩大</h2>
+  <h3>2.1 六种 action 写入不同对象</h3>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/boot/plugin-manager/src/tools.ts#L17-L76"><code>plugin_manager</code></a>把 Web 管理页使用的服务开放给 Agent。先通过列表取得精确标识，再进行四类持久动作：</p>
+  <div class="table-wrap"><table><thead><tr><th>action</th><th>对象与效果</th><th>保留的内容</th></tr></thead><tbody>
+    <tr><td><code>list_plugins</code> / <code>list_bundles</code></td><td>分页读取当前 profile 的插件或 Bundle，返回精确标识。</td><td>不改变配置；仍受同一工具权限检查。</td></tr>
+    <tr><td><code>set_plugin</code></td><td>在 profile patch 的最后一个匹配 override 中修改 disabled，或新增 override。</td><td>保留该 override 的其他配置字段与已安装包。</td></tr>
+    <tr><td><code>set_bundle</code></td><td>改写有序的 <code>dsh.profile.bundles</code>；重新启用会追加到末尾。</td><td>禁用保留依赖；层次优先级可能变化。</td></tr>
+    <tr><td><code>install_bundle</code></td><td>安装并验证 Bundle，默认随后启用。</td><td>安装成功而启用失败时保留依赖。</td></tr>
+    <tr><td><code>remove_bundle</code></td><td>先取消选择、卸载运行贡献，再运行 pnpm remove。</td><td>失败时保留已完成步骤和剩余状态，不自动重新启用。</td></tr>
+  </tbody></table></div>
+  <p>例如临时关闭状态面板，应选择 <code>set_bundle</code> 并传 <code>enabled: false</code>，而不是删除包。若只关闭其中一个可寻址插件，则使用 <code>set_plugin</code>。管理器拒绝关闭自己的关键组件，也不会编辑 Agent preset 内部的组合；profile 修改影响使用该 profile 的所有会话，不能套用旧动态对象“由当前 Session 独占”的假设。</p>
 
-  <h3>2.2 三类 ID 和两个指针把意图与事实分开</h3>
-  <p><code>pluginId</code> 是可持续修改的逻辑插件；<code>packageId</code> 是某一份不可变 Host/Client 源码；<code>pluginRunId</code> 是一次激活尝试，串起审批、两半加载、私有 RPC 与错误。<code>currentPackageId</code> 只在完整激活成功后提交，<code>nextPackageId</code> 保存正在审批、启动或最近失败的目标。</p>
-  <p><code>run</code> 模式用于第一次激活、重启当前版本，以及失败更新后重新运行 current 来回退；当已经有 current 且目标是不同 Package 时必须用 <code>update</code>。更新先停止旧 Run，再启动目标；目标失败不会篡改 current，但也不会自动复活旧 Run。系统保留旧 current 与失败 target next，让调用者显式重试 update 或用 run 启动 current。</p>
+  <h3>2.2 单次调用授权和依赖脚本授权分开</h3>
+  <p>工具在分派任何 action 前都要求 <code>danger-full-access</code>，或为这一次调用请求批准，连列表操作也不例外。较低权限下，<code>ask</code> 可以请求批准；<code>never</code>、拒绝、取消或没有审批通道都会阻止执行。单次批准不会改写整个 Session 的权限模式。</p>
+  <p>原因很具体：新 Host 插件在进程内运行，超出工作区沙箱；包安装还可能运行依赖脚本。若 pnpm 阻止脚本，失败结果中的 <code>pendingBuilds</code> 列出当前 profile 中仍待决定的包名，包括较早尝试留下的项。用户明确批准后，重试才能传 <code>approvedBuilds</code>。<a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/boot/plugin-manager/src/build-approval.ts">服务检查这些包名是否仍待决定</a>，却不能替调用者验证对话是否真的获得批准；保存的许可按 profile 中的包名生效，并可跨后续安装失败保留。</p>
 
-  <h2>三、审批保护的是 Client-bearing 激活，不是 define</h2>
-  <h3>3.1 Host-only 直接启动；带 Client 的版本进入异步协议</h3>
-  <p>Host-only Package 的 <code>cordis_run</code> 会直接走 Host 激活，没有浏览器审批请求。只要 Package 包含 Client 半边，且当前 Package 没有一次性 grant、Plugin 也没有 future-version grant，run 就分配 approval request，返回 <code>awaiting-approval</code>。用户可以只批准这一个 Package，也可以批准这个 Plugin 的后续版本。</p>
-  <p>已授权的 Client Package 返回 <code>starting</code>，而不是 running。页面随后按 Host half → 拉取 Client source → Client half 的顺序异步编排；最终成功、拒绝或技术失败通过 Run 状态与 steering context 回到 Agent。模型不能把 tool result 的“starting”误报成完成，也不能在用户拒绝后不断重发审批。</p>
+  <h2>三、安装完成、配置已保存、激活成功是三份事实</h2>
+  <figure class="hero-image"><img src="../assets/cordis-plugin-install-lifecycle.png" alt="Bundle 安装台：先执行 pnpm 并验证 Bundle；安装失败恢复 manifest 和 lockfile，安装成功才保存选择并进入 HMR 或重启路径；应用失败不撤销成功安装" /></figure>
+  <h3>3.1 包操作与 HMR 使用不同的协调方式</h3>
+  <p>CLI 和服务共享 profile 的 manifest 写锁，避免两次包或配置写入互相覆盖。pnpm 执行在 HMR 队列外；成功安装并通过 Bundle 验证后，<a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/boot/plugin-manager/src/index.ts#L554-L589">配置应用才进入 <code>runExclusive()</code></a>。HMR 本身不拿包写锁。这样耗时下载不会堵住所有源码刷新，配置应用仍与自动 reload 串行。</p>
+  <p>安装失败、取消或装到非 Bundle 时，管理器恢复开始前的 <code>package.json</code> 与 <code>pnpm-lock.yaml</code>，但不声称整个文件系统回滚：下载到 node_modules 或 pnpm store 的文件可以留下，记录脚本决定的 <code>pnpm-workspace.yaml</code> 也不被恢复。安装已成功、后续启用失败，则保留依赖与已保存选择，返回失败供修复。</p>
+  <p>可取消的服务调用使用 requestId 跟踪一次安装。<code>installing</code>、<code>cancelling</code> 和 <code>applying</code> 是进度；<a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/boot/plugin-manager/src/index.ts#L399-L413"><code>cancelInstall()</code></a>只有等 pnpm 退出并恢复文件后才回答 cancelled，进入 applying 后回答 too-late。当前 Agent 工具没有 cancel action；这里是服务/Web 调用面的能力，不能凭类型存在就假定模型也能调用。</p>
 
-  <h3>3.2 授权与激活状态不能合成一个布尔值</h3>
-  <p>一次审批 grant 在技术失败后仍有效，因为用户授权的是代码版本，不是某次网络顺利。相反，<code>pluginRunId</code> 每次尝试都不同，旧页面对过期 Run 的回答不能提交新状态。<code>latestRun</code> 还保留 Host/Client half 的 pending、running、waiting、failed 与具体 phase，修复流程因此是 inspect exact source/diagnostic → 在同一 Plugin 下 define 新 Package → 再 update，而不是新造一个身份逃避错误。</p>
+  <h3>3.2 结果必须同时读取 changed 和 application</h3>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/boot/plugin-manager/src/types.ts#L78-L97"><code>ChangeResult</code></a>把磁盘状态和运行结果分开。<code>changed</code> 比较 profile 文件是否变化；<code>application</code> 可以是 applied、restart-required、overridden、failed 或 cancelled。重复启用可能 changed 为 false 却已有效；配置保存成功也可能 changed 为 true 而应用失败。</p>
+  <pre><code class="language-json">{
+  "stage": "enable",
+  "target": "@example/status-panel",
+  "changed": true,
+  "application": "restart-required",
+  "enabled": true
+}</code></pre>
+  <p>这个简化结果只能报告“配置已保存，需要重启”。没有 HMR 时 profile 不会立即应用变更；替换已安装包版本也需要重启来加载新的 JavaScript 模块代。若更高优先级的 home 或启动覆盖抵消了插件开关，可返回 overridden。HMR 应用还会等待移除插件的清理和 Loader 结算；新出现或改变的 inactive 状态会失败，未改变的既有问题以 warning 返回。</p>
 
-  <h2>四、一份 Package 横跨两个 Cordis 运行时</h2>
-  <h3>4.1 Host 与 Client 都返回 Plugin，都由 Fiber 回收</h3>
-  <figure class="hero-image"><img src="../assets/cordis-host-client-boundary.png" alt="同一 Package 的双端车间：Client-bearing 路径经用户审批后先启动 Host half 再启动 Client half，Host-only 绕过审批；Client 只通过向左的 JSON RPC 调用 Host，停止与更新统一清理 Fiber effects" /></figure>
-  <p>Host 源码在 DSH Node.js 进程的 <code>node:vm</code> context 中作为普通 JavaScript 函数体求值，必须返回 Cordis Plugin。Runner 给它受限 Context façade，并把它挂到 <code>cordis-dynamic</code> group fiber；注册的 Event、Service、Tool、timer 与 handler 都应由 Fiber effect 拥有，stop/update/undefine 才能等待 quiescence 后完整撤销。</p>
-  <p>Client 源码在浏览器以 async function body 求值，拿到 <code>React</code>、<code>styles</code>、<code>host</code>、tagged console 等显式符号；guard 只暴露插件通过 <code>inject</code> 声明的服务。它同样进入 loader 和 Cordis Fiber，所以 Slot、style 与 theme override 不需要另建一套生命周期。</p>
-  <p>跨边界只有 Package-private 的 Client → Host JSON RPC：Host 用 <code>harness.handle(method, handler)</code> 注册，Client 用 <code>host.call(method, args)</code> 调用。function、<code>undefined</code>、class instance 等非 lossless JSON 值会被拒绝；没有通用 Host → Client 调用面。</p>
+  <h2>四、Host 可用仍不等于浏览器面板可用</h2>
+  <figure class="hero-image"><img src="../assets/cordis-profile-activation-boundary.png" alt="持久配置与两端观察：profile 文件经 HMR 或重启进入 Host Loader，管理结果描述 Host 激活；浏览器 Client 同步和实际渲染需要另行检查，配置影响该 profile 的所有会话" /></figure>
+  <h3>4.1 验收跟随读者能看见的结果</h3>
+  <p>管理返回值描述 Host 激活；<a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/boot/plugin-manager/README.md#known-limitations-and-deferred-work">浏览器同步失败另见 Settings 的插件列表</a>。对状态面板，应再确认 Client 已同步、正确 Slot 中确有面板、所需 Service 可用，以及禁用后事件监听和 UI 注册会消失。只看到 installed 或 Host applied，不能宣称页面已经渲染成功。</p>
+  <p>这也解释了持久化带来的成本。重启会重新按 profile 文件装配，多个 Session 可以同时受到新插件影响。需要回退时，禁用 Bundle、修复配置、移除依赖分别处理不同对象；移除必须先卸掉运行贡献才可删包，失败时不会倒走所有步骤。这比临时 eval 多了文件、依赖和发布责任，但留下了可重现的装配来源。</p>
 
-  <h3>4.2 <code>node:vm</code> 是 API shaping，不是敌对代码沙箱</h3>
-  <p>runner 去掉或重定向常见 Node globals，Host façade 也不暴露 Cordis 内部结构；这能抑制无意误用，却挡不住恶意代码借 host-realm helper 逃逸。默认 <code>vmTimeoutMs: 5000</code> 只限制同步求值，async body 可以越过它。源码因此明确要求把这组工具当成 Bash 级能力，并且它不在任何 shipped composition tree 中，部署必须显式 opt in。</p>
+  <h3>4.2 动态 runner 仍在，但不是当前模型写入入口</h3>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/extensions/cordis-host-runner/src/index.ts">Host runner</a>与 Client runner 仍保留 define、run、stop、undefine 的程序化生命周期。它们保存 Session 所有的不可变 Package、current/next 版本指针与 Run 身份；Host-only 直接启动，带 Client 的定义仍经过浏览器批准并按 Host → Client 加载。stop 保留定义，undefine 删除定义，进程重启清空这些内存对象。</p>
+  <p>这部分源码仍适合研究 Cordis effect 回收、异步激活与 JSON RPC，但必须守住入口事实：当前 <code>tool-cordis</code> 没有创建或更新动态定义的工具。<code>node:vm</code> 也仍只是 API 约束，不是敌对代码安全边界；同步超时不能约束任意 async body。保留 runner 不代表 Creator 仍沿用旧的七工具路线。</p>
 
-  <h2>五、停止、删除与重启是三个不同结局</h2>
-  <h3>5.1 Stop 撤销运行，Undefine 撤销身份</h3>
-  <figure class="hero-image"><img src="../assets/cordis-stop-undefine.png" alt="Cordis 维护岔路：stop 取消 Run 和待审批请求后把 Plugin、Packages、grants 与版本指针归档以便重启或回退；undefine 把全部 Package、授权和指针送入删除机，只留下历史移除卡片" /></figure>
-  <p><code>cordis_stop</code> 取消未完成审批或激活，撤回页面 Client half，并 dispose Host Fiber；重复停止是幂等成功。它故意保留 Plugin、每个不可变 Package、审批 grants、<code>currentPackageId</code> 与 <code>nextPackageId</code>，因此可以稍后 restart、retry 或 rollback。</p>
-  <p><code>cordis_undefine</code> 是永久删除：先取消 pending、停止 active Run，再移除整个 Plugin record、Packages、grants 和版本指针。<code>@pluginId</code> 引用与业务 view 随即失效，历史卡片只剩“Plugin removed”的记录。要暂时关闭副作用时调用 undefine，会白白丢失所有修复和回退上下文。</p>
-
-  <h3>5.2 Process-local 不等于无影响</h3>
-  <p><code>DynamicCordisRegistry</code> 只是进程内 Map。DSH 重启后 definition、grants、run 与指针全部消失，不会从 Session history 自动重放；它也不写 Plugin 文件、不修改 <code>cordis.yml</code>、不自动升级成仓库代码。真正值得保留的实验仍要进入普通开发、评审和部署流程。</p>
-  <p>控制权与可见性按 Session 所有：另一个 Session 不能 inspect、run、stop 或 undefine 这份 Plugin。但已经运行的插件接入的是真实 runtime，它注册到共享 scope 的 Service、Event 或工具可能影响同一进程里的其他会话。Session-owned 是管理边界，不是天然的效果隔离。</p>
-
-  <h2>六、自指运行时真正改变了什么</h2>
+  <h2>五、把“扩展了自身”变成可验收的结论</h2>
   <ol>
-    <li><strong>它把扩展开发缩成一个可撤销事务。</strong>Inspect 建立契约，Define 保存不可变候选，Run 产生显式尝试，Fiber 负责回收。</li>
-    <li><strong>它没有跳过版本管理。</strong>不可变 Package、current/next 指针和独立 run identity，反而比“直接 eval 一段字符串”多了一层状态纪律。</li>
-    <li><strong>它没有把人类审批泛化成安全证明。</strong>审批只覆盖 Client-bearing Package 的授权路径；工具本身仍是显式 opt-in 的 Bash 级能力。</li>
-    <li><strong>它把异步结果当成一等状态。</strong><code>awaiting-approval</code>、<code>starting</code>、half-level diagnostics 与 steering，避免前台 tool call 假装等待浏览器完成。</li>
-    <li><strong>它适合临时运行时成果，不适合永久交付。</strong>页面实验、诊断面板和短期工具可以动态完成；需要跨重启、可审计、可发布的能力应转成静态 Plugin。</li>
-    <li><strong>生成契约比叙述文档更接近事实。</strong>这一提交里的 README 漂移说明：分析快速演进的 Agent runtime，必须同时核对生成 catalog、注册源码、状态机与测试。</li>
+    <li><strong>接口事实先于代码：</strong>从只读目录取精确契约，别把查询当业务调用。</li>
+    <li><strong>文件状态与运行状态分开：</strong>Bundle 安装、profile 选择、Host 激活与浏览器渲染各有检查点。</li>
+    <li><strong>跨会话变更按 profile 管理：</strong>权限检查和脚本授权必须覆盖实际的进程内执行与持久文件。</li>
+    <li><strong>失败后依据剩余事实修复：</strong>安装可恢复两份清单，启用失败保留安装，移除失败保留已完成步骤；不存在一条通用“全部回滚”。</li>
+    <li><strong>保留代码不等于保留入口：</strong>动态 runner 的能力只能按其现有调用者解释，不能代替模型实际可见的工具清单。</li>
   </ol>
-  <p>到这里，七篇路线闭环了：从一条 <code>dsh web</code> 启动主线进入 Cordis 组合，再经过事件会话、副作用检查点、压缩重建、多 Agent 所有权，最终回到一个能检查、扩展并撤销自身运行结构的 Cordis runtime。DSH 最值得研究的地方不是工具数量，而是它不断把“谁拥有状态、何时可以执行、失败后怎样恢复”写成可组合的协议。</p>
-
-  <h2 id="sources">参考源码</h2><ul>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/docs/tool-catalog.md#deepseek-aidsh-tool-cordis">生成工具目录</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/tool-cordis/src/index.ts">tool-cordis 注册源码</a>：七工具 schema、分层 self inspection、define/run/stop/undefine 契约。</li>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/tool-cordis/src/providers.ts">Host Inspect Providers</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/cordis-client-runner/src/client/providers.ts">Client Inspect Providers</a>：Service/Event/Builtin/Tool、Slots/Theme 与渐进式精确查询。</li>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/cordis-host-runner/src/registry.ts">动态 Registry</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/cordis-host-runner/src/index.ts">Host Runner</a>：Plugin/Package/Run identity、grants、current/next 指针、审批和状态迁移。</li>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/cordis-host-runner/src/inspect-registry.ts">Inspect Registry</a>：Host 本地查询、Client manifest mirror、first-valid-response 与取消。</li>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/cordis-client-runner/src/client/runtime.ts">Client Runtime</a>、<a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/cordis-client-runner/src/client/guard.ts">Client Guard</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/extensions/tool-cordis/src/prompt.ts">模型协议</a>：双端 Fiber、JSON RPC、审批语义、安全姿态与修复流程。</li>
-  </ul>
-</section></article></main></div><script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../../openclaw/article.js?v=1"></script></body></html>
+  <p>七篇路线最终回到相同问题：谁拥有状态，何时可以执行，失败后留下什么。当前 DSH 用只读 Inspect 让 Agent 理解运行接口，再用持久 Bundle 和 Plugin Manager 改变后续装配。是否真正完成扩展，要由保存结果、激活诊断与用户可见行为共同回答。</p>
+<h2 id="sources">参考源码</h2><ul><li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/extensions/tool-cordis/src/index.ts#L19-L83">Inspect 工具注册</a></li><li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/extensions/cordis-host-runner/src/inspect-registry.ts#L98-L190">Inspect 查询路由</a></li><li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/boot/plugin-manager/src/tools.ts#L17-L76">Plugin Manager 工具与权限</a></li><li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/boot/plugin-manager/src/index.ts#L296-L445">安装、启用、取消与移除</a></li><li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/boot/plugin-manager/src/types.ts#L78-L97">保存状态与应用结果</a></li><li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/boot/app-boot/src/index.ts#L244-L276">Profile 配置应用</a></li><li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/extensions/cordis-host-runner/src/registry.ts">程序化动态定义 Registry</a></li></ul></section></article></main></div><script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../../openclaw/article.js?v=1"></script></body></html>
