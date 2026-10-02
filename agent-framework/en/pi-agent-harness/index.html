@@ -6,13 +6,13 @@
     <title>Agent Framework Source Notes, Part 2: Why Pi Treats a Coding Agent as an Extensible Harness</title>
     <meta
       name="description"
-      content="Part 2 of the Agent Framework source-reading series: follow Pi through pi-ai, agent-core, coding-agent, its tool loop, JSONL session tree, compaction, branch summaries, extensions, and security boundary to establish a minimal agent-runtime baseline."
+      content="Follow Pi 1.0 through the model loop, context reconstruction, session tree, and compaction, then see how the core works with built-in MCP, Codemode, and replaceable extensions."
     />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Agent Framework Source Notes, Part 2: Why Pi Treats a Coding Agent as an Extensible Harness" />
     <meta
       property="og:description"
-      content="Pi stays minimal by keeping model loops, events, tool results, and recoverable sessions in core while leaving workflow policy to extensions."
+      content="Follow Pi 1.0 through the model loop, context reconstruction, session tree, and compaction, then see how the core works with built-in MCP, Codemode, and replaceable extensions."
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/pi-agent-harness-overview.png" />
@@ -130,7 +130,9 @@
           </section>
 
           <section class="article-body">
-            <h2>1. Why a Coding Agent cannot be one Model call</h2>
+            <div class="note key-point"><p>Pi reading route: this chapter establishes the complete runtime map. The <a href="../pi-context/">context chapter</a> follows a log through preservation, editing, and compaction; the <a href="../pi-codemode/">Codemode and MCP chapter</a> follows tool data through a script before it reaches the model. All three are pinned to v1.0.0.</p></div>
+
+<h2>1. Why a Coding Agent cannot be one Model call</h2>
             <p>
               Start with a specific task: “make configuration loading asynchronous, then run the tests.” A coding agent may
               read files, edit the implementation, execute the test suite, inspect the failure, and revise the patch.
@@ -164,8 +166,8 @@
               <li>The model requests the config file; the runtime validates and executes the tool, then records the result.</li>
               <li>The model proposes an edit and a test command. Tools may finish concurrently, but results remain paired to calls.</li>
               <li>The user adds “do not change the public API”; that steering message enters before the next model request.</li>
-              <li>After a test failure, the model sees the error and repairs the code. Draining tools and steering makes the runtime idle; it does not by itself validate the task.</li>
-              <li>A follow-up starts afterward. Under context pressure, the model sees a summary plus recent records.</li>
+              <li>After a test failure, the model sees the error and repairs the code. The outer session can settle after tool work, queued input, and extension continuation are resolved; task acceptance remains separate.</li>
+              <li>A follow-up enters after tools and steering drain; extensions can also append records and request continuation. Under context pressure, the model sees a summary plus recent records.</li>
               <li>The original records remain in the session tree, so the user can branch, recover, or inspect an older path.</li>
             </ol>
             <p>
@@ -194,7 +196,7 @@
             <div class="note">
               <p>
                 <strong>Source scope.</strong>
-                Source links are pinned to public snapshot <code>d1230ea2000d876b479a69b8b061f9d670f262f5</code>.
+                Source links are pinned to the Pi 1.0.0 release snapshot <code>a13d35a742c6ef8462812a28fbe1d8c8b7431c32</code>.
                 Terms such as Harness, stored Session, and current Model input summarize responsibilities visible in public source.
                 Closed provider behavior, third-party extension policy, and sandbox internals remain outside the claims here.
               </p>
@@ -203,7 +205,8 @@
             <p>The whole chapter can first be reduced to one execution route:</p>
             <pre><code class="language-text">User: "Make config loading async, then run tests"
   -&gt; AgentSession: assemble model, tools, system prompt, resources, SessionManager
-  -&gt; agent-core: transformContext -&gt; convertToLlm -&gt; provider stream
+  -&gt; SessionManager: rebuild input from branch, compaction, and context_edit
+  -&gt; agent-core: prepareRequest -&gt; transformContext -&gt; convertToLlm -&gt; provider stream
   -&gt; assistant message: text / thinking / toolCall
   -&gt; tool batch: validate -&gt; beforeToolCall -&gt; execute -&gt; afterToolCall
   -&gt; AgentEvent: message_update / tool_execution_* / turn_end
@@ -214,7 +217,7 @@
             <p>
               This is not literal TypeScript. It names the handoffs the following sections will make precise. The two important
               verbs are append and select: the stored Session primarily appends records, while each Model request assembles
-              Context from the current Leaf, Compaction cutoff, and message conversion rules.
+              Context from the current Leaf, Compaction cutoff, context edits, and message conversion rules.
             </p>
 
             <div class="table-wrap">
@@ -242,7 +245,7 @@
                   </tr>
                   <tr>
                     <td>Current Model input</td>
-                    <td>Apply compaction boundaries, <code>transformContext</code>, and <code>convertToLlm</code> to the active branch.</td>
+                    <td>Apply compaction boundaries, <code>context_edit</code>, <code>transformContext</code>, and <code>convertToLlm</code> to the active branch.</td>
                     <td>The next provider request.</td>
                     <td>UI-only entries may be filtered and old work may be summarized; tool-call/result pairing must remain valid.</td>
                   </tr>
@@ -255,7 +258,7 @@
             <h3>4.1 Each layer handles one class of problem</h3>
             <p>
               This chapter follows four layers of the local coding harness:
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/README.md#L13-L36"><code>pi-ai</code>, <code>pi-agent-core</code>, <code>pi-coding-agent</code>, and <code>pi-tui</code></a>. The repository also contains Chord, telemetry, and durable packages; these four layers describe the path examined here, not the complete monorepo inventory.
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/README.md"><code>pi-ai</code>, <code>pi-agent-core</code>, <code>pi-coding-agent</code>, and <code>pi-tui</code></a>. The repository also contains Chord, telemetry, and durable packages; these four layers describe the path examined here, not the complete monorepo inventory.
               A first-time reader can ignore the package names and ask four questions instead: who normalizes provider messages,
               who loops between model and tools, who owns coding-agent files and sessions, and who renders runtime events.
             </p>
@@ -275,25 +278,25 @@
                     <td><code>pi-ai</code></td>
                     <td>Models, providers, content blocks, tool schemas, usage, and streaming assistant events.</td>
                     <td>It does not select coding tools or persist a session tree.</td>
-                    <td><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/ai/src/models.ts#L91-L222"><code>Provider</code> / <code>Models</code></a></td>
+                    <td><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/ai/src/models.ts"><code>Provider</code> / <code>Models</code></a></td>
                   </tr>
                   <tr>
                     <td><code>pi-agent-core</code></td>
                     <td>Agent state, turn events, model calls, tool batches, and steering/follow-up queues.</td>
                     <td>It does not know what a file tool looks like or where sessions live.</td>
-                    <td><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/agent/README.md#L49-L124">Message and event contracts</a></td>
+                    <td><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/README.md">Message and event contracts</a></td>
                   </tr>
                   <tr>
                     <td><code>pi-coding-agent</code></td>
                     <td>read/bash/edit/write, system prompt, resources, sessions, compaction, extensions, and run modes.</td>
                     <td>It does not make the TUI the only entry point or bind the product to one provider.</td>
-                    <td><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/sdk.ts#L175-L194"><code>createAgentSession</code></a></td>
+                    <td><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/sdk.ts"><code>createAgentSession</code></a></td>
                   </tr>
                   <tr>
                     <td><code>pi-tui</code> / modes</td>
                     <td>Interactive terminal, print/JSON, RPC, and SDK-facing presentation surfaces.</td>
                     <td>The interface consumes the runtime; it does not reimplement the loop.</td>
-                    <td><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/README.md#L15-L19">Four entry modes</a></td>
+                    <td><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/README.md">Four entry modes</a></td>
                   </tr>
                 </tbody>
               </table>
@@ -304,13 +307,15 @@
               the terminal. The SDK constructs an <code>AgentSession</code> directly. RPC encodes commands, acknowledgements, and
               events as line-delimited JSON. Both reuse the same agent and session path.
               The
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/docs/sdk.md#L16-L116">SDK contract</a>
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/sdk.md">SDK contract</a>
               and
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/docs/rpc.md#L20-L76">RPC framing</a>
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/rpc.md">RPC framing</a>
               are different shells over that route.
             </p>
 
-            <h3>4.2 Minimal does not mean completion adapter</h3>
+            <p>Harness here names the coding-agent product and its responsibilities, not a required class named AgentHarness. Version 1.0 removed the old experimental <code>AgentHarness</code> interfaces from agent-core. The separate <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/durable/README.md">pi-durable package</a> remains experimental, and source-only client/server work is outside the default distribution. The local JSONL path below has not thereby migrated to a durable service.</p>
+
+<h3>4.2 Minimal does not mean completion adapter</h3>
             <p>
               A core that merely forwards text to a model cannot explain why a tool result still matches its originating call,
               when mid-run user input becomes visible, or how a restarted process resumes the same branch. Pi keeps those
@@ -335,27 +340,16 @@
               while loop. It hands one step back through <code>stopReason</code> and typed content blocks.
             </p>
 
-            <p>The runtime decision can be read in five steps:</p>
-            <ol>
-              <li>Inject pending steering messages into the current context.</li>
-              <li>Call the provider and stream one complete assistant message.</li>
-              <li>If it contains tool calls, finish the batch and append tool results.</li>
-              <li>Emit <code>turn_end</code>, then check stop policy, next-turn refresh, and steering.</li>
-              <li>Only after tools and steering are empty, drain follow-ups; emit <code>agent_end</code> when those are empty too.</li>
-            </ol>
+            <p>The normal tool path has five steps; errors, cancellation, and explicit stops have separate exits:</p>
+<ol><li>Inject pending input and reconstruct effective context in <code>prepareRequest</code> for each request.</li><li>Call the provider and stream a complete assistant message.</li><li>Finish any tool batch and record its results.</li><li>Call <code>finishTurn</code> to choose default scheduling, continuation, or ending; then emit the low-level <code>turn_end</code>.</li><li>Process requests caused by tools, steering, and follow-up. With no further request or continuation, emit the low-level <code>agent_end</code>.</li></ol>
             <p>
               These are the inner and outer loops in
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/agent/src/agent-loop.ts#L161-L280"><code>runLoop</code></a>:
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts"><code>runLoop</code></a>:
               the inner loop handles tools and steering, while the outer loop lets an otherwise completed agent accept follow-up work.
             </p>
             <div class="note key-point">
-              <p>
-                <strong><code>agent_end</code> is a runtime state, not a quality verdict.</strong>
-                Suppose the agent edits <code>src/config.ts</code>; the first test exits 1, a repair makes the second exit 0, and the
-                runtime emits <code>agent_end</code> after draining tools and input queues. That proves only that no action remains in
-                this run. A diff check must still confirm that the public API is unchanged, then CI or the user must accept the
-                result before it moves from produced to validated to adopted.
-              </p>
+              <p><strong>A low-level agent_end ends that segment of the loop.</strong>AgentSession can still recover from an error or run <code>agent_before_settle</code>, where extensions may add records and continue. The event therefore establishes neither whole-session idleness nor task quality. Even after tests improve from exit code 1 to 0, a diff check must confirm that the public API is preserved before CI or the user accepts the result.</p>
+
             </div>
 
             <figure class="hero-image">
@@ -363,12 +357,15 @@
                 src="../assets/pi-agent-loop.png"
                 alt="Hand-drawn Pi tool-turn path: model request, tool batch, recorded results, turn_end, then next-turn preparation with optional compaction; steering enters before the next turn and follow-up waits for the main task to become idle"
               />
-              <figcaption>Tool results are recorded before the next turn, where context may be compacted and steering is accepted. Follow-up enters only after the original task is idle; errors, cancellation, and explicit stops are discussed in the text.</figcaption>
+              <figcaption>This figure focuses on ordinary tool batches and queue scheduling. Explicit finishTurn decisions and outer-session settlement are covered in the text. Follow-up waits for tools and steering to drain.</figcaption>
             </figure>
 
-            <p>The next turn does not immediately reuse the old request. <code>prepareNextTurn</code> can refresh context, model, and thinking settings; the coding harness counts newly appended tool results and compacts before the next model call when needed. If <code>read</code> returns a large log, the check happens before that follow-on request rather than waiting for the whole run to end. See <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/agent-session.ts#L564-L581">pre-request compaction</a>. Steering that arrives during preparation is polled again, so lengthy compaction does not lose queued input.</p>
+            <p><code>prepareNextTurn</code> can refresh context, model, and thinking. Before every provider call, <code>prepareRequest</code> reconstructs effective messages from SessionManager. The coding harness accounts for new tool results and compacts if needed. Steering arriving during preparation is polled again. See <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts#L759">request reconstruction</a>.</p>
 
-            <h3>5.2 Tools may finish concurrently while results stay paired and ordered</h3>
+
+            <p><code>finishTurn</code> returning continue ensures another model request. A request already caused by tools, steering, or follow-up satisfies it without adding a duplicate. end ends the current low-level run without consuming queues. Errors and aborts remain hard exits regardless of continue. The coding-agent <code>turn_end</code> and <code>agent_before_settle</code> hooks can also return record drafts for preview, validation, and ordered persistence. See the <a href="../pi-context/#continuation">context chapter</a> and <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts">agent loop</a>.</p>
+
+<h3>5.2 Tools may finish concurrently while results stay paired and ordered</h3>
             <p>
               Suppose one response asks to read two unrelated files. Pi can execute those calls in parallel, but completion order
               is not assistant source order. A fast tool may emit <code>tool_execution_end</code> first, while tool-result messages
@@ -381,7 +378,7 @@
               calls concurrently, then uses the original array order when emitting result messages. If configuration sets <code>toolExecution: "sequential"</code> or any target tool declares
               <code>executionMode: "sequential"</code>, the whole batch uses sequential execution. After interrupted parallel preflight, prepared calls check abort again before starting, avoiding new side effects after cancellation.
               See
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/agent/src/agent-loop.ts#L467-L622"><code>executeToolCalls</code></a>.
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts"><code>executeToolCalls</code></a>.
             </p>
 
             <div class="shape-grid">
@@ -407,7 +404,7 @@ toolResult: B</code></pre>
               streamed arguments into apparently valid data. When an assistant response stops at the output limit, Pi refuses to
               execute every tool call from that response and returns explicit errors so the model can issue complete calls.
               The
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/agent/src/agent-loop.ts#L427-L459">truncated-call path</a>
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts">truncated-call path</a>
               protects side-effect integrity, not merely parser success.
             </p>
 
@@ -421,33 +418,34 @@ toolResult: B</code></pre>
             <p>
               This boundary prevents two misreadings. Steering does not erase a running tool, and follow-up does not preempt the
               main task. The low-level contract lives in
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/agent/src/types.ts#L241-L265"><code>getSteeringMessages</code> and <code>getFollowUpMessages</code></a>;
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/types.ts"><code>getSteeringMessages</code> and <code>getFollowUpMessages</code></a>;
               the terminal maps Enter and Alt+Enter onto the two queues.
             </p>
 
             <h2 id="model-view">6. AgentMessage is not a Provider message</h2>
 
             <h3>6.1 Runtime history may contain records the model should never see</h3>
-            <p>
-              The agent layer uses extensible <code>AgentMessage</code> values. They may be standard user, assistant, and tool-result
-              messages or application-specific state. Before each provider request, the runtime applies optional
-              <code>transformContext</code> and required <code>convertToLlm</code>:
-            </p>
-            <pre><code class="language-text">AgentMessage[]
+            <p>The agent layer uses extensible <code>AgentMessage</code> values. Coding-agent first reconstructs the current branch and compaction range, applies content edits, and supplies those messages to the agent layer. Mutating <code>agent.state.messages</code> alone does not persistently change future input: prepareRequest rereads session records. Optional transformContext and required convertToLlm then handle request-time conversion:</p>
+
+            <pre><code class="language-text">SessionManager.buildSessionProjection()
+  -&gt; prepareRequest()
+  -&gt; AgentMessage[]
   -&gt; transformContext()   // compact, prune, or inject external context
   -&gt; AgentMessage[]
   -&gt; convertToLlm()      // filter UI-only items, convert custom messages
   -&gt; provider Message[]</code></pre>
             <p>
               This boundary is explicit in
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/agent/src/agent-loop.ts#L338-L397"><code>streamAssistantResponse</code></a>.
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts"><code>streamAssistantResponse</code></a>.
               Presence in the session does not imply presence in the next model request. A plain extension <code>CustomEntry</code>
               can persist a counter without entering context; <code>CustomMessageEntry</code> is the explicit model-visible form.
             </p>
 
-            <p>The tool set also becomes replayable history. Before each model request, <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/agent/src/agent-loop.ts#L282-L331"><code>declareToolChanges</code></a> compares tools already declared in the transcript with the executable set and records <code>toolsAdded</code> / <code>toolsRemoved</code> on a system message. If an extension removes <code>bash</code>, subsequent requests see that removal instead of trusting the old catalog. Changing only the in-memory tool array would not explain the transition.</p>
+            <p>The tool set also becomes replayable history. Before each model request, <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts"><code>declareToolChanges</code></a> compares tools already declared in the transcript with the executable set and records <code>toolsAdded</code> / <code>toolsRemoved</code> on a system message. If an extension removes <code>bash</code>, subsequent requests see that removal instead of trusting the old catalog. Changing only the in-memory tool array would not explain the transition.</p>
 
-            <h3>6.2 Provider differences stop in <code>pi-ai</code></h3>
+            <p>An extension can append <code>context_edit</code> to replace a recorded log’s content or omit its message in future input, while preserving the raw entry. Resuming the same branch replays the decision. The request-time <code>context</code> hook edits non-system messages and restores system messages afterward; <code>context_with_system</code> receives the complete list and its output is used verbatim. See the <a href="../pi-context/">context chapter</a> for persistent edits versus transient transforms.</p>
+
+<h3>6.2 Provider differences stop in <code>pi-ai</code></h3>
             <p>
               Anthropic, OpenAI Responses, OpenAI-compatible chat, and Google expose different wire shapes, while the loop consumes
               one <code>AssistantMessageEventStream</code>. At stream start, a partial assistant message enters context. Text,
@@ -459,10 +457,13 @@ toolResult: B</code></pre>
               The value of <code>pi-ai</code> is therefore not just a long model list. It decouples the tool loop from provider
               payloads. This adapter boundary becomes a baseline for the general-purpose frameworks later in the series, while Pi
               publishes it as a reusable package. A coding-agent extension can also add a provider or override an endpoint through
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/extensions/types.ts#L1459-L1531"><code>registerProvider</code></a>.
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/extensions/types.ts"><code>registerProvider</code></a>.
             </p>
 
-            <h2 id="session-tree">7. A Session is a JSONL tree, not a chat array</h2>
+            <h3>6.3 A request can select a different physical model</h3>
+<p>Experimental <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/virtual-models.md">virtual models</a> let an extension route a selected virtual model to an actual provider, model, and thinking setting per request. The session retains the virtual selection while assistant records identify the physical model; routing state can persist along the branch. A smaller physical context window triggers checks against that model. Switching can affect cache reuse and message compatibility, so routing capability alone establishes no cost or quality gain. Compare actual outcomes and usage on the same task.</p>
+
+<h2 id="session-tree">7. A Session is a JSONL tree, not a chat array</h2>
 
             <h3>7.1 <code>id + parentId + leaf</code> turns rewind into pointer movement</h3>
             <p>
@@ -480,7 +481,7 @@ toolResult: B</code></pre>
               This is a simplified shape, not a full session file. <code>m3</code> and <code>b1</code> continue along different
               paths without rewriting old records. <code>SessionManager.branch()</code> only moves the leaf to an older entry;
               the next append naturally becomes a new child.
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/session-manager.ts#L1331-L1482">Tree construction and branching</a>
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/session-manager.ts">Tree construction and branching</a>
               make this invariant explicit.
             </p>
 
@@ -520,41 +521,31 @@ toolResult: B</code></pre>
               That <code>BranchSummaryEntry</code> is attached at the new navigation position, not after the abandoned leaf.
               Future turns on the new path can know what the alternative explored without replaying the entire old branch.
               See
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/agent-session.ts#L3255-L3447"><code>navigateTree</code></a>.
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts"><code>navigateTree</code></a>.
             </p>
 
             <h2 id="compaction">8. Compaction shortens current Model input without deleting stored history</h2>
 
             <h3>8.1 First find a cut that does not separate a Tool Call from its result</h3>
-            <p>
-              When context usage exceeds <code>contextWindow - reserveTokens</code>, or the user invokes <code>/compact</code>,
-              Pi prepares compaction. It walks backwards and tries to preserve roughly <code>keepRecentTokens</code> of recent work.
-              A cut cannot land on a tool result because that would retain a result without the tool call that owns it.
-            </p>
+            <p>When usage exceeds <code>contextWindow - reserveTokens</code>, or the user invokes <code>/compact</code>, Pi reconstructs effective input before selecting a retention range. Applied context edits affect summary material and size estimates. An old log does not reenter the summary merely because it remains in JSONL. The runtime tries to retain <code>keepRecentTokens</code>, while avoiding a cut on a tool result that would leave it orphaned.</p>
 
-            <p>
-              Valid boundaries include user, assistant, bash execution, and custom or branch-summary messages. Tool results are
-              explicitly invalid. If one turn alone exceeds the recent-token budget, Pi may split inside that turn; it then creates
-              a separate summary of the early turn prefix and merges it with the history summary.
-              If trailing tool results alone exceed the retention budget, the cut keeps their preceding assistant tool call instead of falling back to the earliest history. <code>keepRecentTokens</code> is therefore an approximate budget, not a hard cap. Budgets can also vary by model. Defaults and cut logic are visible in
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/compaction/compaction.ts#L141-L151"><code>DEFAULT_COMPACTION_SETTINGS</code></a>
-              and
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/compaction/compaction.ts#L418-L470"><code>findCutPoint</code></a>.
-            </p>
+
+            <p>Cuts must respect message roles and complete turns. A turn exceeding the retention budget may have its early prefix summarized separately. Large trailing tool results retain their preceding assistant call. <code>keepRecentTokens</code> is approximate. Current preparation uses <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/compaction.ts#L802">findProjectedCutPoint</a> to select entries by their actual message contributions, including records that contribute no model content.</p>
+
 
             <h3>8.2 Summary generation checkpoints model context</h3>
             <p>The default path performs four separate operations:</p>
             <ol>
-              <li>Convert custom messages to LLM messages, then serialize the conversation as role-labeled text.</li>
+              <li>Take summary material from effective, edited messages; convert custom messages and serialize role-labeled text.</li>
               <li>Truncate very large tool results so the summarization request does not overflow itself.</li>
               <li>Require Goal, Constraints, Progress, Decisions, Next Steps, and Critical Context without continuing the conversation.</li>
               <li>Accumulate read/write/edit file paths and append them as structured summary markers.</li>
             </ol>
             <p>
               These responsibilities live in
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/compaction/utils.ts#L84-L158"><code>serializeConversation</code></a>
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/utils.ts"><code>serializeConversation</code></a>
               and
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/compaction/compaction.ts#L654-L738"><code>generateSummaryWithUsage</code></a>.
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/compaction.ts"><code>generateSummaryWithUsage</code></a>.
               The output is not a polished retrospective. It is a textual checkpoint from which another model can continue
               reasoning. It restores the model-visible view, not workspace files, background processes, tool-internal state, or
               external side effects that have already occurred.
@@ -579,36 +570,33 @@ summary response
             <p>
               The old conversation is not handed back to the normal agent loop, and the summarization request exposes no tools.
               The model produces context-checkpoint text; the compaction runtime still owns <code>firstKeptEntryId</code>, token boundaries,
-              file markers, and entry installation. “Generate a summary” and “replace part of model view” are separate operations. The default path rejects truncated summaries and unexpected tool calls, then checks cancellation again before installation. Transient network failures can follow the configured retry policy; cancellation and deterministic failures are not hidden by repeated calls. See <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/compaction/compaction.ts#L553-L611">summary failure and retry handling</a>.
+              file markers, and entry installation. “Generate a summary” and “replace part of model view” are separate operations. The default path rejects truncated summaries and unexpected tool calls, then checks cancellation again before installation. Transient network failures can follow the configured retry policy; cancellation and deterministic failures are not hidden by repeated calls. See <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/compaction.ts">summary failure and retry handling</a>.
             </p>
 
             <h3>8.3 Append a new Entry, then rebuild the next Model input</h3>
-            <p>
-              After summary generation, <code>AgentSession</code> appends
-              <code>CompactionEntry { summary, firstKeptEntryId, tokensBefore, details }</code> and rebuilds agent state through
-              <code>buildSessionContext()</code>. Old messages remain in JSONL. The model-visible view becomes the latest summary,
-              entries from <code>firstKeptEntryId</code>, and records appended after compaction.
-            </p>
+            <p>After summary generation, AgentSession appends <code>CompactionEntry { summary, firstKeptEntryId, tokensBefore, details }</code> and refreshes state with <code>buildSessionProjection()</code>. Old messages remain in JSONL. New input includes a system checkpoint, the latest summary, effective retained messages, and later records; content edits still participate. The shape below omits unrelated metadata:</p>
 
-            <pre><code class="language-text">durable JSONL:
+
+            <pre><code class="language-text">persistent JSONL:
 M1 -&gt; A1 -&gt; T1 -&gt; M2 -&gt; A2 -&gt; T2 -&gt; C1
 
 C1 = {
   type: "compaction",
   summary: "...",
   firstKeptEntryId: "M2",
-  tokensBefore: 48210
+  tokensBefore: 48210,
+  systemMessage: { role: "system", content: "...", ... }
 }
 
 next model-visible view:
-[compactionSummary(C1), M2, A2, T2]</code></pre>
+[systemCheckpoint(C1), compactionSummary(C1), M2, A2, T2]</code></pre>
             <p>
               This differs from replacing an old array with a summary. Direct replacement destroys omitted evidence. Pi's
               compaction is a lossy projection, but the durable history remains navigable through <code>/tree</code>.
               Persistence and rebuild happen in
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/agent-session.ts#L2089-L2200"><code>AgentSession.compact</code></a>;
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts"><code>AgentSession.compact</code></a>;
               projection rules live in
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/session-manager.ts#L442-L477"><code>buildContextEntries</code></a>.
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/session-manager.ts"><code>buildContextEntries</code></a>.
             </p>
 
             <figure class="hero-image">
@@ -622,39 +610,18 @@ next model-visible view:
             <h3>8.4 Automatic recovery and repeated Compaction have separate stopping conditions</h3>
             <p>
               Automatic compaction separates proactive headroom from interrupted-run recovery. Threshold compaction does not rerun a completed response. Overflow recovery can follow a context overflow or a recoverable length stop: the failed or truncated assistant message is removed from retry input, retained in session history, and followed by at most one compact-and-retry attempt. A response that completed successfully is compacted without retry. Missing provider usage can be estimated from message size; stale pre-compaction usage cannot immediately trigger another compaction.
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/agent-session.ts#L2262-L2388"><code>_checkCompaction</code></a> selects the recovery reason, while <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/agent-session.ts#L2399-L2567"><code>_runAutoCompaction</code></a> performs and installs it. Waiting steering/follow-up messages can continue after compaction.
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts"><code>_checkCompaction</code></a> selects the recovery reason, while <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts"><code>_runAutoCompaction</code></a> performs and installs it. Waiting steering/follow-up messages can continue after compaction.
             </p>
 
-            <p>
-              Repeated compaction does not summarize only entries after the old compaction record. Preparation carries the old
-              summary and starts its next boundary from the prior <code>firstKeptEntryId</code>. The update prompt preserves old
-              information while incorporating later progress, so messages retained by the previous model view do not disappear
-              between rounds.
-              See
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/compaction/compaction.ts#L762-L838"><code>prepareCompaction</code></a>.
-            </p>
+            <p>Repeated compaction starts from the current reconstructed input, which already contains the old summary and retained tail. The next summary absorbs later progress without rereading all raw entries. After context_edit or compaction changes input, older assistant usage no longer describes its current size; <code>estimateProjectedContextTokens</code> estimates effective messages again. Failed assistant messages are also omitted through persistent context edits, keeping retry input consistent after resume. See <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/compaction.ts#L872">prepareCompaction</a> and the <a href="../pi-context/#compaction">context chapter</a>.</p>
+
 
             <h2 id="extensions">9. Where Extensions can intervene in a Run</h2>
 
-            <h3>9.1 Why plan mode, sub-agents, and MCP can stay out of core</h3>
-            <p>
-              Pi's README says the default product omits sub-agents and plan mode. Its philosophy section also lists no built-in
-              MCP, permission popups, to-dos, or background bash. This should not be read as “Pi cannot do them.” The more precise
-              claim is that each feature has multiple valid semantics, and core refuses to choose one for every user.
-              The
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/README.md#L496-L512">README philosophy</a>
-              turns that negative space into a product constraint.
-            </p>
-
-            <p>
-              This works because extensions are not limited to decoration. They can observe provider requests, agent/turn/message
-              events, tool calls and results, and session compaction or tree navigation. They can register tools, commands,
-              shortcuts, flags, and providers, or append model-visible custom messages and UI-only persistent entries.
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/extensions/types.ts#L1261-L1531"><code>ExtensionAPI</code></a>
-              covers nearly the entire path from provider boundary to durable record.
-            </p>
-
-            <div class="table-wrap">
+            <h3>9.1 Built-in capabilities can enter through extensions</h3>
+<p>At v1.0.0, MCP, codemode, and tool_search are built-in extensions. MCP connects servers and discovers tools. Codemode lets a model combine calls and filter results with JavaScript. Tool search loads selected declarations for subsequent requests. These add product capabilities without moving every behavior into agent-core. Follow the data flow in the <a href="../pi-codemode/">Codemode and MCP chapter</a>.</p>
+<p>Extensions can register tools, commands, providers, and MCP servers, and handle model, tool, and session events. turn_end and agent_before_settle can return record drafts and request continuation. Planning, sub-agent orchestration, and permission interactions remain extension choices. Product defaults and core loop behavior live at different layers.</p>
+<div class="table-wrap">
               <table>
                 <thead>
                   <tr>
@@ -680,9 +647,9 @@ next model-visible view:
                     <td>Child work returns through agent messages and session records.</td>
                   </tr>
                   <tr>
-                    <td>MCP / remote execution</td>
-                    <td>Registered tools or overridden built-in tool operations</td>
-                    <td>The model still sees a stable tool schema and result contract.</td>
+                    <td>MCP and scripted tool orchestration</td>
+                    <td>Built-in MCP, codemode, and tool_search; replaceable by extensions.</td>
+                    <td>Nested calls retain tool hooks; discovery and declarations follow explicit rules.</td>
                   </tr>
                   <tr>
                     <td>New provider</td>
@@ -698,9 +665,9 @@ next model-visible view:
               These two mechanisms should not be collapsed. A Skill uses <code>SKILL.md</code> to describe instructions, steps,
               and resources. Pi places its name and description into the system prompt and lets the model read the body on demand.
               An Extension is TypeScript running inside the Pi process; it can register tools, rewrite events, and persist state.
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/skills.ts#L67-L111">Skill metadata validation</a>
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/skills.ts">Skill metadata validation</a>
               and
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/skills.ts#L347-L360"><code>formatSkillsForPrompt</code></a>
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/skills.ts"><code>formatSkillsForPrompt</code></a>
               show progressive disclosure; extension code has full process authority.
             </p>
 
@@ -713,14 +680,8 @@ next model-visible view:
             <h2 id="security">10. Project trust is not a Sandbox</h2>
 
             <h3>10.1 Loading project resources and approving each tool call are separate gates</h3>
-            <p>
-              Pi now has project trust. When a project contains local settings, extensions, skills, prompts, themes, or system-prompt
-              files, interactive startup asks whether to load them. That prevents a repository from silently running project
-              extensions at startup. It does not restrict what built-in tools can do after a session begins.
-              The official
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/docs/security.md#L1-L37">Security document</a>
-              calls project trust an input-loading guard, not a sandbox.
-            </p>
+            <p>Project trust controls protected resources such as project settings, MCP configuration, extensions, skills, prompts, themes, and system-prompt files. A decision is required by default, subject to saved choices, CLI overrides, and extensions. It prevents silent extension loading, not tool actions after startup. The <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/security.md">security documentation</a> lists two exceptions: project sessionDir is read before trust resolution; context files such as AGENTS.override.md, AGENTS.md, and CLAUDE.md load regardless of trust unless context loading is disabled.</p>
+
 
             <p>
               <code>beforeToolCall</code> and the extension <code>tool_call</code> event can block execution, and coding-agent wires
@@ -736,7 +697,7 @@ next model-visible view:
               <code>!</code> commands into a micro-VM. These patterns isolate different owners. In the third pattern, custom
               extension tools still run on the host unless they also delegate their operations.
               The
-              <a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/docs/containerization.md#L1-L18">containerization table</a>
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/containerization.md">containerization table</a>
               makes that boundary explicit.
             </p>
 
@@ -787,7 +748,7 @@ next model-visible view:
                   <tr>
                     <td>Team-specific workflow</td>
                     <td>Extensions, Skills, packages, and SDK/RPC embedding surfaces.</td>
-                    <td>Plan, sub-agent, MCP, permission, and sandbox semantics.</td>
+                    <td>Planning, sub-agents, MCP exposure and authentication, permissions, and isolation policy.</td>
                     <td>Extension code and skills enter the same trust boundary and require review.</td>
                   </tr>
                 </tbody>
@@ -810,15 +771,15 @@ next model-visible view:
 
             <h2 id="sources">Sources</h2>
             <ul>
-              <li><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/README.md">Pi Agent Harness README</a></li>
-              <li><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/agent/src/agent-loop.ts"><code>pi-agent-core</code> agent loop</a></li>
-              <li><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/agent/src/types.ts"><code>AgentLoopConfig</code> and tool hooks</a></li>
-              <li><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/agent-session.ts"><code>AgentSession</code></a></li>
-              <li><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/session-manager.ts"><code>SessionManager</code></a></li>
-              <li><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/compaction/compaction.ts">Compaction implementation</a></li>
-              <li><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/compaction/branch-summarization.ts">Branch summarization implementation</a></li>
-              <li><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/src/core/extensions/types.ts"><code>ExtensionAPI</code></a></li>
-              <li><a href="https://github.com/earendil-works/pi/blob/d1230ea2000d876b479a69b8b061f9d670f262f5/packages/coding-agent/docs/security.md">Pi Security</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/README.md">Pi Agent Harness README</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts"><code>pi-agent-core</code> agent loop</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/types.ts"><code>AgentLoopConfig</code> and tool hooks</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts"><code>AgentSession</code></a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/session-manager.ts"><code>SessionManager</code></a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/compaction.ts">Compaction implementation</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/branch-summarization.ts">Branch summarization implementation</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/extensions/types.ts"><code>ExtensionAPI</code></a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/security.md">Pi Security</a></li>
             </ul>
           </section>
         </article>
