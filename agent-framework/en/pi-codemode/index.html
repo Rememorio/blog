@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Framework Source Notes (15): Pi Codemode: many tools, large results, smaller model input</title>
+    <meta
+      name="description"
+      content="Follow a test-report query through JavaScript orchestration, MCP discovery, nested tool calls, and failure state: process data before asking the model to judge it."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Agent Framework Source Notes (15): Pi Codemode: many tools, large results, smaller model input" />
+    <meta
+      property="og:description"
+      content="Follow a test-report query through JavaScript orchestration, MCP discovery, nested tool calls, and failure state: process data before asking the model to judge it."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/pi-codemode-workshop.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-framework/en/pi-codemode/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-framework/zh/pi-codemode/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-framework/en/pi-codemode/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-framework/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(31, 119, 123, 0.34);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      .shape-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin: 18px 0 22px;
+      }
+
+      .shape-box {
+        min-width: 0;
+        padding: 14px;
+        border: 1px solid rgba(24, 55, 82, 0.14);
+        border-radius: 8px;
+        background: rgba(255, 250, 240, 0.72);
+      }
+
+      .shape-box h3 {
+        margin-top: 0;
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+
+        .shape-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="Article navigation"><a href="../">Framework series</a><a href="../pi-context/">Previous</a><a href="../pi-agent-harness/">Pi overview</a><a href="#sources">Sources</a></nav>
+      <nav class="site-actions" aria-label="Site actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="Language"><a  href="../../zh/pi-codemode/" lang="zh-CN">中文</a><a class="active" aria-current="page" href="./" lang="en">English</a></span></nav>
+    </header>
+    <div class="article-shell"><aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero"><p class="eyebrow">Agent Framework Source Notes · Part 15</p><h1>Pi Codemode: many tools, large results, smaller model input</h1><p class="lead">Follow a test-report query through JavaScript orchestration, MCP discovery, nested tool calls, and failure state: process data before asking the model to judge it.</p>
+          <div class="meta-line"><span>Pi tools</span><span>Discover → execute → filter</span><span>Codemode / MCP / Tool calls</span></div>
+          <figure class="hero-image"><img src="../assets/pi-codemode-workshop.png" alt="The model submits JavaScript; QuickJS calls external file and MCP tools, filters data, and returns selected script output to the next model request." fetchpriority="high" /></figure>
+        </section>
+        <section class="article-body"><div class="note key-point"><p>Reading contract: follow “read three test reports and return only failed cases” to see where scripts run, how tools are discovered, what reaches the model, and what survives a script failure. Start with the <a href="../pi-agent-harness/">Pi overview</a> for the loop and session, or the <a href="../pi-context/">context chapter</a> for shortening logs already in history.</p></div>
+<p>This chapter follows the public implementation of <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/CHANGELOG.md">Pi 1.0.0</a>. Codemode, tool search, and MCP became built-in extensions in 0.99; 1.0 further changed declarations, background connections, and model calls. The scope is the stable CLI path at v1.0.0. SDK sessions require explicit extension setup. Examples explain data flow; they are not measurements of latency, cost, or task success.</p>
+<h2 id="one-task">1. Let the script read reports before the model judges failures</h2>
+<p>Suppose tests produce three JSON reports, each containing hundreds of passing cases and a few failures. A model could call read for each report and search the long output. Yet most of that work is parsing JSON, filtering arrays, and collecting fields. Sending every intermediate record into the conversation consumes input and makes important errors easier to miss.</p>
+<p>Codemode lets the model write JavaScript first. The script reads reports, filters records, and explicitly emits a compact result. The model still decides what to do and how to interpret failures; the script performs mechanical data processing. Tool calls retain their real effects, but their raw results first reach the script instead of automatically becoming the next model messages.</p>
+<pre><code class="language-javascript">const paths = [&quot;reports/unit.json&quot;, &quot;reports/api.json&quot;, &quot;reports/ui.json&quot;];
+const reports = await Promise.all(paths.map(async (path) =&gt; {
+  const raw = await tools.read({ path });
+  const report = JSON.parse(raw);
+  return {
+    path,
+    failed: report.tests
+      .filter((test) =&gt; test.status === &quot;failed&quot;)
+      .map(({ name, error }) =&gt; ({ name, error })),
+  };
+}));
+text(reports);</code></pre>
+<p>The example assumes a tests array and files small enough for read to return complete, directly parseable JSON. It does not create a file interface that bypasses tool limits: a truncation notice, missing file, or unexpected format still breaks the script. The three reads can be submitted concurrently, while the host’s tool scheduling policy still affects their execution order.</p>
+<p>The input to <code>codemode</code> is raw JavaScript, executed as an async function body with top-level await. <code>text()</code>, <code>image()</code>, and top-level return select what reaches the model. Computing a local variable alone does not emit it. See the <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/codemode.md">Codemode documentation</a> for the interface.</p>
+<h2 id="discovery">2. Discover tools before choosing how to call them</h2>
+<p>Replace local reports with a test-platform query, and the data may come from an MCP server. One server can offer hundreds of tools. Including every argument declaration in every request means carrying an entire manual even when a task needs two queries. Pi separates knowing that a server exists from obtaining a particular tool’s declaration.</p>
+<p>MCP tools default to codemode exposure: the model first sees a server summary, and a script searches for tools and reads declarations. The other entry point, tool_search, loads matching tools as direct declarations for subsequent requests. These mechanisms decide when descriptions enter context. Discovery itself neither executes a query nor grants additional permission.</p>
+<figure class="hero-image"><img src="../assets/pi-codemode-discovery.png" alt="An MCP catalog is discovered on demand, either for a codemode script to inspect declarations or for tool_search to declare a selected tool on the next model request; the initial request carries a server summary." loading="lazy" decoding="async" /><figcaption>Only the two indirect entry points are expanded here. Both can reach codemode and deferred tools; direct and hidden exposure are covered below.</figcaption></figure>
+<pre><code class="language-javascript">const matches = await searchTools(&quot;failed test runs&quot;, { namespace: &quot;mcp__tests&quot; });
+text(matches);
+if (matches[0]) text(await describeTool(matches[0].name));</code></pre>
+<p>The tests namespace is hypothetical, and this example only discovers and inspects a tool. After reading its real declaration, the model can supply valid arguments in a later script. Names and parameters should not be guessed from prose. Scripts can also inspect ALL_TOOLS or use describeNamespace for a server’s summary, instructions, and tool names.</p>
+<div class="table-wrap"><table><thead><tr><th>Exposure</th><th>Initial request and later access</th><th>Useful for</th></tr></thead><tbody><tr><td data-label="Exposure">codemode (default)</td><td data-label="Initial request and later access">Neither directly declared nor inlined into the codemode description; scripts discover it.</td><td data-label="Useful for">Combining calls and filtering large results.</td></tr><tr><td data-label="Exposure">deferred</td><td data-label="Initial request and later access">tool_search loads a direct declaration for the next request; scripts can also call it.</td><td data-label="Useful for">Discovering a tool before a direct model call.</td></tr><tr><td data-label="Exposure">direct</td><td data-label="Initial request and later access">Declared directly and also callable from scripts.</td><td data-label="Useful for">Small, frequently used tool sets.</td></tr><tr><td data-label="Exposure">hidden</td><td data-label="Initial request and later access">Registered but unreachable.</td><td data-label="Useful for">Explicitly disabled tools or servers.</td></tr></tbody></table></div>
+<p>The <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/mcp.md">MCP documentation</a> also defines per-tool overrides: exact names take precedence over wildcard rules, and the first matching wildcard wins. Exposure need not be uniform across a server. Declarations loaded by tool_search are recorded on the conversation branch. Script access to indirect tools does not depend on the currently declared tool list. Resuming or navigating the tree therefore has an explicit source for both availability and declaration history.</p>
+<h3>2.1 Why background connections should not keep rewriting old requests</h3>
+<p>Pi connects MCP servers in the background when a session starts. The first prompt waits up to ten seconds only for servers with direct tools, whose declarations belong in that request. Other servers are awaited when discovery or execution needs them: explicitly naming an MCP server waits for that server; searching all tools, reading ALL_TOOLS, or using tool_search waits for all servers.</p>
+<p>Default indirect tools stay outside the codemode description, so new connections do not continually enlarge that declaration. When server summaries change, Pi appends the updated mcp_servers section at prompt start. This reduces changes to earlier content. Actual cache hits still depend on request contents, provider rules, and cache lifetime; append-only updates do not establish a hit rate.</p>
+<h3>2.2 CLI defaults and SDK setup are separate decisions</h3>
+<p>The CLI’s MCP extension activates codemode when a codemode server connects and activates tool_search for deferred servers. Without MCP, <code>+codemode</code> can be added to defaultTools. <code>codemode.mode: "on"</code> keeps declared tools; <code>"only"</code> moves them behind the script entry point. The <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/sdk.md">SDK documentation</a> states that SDK sessions do not load built-in extensions automatically: the resource loader must receive the corresponding factories. CLI setup is not a default behavior of the low-level Agent.</p>
+<h2 id="execution">3. Scripts affect the outside world through the same tool path</h2>
+<p>Generated scripts run in an isolated QuickJS worker with a fresh VM for each call. There are no Node APIs, file system, network, or timers. External access goes through tools or models. This limits direct access to the host and gives it explicit requests to observe.</p>
+<p>In coding-agent, tools calls use <code>ctx.executeTool()</code> to reach <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts#L702">AgentSession’s nested tool execution</a>. Argument validation and extension handlers before and after execution use the ordinary tool pipeline. Child calls carry a <code>parentToolCallId</code> linking them to codemode. The script adds a layer for organizing calls without removing host control over them.</p>
+<pre><code class="language-text">Model issues a codemode call
+  → QuickJS executes JavaScript
+    → tools.&lt;name&gt;(args) requests host execution
+      → Validate / extension tool_call / execute / extension tool_result
+    ← Convert result into a script value
+  → text() / image() / return select output
+← Codemode result enters later model context</code></pre>
+<p>The VM and the tools have different capabilities. A script has no file system, but write still modifies files; it has no network API, but an MCP tool may contact a remote service. The <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/security.md">security documentation</a> says Pi has no built-in per-call approval or sandbox. Permission extensions can intercept calls; actual isolation depends on the host and tool environment. MCP annotations such as readOnlyHint and destructiveHint are server-provided hints, not proof that an operation is safe.</p>
+<p><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/extensions/codemode/execute.ts">execute.ts</a> attaches bounded nested-call summaries to the outer result for display and inspection. They are not a complete archive of every raw tool response. Preserve required reports, change evidence, or audit data in explicit files or storage; do not assume that content filtered out by a script can always be recovered from the conversation.</p>
+<h2 id="results">4. Distinguish three failure layers before reducing output</h2>
+<p>Returning only failed tests seems straightforward, but “the script did not throw” does not establish that all tests passed. Tools have different result conventions. Callers must establish operational success before filtering business data.</p>
+<div class="table-wrap"><table><thead><tr><th>Call</th><th>Script result</th><th>What to check</th></tr></thead><tbody><tr><td data-label="Call">read / edit / write</td><td data-label="Script result">Text output.</td><td data-label="What to check">Rejected calls, truncation notices, and expected format.</td></tr><tr><td data-label="Call">bash</td><td data-label="Script result">Structured output, exit_code, truncated, and related fields.</td><td data-label="What to check">Nonzero exits can resolve normally; inspect exit_code.</td></tr><tr><td data-label="Call">MCP tool</td><td data-label="Script result">Full CallToolResult with content, structuredContent, and isError.</td><td data-label="What to check">isError can resolve normally; Promise status is insufficient.</td></tr></tbody></table></div>
+<p>A JavaScript exception is script failure. A nonzero exit or isError is an operational failure. A failed test inside a valid report is business data. Collapsing all three into “no failed records” could turn a broken query into a false claim that tests passed.</p>
+<pre><code class="language-javascript">const results = await Promise.allSettled([
+  tools.bash({ command: &quot;npm test -- --runInBand&quot; }),
+  tools.read({ path: &quot;reports/previous.json&quot; }),
+]);
+text(results.map((result, index) =&gt; {
+  if (result.status === &quot;rejected&quot;) {
+    return { index, error: String(result.reason) };
+  }
+  return { index, value: result.value };
+}));</code></pre>
+<p>allSettled preserves independent successes and failures; bash’s exit code still needs interpretation. Operations that depend on earlier output must run sequentially. Writes to the same file or remote object also require ordering rather than a reflexive Promise.all. Concurrency overlaps independent waits; it does not establish business correctness.</p>
+<p>Large output has separate limits at separate stages. Direct MCP text over 20 KB loses its middle and points to a complete temporary file; codemode can receive the complete MCP result and filter it first. The script’s final output defaults to 10,000 estimated tokens, retaining the beginning and end when exceeded and linking complete text. bash has its own 1 MiB limit inside scripts. A VM has 256 MB of memory, so moving processing into a script does not permit unbounded accumulation.</p>
+<h2 id="state">5. What survives when a script fails?</h2>
+<p>Suppose a script writes a proposed fix to a file, stores a report cursor, then throws while parsing another report. It is tempting to treat this as an atomic transaction in which failure cancels everything. Pi does not provide that rollback for tool effects.</p>
+<figure class="hero-image"><img src="../assets/pi-codemode-effects.png" alt="A file write already performed by a tool remains after script failure; staged store updates become a codemode-store entry only when the script succeeds." loading="lazy" decoding="async" /><figcaption>The destinations have different commit rules: external effects may already exist while session state still awaits success. Cancelling ongoing calls cannot undo completed writes.</figcaption></figure>
+<p><code>store(key, value)</code> stages small JSON values; <code>load(key)</code> reads the script’s current small state: it starts from earlier successful writes on the active branch, and store updates become readable within the same script. <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/extensions/codemode/execute.ts">executeCodemode</a> appends a <code>codemode-store</code> custom entry only after success. Resuming replays writes from the branch root. Failed scripts do not commit their new store updates, but retain partial output already emitted and report the script error.</p>
+<p>The store suits cursors, IDs, and summaries. One value may contain at most 262,144 JSON characters, with 1,048,576 characters across all values. Image data does not belong there. A branch sees only writes on its path; external files and remote systems do not automatically return to an earlier version. Cross-system consistency still requires idempotency, explicit checkpoints, or compensation.</p>
+<p>When a script ends, unawaited promises are discarded and running tool calls receive cancellation. Starting a write and immediately returning does not confirm that the write completed. Await required results. Timely cancellation depends on each tool, and completed effects remain.</p>
+<h2 id="models">6. What classifiers and image models add to a script</h2>
+<p>The same processing path can use non-chat models: classify failed feedback, or generate a figure from selected results. The models interface queries the catalog and runs classifier and image models with session credentials. Chat models can be listed but cannot be run from scripts. This does not automatically start another conversational sub-agent.</p>
+<p>The <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/codemode.md">model-call contract</a> requires checking <code>stopReason</code> and <code>errorMessage</code>: provider errors can return as values instead of throwing. At most four classifier or image calls execute concurrently per script; additional calls queue. Usage contributes to the codemode result and session cost. Emit images with <code>image(block)</code>; printing base64 produces enormous text the model cannot read as an image.</p>
+<p>A classifier supplies a model judgment. If that judgment hides failures or authorizes archiving reports, retain uncertain cases and validate misclassification. A structured field alone does not establish reliability. Codemode changes where intermediate work happens; the task still needs its own acceptance criteria.</p>
+<h2 id="decision">7. When is a script the right unit of work?</h2>
+<div class="table-wrap"><table><thead><tr><th>Task shape</th><th>Prefer</th><th>Property to preserve</th></tr></thead><tbody><tr><td data-label="Task shape">One call with a short result</td><td data-label="Prefer">A direct tool call.</td><td data-label="Property to preserve">Clear errors and visible results.</td></tr><tr><td data-label="Task shape">Independent reports requiring filtering or aggregation</td><td data-label="Prefer">Codemode for reads and deterministic processing.</td><td data-label="Property to preserve">Source and success/failure for each input.</td></tr><tr><td data-label="Task shape">Many tools with unknown interfaces</td><td data-label="Prefer">Discover first, then choose direct calls or a script.</td><td data-label="Property to preserve">Real declarations and current availability.</td></tr><tr><td data-label="Task shape">Long history no longer needs its full text</td><td data-label="Prefer">ContextEdit or compaction.</td><td data-label="Property to preserve">Raw records, branch semantics, and consistent recovery.</td></tr><tr><td data-label="Task shape">Several external writes</td><td data-label="Prefer">Dependency ordering, idempotency, and checkpoints.</td><td data-label="Property to preserve">Verify effects separately from script success.</td></tr></tbody></table></div>
+<p>Evaluate the design on the same reports: does it produce the same answer, how many failures are missed, how much model input and output is used, what is the full elapsed time, are tool failures interpreted correctly, and does a resumed cursor correspond to completed work? A shorter result is only the first step. The transformation is worth retaining when the task remains correct.</p>
+<p>Together with the previous chapter, Pi offers two distinct intervention points. Codemode selects data before tool results enter model messages; ContextEdit changes future input after history is recorded. Both make evidence retention and model visibility explicit decisions, and both require a separate account of effects already performed outside the model.</p>
+<h2 id="sources">Sources and documentation</h2>
+<ul><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/codemode.md">Codemode: scripts, output, state, and models</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/mcp.md">MCP: discovery, exposure, connections, and resources</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/extensions/codemode/execute.ts">Execution and script-result conversion</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/extensions/codemode/tool.ts">Tool declarations and inline budget</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts">AgentSession: nested tool execution</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/codemode/README.md">The standalone QuickJS sandbox package</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/sdk.md">Explicit SDK setup</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/security.md">Security and project trust</a></li></ul></section>
+      </article></main>
+    </div>
+    <script src="../../table-labels.js"></script>
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        const headings = [...article.querySelectorAll("h2, h3, h4")];
+        const slugCounts = new Map();
+        const slugify = (text) => {
+          const raw = text
+            .trim()
+            .toLowerCase()
+            .replace(/<[^>]+>/g, "")
+            .replace(/["'“”‘’]/g, "")
+            .replace(/[^\p{Script=Han}\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          const base = raw || "section";
+          const count = slugCounts.get(base) || 0;
+          slugCounts.set(base, count + 1);
+          return count ? base + "-" + (count + 1) : base;
+        };
+        const root = document.createElement("ol");
+        root.className = "toc-list";
+        const stack = [{ level: 2, list: root }];
+        headings.forEach((heading) => {
+          if (!heading.id) heading.id = slugify(heading.textContent || "");
+          const level = Number(heading.tagName.slice(1));
+          while (stack.length && level < stack[stack.length - 1].level) stack.pop();
+          if (level > stack[stack.length - 1].level) {
+            const parent = stack[stack.length - 1].list.lastElementChild;
+            const child = document.createElement("ol");
+            child.className = "toc-sublist";
+            if (parent) parent.appendChild(child);
+            stack.push({ level, list: child });
+          }
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = "#" + heading.id;
+          link.textContent = heading.textContent || "";
+          link.className = "toc-link toc-level-" + level;
+          item.appendChild(link);
+          stack[stack.length - 1].list.appendChild(item);
+        });
+        toc.appendChild(root);
+      })();
+    </script>
+  <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+  <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>
