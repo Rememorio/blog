@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Framework Source Notes (14): How Pi preserves history while changing the next context</title>
+    <meta
+      name="description"
+      content="Follow one test log through session branches, append-only content edits, request reconstruction, compaction, and extension continuation: what remains for the user and what reaches the next model request."
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Agent Framework Source Notes (14): How Pi preserves history while changing the next context" />
+    <meta
+      property="og:description"
+      content="Follow one test log through session branches, append-only content edits, request reconstruction, compaction, and extension continuation: what remains for the user and what reaches the next model request."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/pi-context-projection.png" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/agent-framework/en/pi-context/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/agent-framework/zh/pi-context/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/agent-framework/en/pi-context/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/agent-framework/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(31, 119, 123, 0.34);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      .shape-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin: 18px 0 22px;
+      }
+
+      .shape-box {
+        min-width: 0;
+        padding: 14px;
+        border: 1px solid rgba(24, 55, 82, 0.14);
+        border-radius: 8px;
+        background: rgba(255, 250, 240, 0.72);
+      }
+
+      .shape-box h3 {
+        margin-top: 0;
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+
+        .shape-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../en/" aria-label="Blog home"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+      <nav class="local-nav" aria-label="Article navigation"><a href="../">Framework series</a><a href="../trpc-agent-go-evolution/">Previous</a><a href="../pi-codemode/">Next</a><a href="../pi-agent-harness/">Pi overview</a><a href="#sources">Sources</a></nav>
+      <nav class="site-actions" aria-label="Site actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="Language"><a  href="../../zh/pi-context/" lang="zh-CN">中文</a><a class="active" aria-current="page" href="./" lang="en">English</a></span></nav>
+    </header>
+    <div class="article-shell"><aside class="toc-panel" aria-label="Table of contents"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav"></nav></aside>
+      <main class="article-main"><article class="article-card">
+        <section class="article-hero"><p class="eyebrow">Agent Framework Source Notes · Part 14</p><h1>How Pi preserves history while changing the next context</h1><p class="lead">Follow one test log through session branches, append-only content edits, request reconstruction, compaction, and extension continuation: what remains for the user and what reaches the next model request.</p>
+          <div class="meta-line"><span>Pi context</span><span>History → branch → request</span><span>ContextEdit / Compaction / Continuation</span></div>
+          <figure class="hero-image"><img src="../assets/pi-context-projection.png" alt="The raw transcript retains the full log while the active branch is reconstructed into a next-model request containing a log summary." fetchpriority="high" /></figure>
+        </section>
+        <section class="article-body"><div class="note key-point"><p>Reading contract: follow one task—repair configuration loading and run the tests—across stored records, the active branch, and the next model request. This chapter asks which changes survive resume, what compaction reads, and how an extension actually requests more work. The <a href="../pi-agent-harness/">Pi overview</a> introduces the loop and session tree.</p></div>
+<p>The source baseline is <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/CHANGELOG.md">Pi 1.0.0</a>. This chapter follows the local <code>AgentSession</code> and JSONL session path. It does not describe the experimental <code>pi-durable</code> package, the source-only client/server path or provider-internal cache implementation. The logs and records below are simplified teaching examples, not benchmark results.</p>
+<h2 id="one-log">1. One long log has three different destinations</h2>
+<p>The agent reads configuration, edits the implementation, and runs tests. The test log is large, but only a few lines explain the failure. A user may need the complete output later; the next model request needs the failing assertion, its location, and the current change. Overwriting stored history to save tokens destroys evidence. Resending every line on every request spends the working context on repeated output.</p>
+<p>Pi separates those needs. The session keeps recording what happened, while the runtime assembles model input before each request. Give the records short names so the same log can be followed through editing, branching, resume, and compaction:</p>
+<pre><code class="language-text">U1: repair configuration loading; preserve the public API
+A1: assistant requests tests, toolCallId = test-1
+T1: the long result of test-1
+A2: assistant explains the failure and prepares a repair
+E1: replace T1’s contribution to future requests with a short summary</code></pre>
+<p>Two identities matter. <code>T1</code> is a session entry ID, which an edit targets. <code>test-1</code> is a tool-call ID, which the model protocol uses to correlate the call and its result. They are not interchangeable. The rest of the chapter follows T1 without changing examples at each mechanism.</p>
+<div class="table-wrap"><table><thead><tr><th>Representation</th><th>What it contains here</th><th>Consumer</th></tr></thead><tbody><tr><td data-label="Representation">Raw session records</td><td data-label="What it contains here">U1, A1, T1, A2, and the subsequently appended E1. E1 does not rewrite T1.</td><td data-label="Consumer">Storage, UI, exports, and investigation.</td></tr><tr><td data-label="Representation">Active branch</td><td data-label="What it contains here">The path from the current leaf through parentId to the root.</td><td data-label="Consumer">Tree navigation, forks, and path reconstruction.</td></tr><tr><td data-label="Representation">Next model input</td><td data-label="What it contains here">The selected compaction range, content edits, and request-time transforms.</td><td data-label="Consumer">The provider request.</td></tr></tbody></table></div>
+<figure class="hero-image"><img src="../assets/pi-agent-harness-overview.png" alt="Pi layers: coding-agent manages tools, sessions, and compaction above model access and the agent loop, with extensions participating in requests." loading="lazy" decoding="async" /><figcaption>Locate the responsibility first: this chapter follows coding-agent’s session and request assembly; the low-level loop executes each request.</figcaption></figure>
+<h2 id="append-edit">2. Record the edit to recover the same decision</h2>
+<h3>2.1 Keep result identity while replacing content</h3>
+<p>A <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/session-format.md">ContextEditEntry</a> names a target entry and a replacement decision. <code>replacement: null</code> omits the target message; a non-null replacement changes only <code>content</code>. It does not change a tool result into another role or rewrite the original timestamp and usage. For a long log, preserving the result and its call relationship while shortening content is often the appropriate shape:</p>
+<pre><code class="language-json">{&quot;type&quot;:&quot;context_edit&quot;,&quot;targetId&quot;:&quot;T1&quot;,&quot;replacement&quot;:{&quot;content&quot;:&quot;Tests failed: the async-read assertion in config.test.ts failed; all other tests passed.&quot;}}</code></pre>
+<p>This example omits the edit entry’s own id, parentId, and timestamp. It means “use this content when T1 contributes to later requests,” not “run the tests again” or “the original log was this short.” Omitting a tool result altogether can leave its call without a matching result. The edit API does not design a complete protocol repair for an extension; first identify the target’s role in the current request, then choose replacement or omission.</p>
+<pre><code class="language-typescript">// SDK example: targetEntryId must belong to the active branch.
+session.sessionManager.appendContextEdit(targetEntryId, {
+  content: &quot;Tests failed: the async-read assertion failed; all other tests passed.&quot;,
+});
+session.refreshContext();</code></pre>
+<p><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/session-manager.ts#L1360">appendContextEdit()</a> rejects a missing target, a target outside the active branch, or an entry that supplies no editable model content. User, assistant, tool-result, and custom-message entries are eligible. String replacements for assistant and tool-result messages are normalized to text-block arrays. <strong>This is a recoverable content decision, not an automatic log-summarization policy enabled by default.</strong> The caller or extension must select the log and produce a trustworthy replacement.</p>
+<h3>2.2 Edits belong to a branch</h3>
+<p>Continue after E1 and T1 contributes the summary. Navigate to a point before E1 and branch there, and that path has no E1: T1 contributes its original content. The last edit for a target in the effective range wins. Context organization becomes part of the branch rather than an unrecorded process-local patch.</p>
+<pre><code class="language-text">U1 → A1 → T1 → A2 → E1 → U2   T1 contributes replacement content
+                  ↘ U3          no E1 on this branch; T1 contributes original content
+
+Stored T1: unchanged on both paths</code></pre>
+<p>Construction order matters. <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/session-manager.ts#L476">buildContextEntries()</a> selects the active branch and latest compaction range first. <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/session-manager.ts#L543">buildSessionProjection()</a> then collects edits in that range and preserves each output’s source entry. Ordinary custom state and omitted entries may contribute no model message, while a compaction entry may contribute system state and a summary. Entry count is therefore not message count.</p>
+<h2 id="request">3. Rebuild each request, then apply request-time transforms</h2>
+<h3>3.1 Stored records define the base context</h3>
+<p>Whether Pi restarts or immediately begins another turn, the input should be explainable from stored state. Deleting T1 only from an in-memory array cannot provide that property: resume may send the full log again. Pi makes SessionManager the source of base context, so a persistent change needs a replayable representation.</p>
+<p><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts#L759">Request projection</a> is installed through <code>prepareRequest</code>. Selected input is recorded first, then every provider request—including the first—rebuilds with <code>buildSessionProjection()</code>. Executable tool implementations come from the current tool set; messages express the declarations visible to the model. Assigning <code>session.agent.state.messages</code> no longer replaces future request history. SDK integrations should change base state through session records, navigation, or restoration APIs.</p>
+<pre><code class="language-text">Raw entries on the current branch
+  → latest compaction and retained range
+  → context_edit: omit or replace content
+  → prepareRequest: install reconstructed base context
+  → context / context_with_system: request-time transforms
+  → convertToLlm: provider-compatible messages</code></pre>
+<h3>3.2 Two context hooks have different scopes</h3>
+<p>Request-time transformations remain available, but they are not writes to history. <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/extensions/runner.ts#L1289">emitContext()</a> clones messages and runs <code>context</code> handlers on non-system conversation messages. After each handler Pi restores prompt and tool state. A simple slice of the conversation therefore does not accidentally discard the system prompt and initial tool declarations.</p>
+<p>The later <code>context_with_system</code> handlers see the complete transcript, and their returned output is honored. This supports extensions that deliberately restructure system state, but also makes them responsible for the leading system message. Removing it is reported, yet Pi still uses the returned result. A wider editing surface does not make arbitrary transformations valid provider requests.</p>
+<div class="table-wrap"><table><thead><tr><th>Required behavior</th><th>Mechanism</th><th>Meaning after resume</th></tr></thead><tbody><tr><td data-label="Required behavior">Persistently shorten T1</td><td data-label="Mechanism">Append context_edit</td><td data-label="Meaning after resume">Reapplied when rebuilding the current path; original content remains.</td></tr><tr><td data-label="Required behavior">Filter conversation only for this request</td><td data-label="Mechanism">context</td><td data-label="Meaning after resume">No persistent edit record is created automatically; the transform must run again.</td></tr><tr><td data-label="Required behavior">Restructure system prompt or tool-state messages</td><td data-label="Mechanism">context_with_system</td><td data-label="Meaning after resume">The caller preserves valid system state and provider message shape.</td></tr></tbody></table></div>
+<h2 id="compaction">4. Compaction must read the edited contribution too</h2>
+<p>After T1 is shortened, more test results accumulate and trigger compaction. If the summarizer reads raw T1 directly, the reduction is undone: excluded content enters the summary request and may reappear through the summary itself. Compaction needs the same content-selection rules as the current model input.</p>
+<p><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/compaction.ts#L872">prepareCompaction()</a> starts from <code>buildSessionProjection()</code>. It chooses retained material and summary input from edited contributions. <code>findProjectedCutPoint()</code> still avoids using a tool result as an independent cut point; splitting a large turn may require a separate checkpoint for its earlier prefix. Source entry IDs remain available so the resulting <code>firstKeptEntryId</code> points back into the session.</p>
+<figure class="hero-image"><img src="../assets/pi-session-tree-compaction.png" alt="Pi preserves the raw session tree, checks the generated summary, appends CompactionEntry, and rebuilds model input from summary and retained history." loading="lazy" decoding="async" /><figcaption>This figure covers recording and installing default compaction. Summary input first reflects the current branch’s context edits. Runtime validity checks do not establish semantic completeness.</figcaption></figure>
+<p>Usage estimates must change with the input. Earlier assistant usage describes a request made before the edit; it cannot prove that current context is still equally large. <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/compaction.ts#L227">estimateProjectedContextTokens()</a> checks whether the usage record follows the latest context edit or compaction. Otherwise it estimates current messages. Usage from a later request can become authoritative again. Historical accounting stays intact; the estimate of the next request changes.</p>
+<p>Abandoned assistant attempts can likewise be persistently omitted from retry input without disappearing from the transcript. Subsequent compaction works with effective content, the previous summary, and its retained tail. Append-only storage is not a provider-cache guarantee: replacing early content may still change the submitted prefix. Actual requests and returned usage, rather than the storage layout alone, determine what cache behavior can be claimed.</p>
+<h2 id="continuation">5. How an appended record becomes another request</h2>
+<h3>5.1 A boundary can propose records and continuation</h3>
+<p>The log summary is ready, but the model has just delivered its final answer. An extension discovers a missing verification step. Appending a note does not by itself guarantee another model call: changing records and continuing execution are separate decisions. Pi exposes actionable <code>turn_end</code> and <code>agent_before_settle</code> extension boundaries. One handles a completed turn; the other handles work before the session settles into stable idle.</p>
+<p><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/extensions/runner.ts#L1020">emitBoundary()</a> invokes handlers in order. Each receives accumulated <code>entries</code>, the continuation decision, and a reconstructed preview. Returning <code>entries</code> replaces the accumulated list, so an append must preserve earlier drafts. The runtime rebuilds the preview, validates drafts, and finally commits valid drafts in order. Requesting continuation cannot force invalid drafts to be installed.</p>
+<pre><code class="language-text">Extension policy: verification is missing and has not already been requested on this branch
+  → preserve event.entries; add a custom_message with the verification instruction
+  → return continue: true
+  → runtime previews and validates drafts, then appends them in order
+  → continue only when rebuilt context or queued input supports another request</code></pre>
+<p>This is a policy sketch, not a default post-answer verification feature. The extension should also persist whether it already requested verification; requesting continuation on every turn creates a loop with no stopping condition. Plain custom metadata does not invent model input. Eligibility depends on reconstructed context and queued messages, not merely on a returned boolean.</p>
+<figure class="hero-image"><img src="../assets/pi-context-boundary.png" alt="Either turn_end or agent_before_settle enters draft preview; valid entries are appended in order and continuation eligibility determines whether to rebuild another request." loading="lazy" decoding="async" /><figcaption>The envelopes represent alternative intervention points. The append path assumes valid drafts. Committing records and allowing continuation remain separate decisions.</figcaption></figure>
+<h3>5.2 Continue ensures a request without duplicating one</h3>
+<p>The low-level <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts#L163">runLoop</a> calls <code>finishTurn</code> after finalizing the assistant and tool results, then emits <code>turn_end</code>. On a normal path, <code>end</code> ends this run without consuming queued input. <code>continue</code> ensures one more provider request. A request already scheduled by tool results, steering, or follow-up satisfies it; only when none is selected does the loop add a context-only request.</p>
+<p>Errors and aborts remain hard exits from the low-level loop: finishTurn is called, but its continuation decision is ignored. The enclosing AgentSession still owns recovery and settlement. <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts#L1846">agent_before_settle</a> commits drafts and checks valid input and queues again. A low-level <code>agent_end</code> does not mean the entire session has settled, and neither event proves that the task passed verification.</p>
+<h2 id="replay">6. Replay the same log through the whole lifecycle</h2>
+<div class="table-wrap"><table><thead><tr><th>Event</th><th>Record or action</th><th>Effect on future input</th></tr></thead><tbody><tr><td data-label="Event">Tests produce T1</td><td data-label="Record or action">Append the original tool result.</td><td data-label="Effect on future input">The model initially receives its contribution.</td></tr><tr><td data-label="Event">An extension appends E1</td><td data-label="Record or action">E1 targets T1 and stores replacement content.</td><td data-label="Effect on future input">T1 keeps its identity with shorter content.</td></tr><tr><td data-label="Event">Close and resume</td><td data-label="Record or action">Reconstruct the current path and reapply effective E1.</td><td data-label="Effect on future input">No dependence on an earlier process’s array patch.</td></tr><tr><td data-label="Event">Branch before E1</td><td data-label="Record or action">The new path does not include E1.</td><td data-label="Effect on future input">T1 contributes original content; file effects do not roll back.</td></tr><tr><td data-label="Event">Compact a longer conversation</td><td data-label="Record or action">Use edited content for summary selection and size estimates.</td><td data-label="Effect on future input">Read a summary plus retained tail.</td></tr><tr><td data-label="Event">Request missing verification</td><td data-label="Record or action">Commit valid drafts; an eligible continuation schedules a request.</td><td data-label="Effect on future input">More work becomes possible; the result still needs verification.</td></tr></tbody></table></div>
+<p>A useful acceptance check follows this exact route: compare provider input before and after editing, verify raw T1 is unchanged, resume and reconstruct the same input, branch before the edit to check isolation, then inspect compaction material for unintended reintroduction. Finally ensure verification is requested once and failure, abort, and explicit stop can end work. A summary appearing in the UI does not establish those properties.</p>
+<p>The next chapter, <a href="../pi-codemode/">Pi Codemode</a>, moves selection earlier: a script can reduce large tool results before they ever enter model messages. The distinction is when data enters context. Both mechanisms require separating what the model sees from what has already happened outside the model.</p>
+<h2 id="sources">Sources and documentation</h2>
+<ul><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/session-format.md">Session format</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/session-manager.ts">SessionManager: branches, compaction ranges, and content edits</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts">AgentSession: request reconstruction and settlement</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/compaction.ts">Compaction: projected material and usage estimates</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/extensions/runner.ts">ExtensionRunner: boundary previews and request transforms</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts">Agent loop: finishTurn and input scheduling</a></li></ul></section>
+      </article></main>
+    </div>
+    <script src="../../table-labels.js"></script>
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        const headings = [...article.querySelectorAll("h2, h3, h4")];
+        const slugCounts = new Map();
+        const slugify = (text) => {
+          const raw = text
+            .trim()
+            .toLowerCase()
+            .replace(/<[^>]+>/g, "")
+            .replace(/["'“”‘’]/g, "")
+            .replace(/[^\p{Script=Han}\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          const base = raw || "section";
+          const count = slugCounts.get(base) || 0;
+          slugCounts.set(base, count + 1);
+          return count ? base + "-" + (count + 1) : base;
+        };
+        const root = document.createElement("ol");
+        root.className = "toc-list";
+        const stack = [{ level: 2, list: root }];
+        headings.forEach((heading) => {
+          if (!heading.id) heading.id = slugify(heading.textContent || "");
+          const level = Number(heading.tagName.slice(1));
+          while (stack.length && level < stack[stack.length - 1].level) stack.pop();
+          if (level > stack[stack.length - 1].level) {
+            const parent = stack[stack.length - 1].list.lastElementChild;
+            const child = document.createElement("ol");
+            child.className = "toc-sublist";
+            if (parent) parent.appendChild(child);
+            stack.push({ level, list: child });
+          }
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = "#" + heading.id;
+          link.textContent = heading.textContent || "";
+          link.className = "toc-link toc-level-" + level;
+          item.appendChild(link);
+          stack[stack.length - 1].list.appendChild(item);
+        });
+        toc.appendChild(root);
+      })();
+    </script>
+  <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+  <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>
