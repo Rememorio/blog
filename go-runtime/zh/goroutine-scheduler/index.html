@@ -62,7 +62,7 @@
             <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go">runtime/runtime2.go</a>。
             G/M/P 分别保存什么、怎样配合，参考官方 <a href="https://go.dev/src/runtime/HACKING">runtime HACKING</a>；生产观测参考
             <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a> 和 <a href="https://go.dev/doc/diagnostics">Diagnostics</a>。
-            本文核实的是官方 master 的固定开发快照，并不把它当作已发布稳定版；这里讨论 gc runtime 的实现，别的 Go implementation 可以选择不同映射。
+            调度基础对应上述开发快照；执行前安全点与抢占重试对应 <a href="https://github.com/golang/go/tree/553df30bcdbf85a9aa42c5011b4151295a09135b">2026-10-22 核实的 master 快照</a>。这些是 gc runtime 的开发实现，其他 Go implementation 可以选择不同映射。
           </p>
 
           <h2>一、八个 goroutine 不等于八条线程</h2>
@@ -237,11 +237,15 @@ runqputslow(pp, gp, h, t) // 一半 local G + 新 G → global runq</code></pre>
             <code>runqsteal</code> 通过 <code>runqgrab</code> 尝试从另一个 P 的 local queue 取一半，把其中一个直接返回运行，其余落到自己的 local queue。
             批量平衡减少频繁跨 P 竞争；随机选择受害 P 和 spinning M 限额则避免所有空闲线程同时扫描造成 CPU 浪费。
           </p>
+          <p>
+            窃取还要给 runtime 的暂停请求让路。在尝试拿走另一个 P 的 <code>runnext</code> 前，<code>runqgrab</code> 有时会短暂退让，让原 P 先完成本地交接。
+            如果这段退让与 STW 请求重叠，<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/runtime/proc.go#L7766-L7786">当前实现会在退让后重新检查 <code>gcwaiting</code></a>，发现暂停请求就放弃这次窃取，让调度器返回暂停处理路径。
+          </p>
 
           <h3>3.4 <code>execute</code> 才把 runnable 变成 running</h3>
           <p>
             选到 G 后，<code>execute</code> 把当前 M 的 <code>curg</code> 指向它、把 G 的 <code>m</code> 指回当前 M，
-            用 CAS 将状态从 <code>_Grunnable</code> 改为 <code>_Grunning</code>，清理等待与抢占标记，最后 <code>gogo(&amp;gp.sched)</code> 恢复保存现场。
+            用 CAS 将状态从 <code>_Grunnable</code> 改为 <code>_Grunning</code>，清理等待与抢占标记。在记录 trace 的 GoStart 事件后，它还会处理当前 P 上待执行的安全点回调，最后才用 <code>gogo(&amp;gp.sched)</code> 恢复保存现场。
           </p>
 
           <pre><code class="language-go">mp.curg = gp
@@ -249,9 +253,18 @@ gp.m = mp
 casgstatus(gp, _Grunnable, _Grunning)
 gp.waitsince = 0
 gp.preempt = false
-// trace、profiling 与时间片处理省略
+// profiling、时间片与 trace.GoStart 处理省略
+if mp.p.ptr().runSafePointFn != 0 {
+    runSafePointFn()
+}
 gogo(&amp;gp.sched)</code></pre>
-          <span class="source-caption">对应源码：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L3338-L3399">runtime.execute</a>。</span>
+          <span class="source-caption">对应源码（省略非核心处理）：<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/runtime/proc.go#L3340-L3402">runtime.execute</a>。</span>
+
+          <p>
+            安全点回调是 runtime 要求某个 P 在安全位置完成的工作。请求可能在 <code>findRunnable</code> 检查之后才到达；此时 M 尚未运行用户 G，抢占请求也可能找不到目标。
+            <code>execute</code> 的这次补查让该 P 在进入用户代码前完成回调，减少等待下一次抢占重试的机会。它位于 GoStart 之后，因为回调可能产生要求 G 已被 trace 记录为 running 的事件。
+            因而下面的 runnable latency 以状态转换为终点；这段随后发生的 runtime 工作需要结合 trace 阅读。
+          </p>
 
           <p>
             因为 G 与 M 在这里才绑定，普通业务不应依赖 goroutine identity 对应固定线程。只有确有 thread-local/GUI/cgo 要求时才考虑
@@ -285,6 +298,12 @@ wakep()</code></pre>
           <p>
             连续经 <code>runnext</code> 交接的多个 G 可以共享同一个 <code>schedtick</code>，因此检查的是持续占用的时间片，不是每个 G 各自获得一份新的 10ms。10ms 是当前实现触发检查的阈值，不是 goroutine 的最大运行时，也不是延迟 SLA。信号投递、安全点、runtime 临界区、平台支持、cgo/syscall 与 OS 调度都会影响实际交接。
             抢占提供公平机会，不能把 Go 变成硬实时系统。
+          </p>
+
+          <p>
+            暂停协议还必须保证重试能够前进。STW 发起方先登记暂停状态并停止当前及空闲 P，再<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/runtime/proc.go#L1657-L1704">释放 <code>sched.lock</code> 后请求其余 P 抢占</a>，让被抢占的线程能够取得这把锁。
+            需要暂停指定 G 的 <code>suspendG</code> 则保留同步抢占标记，并限制异步请求频率：<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/runtime/preempt.go#L193-L246">重试间隔从每次 <code>preemptM</code> 返回后开始计算</a>。
+            这对 Windows 尤其重要，因为调用本身可能耗时较长；从调用前计时会使目标刚恢复就再次被暂停。若本轮因限频没有实际发出请求，实现会清除“已有请求”的跟踪记录，使到期后的重试继续发生。诊断暂停延迟时，应同时检查请求、重试和目标到达安全点的过程。
           </p>
 
           <h2 id="evidence">五、用 runnable latency 验证调度假设</h2>

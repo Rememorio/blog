@@ -63,7 +63,7 @@
             <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/runtime2.go">runtime/runtime2.go</a>.
             The official <a href="https://go.dev/src/runtime/HACKING">runtime HACKING guide</a> defines what G, M, and P store and how they interact;
             production observation uses <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a> and <a href="https://go.dev/doc/diagnostics">Diagnostics</a>.
-            The source is a fixed snapshot of the official master development branch, not a released stable version. Its gc runtime mapping is not required of every Go implementation.
+            Scheduling fundamentals use that development snapshot; pre-execution safe points and preemption retries use the <a href="https://github.com/golang/go/tree/553df30bcdbf85a9aa42c5011b4151295a09135b">master snapshot verified on October 22, 2026</a>. These describe gc runtime development code; other Go implementations may choose different mappings.
           </p>
 
           <h2>1. Eight Goroutines Are Not Eight Threads</h2>
@@ -242,11 +242,15 @@ runqputslow(pp, gp, h, t) // half the local Gs + new G → global</code></pre>
             <code>runqsteal</code> asks <code>runqgrab</code> for roughly half of another P's local queue. One stolen G returns immediately and the remainder populates the thief's local queue.
             Batch balancing reduces repeated cross-P contention; randomized victim order and a cap on spinning Ms avoid turning idle search into excessive CPU use.
           </p>
+          <p>
+            Stealing also yields to runtime pause requests. Before taking another P's <code>runnext</code>, <code>runqgrab</code> sometimes backs off briefly to let that P complete its local handoff.
+            If the backoff overlaps a stop-the-world request, <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/runtime/proc.go#L7766-L7786">the current implementation rechecks <code>gcwaiting</code> after the backoff</a> and abandons that steal so the scheduler can return to pause handling.
+          </p>
 
           <h3>3.4 <code>execute</code> Turns Runnable into Running</h3>
           <p>
             Once a G is selected, <code>execute</code> points the M's <code>curg</code> at it, points the G's <code>m</code> back to the M, CASes
-            <code>_Grunnable</code> to <code>_Grunning</code>, clears waiting and preemption markers, and finally restores the saved context through <code>gogo(&amp;gp.sched)</code>.
+            <code>_Grunnable</code> to <code>_Grunning</code>, and clears waiting and preemption markers. After recording trace's GoStart event, it handles any pending safe-point callback on the current P, then restores the saved context through <code>gogo(&amp;gp.sched)</code>.
           </p>
 
           <pre><code class="language-go">mp.curg = gp
@@ -254,9 +258,18 @@ gp.m = mp
 casgstatus(gp, _Grunnable, _Grunning)
 gp.waitsince = 0
 gp.preempt = false
-// Trace, profiling, and time-slice work omitted.
+// Profiling, time-slice work, and trace.GoStart omitted.
+if mp.p.ptr().runSafePointFn != 0 {
+    runSafePointFn()
+}
 gogo(&amp;gp.sched)</code></pre>
-          <span class="source-caption">Pinned source: <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/proc.go#L3338-L3399">runtime.execute</a>.</span>
+          <span class="source-caption">Pinned source, with secondary work omitted: <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/runtime/proc.go#L3340-L3402">runtime.execute</a>.</span>
+
+          <p>
+            A safe-point callback is work that the runtime asks a P to perform at a safe position. The request can arrive after <code>findRunnable</code> checks for it, while the M has no running user G for a preemption request to target.
+            This extra check in <code>execute</code> lets the P complete the callback before entering user code, reducing the need to wait for another preemption attempt. It follows GoStart because the callback may emit events that require the trace to have recorded the G as running.
+            The runnable-latency measurement below therefore ends at the state transition; use the trace to examine runtime work that follows it.
+          </p>
 
           <p>
             Because G and M are associated here, ordinary application code must not assume a goroutine identity maps to one thread. Use <code>runtime.LockOSThread</code> only for real thread-local,
@@ -290,6 +303,12 @@ wakep()</code></pre>
           <p>
             Several Gs handed off through <code>runnext</code> can share one <code>schedtick</code>, so the check follows a continuously occupied time slice rather than granting every G a fresh 10 ms. Ten milliseconds is an implementation threshold for requesting intervention, not a maximum run duration or latency SLO. Signal delivery, safe points, runtime critical sections,
             platform support, cgo/syscalls, and OS scheduling affect the actual handoff. Preemption improves fairness; it does not make Go hard real time.
+          </p>
+
+          <p>
+            The pause protocol must also keep retries progressing. The STW initiator records the pause request, stops its own P and idle Ps, then <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/runtime/proc.go#L1657-L1704">releases <code>sched.lock</code> before requesting preemption of the remaining Ps</a>, allowing preempted threads to acquire that lock.
+            To suspend a particular G, <code>suspendG</code> retains synchronous preemption flags while limiting asynchronous attempts: <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/runtime/preempt.go#L193-L246">each retry delay starts after <code>preemptM</code> returns</a>.
+            This matters especially on Windows, where the call itself can take long enough that a delay measured before it would immediately suspend the target again. If rate limiting prevents an actual request, the implementation clears its pending-request tracking so a later retry can proceed. Diagnose pause latency by following the request, retries, and the target's arrival at a safe point.
           </p>
 
           <h2 id="evidence">5. Verify Scheduling with Runnable Latency</h2>
