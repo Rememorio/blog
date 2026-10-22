@@ -175,7 +175,7 @@
               <p>
                 <strong>本文依据。</strong>
                 本文用 Pi 的 coding harness、AgentScope 的 service example、Agno 的 AgentOS，以及 tRPC-Agent-Go 的
-                Session、CodeExecutor、Workspace、Artifact 与 Memory 公开源码说明实际行为。文中的四象限与“工作现场”是跨框架的比较方法；
+                Session、CodeExecutor、Workspace、Artifact 与 Memory 公开源码说明实际行为。各段引用固定到对应实现；SOP 工作区分配、同会话队列和取消终态使用后续快照。文中的四象限与“工作现场”是跨框架的比较方法；
                 不推断任何产品未公开的容器实现、存储拓扑、调度策略或保留时长。
               </p>
             </div>
@@ -399,6 +399,8 @@ service plane
 
             <p>后台执行还要把“已接受”与“已完成”分开。Agno 的 <a href="https://github.com/agno-agi/agno/blob/85b6d1d178b70d59e8f2c0d432d2a66b35004f31/libs/agno/agno/os/routers/agents/router.py#L988-L1068">后台接受路径</a>在配置持久队列、请求满足入队条件且新任务成功入队后返回 <code>202</code> 与 <code>PENDING</code>；它只确认任务已进入执行体系，不能作为报告已经生成的证据。不满足持久入队条件的请求可能走进程内后台路径，因此仅凭 <code>202</code> 也不能断言任务已持久化。<a href="https://github.com/agno-agi/agno/blob/85b6d1d178b70d59e8f2c0d432d2a66b35004f31/libs/agno/agno/os/app.py#L367-L382">队列与事件传输配置</a>也区分并发排队与跨副本传输：配置 <code>queue.redis</code> 可联通取消与事件流，显式 <code>event_stream</code> 可覆盖事件后端。事件可重连仍不等于任意进程状态都能重建。</p>
 
+            <p>同一 Session 的连续任务还要保持先后关系。Agno 默认开启 <code>queue_per_session</code>；具备 <code>serializes_sessions</code> 能力的存储为已标记的 durable ticket 分配接受序号，按同一 <code>session_id</code> 的入队接受顺序执行。<code>running</code> 与等待人工输入的 <code>paused</code> 都占住该会话，后面的任务继续排队；其他 Session 可以并行。自定义存储缺少该能力时，worker 会关闭有效开关并告警。直接调用和进程内回退仍由应用协调。参见<a href="https://github.com/agno-agi/agno/blob/8ac4064bca1659e2c4cc546c158adbecf67867e1/libs/agno/agno/job_queue/session.py#L1-L65">同会话排序</a>与<a href="https://github.com/agno-agi/agno/blob/8ac4064bca1659e2c4cc546c158adbecf67867e1/libs/agno/agno/os/job_queue.py#L650-L662">存储能力检查</a>。</p>
+
             <h3>5.3 CodeExecutor、Workspace 与 Artifact 解决三种问题</h3>
             <p>
               tRPC-Agent-Go 的源码把这条边界说得很直白：
@@ -415,6 +417,8 @@ service plane
             </p>
 
             <p>工作区身份还要分成两层。tRPC-Agent-Go 的 <a href="https://github.com/trpc-group/trpc-agent-go/blob/e76458566eece2ca33c3da28fadd1691929fb46a/codeexecutor/workspace.go#L51-L139"><code>WorkspaceInstanceProvider</code> / <code>IsWorkspaceRetrySafe</code></a> 允许同一个逻辑 <code>Workspace.ID</code> 和路径对应新的物理执行实例；支持该可选能力的后端可以让缓存句柄失效并重新准备现场。<a href="https://github.com/trpc-group/trpc-agent-go/blob/e76458566eece2ca33c3da28fadd1691929fb46a/tool/workspaceexec/workspace_exec.go#L666-L690"><code>workspace_exec</code></a>仅在 stale 错误被判定为可安全重试时重新执行一次；超时、丢失响应、部分产物提交或其他副作用不确定的失败不能靠自动重放解决。实例编号不是文件版本，也不是持久化内容的证明。</p>
+
+            <p>AgentScope 的 SOP 服务进一步把共享范围写进运行配置。<a href="https://github.com/agentscope-ai/agentscope/blob/ed357feb78a45ff02df155bb5610eab9bf543832/src/agentscope/app/_service/_sop.py#L332-L393">创建 SOP run</a>时，服务保存本次流程定义，按 session key 建立会话并保存对应关系；<code>workspace_grain = RUN</code> 让这些会话共享本次 run 新建的 workspace ID，<code>PER_SESSION_KEY</code> 为各 session key 新建独立 workspace ID。运行记录随后持久化。这样，同一个审核流程可以明确选择共享文件现场或隔离会话文件，各会话同时保留自己的身份、权限配置和 SOP 来源信息。</p>
 
             <h2 id="state-owners">六、四种状态，不是一块磁盘</h2>
             <p>
@@ -589,6 +593,8 @@ service plane
                 </tbody>
               </table>
             </div>
+
+            <p>终止原因也应有独立记录。tRPC-Agent-Go 的<a href="https://github.com/trpc-group/trpc-agent-go/blob/d51b52bdda3f8e2c56739652c2e078d10feddfcc/runner/runner.go#L3100-L3140">runner completion event</a>会在显式取消或 deadline 超时时填入 <code>run_outcome.status</code>，值分别为 <code>cancelled</code>、<code>timed_out</code>；即使本次没有 assistant 正文，调用方仍能读取这个结果。消费方按<a href="https://github.com/trpc-group/trpc-agent-go/blob/d51b52bdda3f8e2c56739652c2e078d10feddfcc/event/event.go#L177-L192">类型约定</a>忽略尚不认识的新状态。该字段用于记录运行怎样结束，外部文件写入与业务请求的实际结果仍需要按各自的回执核对。</p>
 
             <p>
               Agno 的 API 路由提供了一个很好的区分：<code>continue</code> 可以从持久化 run state 推进执行，
