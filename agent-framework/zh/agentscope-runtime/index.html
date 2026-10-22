@@ -6,13 +6,13 @@
     <title>Agent 框架源码阅读（三）：跟 AgentScope 的 reply_stream 走一遍</title>
     <meta
       name="description"
-      content="Agent 框架源码阅读第三篇：从 Pi 的最小 core 继续向外，沿 AgentScope 的 reply_stream、事件流、工具权限和 OpenAI Responses / Chat Completions 适配层，看它怎样把单 agent runtime 产品化。"
+      content="沿 AgentScope 的回复主线看事件、权限与 Responses 适配，再看 TeamPipeline 如何分派成员任务、SOP 如何提交和审核。"
     />
     <meta name="theme-color" content="#f5f1e8" />
     <meta property="og:title" content="Agent 框架源码阅读（三）：跟 AgentScope 的 reply_stream 走一遍" />
     <meta
       property="og:description"
-      content="AgentScope 的核心不是一个 while loop，而是一条能报告进度、暂停工具、接收确认并接入多用户服务的 Agent Runtime。"
+      content="沿 AgentScope 的回复主线看事件、权限与 Responses 适配，再看 TeamPipeline 如何分派成员任务、SOP 如何提交和审核。"
     />
     <meta property="og:type" content="article" />
     <meta property="og:image" content="../assets/agentscope-runtime-overview.png" />
@@ -200,8 +200,8 @@
             <div class="note">
               <p>
                 <strong>本文依据。</strong>
-                源码引用固定到 AgentScope 当前公开快照
-                <code>5ff52f877de12d66a30d55af279dd4f42b1590f3</code>。OpenAI API 语义引用官方
+                基础 reply 与权限机制引用公开快照
+                <code>5ff52f877de12d66a30d55af279dd4f42b1590f3</code>；取消、Responses 事件解析及 team/SOP 编排按 <code>ed357feb78a45ff02df155bb5610eab9bf543832</code> 核实。OpenAI API 语义引用官方
                 <a href="https://developers.openai.com/api/docs/guides/migrate-to-responses">Responses 迁移指南</a>。
                 文中“消息记录”“权限检查”“服务接入层”用于概括公开代码的分工，不推断闭源控制台或模型 Provider 内部实现。
               </p>
@@ -447,6 +447,8 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               </p>
             </div>
 
+            <p>并发批次被取消时，runtime 会先取消并等待 worker，排空已入队的工具事件，再向回复循环传播 <code>CancelledError</code>。回复循环据此为尚未结束的调用补齐中断结果，发出 <code>ReplyEndEvent(INTERRUPTED)</code>；配置 <code>interruption_raise_cancelled_error</code> 决定是否继续向调用方抛出取消。即使取消发生在工具进入 Toolkit 之前，这条路径也能关闭 pending call。实现见<a href="https://github.com/agentscope-ai/agentscope/blob/ed357feb78a45ff02df155bb5610eab9bf543832/src/agentscope/agent/_agent.py#L2285-L2301">并发清理</a>与<a href="https://github.com/agentscope-ai/agentscope/blob/ed357feb78a45ff02df155bb5610eab9bf543832/src/agentscope/agent/_agent.py#L1271-L1307">回复收尾</a>。</p>
+
             <h2>七、Responses API 和 Chat Completions 的差别在哪里</h2>
             <p>
               先用一句话记住差别：<strong>Responses API 像一串 typed items，Chat Completions 像一串 chat messages。</strong>
@@ -572,18 +574,8 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               里很清楚。
             </p>
 
-            <p>
-              streaming 解析也分两种。Responses 适配器直接处理 typed event，把 <code>response.output_text.delta</code>
-              转成 <code>TextBlock</code>，把 <code>response.output_item.added</code> 里的 <code>function_call</code>
-              初始化成工具调用，把 <code>response.function_call_arguments.delta</code> 追加到参数里，最后在
-              <code>response.completed</code> 汇总 usage、reasoning item id 与原始 reasoning item。
-              源码见
-              <a href="https://github.com/agentscope-ai/agentscope/blob/5ff52f877de12d66a30d55af279dd4f42b1590f3/src/agentscope/model/_openai_response/_model.py#L261-L396">Responses streaming parser</a>。
-              Chat 适配器则从 <code>choices[0].delta</code> 读 text、reasoning、tool_calls 和 audio，最后同样产出
-              <code>ChatResponse</code>。
-              源码见
-              <a href="https://github.com/agentscope-ai/agentscope/blob/5ff52f877de12d66a30d55af279dd4f42b1590f3/src/agentscope/model/_openai_chat/_model.py#L300-L475">Chat streaming parser</a>。
-            </p>
+            <p>Responses 流解析按 item 与 content part 保持身份。文本和 refusal delta 进入各自的 TextBlock；reasoning summary 与 reasoning text 按事件种类和 part index 分开累积。<code>response.output_item.added</code> 先记录工具 item ID 与 call_id 的对应关系，后续参数 delta 才建立工具调用。无参数调用在 <code>response.function_call_arguments.done</code> 补成 <code>{}</code>。若收到 <code>response.failed</code> 或 <code>error</code>，适配器抛出 <code>openai.APIError</code>，把失败交给上层错误处理。参见<a href="https://github.com/agentscope-ai/agentscope/blob/ed357feb78a45ff02df155bb5610eab9bf543832/src/agentscope/model/_openai_response/_model.py#L281-L394">Responses streaming parser</a>。</p>
+            <p><code>response.completed</code> 汇总 usage，并把原始 reasoning item 与 ID 附回对应内容块。非流式响应也分别保留 reasoning summary、reasoning text 与 refusal 文本。Chat 适配器继续从 <code>choices[0].delta</code> 读取文本、reasoning、tool_calls 和 audio，输出统一的 <code>ChatResponse</code>。两条解析路径见<a href="https://github.com/agentscope-ai/agentscope/blob/ed357feb78a45ff02df155bb5610eab9bf543832/src/agentscope/model/_openai_response/_model.py#L397-L523">Responses 完成与完整响应处理</a>及 <a href="https://github.com/agentscope-ai/agentscope/blob/5ff52f877de12d66a30d55af279dd4f42b1590f3/src/agentscope/model/_openai_chat/_model.py#L300-L475">Chat streaming parser</a>。</p>
 
             <div class="note">
               <p>
@@ -652,10 +644,12 @@ context += assistant Msg([ToolCallBlock, ToolResultBlock])</code></pre>
               <a href="https://github.com/agentscope-ai/agentscope/blob/5ff52f877de12d66a30d55af279dd4f42b1590f3/examples/agent_service/main.py#L50-L155">agent_service example</a>。
             </p>
 
-            <p>
-              这解释了为什么第一篇把 AgentScope 放在“事件化 agent runtime、权限、workspace、服务化 session”这一格。
-              它不是最轻的 API 封装，也不是先让你画 workflow graph；它更像一个把单 agent turn 做完整、再往 service 和 team 扩展的框架。
-            </p>
+            <p>多 Agent 协作沿用同一套暂停与工具结果协议。<a href="https://github.com/agentscope-ai/agentscope/blob/ed357feb78a45ff02df155bb5610eab9bf543832/src/agentscope/pipeline/_team_pipeline.py#L102-L165">TeamPipeline</a> 为 leader 注册外部工具 <code>TeamAssign</code>：leader 提交成员名和完整任务，成员在自己的 context 中执行，最终内容作为工具结果回到 leader。同轮分配给不同成员的任务可以并发；同一成员的任务按调用顺序执行，等待确认时仍占住该成员。确认结果按 <code>reply_id</code> 路由，leader 等待成员结束后再继续。默认在 leader 回复结束后清空成员 context。该适配把 <code>COMPLETED</code> 与 <code>EXCEED_MAX_ITERS</code> 都映射为工具结果 <code>SUCCESS</code>，任务验收仍需检查输出内容。</p>
+            <p>需要预设步骤与审核时，<a href="https://github.com/agentscope-ai/agentscope/blob/ed357feb78a45ff02df155bb5610eab9bf543832/src/agentscope/app/_service/_sop.py#L103-L209">SOP 服务</a>把每步交给指定会话。执行者通过 submit 工具写入提交记录，下一次推进再交给配置的 Agent 或人工 verifier；没有 verifier 的步骤在已有提交后直接完成。人工审核或工具确认会进入 <code>AWAITING</code>，审核失败则清除本次提交并回到 <code>PENDING</code>。服务在执行前持久化状态，返回后读取 submit 写下的记录来决定推进：</p>
+            <pre><code class="language-text">步骤 PENDING → RUNNING → 提交结果
+  无 verifier → COMPLETED
+  Agent verifier → 通过：COMPLETED；未通过：PENDING
+  HumanVerifier → AWAITING → 接收审核结果后推进</code></pre>
             <h3>9.1 “恢复”要按层级说</h3>
             <div class="table-wrap">
               <table>
