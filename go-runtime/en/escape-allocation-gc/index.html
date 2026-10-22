@@ -63,6 +63,7 @@
             <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc.go">malloc.go</a>,
             <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgc.go">mgc.go</a>, and
             <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go">mgcpacer.go</a>.
+            Lifetime handling for pointers into slice elements is additionally checked against the <a href="https://github.com/golang/go/tree/553df30bcdbf85a9aa42c5011b4151295a09135b">October 22, 2026 master development snapshot</a>.
             Metric and profile definitions come from the official <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a>,
             <a href="https://pkg.go.dev/runtime/pprof">runtime/pprof</a>, and <a href="https://go.dev/doc/diagnostics">Diagnostics</a> documentation.
           </p>
@@ -184,10 +185,31 @@ for i := 0; i &lt; count; i++ {
 }</code></pre>
 
           <p>
-            With a toolchain built from the pinned snapshot, 64 results measured <strong>7 allocs/op and about 9.1 KiB/op</strong> for incremental growth,
+            With a toolchain built from the September 20, 2026 snapshot, 64 results measured <strong>7 allocs/op and about 9.1 KiB/op</strong> for incremental growth,
             versus <strong>1 alloc/op and about 4.8 KiB/op</strong> with preallocation. The escaping pointer path used 1 alloc/op and
             64 B/op; the checksum-only value path used 0 alloc/op. Those numbers describe this shape, not a cross-platform constant.
             Excess preallocation can enlarge the live heap, so use a trustworthy bound rather than “as large as possible.”
+          </p>
+
+          <h4>An Element Field's Address Keeps the Backing Storage Alive</h4>
+          <p>
+            Even when the slice header stays inside a function, its caller can retain a pointer into an element. The <code>*int64</code> below points to a field in the result array, whose storage must remain valid after the function returns:
+          </p>
+          <pre><code class="language-go">//go:noinline
+func firstResultBytes() *int64 {
+    var results []fetchResult
+    results = append(results, fetchResult{Bytes: 42})
+    return &amp;results[0].Bytes
+}</code></pre>
+          <p>
+            A separate compiler pass <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/cmd/compile/internal/slice/slice.go#L7-L70">optimizes slice backing stores</a>: when a local slice exclusively references its storage, some appends can use stack space first, with <code>move2heap</code> moving the storage to the heap when the slice is published.
+            Exclusivity matters because existing element pointers do not change when the slice header changes. For an address expression, the current implementation follows struct fields and embedded-array indexes back to the referenced storage. It treats <code>&amp;s[i]</code>, <code>&amp;s[i].field</code>, and <code>&amp;s[i].field[j]</code> when that field is an array as uses that break exclusivity, ending this optimization for that slice.
+            Dereferencing a pointer field or indexing through another slice requires following the separate object they reference.
+          </p>
+          <p>
+            <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/cmd/compile/internal/slice/slice.go#L337-L368">This handling fixes a missed field-address case in the earlier check for direct <code>&amp;s[i]</code></a>.
+            The official <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/test/fixedbugs/issue81612.go#L14-L125">regression test</a> covers branches, element fields, and embedded arrays, then creates additional stack activity after the pointer is returned to verify that the value survives.
+            When reading optimization reports, count returned field pointers among the references retaining the backing array; capacity, preallocation, and the header's location alone cannot determine that storage's lifetime.
           </p>
 
           <h2 id="allocator">3. <code>mallocgc</code> Routes by Size and Pointer Shape</h2>

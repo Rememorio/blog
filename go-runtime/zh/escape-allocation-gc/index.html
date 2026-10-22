@@ -62,6 +62,7 @@
             <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/malloc.go">malloc.go</a>、
             <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgc.go">mgc.go</a> 与
             <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/runtime/mgcpacer.go">mgcpacer.go</a>。
+            slice 元素内部地址的生命周期处理另核对至 <a href="https://github.com/golang/go/tree/553df30bcdbf85a9aa42c5011b4151295a09135b">2026-10-22 的 master 开发快照</a>。
             测量接口来自官方 <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a>、
             <a href="https://pkg.go.dev/runtime/pprof">runtime/pprof</a> 与 <a href="https://go.dev/doc/diagnostics">Diagnostics 文档</a>。
           </p>
@@ -171,9 +172,30 @@ for i := 0; i &lt; count; i++ {
 }</code></pre>
 
           <p>
-            使用本文固定源码构建的工具链聚合 64 个结果，按需增长稳定为 <strong>7 allocs/op、约 9.1 KiB/op</strong>，预分配为
+            使用 2026-09-20 源码快照构建的工具链聚合 64 个结果，按需增长稳定为 <strong>7 allocs/op、约 9.1 KiB/op</strong>，预分配为
             <strong>1 alloc/op、约 4.8 KiB/op</strong>；返回指针为 1 alloc/op、64 B/op，而只计算校验和的值路径为 0 alloc/op。
             这些数字是该实验形状的证据，不是跨平台常量。预分配过大同样会扩大 live heap；更好的输入是可信上界，而不是“越大越安全”。
+          </p>
+
+          <h4>元素字段的地址也会保留底层存储</h4>
+          <p>
+            即使 slice header 留在函数内，调用者仍可能拿走元素内部的地址。下面的 <code>*int64</code> 指向结果数组中的字段；函数返回后，这块存储仍需有效：
+          </p>
+          <pre><code class="language-go">//go:noinline
+func firstResultBytes() *int64 {
+    var results []fetchResult
+    results = append(results, fetchResult{Bytes: 42})
+    return &amp;results[0].Bytes
+}</code></pre>
+          <p>
+            编译器另有一遍 <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/cmd/compile/internal/slice/slice.go#L7-L70">slice backing-store 优化</a>：在能证明局部 slice 独占底层存储时，某些 append 可先使用栈空间，待 slice 对外发布时再通过 <code>move2heap</code> 移到堆上。
+            独占很关键，因为已有的元素指针不会随 slice header 更新。当前实现遇到取地址时，会沿结构体字段和内嵌数组下标查回被引用的存储，把 <code>&amp;s[i]</code>、<code>&amp;s[i].field</code> 和字段为数组时的 <code>&amp;s[i].field[j]</code> 都识别为破坏独占的用法，停止对该 slice 应用这项优化。
+            对指针字段解引用或通过另一个 slice 取元素，则需跟踪它们指向的另一个对象。
+          </p>
+          <p>
+            <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/cmd/compile/internal/slice/slice.go#L337-L368">这项处理修复了只识别直接 <code>&amp;s[i]</code> 时漏掉字段地址的问题</a>。
+            官方 <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/test/fixedbugs/issue81612.go#L14-L125">回归测试</a> 覆盖带分支、元素字段及内嵌数组的形状，并在返回指针后制造额外栈活动，确认值仍保留。
+            读优化报告时，应把返回的字段指针也算进底层数组的持有者；容量、预分配和 header 所在位置都不能单独决定这块存储的寿命。
           </p>
 
           <h2 id="allocator">三、<code>mallocgc</code> 先按大小和指针形状分流</h2>
