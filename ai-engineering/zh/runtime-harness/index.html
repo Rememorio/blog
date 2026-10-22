@@ -12,7 +12,7 @@
     <p>可以把模型想成提出操作建议的工程师，把 Harness 想成车间。工程师可以说“启动这台机器”，但车间仍要确认机器是否存在、操作是否安全、谁有权限、运行范围多大，以及结果记录在哪里。</p>
 
     <div class="reading-contract"><p><strong>读完这篇，你应该能回答：</strong>模型输出一个工具调用后，究竟是谁执行？Harness 最少有哪些部件？Prompt 里写“不要联网”和真正关闭网络有什么区别？</p></div>
-    <div class="evidence-note"><p><strong>术语说明：</strong>厂商对 Harness 的覆盖范围并不完全相同。本系列采用便于学习的较窄定义：Harness 是模型之外、一次运行之内的执行环境；Agent Loop 是驱动模型与 Harness 反复交替的流程。本文把支付测试流程作为工程设计示例，并用 2026 年 9 月 20 日核实的 OpenAI Codex 固定源码快照说明实际实现。七步检查、artifact、幂等和恢复状态是设计建议，不代表所有工具都实现了同一协议；篇末社区教程只作延伸阅读。</p></div>
+    <div class="evidence-note"><p><strong>术语说明：</strong>厂商对 Harness 的覆盖范围并不完全相同。本系列采用便于学习的较窄定义：Harness 是模型之外、一次运行之内的执行环境；Agent Loop 是驱动模型与 Harness 反复交替的流程。本文把支付测试流程作为工程设计示例，并用 2026 年 10 月 22 日核实的 OpenAI Codex 固定源码快照说明实际实现。七步检查、artifact、幂等和恢复状态用于设计评审，具体工具行为需按各自实现核对；篇末社区教程只作延伸阅读。</p></div>
 
     <h2>一、先看懂建议怎样变成真实动作</h2>
     <h3>1.1 Harness 到底是什么</h3>
@@ -67,8 +67,8 @@
 }</code></pre><figcaption><strong>形状级示例：</strong>把决策、执行环境和结果证据绑定在同一 call id 上，才能追踪一条副作用。</figcaption></figure>
     <p>在这套建议的设计中，同一个 <code>call_id</code> 应关联三种不同用途的记录：artifact store 保存完整日志；事件日志保存 proposed、allowed、started、completed 等状态；下一次模型请求只接收足以决定下一步的 observation。恢复时，Runtime 先读取事件日志并查询真实环境，必要时再按引用打开 artifact；它不会根据一段聊天文字猜测副作用是否已经发生。</p>
 
-    <p>在 Codex 中，还要区分工具返回与底层进程结束。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/context.rs#L514-L535">命令结果头</a>会分别显示 <code>Process running with session ID …</code> 或 <code>Process exited with code …</code>。支付测试返回会话标识，只说明进程仍在运行；控制器还要继续读取该会话的输出，拿到退出码和测试结果，才能判断是否通过。一次调用已获准、已经启动和测试已经完成，是三个不同事实。</p>
-    <p>多个调用也不总是串行经过图中路径。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/parallel.rs#L112-L205">ToolCallRuntime</a>读取工具的并行能力：支持并行的调用取得共享读锁，其他调用取得独占写锁，再进入 handler。这个门控制的是该运行时内的工具派发；它不证明并行工具没有业务依赖，也不覆盖所有已经留在后台运行的进程。读两个独立文件可以并发，修改支付代码后再测试则仍有先后依赖。</p>
+    <p>在 Codex 中，还要区分工具返回与底层进程结束。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/context.rs#L524-L545">命令结果头</a>会分别显示 <code>Process running with session ID …</code> 或 <code>Process exited with code …</code>。支付测试返回会话标识，只说明进程仍在运行；控制器还要继续读取该会话的输出，拿到退出码和测试结果，才能判断是否通过。一次调用已获准、已经启动和测试已经完成，是三个不同事实。</p>
+    <p>多个调用能否并行，由工具声明和运行时调度共同决定。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/parallel.rs#L136-L244">ToolCallRuntime</a>读取 handler 的并行能力：支持并行的调用取得共享读锁，其他调用取得独占写锁，锁在 handler 返回后释放。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/handlers/mcp.rs#L172-L184">MCP handler</a>在服务端允许并行，或工具声明 <code>read_only_hint: true</code> 时允许并行；<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/handlers/dynamic.rs#L87-L90">动态工具 handler</a>也声明支持并行。这里的只读提示由工具提供方声明，运行时据此调度；实际权限仍由权限检查和执行环境约束，工具实现需兑现声明。读两个独立文件可以并发，修改支付代码后再测试仍有先后依赖；后台进程存活期间的业务互斥还需另行管理。</p>
 
     <h3>2.3 工具设计决定 Agent 会做哪些动作</h3>
     <p>Prompt 篇关心模型看到的工具说明，以及“应该怎么用”；本篇关心 registry、版本、schema validator、权限、dispatcher 和 artifact，以及“实际上能不能执行”。工具不是越多越好：两个语义重叠的写工具、一个万能 shell 和模糊的自由文本参数，会让动作空间膨胀。模型既要猜工具，又要猜参数，还要从非结构输出里判断成功。</p>
@@ -78,12 +78,15 @@
     </tbody></table></div>
     <p>大量输出不要整段塞回 context。Harness 可以把完整日志存成 artifact，只回填摘要、关键错误和可继续读取的引用。这同时改善 context budget 与恢复能力。</p>
 
-    <h3>2.4 允许执行，不等于可以触达一切</h3>
+    <h3>2.4 按实际权限确定执行范围</h3>
     <p>Permission 回答“这个主体是否被允许做这个动作”；sandbox 回答“即便允许，动作实际能触达什么”。批准运行测试不等于允许访问整个主目录；允许读取仓库不等于允许把内容发到任意网络端点。二者必须组合。</p>
     <figure class="mechanism-figure"><img src="../assets/harness-safety-layers.png" alt="审批决定是否允许动作，沙箱限制执行范围，审计记录结果；审批按策略触发" /><figcaption>审批、隔离与记录各管一件事：审批按策略触发，沙箱范围由执行配置决定，审计保存证据而不授予或收回权限。</figcaption></figure>
     <ul><li><strong>Capability scope：</strong>先不把无关工具暴露给模型。</li><li><strong>Policy decision：</strong>按动作、资源、主体和环境匹配规则。</li><li><strong>Approval：</strong>按明确策略触发，展示动作、目标和必要的 diff；审批也可能由已配置的自动审查处理。</li><li><strong>Sandbox：</strong>用文件系统、网络、进程和凭据隔离限制最坏影响。</li><li><strong>Audit：</strong>记录谁提出、哪条规则允许、实际发生了什么。</li></ul>
 
-    <p>Codex 的 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L129-L230">ToolOrchestrator::run</a>把审批需求分为跳过、禁止和需要审批；严格自动审查模式还能对通常跳过的动作追加审查。随后才选择执行沙箱。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L233-L475">审批与沙箱选择</a>显示：批准不会自动移除隔离；反过来，配置也可能允许不使用进程沙箱。沙箱拒绝后的升级尝试有工具能力、审批策略、网络决策和允许范围等条件，不是“失败就无沙箱再跑一次”。因此应把支付测试需要的目录和网络访问写清，再读取实际策略决定走哪条路径。</p>
+    <p>Codex 的 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs#L124-L225">ToolOrchestrator::run</a>把审批需求分为跳过、禁止和需要审批；严格自动审查模式还能对通常跳过的动作追加审查。随后，<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs#L227-L354">沙箱选择</a>根据权限配置和执行器能力决定本次隔离方式。沙箱拒绝后的升级重试还要满足工具能力、审批策略、网络决策和允许范围等<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs#L395-L474">条件</a>。应先写清支付测试需要的目录和网络访问，再检查实际配置选择的执行路径。</p>
+    <p>当审批由 Guardian 自动审查器处理时，首轮批准覆盖当时提交审查的权限。若测试在该范围内被沙箱拒绝，而策略允许尝试更宽的执行范围，<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs#L484-L533">重试审批逻辑</a>会重新提交实际重试动作：允许无沙箱升级的命令被标成 <code>require_escalated</code>，原先较窄的附加权限被清除。人工或 hook 批准仍按已有的重试范围处理，严格自动审查模式会额外阻止跳过审查。这样，重新评估依据的是下一次动作实际获得的权限。</p>
+    <figure class="shape-example"><pre><code class="language-text">use_default → Guardian 批准 → 沙箱拒绝
+require_escalated → Guardian 再次审查 → 拒绝 → 返回工具错误</code></pre><figcaption><strong>源码测试中的审批轨迹：</strong><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/tests/suite/guardian_sandbox_retry.rs#L112-L208">集成测试</a>配置同步 Guardian 自动审查（关闭 <code>GuardianV2</code>）与允许询问的审批策略，首次审查允许、升级审查拒绝；断言执行器只收到一次启动请求。</figcaption></figure>
 
     <h2>三、进阶：让真实动作可恢复、可追查</h2>
     <h3>3.1 进程中断后，不能只靠聊天记录恢复</h3>
@@ -93,7 +96,7 @@
 → runtime.crashed → run.recovered → effect.reconciled
 → observation.ready</code></pre><figcaption><strong>建议的恢复轨迹：</strong>若 <code>call_42</code> 只有 started 没有 completed，runtime 先查询环境。只读动作可受限重放；带幂等键的写动作先对账；非幂等且状态未知的动作必须进入 blocked 或人工升级，不能直接再执行一次。</figcaption></figure>
 
-    <p>持久化本身也有阶段。Codex 的 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L1013-L1068">RolloutRecorder</a>中，<code>record_canonical_items</code>把记录送入写入队列；<code>persist</code>和<code>flush</code>则等待写入任务确认，并把失败返回调用方。这说明“记录已被接收”与“写入已经确认”不能混用。它提供会话记录的写入机制，没有把任意工具副作用与记录提交合成一笔事务；恢复支付测试时，仍应重新核对文件和进程，涉及真实退款时更需要业务系统的幂等与对账。</p>
+    <p>持久化本身也有阶段。Codex 的 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L1064-L1118">RolloutRecorder</a>中，<code>record_canonical_items</code>把记录送入写入队列；<code>persist</code>和<code>flush</code>则等待写入任务确认，并把失败返回调用方。这说明“记录已被接收”与“写入已经确认”不能混用。它提供会话记录的写入机制，没有把任意工具副作用与记录提交合成一笔事务；恢复支付测试时，仍应重新核对文件和进程，涉及真实退款时更需要业务系统的幂等与对账。</p>
 
     <h3>3.2 用户和系统都要看见动作进行到哪里</h3>
     <p>只有最终文本和总 token 数，无法诊断 harness。需要把一次 run 串成 trace：request assembly、model events、tool proposal、policy decision、sandbox execution、observation、checkpoint 和 exit reason。敏感正文可以脱敏，但控制事件不能消失。</p>
@@ -104,7 +107,7 @@
       <tr><td>当前模型究竟能看到哪些能力？</td><td>没有版本化 registry</td><td>能力漂移和错误选择</td></tr><tr><td>Tool call 在哪里被确定性校验？</td><td>依赖模型自检</td><td>非法参数进入真实执行</td></tr><tr><td>授权与隔离各由谁负责？</td><td>只有 prompt 警告</td><td>命令能访问超出任务需要的资源</td></tr><tr><td>大结果和秘密怎样处理？</td><td>原样回填 context</td><td>泄漏与窗口污染</td></tr><tr><td>进程中断后以什么事实恢复？</td><td>只重放聊天</td><td>重复副作用与错误状态</td></tr><tr><td>每个退出是否有可机读原因？</td><td>只有 final 文本</td><td>Outer loop 无法安全接管</td></tr>
     </tbody></table></div>
     <p>Harness 把“模型能想到”变成“系统能安全做到”。下一篇进入它内部不断前进的控制流：<strong>Agent loop 怎样让一次运行正确收敛。</strong></p>
-    <h2 id="sources">官方资料</h2><ul class="source-list"><li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L129-L230">ToolOrchestrator::run</a>：审批需求</li><li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/parallel.rs#L112-L205">ToolCallRuntime</a>：并行派发</li><li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L1013-L1068">RolloutRecorder</a>：写入与确认</li><li><a href="https://openai.com/index/harness-engineering/">OpenAI：Harness engineering</a></li><li><a href="https://openai.com/index/unrolling-the-codex-agent-loop/">OpenAI：Unrolling the Codex agent loop</a></li><li><a href="https://www.anthropic.com/research/trustworthy-agents">Anthropic：Building and evaluating trustworthy agents</a></li><li><a href="https://www.anthropic.com/engineering/managed-agents">Anthropic：Managed agents</a></li><li><a href="https://www.anthropic.com/engineering/harness-design-long-running-apps">Anthropic：Harness design for long-running applications</a></li></ul>
+    <h2 id="sources">官方资料</h2><ul class="source-list"><li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs#L124-L225">ToolOrchestrator::run</a>：审批需求</li><li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/parallel.rs#L136-L244">ToolCallRuntime</a>：并行派发</li><li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L1064-L1118">RolloutRecorder</a>：写入与确认</li><li><a href="https://openai.com/index/harness-engineering/">OpenAI：Harness engineering</a></li><li><a href="https://openai.com/index/unrolling-the-codex-agent-loop/">OpenAI：Unrolling the Codex agent loop</a></li><li><a href="https://www.anthropic.com/research/trustworthy-agents">Anthropic：Building and evaluating trustworthy agents</a></li><li><a href="https://www.anthropic.com/engineering/managed-agents">Anthropic：Managed agents</a></li><li><a href="https://www.anthropic.com/engineering/harness-design-long-running-apps">Anthropic：Harness design for long-running applications</a></li></ul>
     <h2>延伸阅读</h2><ul class="source-list"><li><a href="https://www.runoob.com/ai-agent/harness-engineering.html">菜鸟教程：Harness Engineering</a></li><li><a href="https://martinfowler.com/articles/harness-engineering.html">Martin Fowler：Harness engineering for coding agent users</a></li><li><a href="https://walkinglabs.github.io/learn-harness-engineering/zh/">Learn Harness Engineering</a></li></ul>
   </section>
 </article></main></div><script src="../../assets/article.js?v=1"></script>
