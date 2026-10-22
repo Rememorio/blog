@@ -99,7 +99,7 @@
                 src="../assets/rollout-recovery-map.png"
                 alt="Codex rollout recovery，展示 append-only JSONL、reverse scan、replay suffix、model history、context baseline 和 resume fork 输出"
               />
-            <figcaption>先倒序选择幸存检查点，再正序重放尾部。恢复与分叉是重建后的两种用途；旧 rollback marker 只参与历史兼容，不能据此推导当前主动回滚 API。</figcaption>
+            <figcaption>存储读取检查点与后续记录，core 根据历史模式选择恢复边界，再重建尾部状态。恢复与分叉共用这条主线，旧 rollback marker 由兼容重放解释。</figcaption>
             </figure>
           </section>
 
@@ -196,11 +196,11 @@
 
             <h2>二、RolloutItem：消息之外还要保存恢复元数据</h2>
             <p>
-              当前 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L127-L217"><code>RolloutItem</code></a> 定义在 history crate，已经不止五类。除了 SessionMeta、ResponseItem、Compacted、TurnContext 和 EventMsg，还有 WorldState、TokenUsageRecord、RetainedContext、agent 间消息和仅供 realtime 展示的记录。恢复代码按用途解释它们，不会把所有持久数据都送给模型。
+              当前 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L213-L310"><code>RolloutItem</code></a> 定义在 history crate，已经不止五类。除了 SessionMeta、ResponseItem、Compacted、TurnContext 和 EventMsg，还有 WorldState、TokenUsageRecord、RetainedContext、agent 间消息和仅供 realtime 展示的记录。恢复代码按用途解释它们，不会把所有持久数据都送给模型。
             </p>
 
             <p>
-              下面仅保留解释机制所需字段，不是完整 schema。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L266-L278"><code>RolloutLine</code></a> 在顶层放 timestamp、可选 ordinal，并扁平化 type/payload；<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/rollout_payload.rs#L20-L68">ResponseItem 的 wire 形状</a> 还可在 payload 旁单独保存 metadata。恢复逻辑按顶层 <code>type</code> 分派。
+              下面仅保留解释机制所需字段，不是完整 schema。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L363-L375"><code>RolloutLine</code></a> 在顶层放 timestamp、可选 ordinal，并扁平化 type/payload；<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/rollout_payload.rs#L29-L77">ResponseItem 的 wire 形状</a> 还可在 payload 旁单独保存 metadata。恢复逻辑按顶层 <code>type</code> 分派。
             </p>
 
             <pre><code class="language-json">{"timestamp":"...","ordinal":1,"type":"session_meta","payload":{"id":"t1"}}
@@ -208,14 +208,10 @@
 {"timestamp":"...","ordinal":3,"type":"response_item","payload":{"type":"function_call","call_id":"A","name":"shell","arguments":"{}"},"metadata":{"client_authored":false}}
 {"timestamp":"...","ordinal":4,"type":"compacted","payload":{"message":"...","window_number":1,"replacement_history":[]}}</code></pre>
 
-            <p>
-              其中 <code>TurnContextItem</code> 记录可恢复的配置，<code>WorldState</code> 保存环境状态的完整快照或增量。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L4474-L4552">写入路径</a> 先记录模型可见上下文，再保存 WorldState，最后在需要时写 TurnContext。单有一个配置对象，并不能证明模型已经看到它；恢复还会检查该段是否有真实输入边界，或压缩后有效的完整 WorldState。
-            </p>
+            <p>TurnContextItem 保存恢复配置，WorldState 保存完整环境快照或增量。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L3844-L3875">每步写入</a>从实际用于采样和工具执行的 StepContext 渲染上下文，先记录模型可见消息，再推进 WorldState 基线并持久化 patch。首轮全量注入还会保存完整 WorldState、TurnContext 与当前设置；只有快照变化时无需重复写 TurnContext。恢复按这些有序记录重建模型已经收到的环境。</p>
 
             <div class="note key-point">
-              <p>
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L199-L217"><code>CompactedItem</code></a> 不只有 summary 和 replacement_history。它还可携带保留上下文、窗口编号及关联 id，以及最新 token usage 记录。replacement history 提供模型历史基座；其他字段让恢复不必为了配置、权限判断所需的事实或 token 总量无限向前扫描。具体字段可选，旧记录仍需要兼容处理。
-            </p>
+              <p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L290-L310">CompactedItem</a>携带 replacement_history、保留上下文、窗口 id、最新 token usage，以及 resume_metadata。后者保存 multi-agent 版本、last_started_turn_id、turn_attribution 和 previous_turn_settings。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L4439-L4484">成功压缩写入</a>随后保存完整 WorldState、TurnContext 和当前设置事件，使历史基座与恢复基线一同落入记录。旧记录的可选字段仍按兼容路径解释。</p>
             </div>
 
             <h2>三、写入先排队，flush 等待文件写入完成</h2>
@@ -239,7 +235,7 @@ flush()                     -> wait for preceding file writes (not fsync)
 shutdown()                  -> final drain before exit</code></pre>
 
             <p>
-              例如从仍在运行的源 thread 准备 fork 时，<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/thread_manager.rs#L1140-L1163">源码先 flush 再读取</a>，避免快照漏掉 writer 队列里的记录。不过这里的完成边界是文件写入和 <code>flush()</code>；<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L1848-L1878">writer 实现</a> 并没有在该处调用 <code>fsync</code>/<code>sync_all</code>。不要把“已接受入队”“已完成文件写入”和“断电后保证稳定介质持久性”视为同一承诺。
+              例如从仍在运行的源 thread 准备 fork 时，<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/thread_manager.rs#L1247-L1268">源码先 flush 再读取</a>，避免快照漏掉 writer 队列里的记录。不过这里的完成边界是文件写入和 <code>flush()</code>；<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L1913-L1943">writer 实现</a> 并没有在该处调用 <code>fsync</code>/<code>sync_all</code>。不要把“已接受入队”“已完成文件写入”和“断电后保证稳定介质持久性”视为同一承诺。
             </p>
 
             <h2>四、恢复入口：先进入 InitialHistory</h2>
@@ -290,52 +286,31 @@ shutdown()                  -> final drain before exit</code></pre>
               恢复算法能把历史补回来，但不能保证换模型后的表现完全等价。
             </p>
 
-            <h2>五、重建算法：倒着找基座，正着补尾巴</h2>
-            <p>
-              <code>reconstruct_history_from_rollout</code> 是这一篇的核心。它没有从第一行一路 replay 到最后。
-              它先倒序扫描，找到足够新的 surviving checkpoint：最新能留下来的 <code>replacement_history</code>、
-              最新的 previous turn settings、最新的 reference context item，以及当前 window id。
-              找到这些以后，旧 item 对当前 history 的影响就可以截断。
-            </p>
+            <h2>五、先选压缩边界，再重建尾部状态</h2>
+<p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L60-L92">select_input_compaction</a>先检查最新 Compacted。它同时有 replacement_history 与 window_number 时，分页历史可直接以它为边界；其他 history mode 还要求 resume_metadata。最新 Compacted 缺少这些条件时，core 重放收到的全部输入，不改选更早检查点跳过这条记录。</p>
+<p>边界确定后，<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L208-L485">reconstruct_rollout</a>倒序扫描所选尾部，恢复幸存 turn 的设置、reference context、WorldState、turn attribution 和窗口信息。resume_metadata 提供检查点处的 last_started_turn_id、归属与 previous settings；较新尾部的有效状态可以覆盖对应项。延迟到达的 TurnComplete 按 turn id 区分，避免把旧轮完成事件算到新轮。相邻 TurnContext 可以恢复环境基线，只有相应 turn 已完成时，其 previous settings 才优先于压缩元数据。</p>
+<p>随后<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L489-L620">正序 replay</a>从 replacement_history 建立 ContextManager，再追加 ResponseItem、agent 间通信及保留上下文。WorldState 按时间顺序应用完整快照和 merge patch；压缩边界会重置旧基线。这样模型历史、配置、归属和窗口号来自同一段有效记录。</p>
+<pre><code class="language-text">core reconstruction:
+  newest compaction has replacement_history + window_number
+  AND (history_mode=paginated OR resume_metadata exists)
+    -> checkpoint + newer suffix
+  otherwise
+    -> replay all supplied items
 
-            <p>
-              倒序扫描时，rollback 被处理成一个计数器。<code>ThreadRolledBack</code> 表示“丢掉最近 N 个真实用户 turn”；
-              倒序看就是跳过接下来 N 个含 <code>UserMessage</code> 的 turn segment。测试里还专门覆盖了一个细节：
-              没有真实用户消息的 standalone task turn 不应该消耗 rollback 次数。
-            </p>
+  reverse selected suffix -> surviving turn/settings/world state
+  seed replacement_history -> replay suffix forward
+  hydrate history + baselines + attribution + window</code></pre>
+<h2>六、存储扫描与旧记录兼容分别处理</h2>
+<p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/model_context.rs#L18-L59">ModelContextScan</a>负责存储层的有界倒序读取。遇到最新 Compacted 同时含 replacement_history 和 window_number 就停止，随后返回时间顺序的记录；其后的 WorldState 与 TurnContext 等伴随状态已经在扫描结果中。遇到缺其中任一字段的旧 Compacted，则继续读取到开头。这个扫描器无需额外找到一个真实用户 turn 才能停止。</p>
+<pre><code class="language-text">storage scan (newest -> oldest):
+  replacement_history + window_number -> stop at this Compacted
+  incomplete Compacted               -> continue to beginning
+  no Compacted                       -> continue to beginning
 
-            <p>
-              倒序选出最新幸存检查点后，<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction.rs#L342-L429">正序 replay</a> 先安装该检查点的 replacement history，再追加尾部 ResponseItem 和 agent 间消息，恢复保留上下文，兼容旧 compact 与 rollback marker。尤其不能见到尾部任何 replacement_history 就再次覆盖：较新的检查点可能属于已撤回的 turn，必须沿原始记录重放，让旧 rollback 语义找得到对应边界。
-            </p>
-
-            <pre><code class="language-text">reconstruction:
-reverse scan
-  find newest surviving replacement_history
-  recover previous_turn_settings
-  recover reference_context_item
-  account for ThreadRolledBack markers
-
-forward replay
-  seed ContextManager from replacement_history
-  append surviving ResponseItem suffix
-  apply rollback markers to the rebuilt history</code></pre>
-
-            <div class="note key-point">
-              <p>
-                这个“倒着找、正着放”的形状很重要。倒序扫描让恢复不必重新解释很久以前的完整日志；
-                正序 replay 保住了剩余尾部的语义顺序。compact 越早提供完整 replacement history，恢复就越有明确基座。
-              </p>
-            </div>
-
-            <h2>六、旧 rollback 记录与有界读取的兼容边界</h2>
-            <p>当前提交协议已经不再提供旧的主动 ThreadRollback 操作。<code>ThreadRolledBack</code> 仍保留在持久 schema 和恢复代码中，用于解释过去写入的记录。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/history.rs#L613-L629"><code>drop_last_n_user_turns</code> 的注释</a> 明确限定了这个用途。不能把兼容读取逻辑当成当前可调用的回滚 API。</p>
-            <p><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/model_context.rs#L16-L49"><code>ModelContextScan</code></a> 为最新模型上下文提供有界倒序读取：它需要同时找到带 replacement_history 和 window_number 的检查点，以及能建立有效配置基线的 turn。裸 <code>role=user</code> 不足以证明真实用户边界，因为环境片段也可能用这个角色。若遇到旧 rollback marker、缺 replacement_history 或缺窗口编号的 compact，就扫描到开头，优先保证兼容语义。</p>
-            <pre><code class="language-text">读取决定，形状示意：
-完整检查点 + 可恢复配置基线 -> 可停止向旧记录扫描
-旧 rollback marker          -> 继续读到开头
-旧 compact 缺关键字段       -> 继续读到开头
-只有 contextual user 消息   -> 尚不能证明用户 turn 边界</code></pre>
-            <p><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/thread-store/src/local/model_context.rs#L158-L198">本地 thread store</a> 实际用这个扫描器读取 rollout 段；core reconstruction 则继续解释收到的 item 序列。存储层“读多少”与运行时“怎样重建”是两层职责，不能因为有倒序算法就断言所有恢复入口都不会读取完整文件。</p>
+core compatibility replay:
+  historical ThreadRolledBack -> drop surviving real user turns
+  contextual user messages   -> do not consume rollback count</code></pre>
+<p>旧 ThreadRolledBack marker 仍由 core 的<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L123-L182">segment 选择</a>和正序重放解释：它撤销最近 N 个真实用户 turn，standalone task 不消耗计数。当前提交协议没有主动 ThreadRollback 操作；<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/context_manager/history.rs#L766-L785">drop_last_n_user_turns</a>服务于旧记录回读。存储扫描根据压缩边界决定读多少，core 再根据 history mode 和记录内容决定怎样恢复。</p>
 
             <h2>七、fork：复制一段可解释的历史，而不是复制进程</h2>
             <p>
@@ -346,7 +321,7 @@ forward replay
             </p>
 
             <p>
-              fork 现在有两种持久化策略。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/thread_manager.rs#L1433-L1480">普通 fork</a> 使用 <code>ForkPersistence::Copied</code>；prepared fork 可使用 <code>Referenced</code>，保存 <code>history_base</code> 与继承 item 数量。子会话仍得到可解释的模型上下文，但不必在自己的 rollout 中重复写整个父历史。该区别不能简化成所有 fork 都复制全部 JSONL。
+              fork 现在有两种持久化策略。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/thread_manager.rs#L1587-L1635">普通 fork</a> 使用 <code>ForkPersistence::Copied</code>；prepared fork 可使用 <code>Referenced</code>，保存 <code>history_base</code> 与继承 item 数量。子会话仍得到可解释的模型上下文，但不必在自己的 rollout 中重复写整个父历史。该区别不能简化成所有 fork 都复制全部 JSONL。
             </p>
 
             <p>
@@ -422,20 +397,20 @@ forward replay
           <section id="sources" class="article-body">
             <h2>参考源码</h2>
             <ul>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L280-L294"><code>InitialHistory</code> 与 <code>ResumedHistory</code> schema</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L127-L217"><code>RolloutItem</code> 与 <code>CompactedItem</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L3282-L3344"><code>TurnContextItem</code> 的恢复注释与字段</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L851-L1007"><code>RolloutRecorder::new</code> 创建与恢复路径</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L1013-L1149"><code>record_canonical_items</code>、<code>persist</code>、<code>flush</code> 与 rollout load</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L1748-L1910">writer pending queue、recovery mode 与重试写入</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L1913-L1975">writer command loop 与 <code>SessionMeta</code> 写入</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L1536-L1779"><code>record_initial_history</code> 与 <code>apply_rollout_reconstruction</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction.rs#L133-L491"><code>reconstruct_history_from_rollout</code> 倒序扫描与正序 replay</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction.rs#L81-L109">旧 rollback marker 的倒序兼容解释</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/thread_manager.rs#L1176-L1255">从 rollout path resume thread</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/thread_manager.rs#L1395-L1532">fork thread 与 <code>forked_from_thread_id</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/tests/suite/compact_resume_fork.rs#L195-L349">测试：compact / resume / fork 后模型可见历史前缀保持</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction_tests.rs#L1010-L1090">测试：恢复旧 rollback 时仅跳过真实用户 turn</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L377-L394"><code>InitialHistory</code> 与 <code>ResumedHistory</code> schema</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L213-L310"><code>RolloutItem</code> 与 <code>CompactedItem</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/protocol.rs#L3443-L3488"><code>TurnContextItem</code> 的恢复注释与字段</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L885-L1045"><code>RolloutRecorder::new</code> 创建与恢复路径</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L1064-L1204"><code>record_canonical_items</code>、<code>persist</code>、<code>flush</code> 与 rollout load</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L1813-L1975">writer pending queue、recovery mode 与重试写入</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L1978-L2048">writer command loop 与 <code>SessionMeta</code> 写入</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L1658-L1909"><code>record_initial_history</code> 与 <code>apply_rollout_reconstruction</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L188-L624"><code>reconstruct_history_from_rollout</code> 倒序扫描与正序 replay</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L133-L161">旧 rollback marker 的倒序兼容解释</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/thread_manager.rs#L1287-L1368">从 rollout path resume thread</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/thread_manager.rs#L1547-L1687">fork thread 与 <code>forked_from_thread_id</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/tests/suite/compact_resume_fork.rs#L193-L346">测试：compact / resume / fork 后模型可见历史前缀保持</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction_tests.rs#L1156-L1241">测试：恢复旧 rollback 时仅跳过真实用户 turn</a></li>
             </ul>
           </section>
         </article>

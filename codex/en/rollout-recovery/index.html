@@ -100,7 +100,7 @@
                 src="../assets/rollout-recovery-map.png"
                 alt="Codex rollout recovery showing append-only JSONL, reverse scan, replay suffix, model history, context baseline, and resume fork output"
               />
-            <figcaption>Select a surviving checkpoint in reverse, then replay the suffix forward. Resume and fork consume the rebuilt context. Legacy rollback markers are compatibility records, not a current active rollback API.</figcaption>
+            <figcaption>Storage reads a checkpoint and its suffix; core selects the recovery boundary for the history mode and reconstructs tail state. Resume and fork share this path, with legacy rollback markers handled during compatibility replay.</figcaption>
             </figure>
           </section>
 
@@ -208,11 +208,11 @@
 
             <h2>2. Rollout Types Preserve More Than Messages</h2>
             <p>
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L127-L217"><code>RolloutItem</code></a> now lives in the history crate and has more than five variants. Alongside SessionMeta, ResponseItem, Compacted, TurnContext, and EventMsg, it includes WorldState, TokenUsageRecord, RetainedContext, inter-agent communication, and model-invisible realtime presentation facts. Each consumer interprets the records it needs; persistence does not make every record model-visible.
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L213-L310"><code>RolloutItem</code></a> now lives in the history crate and has more than five variants. Alongside SessionMeta, ResponseItem, Compacted, TurnContext, and EventMsg, it includes WorldState, TokenUsageRecord, RetainedContext, inter-agent communication, and model-invisible realtime presentation facts. Each consumer interprets the records it needs; persistence does not make every record model-visible.
             </p>
 
             <p>
-              This shape-level fragment omits required fields to focus on the envelope. <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L266-L278"><code>RolloutLine</code></a> keeps timestamp and optional ordinal at the top level and flattens type/payload. The <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/rollout_payload.rs#L20-L68">ResponseItem wire representation</a> can store metadata beside the payload. Reconstruction dispatches on top-level <code>type</code>, not a nested item.type.
+              This shape-level fragment omits required fields to focus on the envelope. <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L363-L375"><code>RolloutLine</code></a> keeps timestamp and optional ordinal at the top level and flattens type/payload. The <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/rollout_payload.rs#L29-L77">ResponseItem wire representation</a> can store metadata beside the payload. Reconstruction dispatches on top-level <code>type</code>, not a nested item.type.
             </p>
 
             <pre><code class="language-json">{"timestamp":"...","ordinal":1,"type":"session_meta","payload":{"id":"t1"}}
@@ -220,14 +220,10 @@
 {"timestamp":"...","ordinal":3,"type":"response_item","payload":{"type":"function_call","call_id":"A","name":"shell","arguments":"{}"},"metadata":{"client_authored":false}}
 {"timestamp":"...","ordinal":4,"type":"compacted","payload":{"message":"...","window_number":1,"replacement_history":[]}}</code></pre>
 
-            <p>
-              <code>TurnContextItem</code> preserves recoverable settings, while <code>WorldState</code> stores full environment snapshots or changes. The <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L4474-L4552">write path</a> records model-visible context before WorldState and the required TurnContextItem. A bare settings object does not prove its context reached history; recovery also looks for a real input boundary or a valid full WorldState after compaction.
-            </p>
+            <p>TurnContextItem stores recovery configuration; WorldState carries full environment snapshots or patches. The <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L3844-L3875">per-step writer</a> renders context from the StepContext used for sampling and tool execution, records visible messages first, then advances the WorldState baseline and persists its patch. Initial full injection also saves full WorldState, TurnContext and current settings. A snapshot-only change needs no duplicate TurnContext. Recovery rebuilds the environment already presented to the model from these ordered records.</p>
 
             <div class="note key-point">
-              <p>
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L199-L217"><code>CompactedItem</code></a> can hold replacement history, retained context, window numbers and ids, and the latest token usage record. The replacement gives the model-history base; the remaining records let recovery restore settings, authorization-relevant facts, and token totals without indefinitely scanning older history. Fields are optional, so older records still need compatibility handling.
-            </p>
+              <p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L290-L310">CompactedItem</a> carries replacement_history, retained context, window ids, latest token usage and resume_metadata. The latter stores the multi-agent version, last_started_turn_id, turn_attribution and previous_turn_settings. <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L4439-L4484">Successful compaction</a> then writes full WorldState, TurnContext and current settings, keeping the history base and recovery baselines together. Optional fields in older records follow compatibility handling.</p>
             </div>
 
             <h2>3. Writes Queue Before File Writes Complete</h2>
@@ -254,7 +250,7 @@ flush()                     -> wait for preceding file writes (not fsync)
 shutdown()                  -> final drain before exit</code></pre>
 
             <p>
-              Preparing a fork from an active source thread <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/thread_manager.rs#L1140-L1163">flushes before reading</a> so queued records are not omitted. The completion boundary is file writes and <code>flush()</code>: the <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L1848-L1878">writer</a> does not call <code>fsync</code>/<code>sync_all</code> here. Queue acceptance, completed writes, and power-loss-safe stable storage are different guarantees.
+              Preparing a fork from an active source thread <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/thread_manager.rs#L1247-L1268">flushes before reading</a> so queued records are not omitted. The completion boundary is file writes and <code>flush()</code>: the <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L1913-L1943">writer</a> does not call <code>fsync</code>/<code>sync_all</code> here. Queue acceptance, completed writes, and power-loss-safe stable storage are different guarantees.
             </p>
 
             <h2>4. Resume and Fork Enter Through InitialHistory</h2>
@@ -308,58 +304,31 @@ shutdown()                  -> final drain before exit</code></pre>
               behavior, and runtime performance.
             </p>
 
-            <h2>5. Reconstruction Scans Backward, Then Replays Forward</h2>
-            <p>
-              <code>reconstruct_history_from_rollout</code> does not replay the
-              whole file from the first line. It first scans newest-to-oldest.
-              The scan looks for the newest surviving replacement-history
-              checkpoint, previous turn settings, reference context item, and
-              window id. Once those are known, older items cannot affect the
-              rebuilt state.
-            </p>
+            <h2>5. Select a compaction boundary, then rebuild tail state</h2>
+<p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L60-L92">select_input_compaction</a> inspects the newest Compacted. When it has replacement_history and window_number, paginated history can use it as a boundary; other history modes additionally require resume_metadata. If the newest compaction lacks the required fields, core replays all supplied input instead of choosing an older checkpoint that would skip its effect.</p>
+<p>With that boundary selected, <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L208-L485">reconstruct_rollout</a> scans the suffix backward for surviving turn settings, reference context, WorldState, turn attribution and window information. resume_metadata provides checkpoint values for last_started_turn_id, attribution and previous settings; valid newer tail state can supersede them. Late TurnComplete events are matched by turn id so an older completion cannot complete a newer turn. A companion TurnContext restores the environment baseline; its previous settings take priority over compaction metadata once that turn has completed.</p>
+<p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L489-L620">Forward replay</a> seeds ContextManager from replacement_history and appends response items, inter-agent communication and retained context. WorldState full snapshots and merge patches are applied chronologically, with compaction resetting the old baseline. Model history, settings, attribution and window identity then come from the same valid record sequence.</p>
+<pre><code class="language-text">core reconstruction:
+  newest compaction has replacement_history + window_number
+  AND (history_mode=paginated OR resume_metadata exists)
+    -> checkpoint + newer suffix
+  otherwise
+    -> replay all supplied items
 
-            <p>
-              Historical rollback markers become a counter during this reverse pass.
-              <code>ThreadRolledBack</code> means “drop the newest N real user
-              turns.” In reverse, that means skipping the next N finalized turn
-              segments that actually contain a user message. Tests cover the
-              distinction: standalone task turns should not consume rollback
-              skips.
-            </p>
+  reverse selected suffix -> surviving turn/settings/world state
+  seed replacement_history -> replay suffix forward
+  hydrate history + baselines + attribution + window</code></pre>
+<h2>6. Storage scanning and legacy compatibility have separate rules</h2>
+<p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/model_context.rs#L18-L59">ModelContextScan</a> bounds the storage layer's reverse read. It stops at the newest Compacted containing both replacement_history and window_number, then returns the collected items chronologically. Companion WorldState and TurnContext records written afterward are already included. An older Compacted missing either field requires reading to the beginning. Finding another real user turn is not a stop prerequisite.</p>
+<pre><code class="language-text">storage scan (newest -> oldest):
+  replacement_history + window_number -> stop at this Compacted
+  incomplete Compacted               -> continue to beginning
+  no Compacted                       -> continue to beginning
 
-            <p>
-              After selecting the newest surviving checkpoint, <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction.rs#L342-L429">forward replay</a> installs its replacement history and replays the suffix: annotated response items, inter-agent messages, retained context, and legacy compaction/rollback records. A newer replacement checkpoint in that suffix may belong to a rolled-back turn. It must not blindly overwrite the selected base; original records preserve the boundaries needed by compatibility replay.
-            </p>
-
-            <pre><code class="language-text">reconstruction:
-reverse scan
-  find newest surviving replacement_history
-  recover previous_turn_settings
-  recover reference_context_item
-  account for ThreadRolledBack markers
-
-forward replay
-  seed ContextManager from replacement_history
-  append surviving ResponseItem suffix
-  apply rollback markers to the rebuilt history</code></pre>
-
-            <div class="note key-point">
-              <p>
-                The shape matters. The reverse pass avoids interpreting old log
-                prefixes after a surviving checkpoint. The forward pass preserves
-                the exact ordering semantics of the live tail.
-              </p>
-            </div>
-
-            <h2>6. Legacy Rollback Records Limit Bounded Reads</h2>
-            <p>The current submission protocol no longer exposes the former ThreadRollback operation. <code>ThreadRolledBack</code> remains in persistence and recovery for historical records. The <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/history.rs#L613-L629"><code>drop_last_n_user_turns</code> comment</a> explicitly limits it to that replay role. Compatibility code does not establish a current callable rollback API.</p>
-            <p><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/model_context.rs#L16-L49"><code>ModelContextScan</code></a> supports bounded reverse reads of the latest model context. It needs both a checkpoint containing replacement_history and window_number and a turn establishing a valid settings baseline. A raw <code>role=user</code> item is insufficient: contextual fragments can use that role too. Legacy rollback markers or compacted records missing either required field force a scan back to the beginning.</p>
-            <pre><code class="language-text">shape-level read decision:
-Complete checkpoint + settings baseline -> bounded scan may stop
-Legacy rollback marker                  -> scan to the beginning
-Legacy compact missing required fields  -> scan to the beginning
-Contextual user fragment alone          -> no proven user-turn boundary</code></pre>
-            <p>The <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/thread-store/src/local/model_context.rs#L158-L198">local thread store</a> actually feeds rollout segments through this scanner. Core reconstruction then interprets the supplied item sequence. Storage selection and semantic replay are separate responsibilities; a reverse algorithm does not prove that every recovery entry avoids reading a complete file.</p>
+core compatibility replay:
+  historical ThreadRolledBack -> drop surviving real user turns
+  contextual user messages   -> do not consume rollback count</code></pre>
+<p>Core's <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L123-L182">segment selection</a> and forward replay still interpret historical ThreadRolledBack markers, removing the latest N real user turns while standalone tasks consume no count. The current submission protocol has no active ThreadRollback operation; <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/context_manager/history.rs#L766-L785">drop_last_n_user_turns</a> serves legacy replay. Storage chooses how much to read from the compaction boundary; core uses history mode and record contents to choose how to reconstruct it.</p>
 
             <h2>7. Fork Copies Replayable History</h2>
             <p>
@@ -371,7 +340,7 @@ Contextual user fragment alone          -> no proven user-turn boundary</code></
             </p>
 
             <p>
-              Fork persistence has two strategies. <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/thread_manager.rs#L1433-L1480">Ordinary forks</a> use <code>ForkPersistence::Copied</code>; prepared forks may use <code>Referenced</code> with a history_base and inherited item count. The child still receives reconstructable model context without necessarily rewriting the parent’s entire history into its own rollout. Forking is therefore not universally a full JSONL copy.
+              Fork persistence has two strategies. <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/thread_manager.rs#L1587-L1635">Ordinary forks</a> use <code>ForkPersistence::Copied</code>; prepared forks may use <code>Referenced</code> with a history_base and inherited item count. The child still receives reconstructable model context without necessarily rewriting the parent’s entire history into its own rollout. Forking is therefore not universally a full JSONL copy.
             </p>
 
             <h2>8. The Prompt Cache Connection</h2>
@@ -451,20 +420,20 @@ Contextual user fragment alone          -> no proven user-turn boundary</code></
           <section id="sources" class="article-body">
             <h2>Sources</h2>
             <ul>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L280-L294"><code>InitialHistory</code> and <code>ResumedHistory</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L127-L217"><code>RolloutItem</code> and <code>CompactedItem</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L3282-L3344"><code>TurnContextItem</code> persistence comment and fields</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L851-L1007"><code>RolloutRecorder::new</code> create and resume paths</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L1013-L1149"><code>record_canonical_items</code>, <code>persist</code>, <code>flush</code>, and rollout loading</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L1748-L1910">writer pending queue, recovery mode, and retry behavior</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/rollout/src/recorder.rs#L1913-L1975">writer command loop and <code>SessionMeta</code> write</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L1536-L1779"><code>record_initial_history</code> and <code>apply_rollout_reconstruction</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction.rs#L133-L491"><code>reconstruct_history_from_rollout</code> reverse scan and forward replay</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction.rs#L81-L109">Legacy rollback marker interpretation</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/thread_manager.rs#L1176-L1255">resuming a thread from rollout path</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/thread_manager.rs#L1395-L1532">forking a thread and <code>forked_from_thread_id</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/tests/suite/compact_resume_fork.rs#L195-L349">test: compact / resume / fork preserve model-visible history prefix</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction_tests.rs#L1010-L1090">test: legacy rollback skips only real user turns</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L377-L394"><code>InitialHistory</code> and <code>ResumedHistory</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L213-L310"><code>RolloutItem</code> and <code>CompactedItem</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/protocol.rs#L3443-L3488"><code>TurnContextItem</code> persistence comment and fields</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L885-L1045"><code>RolloutRecorder::new</code> create and resume paths</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L1064-L1204"><code>record_canonical_items</code>, <code>persist</code>, <code>flush</code>, and rollout loading</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L1813-L1975">writer pending queue, recovery mode, and retry behavior</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/rollout/src/recorder.rs#L1978-L2048">writer command loop and <code>SessionMeta</code> write</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L1658-L1909"><code>record_initial_history</code> and <code>apply_rollout_reconstruction</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L188-L624"><code>reconstruct_history_from_rollout</code> reverse scan and forward replay</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction.rs#L133-L161">Legacy rollback marker interpretation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/thread_manager.rs#L1287-L1368">resuming a thread from rollout path</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/thread_manager.rs#L1547-L1687">forking a thread and <code>forked_from_thread_id</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/tests/suite/compact_resume_fork.rs#L193-L346">test: compact / resume / fork preserve model-visible history prefix</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/rollout_reconstruction_tests.rs#L1156-L1241">test: legacy rollback skips only real user turns</a></li>
             </ul>
           </section>
         </article>
