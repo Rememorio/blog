@@ -101,12 +101,12 @@
                 src="../assets/hook-lifecycle-slots.png"
                 alt="Hook 重点触发点、条件压缩、Stop 续跑与 Interrupt、SessionEnd 通知"
               />
-            <figcaption>图中展示重点触发点，不穷举十二个事件；工具、审批与压缩按需发生，SubagentStop 等事件见正文。Stop 的续跑能力不适用于中断和会话关闭。</figcaption>
+            <figcaption>图中展示工具、压缩与收尾等重点触发点；完整十四个事件见正文，包括模型请求前后的观察事件。工具、审批与压缩按需发生；Stop 可以请求续跑，Interrupt 与 SessionEnd 负责通知。</figcaption>
             </figure>
           </section>
 
           <section class="article-body">
-            <p><strong>阅读契约。</strong>按触发时刻跟踪 hook 的输入、同步决定、异步结果和事件，区分续跑机会与结束通知。 本文核实于 2026-09-20，依据公开源码 <a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">固定公开源码快照</a>；不推断未公开的服务实现。</p>
+            <p><strong>阅读契约。</strong>按触发时刻跟踪 hook 的输入、同步决定、异步结果和事件，区分续跑机会与结束通知。 本文核实于 2026-10-22，依据公开源码 <a href="https://github.com/openai/codex/tree/2f3fb111be71d277c80bd5b96d9019748b921f5a">固定公开源码快照</a>；不推断未公开的服务实现。</p>
 
             <p>
               先把场景放具体一点。用户提交一句话以后，Codex 可能先整理上下文，接着调用模型；
@@ -151,7 +151,7 @@
             </ol>
 
             <h2>一、先把 hook 放回时间线</h2>
-            <p>当前 <code>HookEventName</code> 包含十二个事件：<code>PreToolUse</code>、<code>PermissionRequest</code>、<code>PostToolUse</code>、<code>PreCompact</code>、<code>PostCompact</code>、<code>SessionStart</code>、<code>SessionEnd</code>、<code>UserPromptSubmit</code>、<code>SubagentStart</code>、<code>SubagentStop</code>、<code>Stop</code> 和 <code>Interrupt</code>。这些是条件触发点，不是一条每轮必经的固定流水线。</p>
+            <p>当前 <code>HookEventName</code> 包含十四个事件：<code>PreToolUse</code>、<code>PermissionRequest</code>、<code>PostToolUse</code>、<code>PreCompact</code>、<code>PostCompact</code>、<code>SessionStart</code>、<code>SessionEnd</code>、<code>UserPromptSubmit</code>、<code>SubagentStart</code>、<code>SubagentStop</code>、<code>Stop</code>、<code>Interrupt</code>、<code>PreModelRequest</code> 和 <code>PostModelRequest</code>。各事件在相应运行阶段按条件触发。</p>
 
             <div class="table-wrap">
               <table>
@@ -176,6 +176,7 @@
                     <td>补充 model context，或阻止这条输入继续进入 turn。</td>
                     <td><code>user_prompt_submit.rs</code> 与 <code>inspect_pending_input</code>。</td>
                   </tr>
+                  <tr><td><code>PreModelRequest</code> / <code>PostModelRequest</code></td><td>每次模型请求尝试前后，包括重试。</td><td>记录诊断与完成、失败、取消状态；同步后置 handler 会延迟工具分派。</td><td><code>model_request.rs</code> 与模型采样路径。</td></tr>
                   <tr>
                     <td><code>PreToolUse</code></td>
                     <td>工具真正执行之前。</td>
@@ -264,7 +265,7 @@
               </table>
             </div>
 
-            <p>discovery 从 config layers 与 plugin hook sources 读取配置，校验 matcher、启用状态和 trust hash，然后生成运行时 handler。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/discovery.rs#L479-L650">当前支持 command 与 MCP tool 两种 handler</a>：command 可以声明异步执行，MCP hook 则指定 server、tool 和 input 模板。<code>SessionEnd</code> 是例外：异步 command 被改为同步运行，MCP handler 被拒绝。未信任或未启用的条目仍可展示，但不会因此获得执行资格。</p>
+            <p>discovery 从 config layers 与 plugin hook sources 读取配置，校验 matcher、启用状态和 trust hash，然后生成运行时 handler。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/engine/discovery.rs#L518-L691">当前支持 command 与 MCP tool 两种 handler</a>：command 可以声明异步执行，MCP hook 则指定 server、tool 和 input 模板。<code>SessionEnd</code> 是例外：异步 command 被改为同步运行，MCP handler 被拒绝。未信任或未启用的条目仍可展示，但不会因此获得执行资格。</p>
 
             <div class="note key-point">
               <p>
@@ -273,11 +274,13 @@
               </p>
             </div>
 
+            <p>Plugin hook 的信任还绑定到包内容。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/engine/plugin_trust.rs#L18-L70"><code>PluginHookTrust</code></a>同时检查声明 hash 与 <code>trusted_content_hash</code>；需要信任校验的 command/MCP hook 每次执行前重新验证内容，校验计入该 hook 的 timeout。比如声明一直是 <code>python check.py</code>，而 <code>check.py</code> 被更新，下一次执行也需要重新批准。旧版只有声明 hash 的批准会迁移到同一 plugin 与配置目录共享的不可变内容基线。</p>
+
             <h2>三、hook run 是可见事实，不是后台日志</h2>
             <p>
               一个 hook event 触发时，Codex 不会直接静默运行 command。各个 event 文件都有相似的骨架：
               先 <code>preview</code> 匹配 handler，把每个 handler 转成
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs"><code>HookRunSummary</code></a>；
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/protocol.rs"><code>HookRunSummary</code></a>；
               再 <code>run</code> command；最后把 stdout、stderr、exit code 或 JSON output 解析成 event-specific outcome。
             </p>
 
@@ -316,11 +319,11 @@
             </div>
 
             <h3>3.1 同步决策与异步通知要分开观察</h3>
-            <p><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/dispatcher.rs#L114-L185">dispatcher</a> 用 <code>FuturesUnordered</code> 并发运行匹配的同步 handler，收集完后按配置顺序整理结果；异步 command 则进入 session 的后台任务集合，不参与当前同步决策。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/command_runner.rs#L108-L164">异步结果处理</a> 保留 context、warning、error，丢弃 Stop 与 Feedback 条目。因此看到 HookStarted 只代表运行开始，不能认为阻断检查已经完成；异步 hook 也不能在副作用发生后追溯否决它。</p>
+            <p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/engine/dispatcher.rs#L116-L188">dispatcher</a> 用 <code>FuturesUnordered</code> 并发运行匹配的同步 handler，收集完后按配置顺序整理结果；异步 command 则进入 session 的后台任务集合，不参与当前同步决策。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/engine/command_runner.rs#L115-L167">异步结果处理</a> 保留 context、warning、error，丢弃 Stop 与 Feedback 条目。因此看到 HookStarted 只代表运行开始，不能认为阻断检查已经完成；异步 hook 也不能在副作用发生后追溯否决它。</p>
 
             <p>当多个同步 PreToolUse handler 都返回 <code>updated_input</code> 时，采用最后完成的改写；若任意结果要求 block，就丢弃改写。这是按完成顺序选输入、按事件规则汇总决定的组合，不能简单理解为配置文件最后一条赢。</p>
 
-            <p>MCP hook 的 input 还支持类型保留的模板替换。例如 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/mcp_runner.rs#L90-L107">完整占位符</a> <code>{"count":"${tool_input.count}"}</code> 在事件给出数字 3 时会成为 <code>{"count":3}</code>；嵌入文字中的占位符才转成字符串，字段缺失会使 hook 失败。</p>
+            <p>MCP hook 的 input 还支持类型保留的模板替换。例如 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/engine/mcp_runner.rs#L104-L121">完整占位符</a> <code>{"count":"${tool_input.count}"}</code> 在事件给出数字 3 时会成为 <code>{"count":3}</code>；嵌入文字中的占位符才转成字符串，字段缺失会使 hook 失败。</p>
 
             <h2>四、UserPromptSubmit：输入写进 history 之前运行</h2>
             <p>
@@ -341,6 +344,16 @@
               这和 skill injection 的性质不同。skill 是用户点名后的工作方法，稍后作为 injection item 记录进 conversation；
               prompt hook 则在用户输入进入 history 前运行，可以给出提醒、附加上下文，或者阻止这条输入继续。
             </p>
+
+            <h3>4.1 每次模型请求也有观察槽</h3>
+            <p>配置相应 handler 后，<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L2688-L2756"><code>PreModelRequest</code> 与 <code>PostModelRequest</code></a>围绕每次模型请求尝试运行，重试也会再触发。输入包含 session、turn、cwd、model，以及可用的子 agent 身份；后置事件记录 <code>completed</code>、<code>failed</code> 或 <code>cancelled</code>，有数据时附带 error 与 token usage。</p>
+            <p>这两个事件的<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/events/model_request.rs#L115-L168">输出只作为诊断处理</a>：stdout 即使包含 block 或 context 指令，也只进入诊断日志；stderr 与执行错误会成为错误条目。它们提供观察能力。同步 <code>PostModelRequest</code> 会让该响应的工具分派等待 hook 完成；只有异步后置 handler 时，流式工具分派可以继续。取消可以中断前台等待，hook 任务仍由 session 管理。</p>
+<pre><code class="language-text">已配置模型请求 hooks：
+  PreModelRequest -> 请求尝试 1 -> PostModelRequest(failed)
+  [满足重试条件] PreModelRequest -> 请求尝试 2
+  -> PostModelRequest(completed, token_usage)
+  -> [同步后置 hook 完成后] 分派该响应的工具</code></pre>
+            <p>排查“模型已经返回，工具为何还没启动”时，可以查看这组 hook 的 started/completed 事件。请求完成与同步后置 handler 完成分别有自己的时间边界。</p>
 
             <h2>五、工具执行前、审批中、执行后是三类 hook</h2>
             <p>
@@ -417,7 +430,7 @@
             </div>
 
             <h3>6.1 中断与会话关闭只有通知，不会续跑</h3>
-            <p><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/hook_runtime.rs#L493-L540"><code>run_turn_interrupt_hooks</code></a> 运行时 active turn 已经脱离，会复用最后一个执行步骤的 hook discovery，而不会再创建一个工作步骤。<code>SessionEnd</code> 在关闭根会话时运行；这两个入口都排除 subagent，子任务使用自己的 SubagentStart / SubagentStop 生命周期。</p>
+            <p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/hook_runtime.rs#L457-L504"><code>run_turn_interrupt_hooks</code></a> 运行时 active turn 已经脱离，会复用最后一个执行步骤的 hook discovery，而不会再创建一个工作步骤。<code>SessionEnd</code> 在关闭根会话时运行；这两个入口都排除 subagent，子任务使用自己的 SubagentStart / SubagentStop 生命周期。</p>
 
             <p>两种通知默认超时 1 秒，上限 3 秒。SessionEnd 在 shutdown 已关闭 MCP runtime 后运行，所以只允许同步 command；它与 Interrupt 的结果用于完成事件，不接受 Stop 那样的 continuation。把“用户中断任务”误当成 Stop，会错误地期待 hook 有权让模型继续工作。</p>
 
@@ -484,21 +497,21 @@
 
             <h2 id="sources">参考源码</h2>
             <ul class="source-list">
-              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">openai/codex · 5c5308fc9a9e</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L1579-L1592">HookEventName</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/discovery.rs#L479-L650">command / MCP discovery</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/discovery.rs#L740-L761">Interrupt / SessionEnd timeout</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/dispatcher.rs#L114-L185">concurrent and async dispatch</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/command_runner.rs#L108-L164">async result handling</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/engine/mcp_runner.rs#L23-L107">MCP hook templates</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/hook_runtime.rs">runtime hook slots</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/handlers.rs#L295-L318">SessionEnd during shutdown</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/events/pre_tool_use.rs#L129-L167">updated_input completion ordering</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/approvals.rs#L473-L549">central permission hook routing</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/registry.rs#L600-L790">tool hook integration</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/events/stop.rs">Stop continuation</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/events/interrupt.rs">Interrupt notification</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/hooks/src/events/session_end.rs">SessionEnd notification</a></li>
+              <li><a href="https://github.com/openai/codex/tree/2f3fb111be71d277c80bd5b96d9019748b921f5a">openai/codex · 2f3fb111be71</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/protocol.rs#L1699-L1714">HookEventName</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/engine/discovery.rs#L518-L691">command / MCP discovery</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/engine/discovery.rs#L839-L860">Interrupt / SessionEnd timeout</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/engine/dispatcher.rs#L116-L188">concurrent and async dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/engine/command_runner.rs#L115-L167">async result handling</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/engine/mcp_runner.rs#L25-L121">MCP hook templates</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/hook_runtime.rs">runtime hook slots</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/handlers.rs#L309-L342">SessionEnd during shutdown</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/events/pre_tool_use.rs#L129-L167">updated_input completion ordering</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/approvals.rs#L453-L552">central permission hook routing</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/registry.rs#L700-L896">tool hook integration</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/events/stop.rs">Stop continuation</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/events/interrupt.rs">Interrupt notification</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/hooks/src/events/session_end.rs">SessionEnd notification</a></li>
             </ul>
           </section>
         </article>
