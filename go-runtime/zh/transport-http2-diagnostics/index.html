@@ -49,7 +49,7 @@
             复用连接只是少建连接，不表示每个请求都能立刻出发。它可能在等一条可用连接，等服务器返回数据，或在 HTTP/2 连接里等一个并发名额。
             本篇先把这三种“等”分开，再解释响应体、连接池、HTTP/2 stream 和诊断工具怎样帮我们找到真正的慢点。
           </p>
-          <div class="meta-line"><span>源码：Go 开发分支固定快照</span><span>路径：Transport.getConn → persistConn / bodyEOFSignal → HTTP/2 clientStream</span><span>实验：transport_lab_test.go</span></div>
+          <div class="meta-line"><span>源码：Go 开发分支固定快照</span><span>路径：Transport.getConn → poolGetConn → persistConn / bodyEOFSignal → HTTP/2 clientStream</span><span>实验：transport_lab_test.go</span></div>
           <figure class="hero-image"><img src="../assets/connection-diagnosis-route.png" alt="网络实验台：fetchd 请求经 Transport.getConn 竞争空闲连接与新拨号；HTTP/1 在真实 EOF 或有界排空成功后才可能回池，HTTP/2 复用多个流，右侧笔记本汇合请求阶段、压力与并发证据" /></figure>
         </section>
 
@@ -57,11 +57,11 @@
           <div class="note route-note"><p><strong>阅读目标：</strong>先不背连接池字段。读完前半篇，你应该能区分三种“等”：等一条可用连接、等服务器返回数据、等 HTTP/2 连接里的 stream 名额。它们都表现为请求变慢，却需要完全不同的证据和修复。</p></div>
 
           <p>
-            本文先讲 <code>Transport</code> 与 <code>Response.Body</code> 文档保证的行为，再用 <a href="https://github.com/golang/go/tree/f043823a99a4118989a34afec015d23b5d54d01e">Go 开发分支固定快照</a> 的
-            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go">net/http/transport.go</a>、
-            <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/internal/http2/transport.go">internal/http2/transport.go</a> 与
+            本文先讲 <code>Transport</code> 与 <code>Response.Body</code> 文档保证的行为，再用 <a href="https://github.com/golang/go/tree/553df30bcdbf85a9aa42c5011b4151295a09135b">Go 开发分支固定快照</a> 的
+            <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go">net/http/transport.go</a>、
+            <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/internal/http2/transport.go">internal/http2/transport.go</a> 与
             <a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/httptrace/trace.go">httptrace/trace.go</a>。
-            这是开发分支快照，不代表稳定版行为；HTTP/2 实现已从旧版 bundled 文件迁入内部包。各诊断工具能观察什么，依据 <a href="https://pkg.go.dev/net/http/httptrace">httptrace</a>、
+            本文聚焦 HTTP/1 与 HTTP/2，连接池实现位于 <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport_pool.go#L37-L99">transport_pool.go</a>。固定快照中的字段与错误恢复策略属于开发分支实现；各项配置仍需按实际工具链版本核对。各诊断工具能观察什么，依据 <a href="https://pkg.go.dev/net/http/httptrace">httptrace</a>、
             <a href="https://pkg.go.dev/runtime/metrics">runtime/metrics</a>、
             <a href="https://pkg.go.dev/net/http/pprof">net/http/pprof</a> 与 <a href="https://go.dev/doc/diagnostics">Diagnostics</a>。
           </p>
@@ -86,8 +86,7 @@
             收响应三个时间点，才能知道等待属于池、上游还是协议流控。
           </p>
           <p>
-            一个共享 <code>Transport</code> 同时维护按 connect method 分组的 idle connection、等待 idle 的请求票据、
-            正在 dial 的票据和 per-host 总连接计数。cache key 不只是裸 hostname，还受 scheme、address、proxy 与是否强制 HTTP/1 等连接方法影响。
+            一个共享 <code>Transport</code> 按连接目标保存 <code>clientConnPoolEntry</code>，每个条目集中管理可复用连接、等待请求数、正在拨号的记录和连接计数。cache key 由 connect method 产生，包含 scheme、address、proxy 与是否强制 HTTP/1 等信息。
             所以两个 URL 看起来同域，不代表一定命中同一池；反过来，为每次请求新建 Transport，则会把所有复用状态主动丢掉。
           </p>
 
@@ -105,28 +104,25 @@ client := &amp;http.Client{Transport: transport} // 进程内共享</code></pre>
           </p>
 
           <h2>二、HTTP/1：拿连接、用连接、归还连接</h2>
-          <h3>2.1 <code>getConn</code> 让 idle 与 dial 竞争同一张票据</h3>
+          <h3>2.1 <code>poolGetConn</code> 等连接可用或拨号额度释放</h3>
           <p>
-            <code>getConn</code> 先为请求建立 <code>wantConn</code>，调用 <code>queueForIdleConn</code>；若没有立即交付，再进入
-            <code>queueForDial</code>。此时 idle connection 可能先出现，也可能 dial 先完成，<code>w.tryDeliver</code> 保证只有一方赢得票据。
-            这就是源码注释引用的 socket late binding：请求不必在一开始就押注“等旧连接”还是“建新连接”。
+            <code>getConn</code> 发出 httptrace 的 GetConn 事件后，把获取连接交给 <code>poolGetConn</code>。后者先锁住目标条目，尝试拿走一条可用 HTTP/1 连接；没有现成连接时增加等待计数，进入 select 循环。正在拨号时仍可接收别人归还的连接，因此复用连接与新拨号继续竞争同一次获取。
           </p>
-
-          <pre><code class="language-go">if delivered := t.queueForIdleConn(w); !delivered {
-    t.queueForDial(w)
-}
-select {
-case r := &lt;-w.result:
-    return r.pc, r.err
-case &lt;-treq.ctx.Done():
-    return nil, context.Cause(treq.ctx)
-}</code></pre>
-          <span class="source-caption"><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L1558-L1634">Transport.getConn</a> 与票据等待。</span>
-
           <p>
-            还有一个容易错读的细节：dial context 用 <code>context.WithoutCancel</code> 从 request context 脱离，再单独加内部 cancel。
-            当前请求取消后，<code>getConn</code> 会返回取消错误，但已经开始的 dial 可以继续，因为刚建好的连接可能交付给未来请求。
-            这不是忽略 deadline；请求已经不再等待这次 dial，但 <code>Transport</code> 可以保留 dial 结果供下一次请求复用。
+            条目用三个容量为 1 的 channel 同时表达互斥锁与可用条件。持锁时三个 channel 都没有值；解锁时根据当前状态向其中一个放入令牌：有连接可取时选择 <code>cangetc</code>，否则有拨号额度时选择 <code>candialc</code>，两者都不可用时选择维护代码使用的 <code>lockc</code>。等待请求只监听前两者，并另外监听自己的拨号结果与 context 取消。
+          </p>
+          <pre><code class="language-go">// clientConnPoolEntry.unlock 中发布下一个可执行动作
+switch {
+case len(ent.idleConns) &gt; 0 || ent.altConn != nil:
+    ent.cangetc &lt;- struct{}{}
+case tr.MaxConnsPerHost &lt;= 0 || ent.numConns+ent.dials.size &lt; tr.MaxConnsPerHost:
+    ent.candialc &lt;- struct{}{}
+default:
+    ent.lockc &lt;- struct{}{}
+}</code></pre>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go#L1140-L1164">getConn</a>；<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport_pool.go#L115-L134">条目解锁与条件令牌</a>；<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport_pool.go#L388-L495">poolGetConn 等待循环</a>。</span>
+          <p>
+            拿到拨号令牌后，请求创建一次 <code>poolDial</code>，启动拨号并停止监听下一次拨号额度；每次获取连接最多发起一次拨号。拨号 context 通过 <code>context.WithoutCancel</code> 保留值、脱离请求取消，再加内部 cancel。若请求先取消或先取到归还的连接，拨号仍可完成；<code>poolDialForEntry</code> 看到请求已结束获取后，可把新连接放回池供其他请求使用。请求的取消错误会及时返回给调用者。
           </p>
 
           <h3>2.2 三个限制分别控制“总量”和“留下多少”</h3>
@@ -141,11 +137,12 @@ case &lt;-treq.ctx.Done():
           </table></div>
 
           <p>
-            <code>queueForDial</code> 在 <code>MaxConnsPerHost</code> 为 0 时直接 dial；有上限时先检查当前计数，满了把票据压进
-            <code>connsPerHostWait</code>。取消请求会让票据不再 waiting，队列清理时跳过它。这个等待时间不会在默认 metrics 中自动出现，
-            需要应用通过 httptrace 的 GetConn/GotConn 差值或显式 wrapper 记录。
+            上表给出配置文档的计数语义。当前外层池以 <code>ent.numConns + ent.dials.size</code> 判断拨号额度，HTTP/1 的已建立连接与正在拨号分别计入这两项。没有可用连接且达到上限后，条目只发布 <code>lockc</code>；请求要等连接归还、连接退出释放额度，或自己的 context 取消。等待耗时由应用通过 GetConn/GotConn 或 wrapper 记录。
           </p>
-          <span class="source-caption">配置语义：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L195-L233">Transport fields</a>；排队实现：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L1636-L1707">queueForDial</a>。</span>
+          <p>
+            HTTP/2 还存在一层实现限制：外层的 <code>altConn</code> 通常引用一个自行管理连接池的 HTTP/2 Transport，外层计数没有逐条统计它内部的 TCP 连接。因此在这个快照中，<code>MaxConnsPerHost</code> 的外层计数不足以证明 HTTP/2 的实际 socket 总数受同一硬上限约束；还要核对下文的 stream 限制与实际连接观测。
+          </p>
+          <span class="source-caption">配置语义：<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go#L196-L216">Transport fields</a>；拨号额度：<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport_pool.go#L115-L134">clientConnPoolEntry.unlock</a>；HTTP/2 计数限制：<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport_pool.go#L62-L72">altConn 注释</a>。</span>
 
           <h3 id="http1">2.3 HTTP/1 的 <code>persistConn</code> 是一读一写两条循环</h3>
           <p>
@@ -162,10 +159,15 @@ case &lt;-treq.ctx.Done():
   → readLoop waits for body EOF decision</code></pre>
 
           <p>
-            没有 body 的 response 可以在交付前回池；有 body 时，readLoop 包一层 <code>bodyEOFSignal</code>，然后停在
-            <code>waitForBodyRead</code>。调用方读到底层 <code>io.EOF</code> 会传回该错误值；在尚未读到终止错误前 Close 会传回内部 <code>errClosedEarly</code>。
+            可复用且没有 body 的普通 response 可以在交付前回池；有 body 时，readLoop 包一层 <code>bodyEOFSignal</code>，然后停在
+            <code>waitForBodyRead</code>。当前通知 channel 传递无指针的 <code>bodyReadStatus</code>：真实 EOF、提前关闭、读取错误分别对应 <code>bodyReadEOF</code>、<code>bodyReadClosedEarly</code>、<code>bodyReadError</code>。
             正常 EOF 可以直接尝试回池；提前关闭则进入下面的有界排空分支。两条路径都仍要求连接健康、未见 socket EOF、request 已写完。
           </p>
+
+          <p>
+            上传请求体时，服务器可能先返回拒绝响应再关连接，客户端的写错误与响应读取就会竞争。当前 <code>persistConn.roundTrip</code> 遇到 <code>*net.OpError</code> 网络写错误，会继续等响应，最多等待 50ms；若配置了更短的 <code>ResponseHeaderTimeout</code>，则采用较短值，context 取消仍参与 select。响应及时到达时交付响应，等待到期则返回写错误；从应用提供的 body 读出的普通错误会立即返回。这让上游的拒绝状态有机会保留下来。
+          </p>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go#L2414-L2416">postRequestWriteErrorWaitTime</a> 与 <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go#L2516-L2616">roundTrip 错误及响应竞争</a>。</span>
 
           <h3>2.4 <code>Close</code> 是释放资源，不自动等于可复用</h3>
           <pre><code class="language-text">短响应：读到 resp.Body 的真实 EOF → Close → 连接可以回池
@@ -175,23 +177,32 @@ case &lt;-treq.ctx.Done():
           <p>
             当前开发快照已不再把“EOF 前 Close”一律解释为丢弃连接。readLoop 会先判断连接可复用、keep-alive 开启且 <code>ContentLength ≤ 256 KiB</code>；未知长度的 -1 也满足这个入口条件。随后先允许 Close 返回，再尝试丢弃未读数据：最多读取 256 KiB + 1 字节，必须在 50ms 内观察真实 EOF 才能回池。入口比较的是响应的 ContentLength，不是剩余字节数；已知总长度大于上限，即使只剩一个字节也不走此分支。这里读的是当前 <code>resp.ContentLength</code>；自动 gzip 解压会把它改成 -1，所以不能直接拿线上原始 Content-Length 推断。排空读取底层响应体，压缩字节预算也不等于应用的解压后读取上限。
           </p>
+          <p>
+            回池还要求请求属于普通 HTTP 交换。当前 readLoop 对所有 <code>CONNECT</code> 请求都禁用 keep-alive 回池，包括非 2xx 响应；成功切换为隧道的连接则进入隧道所有权路径。
+          </p>
           <figure class="figure"><img src="../assets/http1-connection-reuse.png" alt="HTTP/1 响应生命周期：真实 EOF 可尝试回池；提前 Close 返回后，符合条件的响应由 readLoop 在 256 KiB 与 50ms 预算内尝试排空，成功到达 EOF 才可复用，否则关闭连接；Close 返回不代表回池完成" /></figure>
 
-          <pre><code class="language-go">waitForBodyRead := make(chan error, 1)
-resp.Body = &amp;bodyEOFSignal{
+          <pre><code class="language-go">waitForBodyRead := make(chan bodyReadStatus, 1)
+body := &amp;bodyEOFSignal{
     body: resp.Body,
     earlyCloseFn: func() error {
-        waitForBodyRead &lt;- errClosedEarly
+        waitForBodyRead &lt;- bodyReadClosedEarly
         &lt;-eofc
         return nil
     },
     fn: func(err error) error {
-        waitForBodyRead &lt;- err
-        // ...
+        if err == io.EOF {
+            waitForBodyRead &lt;- bodyReadEOF
+            &lt;-eofc
+        } else {
+            waitForBodyRead &lt;- bodyReadError
+            // ...
+        }
         return err
     },
-}</code></pre>
-          <span class="source-caption">通知分支摘要；排空与完整判断：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L2400-L2436">maybeDrainBody</a>；<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L2438-L2630">persistConn.readLoop</a>；wrapper：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L3217-L3281">bodyEOFSignal</a>。</span>
+}
+resp.Body = body</code></pre>
+          <span class="source-caption">通知分支摘要；排空与完整判断：<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go#L1828-L1858">maybeDrainBody</a>；<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go#L1860-L2075">persistConn.readLoop</a>；wrapper：<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go#L2671-L2747">bodyEOFSignal</a>。</span>
 
           <p>
             这正好解释 <code>fetchd</code> 在 1 MiB 上限附近的行为：<code>io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))</code>
@@ -204,19 +215,29 @@ resp.Body = &amp;bodyEOFSignal{
             结果是否 truncated、Close 何时返回与连接最终是否复用应分别记录；需要证明回池时观察 <code>httptrace.PutIdleConn</code> 或后续 GotConn，而不是把 Close 返回当作完成信号。这些排空阈值是源码实现，不是 API 保证。
           </p>
 
-          <h3>2.5 <code>tryPutIdleConn</code> 先服务 waiter，再留下 idle</h3>
+          <h3>2.5 归还连接后，条目重新发布可用令牌</h3>
           <p>
-            回池不是简单 append。<code>tryPutIdleConn</code> 先拒绝禁用 keep-alive 或 broken 的连接，再标记 reused；
-            若已有请求在 <code>idleConnWait</code> 等待，HTTP/1 connection 直接交付给第一个仍 waiting 的票据。
-            无 waiter 才进入 per-host idle list，应用 <code>MaxIdleConnsPerHost</code>、global LRU 和 IdleConnTimeout。
+            <code>tryPutIdleConn</code> 拒绝禁用 keep-alive 或已损坏的连接，再标记 reused，并把普通 Transport 连接交给 <code>poolPutIdleConn</code>。HTTP/1 连接先加入目标条目的 <code>idleConns</code> 与全局 LRU，接受每目标容量、全局容量与空闲超时约束。条目解锁后发布 <code>cangetc</code>，等待请求取出连接并从 idle list 和 LRU 移除。等待者通过条件令牌重新竞争。
           </p>
+          <p>
+            HTTP/2 与 HTTP/3 的共享连接另外存放在 <code>altConn</code>；取用它时保留这个引用，未来请求仍可共享。HTTP/1 的空闲定时器现在属于目标条目：触发后检查其中各连接的 idleAt，关闭到期连接，再按下一条到期时间重设定时器。协议内部仍负责自己的连接与 stream 状态。
+          </p>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go#L1071-L1097">tryPutIdleConn</a>；<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport_pool.go#L256-L360">poolPutIdleConn 与条目空闲定时器</a>；<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport_pool.go#L500-L546">取用 HTTP/1 与 altConn</a>。</span>
 
+          <h3>2.6 复用连接失败后，重试还要满足重放条件</h3>
           <p>
-            HTTP/2 在这里已经出现分叉：<code>pconn.alt != nil</code> 的连接不会像 HTTP/1 那样从 idle list “取走”，
-            因为同一连接能同时交付给所有等待者，还会继续留给未来请求。这不是 idle 一词的日常含义，而是 Transport 把可共享 alternative protocol connection
-            放在同一套池接口下的实现选择。
+            空闲连接可能恰好被服务器关闭。<code>shouldRetryRequest</code> 会结合连接是否曾成功使用、错误发生阶段及请求能否重放决定重试。当前 <code>Request.isReplayable</code> 把 <code>QUERY</code> 与 GET、HEAD、OPTIONS、TRACE 一并识别为幂等方法；若带请求体，还需要 <code>GetBody</code> 重建它。幂等键也可表达重放意图，但业务仍需提供相应去重语义与重试预算。
           </p>
-          <span class="source-caption"><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L1104-L1214">tryPutIdleConn</a> 与 HTTP/1/HTTP/2 waiter 分支。</span>
+          <pre><code class="language-go">req, err := http.NewRequestWithContext(ctx, "QUERY", endpoint, strings.NewReader(query))
+if err != nil {
+    return err
+}
+// strings.Reader 让 NewRequestWithContext 自动设置 GetBody。
+// 换成任意一次性流后，需要另外提供可重新打开正文的 GetBody。</code></pre>
+          <p>
+            已复用连接上若一个字节都没写出，源码另有较早的安全重试分支：只要正文为空或可通过 GetBody 重新读取即可。其他符合重放条件的请求也只对指定网络失败重试，例如读取首响应字节时失败或服务器关闭空闲连接；HTTP 503 等状态响应仍交给业务处理。
+          </p>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go#L824-L868">shouldRetryRequest</a>；<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/request.go#L1557-L1572">Request.isReplayable</a>。</span>
 
           <h2 id="http2">三、HTTP/2 把“一连接一请求”变成“一连接多 stream”</h2>
           <p>
@@ -231,11 +252,11 @@ resp.Body = &amp;bodyEOFSignal{
             再启动 <code>go cs.doRequest</code>。客户端发起的 stream ID 使用递增奇数 1、3、5……
           </p>
 
-          <figure class="figure"><img src="../assets/http2-stream-multiplexing.png" alt="HTTP/2 接收流控实验台：三个流共用一条连接，响应 DATA 从服务端流向客户端；每条流有窗口并共享连接窗口，读取响应体后以 WINDOW_UPDATE 返还接收额度；并发名额不足时按配置等待或另建连接" /></figure>
+          <figure class="figure"><img src="../assets/http2-stream-multiplexing.png" alt="HTTP/2 接收流控实验台：三个流共用一条连接，响应 DATA 从服务端流向客户端；每条流有窗口并共享连接窗口，读取响应体后以 WINDOW_UPDATE 返还接收额度；并发名额不足时按配置等待或由 HTTP/2 内层池另建连接" /></figure>
 
           <pre><code class="language-go">type ClientConn struct {
     tconn                net.Conn
-    flow                 outflow
+    flow                 connOutflow
     inflow               inflow
     streams              map[uint32]*clientStream
     nextStreamID         uint32
@@ -251,7 +272,7 @@ type clientStream struct {
     inflow inflow
     abort chan struct{}
 }</code></pre>
-          <span class="source-caption">内部包字段节选：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/internal/http2/transport.go#L127-L279">http2.ClientConn 与 clientStream</a>。</span>
+          <span class="source-caption">内部包字段节选：<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/internal/http2/transport.go#L127-L278">http2.ClientConn 与 clientStream</a>。</span>
 
           <h3>3.1 并发上限是 stream slot，不只是 TCP 连接数</h3>
           <p>
@@ -283,7 +304,12 @@ transport.HTTP2 = &amp;http.HTTP2Config{
             <code>reqHeaderMu</code> 是发送新 request header block 的 semaphore，避免 header block 交错，不代表整条 HTTP/2 connection 串行。
             DATA frame 仍会在 stream 间 multiplex。HTTP/2 消除了 HTTP/1 请求级队头阻塞，却没有消除 TCP loss 的传输层队头阻塞：一个丢包仍会阻塞同一 TCP connection 上所有 stream 的有序字节。
           </p>
-          <span class="source-caption">两级 inflow/outflow：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/internal/http2/flow.go#L1-L120">HTTP/2 flow control</a>；response body 返还 credit：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/internal/http2/transport.go#L2400-L2495">transportResponseBody.Read</a>。</span>
+          <span class="source-caption">两级 inflow/outflow：<a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/internal/http2/flow.go#L1-L175">HTTP/2 flow control</a>；response body 返还 credit：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/internal/http2/transport.go#L2400-L2495">transportResponseBody.Read</a>。</span>
+
+          <p>
+            发送侧的窗口实现还避免了每次设置更新都遍历所有 stream：连接保存 <code>connOutflow.initial</code>，每个 stream 保存相对这个初始值的 <code>delta</code>。可发送字节取“initial + delta”与连接剩余额度的较小值；<code>SETTINGS_INITIAL_WINDOW_SIZE</code> 只更新共享初始值，stream 在使用窗口时再计算实际额度并检查溢出。接收侧按应用读取量返还 credit，分别维护 stream 与连接两级额度。
+          </p>
+          <span class="source-caption"><a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/internal/http2/flow.go#L84-L175">connOutflow、outflow 与延迟窗口计算</a>。</span>
 
           <h3>3.3 取消一个 stream，通常保留整条连接</h3>
           <p>
@@ -298,6 +324,10 @@ transport.HTTP2 = &amp;http.HTTP2Config{
             而不是把 Transport 的内部重试当业务 exactly-once。
           </p>
           <span class="source-caption">每请求 stream 与取消 select：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/internal/http2/transport.go#L1045-L1171">http2.ClientConn.roundTrip</a>；reset 写入：<a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/internal/http2/transport.go#L2958-L2997">writeStreamReset</a>。</span>
+
+          <p>
+            本文的连接与 stream 路线限定为 HTTP/1 和 HTTP/2。该快照已把 HTTP/3 实现迁入 <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/internal/http3/doc.go#L5-L10">net/http/internal/http3</a>，但 <code>Protocols.setHTTP3</code> 仍未导出，测试通过 <a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/export_test.go#L241-L244">测试专用 SetHTTP3</a> 接入；现有 <code>fetchd</code> 配置继续使用 HTTP/1 与 HTTP/2。
+          </p>
 
           <h2 id="lab">四、实验同时证明复用、排队和 multiplex</h2>
           <p>
@@ -447,13 +477,13 @@ trace.WithRegion(ctx, "outbound-fetch", func() {
           <h2 id="sources">参考源码与文档</h2>
           <ul class="source-list">
             <li><a href="https://pkg.go.dev/net/http#Transport">net/http Transport documentation</a></li>
-            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L1558-L1707">getConn and per-host dial queue</a></li>
-            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L1104-L1214">Idle connection delivery and pooling</a></li>
-            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L2438-L2630">persistConn.readLoop and body EOF decision</a></li>
-            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/transport.go#L3217-L3281">bodyEOFSignal</a></li>
-            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/internal/http2/transport.go#L127-L279">HTTP/2 client connection and stream state</a></li>
+            <li><a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport_pool.go#L388-L495">poolGetConn and per-target acquisition</a></li>
+            <li><a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport_pool.go#L256-L360">Idle connection pooling and entry timers</a></li>
+            <li><a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go#L1860-L2075">persistConn.readLoop and body EOF decision</a></li>
+            <li><a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/transport.go#L2671-L2747">bodyEOFSignal</a></li>
+            <li><a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/internal/http2/transport.go#L127-L278">HTTP/2 client connection and stream state</a></li>
             <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/internal/http2/transport.go#L1045-L1171">HTTP/2 RoundTrip and cancellation</a></li>
-            <li><a href="https://github.com/golang/go/blob/f043823a99a4118989a34afec015d23b5d54d01e/src/net/http/internal/http2/flow.go#L1-L120">HTTP/2 connection and stream flow control</a></li>
+            <li><a href="https://github.com/golang/go/blob/553df30bcdbf85a9aa42c5011b4151295a09135b/src/net/http/internal/http2/flow.go#L1-L175">HTTP/2 connection and stream flow control</a></li>
             <li><a href="https://pkg.go.dev/net/http/httptrace">net/http/httptrace documentation</a></li>
             <li><a href="https://pkg.go.dev/runtime/metrics">runtime/metrics documentation</a></li>
             <li><a href="https://pkg.go.dev/net/http/pprof">net/http/pprof documentation</a></li>
