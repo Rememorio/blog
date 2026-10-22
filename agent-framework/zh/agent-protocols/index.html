@@ -258,6 +258,12 @@
               并且有用于延迟结果和状态跟踪的<a href="https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks">实验性 Tasks</a>。Tasks 需要单独协商支持；普通 <code>tools/call</code> 不会自动变成长任务。它的主边界仍是 runtime 与工具/数据，但边界两端可以双向协作。
             </p>
 
+            <h3>4.3 通过资源分发技能</h3>
+            <p>续约助手还可能需要一份“续约政策检查”技能，里面有说明和模板。MCP Python SDK 已实现 <code>io.modelcontextprotocol/skills</code> 扩展：服务端通过 <code>skills/list</code> 与 <code>skills/get</code> 返回技能目录和文件清单，客户端再通过普通资源读取取得 <code>SKILL.md</code> 等文件。目录扫描、内容存储和更新时机由服务端应用实现；Host 决定何时把取得的内容交给模型。这里描述的是该 SDK 的扩展实现，连接时仍需检查扩展能力。见<a href="https://github.com/modelcontextprotocol/python-sdk/blob/2af9e3089ac66b35c1550c500aae86a82efb1e17/docs/advanced/skills.md#L3-L23">扩展职责</a>与<a href="https://github.com/modelcontextprotocol/python-sdk/blob/2af9e3089ac66b35c1550c500aae86a82efb1e17/src/mcp/client/extensions/skills.py">客户端实现</a>。</p>
+            <pre><code class="language-text">发现技能 → 取得技能清单 → resources/read 读取所需文件
+          → Host 核对文件与来源 → 放入本次模型上下文</code></pre>
+            <p>固定文件清单带有字节数和 SHA-256；<code>Client.read_resource</code> 返回内容后，Host 自行核对 URI、大小与摘要。标为 <code>dynamic</code> 的内容缺少可核对的文件摘要。Host 还要保留来源标记，并单独处理技能声明的工具授权；加载说明文件的动作本身只增加模型输入。见<a href="https://github.com/modelcontextprotocol/python-sdk/blob/2af9e3089ac66b35c1550c500aae86a82efb1e17/docs/advanced/skills.md#L60-L91">内容读取与 Host 检查职责</a>。</p>
+
             <h2>五、A2A：把一件事交给不透明的远程 agent</h2>
             <h3>5.1 远程 agent 不是一个大工具</h3>
             <p>
@@ -314,6 +320,11 @@
               <code>STATE_DELTA</code> 再用 JSON Patch 传递增量变化。前端不必从一串文本反推 runtime 状态。
             </p>
 
+            <p>消息快照还有一个会影响下一轮执行的细节。假设流式工具结果已经显示在调用后，后端随后用新消息 id 返回同一结果；仅按消息 id 合并，结果可能落到另一条 assistant 文本之后。当前 AG-UI TypeScript 客户端在应用 <code>MESSAGES_SNAPSHOT</code> 后，按 <code>toolCallId</code> 将可配对结果放回调用附近，保留并行结果的相对顺序。下一次发出的 <code>RunAgentInput.messages</code> 因而继续携带可用的调用与结果序列。见<a href="https://github.com/ag-ui-protocol/ag-ui/blob/009735e83648528b45beeaa0f229560b10b8d62e/sdks/typescript/packages/client/src/apply/default.ts#L158-L228">快照重排规则</a>。</p>
+            <pre><code class="language-text">快照合并后：assistant(call tc-7) → assistant(text) → tool(tc-7)
+配对恢复后：assistant(call tc-7) → tool(tc-7) → assistant(text)</code></pre>
+            <p>这项修复依赖调用身份：只有全段历史中唯一的调用 id 才允许把提前到达的结果向后移动；父子 Agent 复用同一个 id 时，客户端仍可能配错结果。应用应为调用分配可区分的身份，适配器保留该身份穿过事件流和快照。</p>
+
             <h3>6.2 中断是 run 的结果，不是一个没发完的回答</h3>
             <p>
               如果 CRM 工具要求用户确认读取敏感套餐，当前 run 可以以 interrupt outcome 结束。前端显示审批界面，用户回答后用新 run 携带 resume 信息。
@@ -358,7 +369,18 @@
 
             <p>版本与恢复也要协商。官方仓库 <a href="https://github.com/agentclientprotocol/agent-client-protocol/blob/f0a04b2172614ca37f2fecf2a2d877a063b37e5f/README.md#L15-L29">README</a>把稳定协议标为 v1；schema 包版本、仓库中的 v2 或 draft 目录不能替代 initialize 的线协议版本。v1 <a href="https://github.com/agentclientprotocol/agent-client-protocol/blob/f0a04b2172614ca37f2fecf2a2d877a063b37e5f/schema/v1/schema.json#L4339-L4382">会话合同</a>区分 <code>session/load</code> 的历史重放与 <code>session/resume</code> 的无历史续接，两者分别受能力声明约束。仅有 session id 不保证编辑器能恢复旧消息。</p>
 
-            <h3>7.2 历史上还有 Agent Communication Protocol</h3>
+            <h3>7.2 在时间线上展示压缩与提示</h3>
+            <p>编辑器运行很久后，用户需要知道上下文何时压缩、留下了哪些摘要。ACP v1 的 <a href="https://github.com/agentclientprotocol/agent-client-protocol/blob/6a2ca3272f4eeb109112e2dfd04056e75884fce3/schema/v1/CHANGELOG.md#L23-L34">schema 1.25.0</a> 已将压缩事件和提示通知纳入稳定定义；Agent 发送前，客户端要在 <code>initialize</code> 声明 <code>clientCapabilities.session.compaction: {}</code> 或 <code>session.notices: {}</code>。能力缺省或为 null 时，Agent 使用普通消息等受支持的方式说明情况。见<a href="https://github.com/agentclientprotocol/agent-client-protocol/blob/6a2ca3272f4eeb109112e2dfd04056e75884fce3/docs/protocol/v1/initialization.mdx#L184-L214">能力协商</a>。</p>
+            <p>一次压缩用同一个 <code>compactionId</code> 贯穿开始、摘要增量与结束。首次事件确定时间线位置，后续更新原地修改；下面只展示 <code>session/update</code> 内部的 <code>update</code> 对象：</p>
+            <pre><code class="language-json">[
+  {"sessionUpdate":"compaction_update","compactionId":"cmp-7","status":"in_progress"},
+  {"sessionUpdate":"compaction_summary_chunk","compactionId":"cmp-7","content":{"type":"text","text":"保留续约条件与测试结果。"}},
+  {"sessionUpdate":"compaction_update","compactionId":"cmp-7","status":"completed"}
+]</code></pre>
+            <p>最后一条省略 <code>summary</code>，会保留已收到的摘要；传入数组则替换，null 或空数组会清空。重放也遵循这些规则，Agent 需要用替换或清空避免重复追加。编辑器可自行折叠旧对话；摘要字段只承载可向用户展示的内容，隐藏上下文由 Agent 保密。见<a href="https://github.com/agentclientprotocol/agent-client-protocol/blob/6a2ca3272f4eeb109112e2dfd04056e75884fce3/docs/protocol/v1/prompt-turn.mdx#L275-L424">压缩生命周期与补丁规则</a>。</p>
+            <p><code>notice</code> 适合显示“MCP 服务暂不可用”这样的即时提示，由客户端决定显示和消失时机，通常不进入历史重放。它没有确认回执，severity 为 error 也只影响展示。需要用户批准的操作继续走权限请求，需要完成的工作继续依赖执行状态；这些状态转换应独立于提示是否被用户看到。见<a href="https://github.com/agentclientprotocol/agent-client-protocol/blob/6a2ca3272f4eeb109112e2dfd04056e75884fce3/docs/protocol/v1/prompt-turn.mdx#L215-L273">通知合同</a>。</p>
+
+            <h3>7.3 历史上还有 Agent Communication Protocol</h3>
             <p>
               搜索 ACP 时还会找到 BeeAI 的 <a href="https://github.com/i-am-bee/acp/blob/e5265ca9fa06c55cd011b1e81ee927f6d80af8f6/README.md">Agent Communication Protocol</a>。
               它解决的是 agent、应用和人之间的远程通信，与前面的 A2A 更接近，不是编辑器协议。
