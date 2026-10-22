@@ -1,44 +1,47 @@
 <!doctype html><html lang="zh-CN"><head>
-  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>DeepSeek Harness 源码笔记（五）：压缩不是删历史</title>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>DeepSeek Harness 源码笔记（五）：压缩与请求重建</title>
   <meta name="description" content="从 token pressure、文本裁剪、图片卸载、summary replacement 与 system/message 重建，读懂 DeepSeek Harness 怎样压缩模型表面而不删除事件事实。" />
-  <meta property="og:title" content="DeepSeek Harness 源码笔记（五）：压缩不是删历史" /><meta property="og:type" content="article" /><meta property="og:image" content="../assets/compaction-control-loop.png" />
+  <meta property="og:title" content="DeepSeek Harness 源码笔记（五）：压缩与请求重建" /><meta property="og:type" content="article" /><meta property="og:image" content="../assets/compaction-control-loop.png" />
   <link rel="canonical" href="https://rememorio.github.io/blog/deepseek-harness/zh/compaction-reconstruction/" /><link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/deepseek-harness/zh/compaction-reconstruction/" /><link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/deepseek-harness/en/compaction-reconstruction/" /><link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/deepseek-harness/" />
   <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" /><link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" /><link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
 </head><body id="top"><header class="site-header"><a class="brand" href="../../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a><nav class="local-nav"><a href="../">DSH 系列</a><a href="../governed-effects/">上一篇</a><a href="../multi-agent-runtime/">下一篇</a><a href="#sources">参考源码</a></nav><nav class="site-actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch"><a class="active" href="./">中文</a><a href="../../en/compaction-reconstruction/">English</a></span></nav></header>
 <div class="article-shell"><aside class="toc-panel" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc" class="toc-nav"></nav></aside><main class="article-main"><article class="article-card">
-<section class="article-hero"><p class="eyebrow">DeepSeek Harness 源码笔记 · 第五篇</p><h1>压缩不是删历史：重写模型表面，还原请求前缀</h1>
-  <p class="lead">DSH 的 compaction 不编辑旧事件。它先测量当前实际请求，在必要时无模型裁剪超大 tool result，再把最老的平衡 surface 区间替换成有来源的 checkpoint；模型少看一段，事件日志却仍能解释这段改变从哪里来。</p>
-  <div class="meta-line"><span>系列 5 / 7</span><span>源码核实：2026-09-20</span><span>主题：压缩与重建</span><span>核心：Measure → Prune → Replace → Reconstruct</span></div>
+<section class="article-hero"><p class="eyebrow">DeepSeek Harness 源码笔记 · 第五篇</p><h1>压缩与请求重建：保留日志，缩短模型输入</h1>
+  <p class="lead">DSH 保留原始事件，先计量当前实际请求、预留输出和压缩余量，再按需裁剪超大工具结果，把最老的平衡消息区间替换成有来源的摘要。后续请求继续从事件、当前消息视图和工具历史重建。</p>
+  <div class="meta-line"><span>系列 5 / 7</span><span>源码核实：2026-10-22</span><span>主题：压缩与重建</span><span>核心：Measure → Prune → Replace → Reconstruct</span></div>
   <nav class="series-strip"><a href="../runtime-route/"><strong>01</strong> 运行主线</a><a href="../cordis-composition/"><strong>02</strong> Cordis</a><a href="../event-sourced-session/"><strong>03</strong> 事件会话</a><a href="../governed-effects/"><strong>04</strong> 副作用</a><span class="series-current"><strong>05</strong> 压缩</span><a href="../multi-agent-runtime/"><strong>06</strong> 多 Agent</a><a href="../self-referential-runtime/"><strong>07</strong> 持久插件</a><a href="../"><strong>路线图</strong></a></nav>
   <figure class="hero-image"><img src="../assets/compaction-control-loop.png" alt="自动 pressure 压缩：压力达到阈值后运行可选文本裁剪，再计量；足够安全则直接继续，否则摘要替换旧平衡区间；system head 与最近尾部保留，原始事件不删除" /></figure>
 </section><section class="article-body">
-  <p>“上下文太长就总结一下”隐藏了四个不同问题：按什么请求算 token；哪一段可以切而不拆开 tool call/result；摘要是追加还是替换；恢复时 system、tools、provider config 和 session prefix 从哪里回来。只回答第一个，得到的只是一个偶尔能跑的 prompt trick。</p>
+  <p>压缩需要为具体请求计价，选择 tool call/result 平衡的区间，提交摘要替换，再在恢复时重建 system、tools、provider config 和 session prefix。</p>
   <p>DSH 把它建成一条可审计的状态转换。<code>ctx.tokenMeter</code> 为真实 request envelope 和 current surface 定价；pruner 可先处理纯体积问题；compaction backend 在日志里建立 bracket；一次摘要替换只提交一条带 provenance 的 <code>user/message</code> replacement。</p>
-  <div class="note"><p><strong>阅读契约。</strong>读完以后，你应该能解释：0.8 和 0.16 分别控制什么；为什么低于 pressure 时不能顺手 prune；为什么区间按 surface position 而不是 numeric seq；summary request 怎样复用旧 KV cache、未来 request 又从哪里失效；以及 raw log、current surface、request/header 各自负责哪一部分重建。</p></div>
-  <p><strong>证据边界。</strong>本文固定在提交 <a href="https://github.com/deepseek-ai/deepseek-harness/commit/ddefc45fbc7f8e46dd73185e68295696d1297887"><code>ddefc45</code></a>。默认值属于 <code>compaction-basic</code>，不是 compaction seam 的永久协议；不同 provider 的 capacity、usage 与 KV-cache 计费仍由 adapter 报告。源码保证 replacement 和事件关系，不保证模型摘要一定保留所有业务语义。</p>
+  <div class="note"><p><strong>阅读契约。</strong>读完以后，你应该能解释：0.8 和 0.16 分别控制什么；为什么低于 pressure 时不能顺手 prune；surface position 怎样决定区间成员；summary request 怎样复用旧 KV cache、未来 request 又从哪里失效；以及 raw log、current surface、request/header 各自负责哪一部分重建。</p></div>
+  <p><strong>源码范围。</strong>本文依据提交 <a href="https://github.com/deepseek-ai/deepseek-harness/commit/687f282e8625c6b8d11ff58211a90524be2e4317"><code>687f282</code></a> 的 compaction-basic、图片卸载与 Session 请求重建。预算来自实际 route 的容量和输出上限；缓存命中与计费取决于 provider 的声明和返回值。</p>
 
   <h2>一、先为完整请求定价，再决定是否压缩</h2>
-  <h3>1.1 Pressure 不是 messages.length</h3>
-  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/compaction/compaction-basic/README.md#L101-L131"><code>BasicCompactionEngine</code></a> 读取最近一次 canonical logged envelope 和同一 log revision 的 current surface。计量因此覆盖 system prompt、tool schemas、routing、assistant completion、tool results，以及已进入日志的 context 与 steering，而不是只数对话字符串。</p>
-  <p>容量来自最近 durable provider/model route 的 adapter。默认在窗口的 <code>thresholdRatio: 0.8</code> 处触发，并按窗口的 <code>retainRatio: 0.16</code> 为最近历史保留 token 预算；不是保留 16% 的消息条数。每个精确 provider/model 可覆盖策略。adapter 不提供 capacity 时，显式 pressure 检查抛配置错误，自动 pre-step listener 则按目标警告一次并继续完整历史；provider 确认的 canonical overflow 仍能尝试缩减。图片节点计价会采用该 route 声明的图片价格，replacement 的日志 shadow price 仍使用固定启发式，两者职责不同。</p>
+  <h3>1.1 按窗口、输出与余量计算触发预算</h3>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction-basic/README.md#L112-L129"><code>BasicCompactionEngine</code></a> 读取最近一次 canonical logged envelope 和同一 log revision 的 current surface。计量因此覆盖 system prompt、tool schemas、routing、assistant completion、tool results，以及已进入日志的 context 与 steering。</p>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction-basic/src/config.ts#L143-L208">预算解析</a>读取 adapter 声明的窗口 <code>W</code>，从最近 request/header 的有效 <code>maxTokens</code> 取得输出预留 <code>O</code>；缺省时用 adapter 默认值，再缺省为 0。额外余量 <code>B = headroomTokens</code> 默认 65,536。触发值为 <code>floor(min(W × thresholdRatio, W − O − B))</code>，默认 thresholdRatio 为 0.8；近期历史预算为 <code>floor((W − O) × retainRatio)</code>，默认 retainRatio 为 0.16；显式 <code>retainTokens</code> 会覆盖这个比例计算。每个精确 provider/model 可以覆盖策略。</p>
+  <table><thead><tr><th>形状级预算示例</th><th>值</th></tr></thead><tbody><tr><td>窗口 W / 输出预留 O / 余量 B</td><td>1,000,000 / 256,000 / 65,536</td></tr><tr><td>压力触发值</td><td>min(800,000, 678,464) = 678,464</td></tr><tr><td>保留近期历史</td><td>floor(744,000 × 0.16) = 119,040</td></tr></tbody></table>
+  <p>这组数字对应<a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction-basic/tests/compaction-basic.spec.ts#L430-L455">预算测试</a>。摘要调用自身的 <code>maxTokens</code> 默认跟随解析后的 headroom；显式按模型上限优先于显式全局上限。小窗口部署须下调余量，设为 0 时还须提供正数摘要上限。容量缺失、输出加余量耗尽窗口，或保留预算不小于触发值都会让手动 pressure 检查抛错；自动 listener 按目标警告一次并跳过主动压缩，provider 确认的 overflow 恢复仍可尝试。</p>
 
   <h3>1.2 只选择完整、平衡、可替换的 surface units</h3>
-  <p>Range selection 从最老的非 system-head 节点开始，把 recent tail 留在右侧，并用 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/compaction/compaction/README.md#tool-pairing-boundaries">tool-pairing boundary helpers</a> 防止 unanswered call 穿过切口。surface 第 0 项若是 <code>system/message</code>，永不进入压缩范围；之后追加的 system 更新则属于可压缩历史。turn boundary 不会保护一次 runaway turn 里的旧 step；相反，一个仍开放、不可分割的尾部会让 compaction 暂时 decline，等它闭合。</p>
-  <p>区间是 surface-position span，不是 seq 数字范围。旧范围被 replacement 后，新事件虽然拥有更高 seq，却占回被遮蔽区间的位置；再次压缩必须按当前位置读取，不能用 <code>start &lt;= seq &lt;= end</code> 猜成员。</p>
+  <p>Range selection 从最老的非 system-head 节点开始，把 recent tail 留在右侧，并用 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction/README.md#tool-pairing-boundaries">tool-pairing boundary helpers</a> 防止 unanswered call 穿过切口。surface 第 0 项若是 <code>system/message</code>，永不进入压缩范围；之后追加的 system 更新则属于可压缩历史。turn boundary 不会保护一次 runaway turn 里的旧 step；相反，一个仍开放、不可分割的尾部会让 compaction 暂时 decline，等它闭合。</p>
+  <p>区间按 surface position 选择成员。旧范围被 replacement 后，新事件虽然拥有更高 seq，却占回被遮蔽区间的位置；再次压缩必须按当前位置读取，不能用 <code>start &lt;= seq &lt;= end</code> 猜成员。</p>
 
   <h2>二、先做无模型裁剪，再付摘要调用成本</h2>
   <h3>2.1 tool-result pruner 只改模型表面</h3>
   <figure class="hero-image"><img src="../assets/tool-result-pruning.png" alt="Tool result pruning：完整 tool result 经过 ctx.toolResultPruner 后，current surface 只保留 head、固定 omission marker 和 tail，并用 surfaceOp replace 与 sourceEventSeqs 引用 originalSeq；append-only log 仍保存完整原事件" /></figure>
-  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/compaction/compaction-tool-result-pruner/README.md#L42-L82"><code>ctx.toolResultPruner</code></a> 默认只在 text blocks 合计超过 8192 个 Unicode code points 时动作，保留前 4096、固定 marker 和后 1024。非文本 block 保持相对顺序；切片不会拆 UTF-16 surrogate pair，但可能拆 grapheme cluster。</p>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction-tool-result-pruner/README.md#L42-L82"><code>ctx.toolResultPruner</code></a> 默认只在 text blocks 合计超过 8192 个 Unicode code points 时动作，保留前 4096、固定 marker 和后 1024。非文本 block 保持相对顺序；切片不会拆 UTF-16 surrogate pair，但可能拆 grapheme cluster。</p>
   <p>新 <code>tool/result</code> 复制原 data，仅改 content，并用 <code>surfaceOp: replace</code> 遮蔽原节点；<code>sourceEventSeqs: [originalSeq]</code> 引用被替换结果。裁剪输入来自原节点的当前消息投影，因此已经记录的图片卸载标记也保留在替换内容中。每次 replacement 之前还紧邻追加 <code>compaction/prune</code>，记录被遮蔽节点与启发式 token 价格，供计量投影扣除旧价格。原事件仍在 append-only log；新文本严格变小且不再超过阈值，所以重复扫描不会继续裁剪同一文本。</p>
 
-  <h3>2.2 Prune 是 pressure-qualified pass，不是后台清洁工</h3>
+  <h3>2.2 达到压力条件后才调用 pruner</h3>
   <p>低于 pressure 的 step check 不 prune。只有 pressure 或 canonical overflow 已经成立，basic backend 才调用可选 pruner，随后重新用 token meter 测量；若已经安全，就跳过摘要调用。这个顺序把便宜、确定的 syntactic shrink 放在模型调用前，又避免仅因“工具输出看起来大”就破坏仍可复用的 KV prefix。</p>
-  <p>character budget 也不是 token budget。若 pruned tool unit 仍因非文本内容或不可裁部分超窗，或者 system/tools envelope 本身过大，surface compaction 无法修复。</p>
+  <p>裁剪限制按 Unicode code point 计算，压缩压力按 token 计量。图片节点使用路由声明的图片价格，日志中的 shadow price 继续使用固定启发式；prune 事件记录旧节点的启发式价格，随后仍要重新计量完整请求。若 pruned tool unit 仍因非文本内容或不可裁部分超窗，或者 system/tools envelope 本身过大，surface compaction 无法修复。</p>
 
   <h3>2.3 图片预算溢出由独立的 offload 事件处理</h3>
   <figure class="hero-image"><img src="../assets/image-offload-recovery.png" alt="图片卸载：adapter 报告 IMAGE_OFFLOAD_REQUIRED 后，记录 image/offload 选择旧输入图片，后续请求用附件文字与只读路径替代这些图片，再尝试请求；原消息节点与日志仍保留" /></figure>
-  <p>一条工具结果可能只有几百字，却含有多张高成本图片；文本 pruner 无法处理这种压力。<a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/compaction/compaction-image-offload/src/index.ts#L25-L41">image-offload 插件</a> 只响应带 <code>offloadImages</code> 数量的 <code>IMAGE_OFFLOAD_REQUIRED</code>。它按失败请求的消息顺序选最老的 user/tool 输入图片，跳过 assistant 输出与已卸载图片，把消息 seq 和深度优先图片索引记为 <code>image/offload</code>。</p>
+  <p>一条工具结果可能只有几百字，却含有多张高成本图片；文本 pruner 无法处理这种压力。<a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction-image-offload/src/index.ts#L25-L41">image-offload 插件</a> 只响应带 <code>offloadImages</code> 数量的 <code>IMAGE_OFFLOAD_REQUIRED</code>。它按失败请求的消息顺序选最老的 user/tool 输入图片，跳过 assistant 输出与已卸载图片，把消息 seq 和当前 content 数组中的图片出现索引记为 <code>image/offload</code>。</p>
+  <p>当前工具结果使用一等 <code>role: 'tool'</code> 消息，content 直接容纳文本和图片；pruner 与 offload 都读取该消息的当前投影。agent 请求已经取消时，offload listener 直接交给后续处理，不再追加卸载决定或发起重试。</p>
   <pre><code class="language-typescript">// 形状级示例：选择当前消息节点 42 的第一张图片
 { type: 'image/offload', data: { targets: [{ seq: 42, imageIndexes: [0] }] } }
 // 后续模型请求：该图片变成附件名称和可用只读路径的文字占位
@@ -52,49 +55,50 @@
     <li><code>compaction/start</code> 同步追加，获取 log-recorded lock。</li>
     <li>backend 生成 summary，并重新验证选择的 span 没漂移。</li>
     <li><code>compaction/summary</code> 记录原始 summary、range、shadowed seqs、token 计量、摘要调用目标及 usage；它是 log-only。</li>
-    <li>一条 <code>user/message</code> 携带 checkpoint 内容、<code>compactCheckpointSource(compactionId)</code> 与 <code>surfaceOp: replace</code>；其 <code>sourceEventSeqs</code> 依次引用 start、summary 和全部 shadowed seq，这是摘要提交唯一的 surface replacement。</li>
+    <li>一条 <code>user/message</code> 携带 checkpoint 内容、<code>compactCheckpointSource(compactionId)</code> 与 <code>surfaceOp: replace</code>；source 的 kind 为 <code>compact-checkpoint</code>，其 <code>sourceEventSeqs</code> 依次引用 start、summary 和全部 shadowed seq，这是摘要提交唯一的 surface replacement。</li>
     <li><code>compaction/end</code> 最后释放 lock。</li>
   </ol>
-  <p>因此模型下一次保留 system head，并看见一个 <code>&lt;compacted-summary&gt;</code> checkpoint 和 recent tail；人类 transcript 与精确审计仍能读旧 append-origin 事件。summary 不会作为第二份 history 追加，<code>compaction/*</code> 也从不进入 model surface。</p>
+  <p>因此模型下一次保留 system head，并看见一个 <code>&lt;compacted-summary&gt;</code> checkpoint 和 recent tail；人类 transcript 与精确审计仍能读旧 append-origin 事件。checkpoint 替换该区间，<code>compaction/*</code> 保持 log-only。</p>
 
   <h3>3.2 Convergence 和 changed-span 都必须显式失败</h3>
   <p>Basic backend 拒绝不比 source 更小的 summary；已成功缩减但压力仍高时，才按 <code>compactionRetries</code> 继续压缩 checkpoint，耗尽后抛错。自动 pre-step listener 捕获操作错误并警告、继续 turn；canonical overflow 恢复则只有 replacement generation 前进才允许重试，即使先完成 pruning、后面的摘要失败也可满足这一条件。没有任何缩减进展时，原 provider 错误保持有效。</p>
-  <p>摘要请求失败时还有同步 <code>compaction/summary-error</code> waterfall。图片卸载插件只选择这次摘要区间内的图片；一旦记录选择，backend 重新派生消息与计价，再在同一个 bracket 内调用摘要。若之后失败或取消，已经记录的图片卸载仍有效。因此“没有提交摘要 replacement”不等于“模型可见输入完全没变”。待替换区间的其他变化会拒绝过期摘要；关闭 bracket 失败仍会留下阻塞当前 lifecycle 的 orphan start。</p>
+  <p>摘要请求失败时还有同步 <code>compaction/summary-error</code> waterfall。图片卸载插件只选择这次摘要区间内的图片；一旦记录选择，backend 重新派生消息与计价，再在同一个 bracket 内调用摘要。若之后失败或取消，已经记录的图片卸载仍有效。这些已持久化的卸载选择会改变后续模型输入。待替换区间的其他变化会拒绝过期摘要；关闭 bracket 失败仍会留下阻塞当前 lifecycle 的 orphan start。</p>
 
   <h2>四、摘要调用和未来请求有相反的 cache 方向</h2>
-  <h3>4.1 Summarizer replay 旧前缀，只有尾部 instruction 是新的</h3>
+  <h3>4.1 摘要调用重放已记录的历史</h3>
   <figure class="hero-image"><img src="../assets/compaction-kv-cache.png" alt="KV 缓存的两种影响：摘要请求重放相同前缀，让 provider 有机会复用缓存，再追加新指令；后续会话请求在首次替换位置之前仍可复用旧前缀，此后摘要与近期尾部需重新计算；实际命中取决于 provider 合同" /></figure>
-  <p>默认 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/compaction/compaction-basic/src/summarizer.ts#L119-L175">summarizer</a> 直接调用一次 <code>ctx.llm.stream()</code>：先从 surface 第 0 项派生 system 消息，再接被遮蔽区间的消息，tools 则取自最新 request/header，最后追加固定 compaction instruction。system head 不进入摘要替换范围，空 head 不产生 wire message。保持同 route 和相同前缀让 provider 有机会复用 warm cache；这仍取决于 provider 的缓存合同，不能从本地 replay 推导必然命中。换 route、非 head 区间或图片 offload 都可能减少这份优势。</p>
-  <p>调用设置 <code>purpose: 'compaction'</code>，但不改变 model-visible body。只有返回的 text 进入 checkpoint；reasoning 与 tool calls 不进入，image output 以 <code>UNSUPPORTED_CONTENT</code> 失败，避免生成孤儿调用或静默丢内容。</p>
+  <p>默认 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction-basic/src/summarizer.ts#L120-L177">summarizer</a>直接调用 <code>ctx.llm.stream()</code>：先派生 surface 第 0 项 system 消息，再接被遮蔽区间，传入 header 的 active tools 和 <code>Session.toolHistory()</code>，最后追加摘要指令；空 system head 不产生消息，但仍留在压缩范围之外。指令是无 durable id/source 的冻结 <code>RequestUserInput</code>；重放历史与最终 checkpoint 保持 durable 消息身份。派发前，LLM 层按 route 投影工具定义和 developer 更新；同 route、相同投影前缀才有复用缓存的机会。</p>
+  <p><a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/llm/llm/README.md#L181">工具更新投影</a>会按模型能力选择内容：<code>in-history</code> 保留移除过的定义和更新；<code>addition-only</code> 去掉移除定义与移除消息；不支持更新的 route 使用当前 active tools。缺少 toolHistory，或请求区间没有包含对应更新时，也回到当前定义。换摘要 route、选择非头部区间或卸载图片都可能改变可复用前缀。</p>
+  <p>调用设置 <code>purpose: 'compaction'</code>，但不改变 model-visible body。只有返回的 text 进入 checkpoint；reasoning 与 tool calls 不进入，image output 以 <code>UNSUPPORTED_CONTENT</code> 失败。</p>
 
   <h3>4.2 Replacement 让未来请求从第一个变化 token 起失效</h3>
-  <p>未来 conversation request 的 system、tools 和 replacement 前未改变的 history 仍可复用；从第一个被遮蔽的 token 起，旧 cache 不再匹配，checkpoint 与 recent tail 需要重新计算。append-only log 没变不等于 request bytes 没变：KV cache 服从模型输入表面，不服从审计存储。</p>
+  <p>未来 conversation request 的 system、tools 和 replacement 前未改变的 history 仍可复用；从第一个被遮蔽的 token 起，旧 cache 不再匹配，checkpoint 与 recent tail 需要重新计算。KV cache 根据请求字节匹配；保留的原始日志继续服务审计。</p>
 
-  <h2>五、System 消息与 request header 分工重建请求</h2>
-  <h3>5.1 System 已经属于派生消息序列</h3>
-  <figure class="hero-image"><img src="../assets/compaction-request-reconstruction.png" alt="请求重建：current surface 的 system、user、assistant、tool 由 deriveMessages 产生 messages；request/header 经 foldRequestHeader 恢复 config、tools 与 adapterDefaults，再组合请求" /></figure>
-  <p><code>deriveMessages()</code> 现在同时派生 system、user、assistant 与 tool 消息。system prompt 来自 <code>system/message</code>，通常以 surface 第 0 项作为稳定 head；支持 in-history 更新的 route 还可在后续位置看到 system 更新。<a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/src/request-header.ts#L15-L28"><code>request/header</code></a> 只保存 config、adapterDefaults 与 tools，不能再从 <code>header.system</code> 取 system。</p>
-  <p><code>foldRequestHeader()</code> 仍选择日志前缀中的最后一个完整 snapshot，空 tools 规范化为 absent，schemas 按顺序比较。除 <code>initial</code>、<code>resume</code>、<code>change</code> 外，reason 还有 <code>series</code>：即使 config/tools 没变，surface replacement 或显式新消息系列也要记录边界；header 同时变化时由 <code>startsSeries</code> 保留该事实。重建输入须组合派生 messages 与 header，并恢复已注册的消息投影（例如 image/offload），不能只拼回旧文本。</p>
+  <h2>五、从消息、请求头和工具历史重建请求</h2>
+  <h3>5.1 重建消息、配置与工具历史</h3>
+  <figure class="hero-image"><img src="../assets/compaction-request-reconstruction.png" alt="请求重建：同一会话日志经 deriveMessages 产生 system、developer、user、assistant、tool 消息，foldRequestHeader 恢复配置和当前工具，toolHistory 恢复工具历史；三者经路由投影组成 LLM 请求" /></figure>
+  <p><code>deriveMessages()</code> 从 system、developer、user、assistant 和 tool 消息生成当前序列。system prompt 来自 <code>system/message</code>；surface 第 0 项保持稳定头部，后续 system 更新可进入历史。<a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/core/session/src/request-header.ts#L15-L28"><code>request/header</code></a>保存 config、adapterDefaults 和 active tools。工具增减由 <code>developer/message</code> 记录：addition 通过 <code>headerSeq</code> 指向当时的完整定义，removal 记录工具名。</p>
+  <p><code>foldRequestHeader()</code> 选择日志前缀中的最后一个 canonical snapshot。Session 拒绝空的 optional tools 数组和 adapterDefaults 对象；工具 schema 按顺序比较。reason 支持 initial、resume、change 和 series；surface replacement 或显式新消息系列会记录边界，同时发生 header 变化时带 <code>startsSeries</code>。<a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/core/session/src/tool-history.ts#L24-L73"><code>toolHistory()</code></a>增量折叠历史 header 与 developer 消息，按历史 headerSeq 还原添加时的定义。重建请求因此要组合消息投影、有效 header 和工具历史，再由目标 route 完成投影。恢复时还要注册 image/offload 等已使用的消息投影定义，Session 才能还原对应内容。</p>
 
   <h3>5.2 end-seed 区分 live lock 和旧 crash evidence</h3>
-  <p>最新 unmatched <code>compaction/start</code> 若位于最近 <code>session/end-seed</code> 之后，就是当前 lifecycle 的 live lock，返回 <code>busy</code>；若在 boundary 之前，只是上一进程留下的 stale evidence，不阻塞新 compaction。锁存在日志里而不是 WeakSet，恢复才有证据做这个判断。</p>
+  <p>最新 unmatched <code>compaction/start</code> 若位于最近 <code>session/end-seed</code> 之后，就是当前 lifecycle 的 live lock，返回 <code>busy</code>；若在 boundary 之前，只是上一进程留下的 stale evidence，不阻塞新 compaction。恢复端根据日志中的锁与生命周期边界完成判断。</p>
 
   <h2>六、这套压缩协议带来的工程判断</h2>
   <ol>
-    <li><strong>不要把 compaction 实现成 delete。</strong>遮蔽模型表面即可；审计、恢复和人类历史需要旧事实。</li>
+    <li><strong>保留原始事件。</strong>摘要替换模型可见区间，审计、恢复和人类历史继续读取原始记录。</li>
     <li><strong>先量 envelope，再量 history。</strong>system prompt 或 schemas 已经吃满窗口时，摘要再多轮也救不了。</li>
     <li><strong>优先确定性 pruning。</strong>它可能免掉一次模型调用；自动 pressure 路径必须先确认压力，再裁剪并重新计量。</li>
-    <li><strong>Replacement 必须有 provenance。</strong>checkpoint 没有 compactionId 与 sourceEventSeqs，就无法证明自己替代了什么。</li>
-    <li><strong>缓存判断以 request bytes 为准。</strong>日志 append-only 不意味着模型 cache 永不失效。</li>
-    <li><strong>摘要是有损的。</strong>事件关系可验证，不代表 summary 语义完备；关键路径仍应依赖结构化状态和外部事实。图片 offload 也是持久化的有损选择，不能把路由变大当成自动恢复。</li>
+    <li><strong>Replacement 必须记录来源。</strong>checkpoint 没有 compactionId 与 sourceEventSeqs，就无法证明自己替代了什么。</li>
+    <li><strong>缓存判断以 request bytes 为准。</strong>缓存复用依赖未改变的请求前缀。</li>
+    <li><strong>摘要是有损的。</strong>摘要可能遗漏语义细节；关键路径仍应依赖结构化状态和外部事实。图片 offload 也是持久化的有损选择，换到更大路由后仍保留卸载选择。</li>
   </ol>
-  <p>下一篇转向多个 agent：spawn、fork、workflow 与 Ralph loop 怎样共享同一个 SubagentRuntime，又怎样限制 session lineage、工具范围、并发和 delegation depth。</p>
+  <p>下一篇跟踪多个 agent 的 spawn、fork、workflow 与 Ralph loop，观察子会话目录、工具范围、并发和委派深度如何协作。</p>
 
   <h2 id="sources">参考源码</h2><ul>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/compaction/compaction-basic/README.md#L101-L131">compaction-basic README</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/compaction/compaction-basic/src/region.ts#L388-L523">区间事务</a>：pressure、retention、summary replay、transaction 与 overflow recovery。</li>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/compaction/compaction/README.md#L89-L116">compaction seam README</a>：服务边界、tool pairing、surface contract 与 durable bracket。</li>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/compaction/compaction-tool-result-pruner/README.md#L42-L82">tool-result-pruner README</a>：code-point budget、content-only replacement 与限制。</li>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/src/request-header.ts#L15-L69">request-header.ts</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/core/session/README.md#L42-L90">Session README</a>：envelope 重建、surface replacement 与 KV-cache 语义。</li>
-    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/compaction/compaction-image-offload/src/index.ts#L25-L41">image-offload recovery</a> / <a href="https://github.com/deepseek-ai/deepseek-harness/blob/ddefc45fbc7f8e46dd73185e68295696d1297887/packages/compaction/compaction-image-offload/src/image-offload.ts#L18-L48">offloadOldestImages</a>: 图片选择、持久化投影与两条重试入口。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction-basic/README.md#L112-L129">compaction-basic README</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction-basic/src/region.ts#L387-L522">区间事务</a>：pressure、retention、summary replay、transaction 与 overflow recovery。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction/README.md#L89-L116">compaction seam README</a>：服务边界、tool pairing、surface contract 与 durable bracket。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction-tool-result-pruner/README.md#L42-L82">tool-result-pruner README</a>：code-point budget、content-only replacement 与限制。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/core/session/src/request-header.ts#L15-L69">request-header.ts</a> 与 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/core/session/README.md#L42-L56">Session README</a>：envelope 重建、surface replacement 与 KV-cache 语义。</li>
+    <li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction-image-offload/src/index.ts#L25-L41">image-offload recovery</a> / <a href="https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/compaction/compaction-image-offload/src/image-offload.ts#L16-L45">offloadOldestImages</a>: 图片选择、持久化投影与两条重试入口。</li>
   </ul>
 </section></article></main></div><script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script><script defer src="../../../assets/code-highlight.js?v=1"></script><script defer src="../../../openclaw/article.js?v=1"></script></body></html>
