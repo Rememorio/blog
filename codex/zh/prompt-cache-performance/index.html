@@ -181,20 +181,12 @@
               </table>
             </div>
 
-            <p>
-              因此，Codex 的性能文章不能只看网络请求耗时。它要先看模型视图怎么构造。
-              <code>Prompt</code> 结构就把这件事拆开了：conversation <code>input</code>、可用 <code>tools</code>、
-              <code>parallel_tool_calls</code>、<code>base_instructions</code>、output schema。
-              到 <code>ModelClient::build_responses_request</code> 时，它们会变成 Responses API 的请求字段：
-              <code>instructions</code>、<code>input</code>、<code>tools</code>、<code>reasoning</code>、<code>text</code>
-              和 <code>prompt_cache_key</code>。
-            </p>
+            <p>Prompt 保存 input、tools、parallel_tool_calls、base_instructions 和 output schema。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/client.rs#L979-L1125">build_responses_request</a>将它们转成 Responses payload：基础指令进入 input 前缀，tools 的位置由 Responses 分支决定，reasoning、text 和 prompt_cache_key 保存控制信息。</p>
 
             <pre><code class="language-text">形状示意：
 Responses request
-  instructions: stable base instructions
-  tools:        model-visible tool schemas
-  input:        prior context + dynamic turn tail
+  tools:        model-visible schemas (ordinary Responses)
+  input:        base instructions + prior context + dynamic turn tail
   text:         output schema / verbosity
   prompt_cache_key: session/request-family cache key</code></pre>
 
@@ -203,24 +195,17 @@ Responses request
               <code>cached_tokens</code> 只是结果指标；稳定前缀才是 runtime 能主动维护的工程纪律。
             </p>
 
-            <h2>二、缓存 key：跟随 session 和请求族</h2>
-            <p>
-              <code>ModelClient</code> 是 session-scoped，跨 turn 保留认证、provider 和传输状态。但“作用域是 session”不代表 key 永远等于 thread id。thread 的持久身份、当前运行 session 与内部辅助会话的请求族，是三个需要分开看的值。
-            </p>
+            <h2>二、缓存 key 与 session 身份分别配置</h2>
+<p>ModelClient 跨 turn 保存认证、provider 和传输状态。调用方通过 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/thread_manager.rs#L271-L286">StartThreadOptions.prompt_cache_key</a> 选择三种策略：SessionDerived 沿用默认推导，Custom(String) 发送指定 key，Omit 省略请求体中的 prompt_cache_key。策略会传给子 agent、委派和 Guardian 审查会话；从存储冷恢复时，host 需要重新提供该策略。</p>
+<pre><code class="language-text">PromptCacheKey policy:
+  SessionDerived -> session-derived key (default)
+  Custom("project-a") -> prompt_cache_key: "project-a"
+  Omit -> no prompt_cache_key in the request body
 
-            <p>
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L549-L583"><code>ModelClient::prompt_cache_key()</code></a> 优先返回 override；对于有 parent thread id 的内部会话，返回 <code>source:parent_thread_id</code>；其余使用 <code>responses_metadata.session_id</code>。<code>build_responses_request</code> 把结果写入请求。这样相关辅助请求可以共享一个稳定的请求族 key，普通请求则跟随当前 session；不能再概括成“默认就是 thread_id”。
-            </p>
-
-            <div class="note key-point">
-              <p>
-              <code>prompt_cache_key</code> 不指定缓存截止到哪条消息，也不保证命中。还要分清公开 API 合同与 ChatGPT 请求适配：当前客户端另有 <code>responses_session_id()</code>，非根 agent 保留实际 session id，其余会使用所选 key 建立请求亲和性。这是可见的客户端 header 选择，不能据此推出所有模型都采用相同的服务端路由算法。
-            </p>
-            </div>
-
-            <p>
-              Guardian 审查会话等调用方可以在 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L549-L559"><code>with_session_options</code></a> 中传入 key override。它表达哪些请求应被放进同一请求族；新用户消息本身无需每次制造新 key。缓存是否复用仍应由 usage 观测。
-            </p>
+session-id and thread identity headers:
+  remain governed by session identity</code></pre>
+<p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/client.rs#L657-L688">默认推导</a>先使用 session_id_override；内部会话有 parent thread id 时使用 source:parent_thread_id；其余使用 responses_metadata.session_id。responses_session_id() 独立沿 session 身份计算 header：非 root agent 使用实际 session id，其余使用默认推导值。切换 Custom 或 Omit 不会同时改动这组身份 header。</p>
+<p>key 为相关请求提供稳定的分组值；实际复用仍由模型合同、输入前缀和服务端缓存状态决定。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/tests/suite/prompt_cache_key.rs#L1-L220">测试</a>覆盖三种策略跨 turn 的请求体与身份 header。评估效果时应读取 usage，单看 key 相同无法计算命中量。</p>
 
             <h2>三、稳定前缀：instructions、tools、context base</h2>
             <p>
@@ -229,9 +214,7 @@ Responses request
             </p>
 
             <h3>3.1 <code>instructions</code> 要稳定</h3>
-            <p>
-              普通 Responses 分支从 <code>prompt.base_instructions.text</code> 构造顶层 instructions。当前 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L869-L931">Responses Lite 分支</a> 则把工具放进 <code>AdditionalTools</code>、把基础指令变成 input 前缀消息，顶层 instructions 为空且不发送 tools。前缀项 id 由 thread 命名空间和可见内容稳定生成；并不是每次请求随机生成一套 id。连续请求应稳定的是实际采用的请求形状。
-            </p>
+            <p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/client.rs#L1007-L1048">请求构造器</a>将非空 base instructions 变成 input 前缀消息，普通 Responses 和 Responses Lite 都采用这一位置。普通 Responses 的 tools 保留在顶层；Lite 把工具表示为 AdditionalTools。重建的前缀项 id 由 thread 命名空间和可见内容稳定计算，重试与恢复可保持相同身份。</p>
 
             <p>
               这里的关键不是“指令永远不变”。模型、personality、collaboration mode 或配置切换时，它当然会变。
@@ -240,9 +223,7 @@ Responses request
             </p>
 
             <h3>3.2 <code>tools</code> 是前缀的一部分</h3>
-            <p>
-              工具定义会参与可复用前缀，但缓存资格应按所选模型合同判断，不能把固定 1024-token 门槛推广到所有模型。普通 Responses 使用顶层 <code>tools</code>；Responses Lite 使用 input 中的 <code>AdditionalTools</code>。两条分支都来自当前 <code>StepContext</code> 捕获的工具路由，后续请求才观察新的工具集合。
-            </p>
+            <p>工具定义会参与可复用前缀。普通 Responses 使用顶层 tools；Lite 使用 input 中的 AdditionalTools。当 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L1672-L1701">build_prompt</a>使用增量工具窗口时，基础指令和工具目录由 history 保存，Prompt 不再另加整份副本。新窗口要求 use_responses_lite 与 IncrementalTools；已有窗口沿 history 中是否存在工具声明决定，以保持恢复和续接时的目录模式。后续工具变化以目录更新进入历史；每步使用 StepContext 捕获的工具路由。缓存资格与长度门槛按所选模型合同判断。</p>
 
             <p>
               这解释了一个常见的体感问题：工具越多，单轮请求越重；但如果工具 schema 足够稳定，
@@ -261,9 +242,9 @@ Responses request
             </p>
 
             <h3>3.4 完整输入与 WebSocket 增量传输分开看</h3>
-            <p><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L1376-L1443">WebSocket continuation</a> 先比较完整逻辑请求。只有非 input 属性兼容，且前次 input 加服务端输出仍是当前 input 的前缀，才可以用上次 response id 加新增 input 继续。压缩、配置变化或前缀不匹配会让这次传输发送完整 input；这不等于服务端缓存一定全未命中。</p>
+            <p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/client.rs#L1528-L1594">WebSocket continuation</a> 先比较完整逻辑请求。只有非 input 属性兼容，且前次 input 加服务端输出仍是当前 input 的前缀，才可以用上次 response id 加新增 input 继续。压缩、配置变化或前缀不匹配会让这次传输发送完整 input；这不等于服务端缓存一定全未命中。</p>
             <pre><code class="language-text">形状示意（省略字段）：
-普通 Responses: instructions + tools + input
+普通 Responses: tools + input(基础指令 + history)
 Responses Lite: input = AdditionalTools + 基础指令消息 + history
 
 完整逻辑输入: S + 前次输出 + 新工具结果
@@ -271,7 +252,11 @@ WebSocket 可续接: previous_response_id + 新工具结果
 无法续接: 完整 input
 缓存效果: 单独观察 usage，不能从传输字节数推出</code></pre>
 
-            <h2>四、动态尾部：改变可以发生，但要晚一点发生</h2>
+            <h3>3.5 输出回放保留服务端返回的表示</h3>
+<p>默认关闭的 <code>output_token_replay</code> 在 OpenAI provider 上向 include 加入 output.encrypted_content。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/client.rs#L1046-L1077">请求构造器</a>保留已存历史中的消息、工具调用密文及相关 status、annotations、logprobs，使后续请求可以回放返回项；关闭开关后，历史里的密文仍保留。发送到其他 provider 时，请求副本会去掉这些新增输出密文，已有 reasoning/compaction 类型按各自路径处理。</p>
+<p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/tests/suite/output_token_replay.rs#L25-L157">集成测试</a>覆盖 provider 与开关组合，以及恢复后关闭 replay 的情况。它为服务端提供可回放表示；实际收益仍要看 cached input、TTFT 和总延迟。加密 Compaction/ContextCompaction 另有预算估算：考虑 replay cache 的体积后，按约 12 个密文字节估算 1 token 并向上取整；这是启发式计数。</p>
+
+<h2>四、动态尾部：改变可以发生，但要晚一点发生</h2>
             <p>
               动态信息不可避免。用户会改变 cwd、权限、model、reasoning effort；工具会返回新的 stdout/stderr；
               hooks 可能补 additional context；MCP 工具列表可能刷新；compact 可能替换 history。
@@ -337,9 +322,7 @@ WebSocket 可续接: previous_response_id + 新工具结果
               <code>history_version</code>。<code>get_context_remaining</code> 使用统一的 context-window status，报告 auto-compact scope 与有效完整窗口两种剩余额度中的较小值；它不是简单地用模型标称窗口减去累计 usage。
             </p>
 
-            <p>
-              当前 remote compact v2 在 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact_remote_v2_attempt.rs#L30-L121">独立 attempt</a> 中克隆 history、按窗口裁剪工具输出、保留历史元数据，并追加 <code>CompactionTrigger</code>。它通过相同的 ModelClientSession 流式请求通道提交；<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact_remote_v2.rs#L387-L502">结果收集</a> 必须等到 <code>response.completed</code>，并且恰好得到一个 compaction output，才可安装替换历史。请求已发出、收到输出项和替换历史已安装，是三个不同状态。
-            </p>
+            <p>前台 remote v2 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact_remote_v2_attempt.rs#L67-L215">attempt</a>克隆 history、裁剪工具输出并携带专用元数据，通过本轮 ModelClientSession 请求。默认关闭的后台压缩使用独立请求，在主 turn 继续工作时生成候选；完成后仍须校验前缀、模型和认证状态。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact_remote_v2.rs#L375-L477">收集器</a>要求 response.completed 和恰好一个 compaction output，安装后完整上下文与保留尾部共同形成后续缓存前缀。已完成但被丢弃的后台请求仍计入 usage。</p>
 
             <div class="note key-point">
               <p>
@@ -476,28 +459,28 @@ WebSocket 可续接: previous_response_id + 新工具结果
               <li><a href="https://developers.openai.com/api/docs/guides/prompt-caching">OpenAI Prompt caching guide</a></li>
               <li><a href="https://developers.openai.com/cookbook/examples/prompt_caching_201">OpenAI Prompt Caching 201</a></li>
               <li><a href="https://developers.openai.com/api/docs/guides/latest-model">OpenAI latest model guide：reasoning models 与 prompt caching 建议</a></li>
-              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">openai/codex 固定源码快照</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client_common.rs#L20-L67"><code>Prompt</code> 结构与 <code>get_formatted_input_for_request()</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L249-L283"><code>ModelClient</code> 与 turn-scoped <code>ModelClientSession</code> 注释</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L549-L583"><code>with_session_options()</code> 与 session / 内部请求族 key</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/client.rs#L869-L985"><code>build_responses_request()</code> 构造 instructions、input、tools 与 <code>prompt_cache_key</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/codex-api/src/common.rs#L259-L308"><code>ResponsesApiRequest</code> 与 websocket request 保留 <code>prompt_cache_key</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/session.rs#L1684-L1720">session 初始化 <code>ModelClient</code> 与 Guardian review override</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L177-L456"><code>run_turn</code> 构造 sampling request input 的顺序</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/history.rs#L74-L476"><code>ContextManager</code>、<code>reference_context_item</code> 与 <code>for_prompt()</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/history.rs#L718-L794">token usage 更新与本地估算</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L2305-L2340"><code>TokenUsageInfo</code> 与 <code>TokenCountEvent</code></a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tasks/mod.rs#L308-L362">turn start 记录 token usage 起点与 tracing 字段</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tasks/mod.rs#L714-L773">turn stop 计算 cached / non-cached token usage</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tasks/mod.rs#L803-L837">turn 完成事件记录 duration 与 time-to-first-token</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/handlers/get_context_remaining.rs#L81-L91"><code>get_context_remaining</code> 计算剩余 context window</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact_remote_v2_attempt.rs#L30-L121">remote compact v2 clone history、trim tool outputs、构造 prompt</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact_remote_v2_attempt.rs#L30-L121">compact attempt 与共享请求通道</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/tests/suite/prompt_caching.rs#L132-L287">测试：tools 与 instructions 在连续请求中保持稳定</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/tests/suite/prompt_caching.rs#L383-L476">测试：cached contextual prefix 跨请求复用</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/tests/suite/prompt_caching.rs#L478-L602">测试：thread settings override 保持 cached prefix 和 key</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/tests/suite/prompt_caching.rs#L751-L879">测试：per-turn overrides 保持 cached prefix 和 key</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact_remote_v2_attempt.rs#L30-L121">remote compact v2 使用共享采样通道与 <code>prompt_cache_key</code></a></li>
+              <li><a href="https://github.com/openai/codex/tree/2f3fb111be71d277c80bd5b96d9019748b921f5a">openai/codex 固定源码快照</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/client_common.rs#L21-L67"><code>Prompt</code> 结构与 <code>get_formatted_input_for_request()</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/client.rs#L257-L296"><code>ModelClient</code> 与 turn-scoped <code>ModelClientSession</code> 注释</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/client.rs#L637-L688"><code>with_session_context()</code> 与 session / 内部请求族 key</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/client.rs#L979-L1129"><code>build_responses_request()</code> 构造 instructions、input、tools 与 <code>prompt_cache_key</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/codex-api/src/common.rs#L278-L326"><code>ResponsesApiRequest</code> 与 websocket request 保留 <code>prompt_cache_key</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/session.rs#L1804-L1846">session 初始化 ModelClient 与 cache key 策略</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L194-L493"><code>run_turn</code> 构造 sampling request input 的顺序</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/context_manager/history.rs#L91-L608"><code>ContextManager</code>、<code>reference_context_item</code> 与 <code>for_prompt()</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/context_manager/history.rs#L886-L962">token usage 更新与本地估算</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/protocol.rs#L2460-L2495"><code>TokenUsageInfo</code> 与 <code>TokenCountEvent</code></a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tasks/mod.rs#L323-L383">turn start 记录 token usage 起点与 tracing 字段</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tasks/mod.rs#L750-L809">turn stop 计算 cached / non-cached token usage</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tasks/mod.rs#L839-L876">turn 完成事件记录 duration 与 time-to-first-token</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/handlers/get_context_remaining.rs#L86-L96"><code>get_context_remaining</code> 计算剩余 context window</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact_remote_v2_attempt.rs#L67-L220">remote compact v2 clone history、trim tool outputs、构造 prompt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact_remote_v2_attempt.rs#L67-L220">compact attempt 与共享请求通道</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/tests/suite/prompt_caching.rs#L132-L287">测试：tools 与 instructions 在连续请求中保持稳定</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/tests/suite/prompt_caching.rs#L377-L470">测试：cached contextual prefix 跨请求复用</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/tests/suite/prompt_caching.rs#L472-L596">测试：thread settings override 保持 cached prefix 和 key</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/tests/suite/prompt_caching.rs#L745-L873">测试：per-turn overrides 保持 cached prefix 和 key</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact_remote_v2_attempt.rs#L67-L220">remote compact v2 使用共享采样通道与 <code>prompt_cache_key</code></a></li>
             </ul>
           </section>
         </article>
