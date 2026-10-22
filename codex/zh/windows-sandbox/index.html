@@ -104,7 +104,7 @@
           </section>
 
           <section class="article-body">
-            <p><strong>阅读契约。</strong>从权限决定追到 Windows 用户、ACL、网络规则和命令进程，并区分 setup 可恢复与运行时就绪。 本文核实于 2026-09-20，依据公开源码 <a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">固定公开源码快照</a>；不推断未公开的服务实现。</p>
+            <p><strong>阅读契约。</strong>从权限决定追到 Windows 用户、ACL、网络规则和命令进程，并区分 setup 可恢复与运行时就绪。 本文核实于 2026-10-22，依据公开源码 <a href="https://github.com/openai/codex/tree/2f3fb111be71d277c80bd5b96d9019748b921f5a">固定公开源码快照</a>；不推断未公开的服务实现。</p>
 
             <p>
               如果只看产品体验，沙箱像是一个开关：允许写工作区、禁止联网、必要时请求审批。
@@ -258,8 +258,7 @@
 
             <p>
               文件这边比较容易落地：工作区可写，仓库里的敏感控制目录还能额外加拒绝写入。
-              例如 <code>workspace_acl.rs</code> 会保护 <code>.codex</code> 和 <code>.agents</code>
-              子目录，避免 sandbox 子进程把 Codex 自己的控制面写坏。
+              例如可写根下的默认拒绝写入目录包含 <code>.codex</code>、<code>.agents</code> 和 <code>.aws</code>，保护控制面与 AWS 配置；这些路径由 setup 与 ACL 准备逻辑落实。
             </p>
 
             <p>
@@ -337,9 +336,9 @@ const ONLINE_USERNAME: &amp;str = "CodexSandboxOnline";</code></pre>
             </p>
 
             <h3>4.1 setup 入口还要区分运行时与资源归属</h3>
-            <p>配置安全材料并不只有一条启动方式。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/setup.rs#L1073-L1106"><code>run_elevated_setup_with_proxy_settings</code></a> 在请求 registered Core 时，通过经过认证的 sandbox service 协调配置；这条路径要求服务成功响应，不会静默退回 legacy setup。普通 legacy 路径才调用原来的提权 helper。二者是条件分支，不是每次命令都依次执行的两次安装。</p>
+            <p>配置安全材料并不只有一条启动方式。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/setup.rs#L1085-L1118"><code>run_elevated_setup_with_proxy_settings</code></a> 在请求 registered Core 时，通过经过认证的 sandbox service 协调配置；这条路径要求服务成功响应，不会静默退回 legacy setup。普通 legacy 路径才调用原来的提权 helper。二者是条件分支，不是每次命令都依次执行的两次安装。</p>
 
-            <p>Registered runtime 还必须证明资源属于谁。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/runtime_ownership.rs#L65-L128"><code>RuntimeRegistration</code></a> 记录 package family、两个 sandbox account 的 SID 和 alias、metadata roots，以及 <code>ready_package</code>。后者只在账户注册与 metadata 授权都成功后提交；<code>can_resume_registration()</code> 只表示注册可以继续，不能当作命令已经可以执行。进入配置时还检查 user SID、安装目录与 package family，清理中的资源不能直接重新使用。</p>
+            <p>Registered runtime 还必须证明资源属于谁。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/runtime_ownership.rs#L65-L128"><code>RuntimeRegistration</code></a> 记录 package family、两个 sandbox account 的 SID 和 alias、metadata roots，以及 <code>ready_package</code>。后者只在账户注册与 metadata 授权都成功后提交；<code>can_resume_registration()</code> 只表示注册可以继续，不能当作命令已经可以执行。进入配置时还检查 user SID、安装目录与 package family，清理中的资源不能直接重新使用。</p>
 <pre><code class="language-text">运行时选择：
   Legacy     -> 提权 helper 配置
   Registered -> 已认证 service 校验所有者并协调配置
@@ -347,6 +346,8 @@ const ONLINE_USERNAME: &amp;str = "CodexSandboxOnline";</code></pre>
 注册状态：
   记录资源归属 -> 注册账户与 metadata 授权 -> ready_package
   可恢复注册 ≠ 可执行命令</code></pre>
+            <p>App-server 的 registered Core setup 入口还会<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/app-server/src/request_processors/windows_sandbox_processor.rs#L202-L228">请求启动 provisioning service</a>；服务连接为启动保留短暂等待窗口，随后仍验证服务与配置结果。服务已发起启动、注册可恢复和 <code>ready_package</code> 成立分别表示不同阶段。</p>
+
             <h2>五、command runner 以 sandbox 用户启动真正的命令</h2>
             <p>
               有了 sandbox 用户，还剩一个实际问题：Codex 主进程通常以真实用户身份运行，
@@ -368,6 +369,14 @@ const ONLINE_USERNAME: &amp;str = "CodexSandboxOnline";</code></pre>
               防火墙和 ACL 可以生效。交互方面，Codex 仍然保留对命令生命周期的观察：
               可以写 stdin、读输出、处理 resize、等待退出，也能把结果写回 protocol event 和 rollout。
             </p>
+
+            <h3>5.1 临时目录权限必须跟着子进程环境走</h3>
+            <p>开发命令常把中间文件写到临时目录。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/resolved_permissions.rs#L175-L210"><code>resolve_workload_temp_paths</code></a>从最终交给子进程的环境中读取绝对 <code>TEMP</code>/<code>TMP</code> 路径，展开权限策略中的 <code>:tmpdir</code>；缺失、空值或相对路径不会回退到 host 的临时目录。展开时保留访问模式和缺失路径规则，普通权限求值继续处理只读或拒绝子路径。</p>
+<pre><code class="language-text">子进程环境：TEMP=C:\build\tmp
+权限：:tmpdir 可写；C:\build\tmp\private 拒绝访问
+结果：临时写入根来自 C:\build\tmp；private 仍受拒绝规则约束
+若 TEMP/TMP 均不可用：不会借用 host 临时目录取得写权限</code></pre>
+            <p>Windows 环境变量名不区分大小写。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/process.rs#L68-L92">环境块构造</a>按确定顺序合并大小写重复键，权限解析也使用同一顺序，确保 <code>TEMP</code> 与 <code>Temp</code> 并存时，准备 ACL 的路径与子进程实际看到的路径一致。</p>
 
             <h2>六、放回 Codex 主线：平台沙箱保护的到底是什么</h2>
             <p>
@@ -437,16 +446,17 @@ const ONLINE_USERNAME: &amp;str = "CodexSandboxOnline";</code></pre>
 
             <h2 id="sources">参考源码</h2>
             <ul class="source-list">
-              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">openai/codex · 5c5308fc9a9e</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/setup.rs#L1069-L1138">setup / runtime selection</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/setup_provisioning/sandbox_users.rs#L70-L159">sandbox user provisioning</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/setup_provisioning/firewall.rs">firewall rules</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/runtime_ownership.rs#L15-L128">registered runtime ownership / readiness</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs">runner launch / IPC</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs">restricted command process</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/token.rs">restricted token</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/workspace_acl.rs">workspace ACL</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs">unified exec Windows backend</a></li>
+              <li><a href="https://github.com/openai/codex/tree/2f3fb111be71d277c80bd5b96d9019748b921f5a">openai/codex · 2f3fb111be71</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/setup.rs#L1081-L1150">setup / runtime selection</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/setup_provisioning/sandbox_users.rs#L70-L159">sandbox user provisioning</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/setup_provisioning/firewall.rs">firewall rules</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/runtime_ownership.rs#L15-L128">registered runtime ownership / readiness</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs">runner launch / IPC</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs">restricted command process</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/token.rs">restricted token</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/workspace_acl.rs">workspace ACL</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/permissions.rs#L2355-L2405">protected writable-root subpaths</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs">unified exec Windows backend</a></li>
             </ul>
           </section>
         </article>
