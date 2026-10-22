@@ -98,7 +98,7 @@
                 src="../assets/codex-turn-runtime-overview.png"
                 alt="Codex 一轮请求：捕获 StepContext 后构造模型请求，按需执行工具并回传结果，事件通知与 rollout 恢复记录分别保留"
               />
-            <figcaption>工具循环按需发生；事件用于客户端观察，rollout 保存消息、上下文快照和压缩等记录。图中的 StepContext 到 rollout 表示保存相关记录，并非序列化整个运行时对象。</figcaption>
+            <figcaption>工具循环按需发生；事件用于客户端观察，rollout 保存消息、上下文快照和压缩等记录。图中的 StepContext 到 rollout 表示保存相关消息与持久快照。</figcaption>
             </figure>
           </section>
 
@@ -220,19 +220,14 @@
             <p>
               Codex 可以从不同产品面进入：CLI、TUI、app-server、MCP、subagent 等。
               源码里有一个很有用的信号：
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L2820-L2830"><code>SessionSource</code></a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/protocol.rs#L2976-L2991"><code>SessionSource</code></a>
               把 <code>Cli</code>、<code>VSCode</code>、<code>Exec</code>、<code>Mcp</code>、<code>SubAgent</code>
               等来源放进同一个枚举。它提醒我们：入口会影响来源标签和交互方式，但请求离开入口后要进入共享协议层。
             </p>
 
             <h3>2.1 <code>Submission</code> 是任务单，<code>Op</code> 是任务类型</h3>
             <p>
-              进入 protocol 层后，用户输入不再只是一段文本。
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L191-L206"><code>Submission</code></a>
-              像一张任务单：有 id，有真正要做的 <code>op</code>，还可以带客户端消息 id 和 trace。
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L597-L676"><code>Op</code></a>
-              则说明任务类型：用户输入、thread settings、approval、interrupt、realtime conversation、tool refresh
-              都是不同的 operation。
+              进入运行时的输入先组织成 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/turn_input.rs#L55-L68"><code>TurnInputRequest</code></a>，其中包含用户材料、线程设置、启动选项和附加上下文。core 再用 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/submission.rs#L1-L22"><code>Submission</code></a> 包住 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/protocol.rs#L650-L748"><code>Op</code></a>，为队列交接保留 id、trace 和父子 turn 信息。用户输入对应 <code>Op::TurnInput</code>；设置更新、审批、interrupt 和 realtime 操作各有自己的类型。
             </p>
 
             <pre><code class="language-text">形状示意：
@@ -240,18 +235,22 @@
 
   Submission {
     id: "...",
-    op: Op::UserInput(...),
-    metadata: 客户端消息 / trace
+    op: Op::TurnInput { request, mode, reply },
+    trace: "..."
   }</code></pre>
 
             <p>
-              这段只是形状示意，不是源码复刻。它要表达的是：请求开始进入系统时，已经有了任务身份和类型。
-              从这里开始，源码阅读就不再追“哪一句话发给模型”，而是追“哪一种 operation 被提交给运行时”。
+              上面的形状示意省略了队列内部字段。输入还要选择 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/turn_input.rs#L186-L198"><code>TurnInputMode</code></a>：<code>StartOrSteer</code> 在空闲时开新 turn、运行时补充当前 turn；<code>StartIfIdle</code> 只在空闲时启动；<code>Steer</code> 要求指定的 turn 仍在运行。core 在同一条提交队列里判断状态，从而让输入路由与设置更新遵守调用顺序。
             </p>
 
             <h2>三、会话层：<code>SessionIo</code> 门面接住任务</h2>
             <p>
-              任务进入 core 后，通过 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L408-L416"><code>SessionIo</code></a> 的队列接口与运行时交互。这个结构持有 <code>tx_sub</code>、<code>rx_event</code>、agent status 和后台 submission loop 的结束信号。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L957-L1009"><code>submit()</code></a> 给 operation 分配 id 并入队；<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L1060-L1067"><code>next_event()</code></a> 读取运行时输出。提交成功表示队列已接受任务，完成状态要等待后续事件。
+              任务进入 core 后，通过 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L428-L436"><code>SessionIo</code></a> 的队列接口与运行时交互。这个结构持有 <code>tx_sub</code>、<code>rx_event</code>、agent status 和后台 submission loop 的结束信号。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L1057-L1109"><code>submit()</code></a> 给 operation 分配 id 并入队；<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L1182-L1189"><code>next_event()</code></a> 读取运行时输出。提交成功表示队列已接受任务，完成状态要等待后续事件。
+            </p>
+
+            <p>
+              例如任务 T1 正在运行时，新的“只改解析函数”输入采用 <code>StartOrSteer</code>，可能得到 <code>Steered(T1)</code>；若 T1 已结束，同一模式会启动 T2。需要严格补充 T1 的调用方应使用 <code>Steer { expected_turn_id: T1 }</code>，条件不满足时读取拒绝原因。
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L1111-L1142"><code>submit_turn_input()</code></a> 等待的是 core 的路由判断。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/turn_input.rs#L240-L268">接收结果</a>返回后，用户输入 hook、模型历史更新、rollout 持久化和采样仍有各自的执行时点。
             </p>
 
             <div class="note key-point">
@@ -266,7 +265,7 @@
               进入 session 之后，请求会进入 turn。这里的 turn 不要理解成聊天软件里的一问一答，
               更接近“一次可以推进、取消和记录的工作单元”：它可以整理上下文、调用模型、处理工具请求、等待审批、
               接收补充输入、被取消，也可以把中间过程发成事件。
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L149-L199"><code>run_turn</code></a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L160-L220"><code>run_turn</code></a>
               的注释把主循环说得很朴素：每次 sampling request 里，模型要么返回 function calls，要么返回 assistant message；
               如果是 function call，运行时执行工具并把 output 放进下一次 sampling；如果没有工具或其他 continuation 需要处理，运行时才进入本轮收尾。
             </p>
@@ -290,16 +289,11 @@
 
             <h2>四、turn 层：先整理材料，再问模型</h2>
             <p>
-              turn 开始后，运行时要确定本次采样能读到的材料。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn_context.rs#L303-L362"><code>TurnContext</code></a> 保存整轮身份、初始设置和控制状态；<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/step_context.rs#L17-L45"><code>StepContext</code></a> 则在每次模型请求前固定一版模型设置、环境、MCP 连接和工具路由。一次 turn 可以采样多次，后续请求可以捕获更新；正在执行的请求继续使用已经捕获的那一版，避免模型看到的工具说明与执行器不一致。
+              turn 开始后，运行时要确定本次采样能读到的材料。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn_context.rs#L323-L388"><code>TurnContext</code></a> 保存整轮身份、初始设置和控制状态；<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/step_context.rs#L22-L47"><code>StepContext</code></a> 则在每次模型请求前固定一版模型设置、环境、MCP 连接和工具路由。一次 turn 可以采样多次，后续请求可以捕获更新；正在执行的请求继续使用已经捕获的那一版，避免模型看到的工具说明与执行器不一致。
             </p>
 
             <p>
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L1557-L1575"><code>build_prompt()</code></a>
-              把整理后的 input、<code>step_context.tool_router.model_visible_specs()</code>、parallel tool call 能力、base instructions、
-              output schema 等字段合成 <code>Prompt</code>。也就是说，
-              运行时会从保存的历史和当前环境里挑选、整理出本轮发给模型的材料。
-              第二篇会专门拆 <code>ContextManager</code>、<code>for_prompt()</code> 和 compact，这里先建立入口：
-              <strong>模型看到的是运行时整理过的材料，不是 UI 上所有文本的简单拼接。</strong>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L1672-L1700"><code>build_prompt()</code></a> 将整理后的 input、输出 schema 和工具相关设置组合成 <code>Prompt</code>。通常工具说明与基础指令通过独立字段提供；当 Responses Lite 的新窗口启用 <code>IncrementalTools</code> 时，<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/step_context.rs#L49-L59">增量声明模式</a> 会把这些内容记录到历史，<code>Prompt</code> 的对应独立字段留空。已有窗口则按<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/world_state.rs#L44-L55">历史是否含工具声明</a>延续相应模式。模型通过这些声明获得当前能力及后续更新。第二篇会沿 <code>ContextManager</code>、<code>for_prompt()</code> 和压缩说明这些材料怎样保留。
             </p>
 
             <h2>五、工具层：模型提出动作，审批与 sandbox 决定执行</h2>
@@ -307,23 +301,23 @@
               现在看最容易误读的一步：模型要求 Codex 执行命令或修改文件。
               源码里要分成两层看。第一层是“能力菜单”：运行时告诉模型本轮有哪些工具可以被请求。
               这些工具 schema 来自
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L1746-L1825"><code>built_tools()</code></a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L1908-L1996"><code>built_tools()</code></a>
               和
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/router.rs#L74-L211"><code>ToolRouter</code></a>：
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/router.rs#L84-L145"><code>ToolRouter</code></a>：
               MCP tools、plugins、apps、dynamic tools 和 extension executors 会被合并成一套 request-scoped router。
               当模型真的返回 tool call 时，
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/router.rs#L300-L380">router dispatch</a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/router.rs#L359-L393">router dispatch</a>
               才把调用交给注册的工具执行器。
             </p>
 
             <p>
               第二层是“能不能执行”。这一步由
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L1-L7"><code>ToolOrchestrator</code> 文件头</a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs#L1-L7"><code>ToolOrchestrator</code> 文件头</a>
               直接把顺序写出来：approval、select sandbox、attempt、sandbox denial 后升级重试。
               在具体实现里，
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L162-L318">orchestrator</a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs#L125-L165">orchestrator</a>
               会先根据 approval policy、filesystem sandbox policy 和工具自己的 requirement 做审批判断，
-              再选择初始 sandbox，并把 workspace roots、网络策略和平台 sandbox 参数一起带到 attempt。
+              再<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs#L337-L390">选择初始 sandbox</a>，并把 workspace roots、网络策略和平台 sandbox 参数一起带到 attempt。
             </p>
 
             <div class="note key-point">
@@ -337,7 +331,7 @@
             <h2>六、输出层：事件给客户端，rollout 留下恢复线索</h2>
             <p>
               运行时推进时，会不断发事件。
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L1338-L1358"><code>Event</code> 和 <code>EventMsg</code></a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/protocol.rs#L1450-L1483"><code>Event</code> 和 <code>EventMsg</code></a>
               把输出也类型化：warning、context compacted、用于旧记录兼容的 thread rolled back、turn started、turn complete、
               agent message delta、tool call、token count、hook lifecycle 等都不是一段无结构日志。
               客户端可以把这些事件渲染成聊天气泡、进度条、diff、审批弹窗或状态文本。
@@ -356,11 +350,7 @@
             </p>
 
             <p>
-              恢复和审计还需要更耐久的记录：
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L127-L217"><code>RolloutItem</code></a>
-              会保存 session metadata、response items、compacted records、turn context、WorldState、token usage 和 event messages 等。
-              所以后面讲 resume、旧 rollback 记录的恢复和 compact 时，不能只看屏幕上还显示什么。
-              屏幕是当前视图，rollout 才是恢复时要回放的一层记录。
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L213-L231"><code>RolloutItem</code></a> 保存 session metadata、response items、压缩记录、turn context、WorldState、token usage 和事件等。以工作环境变化为例，运行时先把当前 step 的环境与指令渲染成模型可见材料，写入历史后，再保存描述这次变化的 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L3844-L3875">WorldState patch</a>。恢复时既需要能重放的历史，也需要下一次差量更新所依据的状态基线；第十篇会展开完整快照和后续补丁的配合。
             </p>
 
             <h2>七、沿这条路线继续读</h2>
@@ -467,23 +457,23 @@
 
             <h2 id="sources">参考源码与文档</h2>
             <ul class="source-list">
-              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">openai/codex 固定源码快照</a></li>
+              <li><a href="https://github.com/openai/codex/tree/2f3fb111be71d277c80bd5b96d9019748b921f5a">openai/codex 固定源码快照</a></li>
               <li><a href="https://developers.openai.com/codex">Codex 官方文档总览</a></li>
               <li><a href="https://openai.com/zh-Hans-CN/index/unrolling-the-codex-agent-loop/">OpenAI：深入解析 Codex 智能体循环</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L191-L206">Submission</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L597-L676">Op</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L1338-L1358">Event / EventMsg</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/protocol/src/protocol.rs#L2820-L2830">SessionSource</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L408-L416">SessionIo 门面</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L957-L1009">submit / submit_with_id</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L1060-L1067">next_event</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L149-L199">run_turn 主线</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn_context.rs#L305-L362">TurnContext</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L1557-L1575">build_prompt</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L1746-L1825">built_tools</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/router.rs#L74-L211">ToolRouter</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L1-L7">ToolOrchestrator 顺序</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/history/src/lib.rs#L127-L217">RolloutItem</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/submission.rs#L1-L22">Submission</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/protocol.rs#L650-L748">Op</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/protocol.rs#L1450-L1483">Event / EventMsg</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/protocol/src/protocol.rs#L2976-L2991">SessionSource</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L428-L436">SessionIo 门面</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L1057-L1109">submit / submit_with_id</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L1182-L1189">next_event</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L160-L220">run_turn 主线</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn_context.rs#L323-L388">TurnContext</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L1672-L1700">build_prompt</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L1908-L1996">built_tools</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/router.rs#L84-L145">ToolRouter</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs#L1-L7">ToolOrchestrator 顺序</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/history/src/lib.rs#L213-L231">RolloutItem</a></li>
             </ul>
           </section>
         </article>
