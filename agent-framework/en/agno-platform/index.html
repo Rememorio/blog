@@ -204,7 +204,7 @@
             <div class="note">
               <p>
                 <strong>Source scope.</strong>
-                Source links are pinned to Agno public snapshot <code>85b6d1d178b70d59e8f2c0d432d2a66b35004f31</code>.
+                Core execution, session, and interface descriptions cite <code>85b6d1d178b70d59e8f2c0d432d2a66b35004f31</code>; durable queue and successive approval pauses are verified at <code>8ac4064bca1659e2c4cc546c158adbecf67867e1</code>. Each link identifies its version.
                 This chapter uses the public README and source code. Platform behavior is described from visible classes, routes, Sessions, Approval logic, and Auth structure.
               </p>
             </div>
@@ -348,10 +348,11 @@ POST /agents/sales-assistant/runs/{run_id}/continue
 
             <h2 id="three-api-routes-own-the-run-lifecycle">6. API routes create, pause, and continue a Run</h2>
             <p><code>POST /agents/{agent_id}/runs</code> supports text, media, sessions, factory input, SSE, and background execution.
-              Background work requires an Agent database. With <code>QueueConfig(durable=True)</code>, serializable requests without media or a pinned version, targeting a registered ordinary Agent, can enter a durable queue.
-              A committed queue row means accepted work; a Worker that claims it performs execution. Streaming clients tail events, while non-streaming clients receive <code>202</code> and run identifiers.
-              Ineligible requests can still use process-local background execution. A detached task survives a client disconnect, not automatically a process crash.
-              See <a href="https://github.com/agno-agi/agno/blob/85b6d1d178b70d59e8f2c0d432d2a66b35004f31/libs/agno/agno/os/routers/agents/router.py#L820-L1089">background dispatch</a> and <a href="https://github.com/agno-agi/agno/blob/85b6d1d178b70d59e8f2c0d432d2a66b35004f31/libs/agno/agno/os/app.py#L367-L378">queue configuration</a>.</p>
+              Background execution requires an Agent database. With <code>QueueConfig(durable=True)</code>, the durable queue accepts serializable, media-free requests whose component the Worker can resolve again.
+              Sources include registered instances, registered factories, and components or pinned versions loaded through a synchronous <code>BaseDb</code>.
+              After the queue row commits, a Worker claims execution; streaming callers tail events, while non-streaming callers receive <code>202</code> and a run ID.
+              Other requests use the in-process background path, whose lifetime depends on the accepting process.
+              See <a href="https://github.com/agno-agi/agno/blob/8ac4064bca1659e2c4cc546c158adbecf67867e1/libs/agno/agno/os/routers/agents/router.py#L910-L946">streaming admission</a> and <a href="https://github.com/agno-agi/agno/blob/8ac4064bca1659e2c4cc546c158adbecf67867e1/libs/agno/agno/os/job_queue.py#L367-L408">component resolution sources</a>.</p>
             <pre><code class="language-text">background request -> check database and queue eligibility
   eligible -> durable acceptance -> Worker claim -> final run record
   ineligible -> process-local background execution
@@ -359,6 +360,17 @@ POST /agents/sales-assistant/runs/{run_id}/continue
             <p>The queue accepts <code>Idempotency-Key</code>: duplicate submissions reuse the original run, and a full queue returns <code>429</code>.
               A streaming submission that reuses a non-streaming job's key receives a conflict and must poll the original run.
               Submission deduplication does not guarantee exactly-once CRM writes. Verify the final run separately from its best-effort live event stream.</p>
+
+            <p>A database component's ticket stores its source, owner scope, and version. For an unpinned request, submission reads and records the current version. If that read fails, the version can remain empty and the Worker resolves the current version later; callers requiring reproducible execution should explicitly pin it.
+              A factory ticket stores the user, session, input, and claims/scopes authenticated at admission. The Worker rebuilds that context and calls the factory again. Reading attributes of <code>ctx.request</code> there raises <code>FactoryContextRequired</code> and ends the accepted run in error, so factories should depend on serializable context fields.
+              See <a href="https://github.com/agno-agi/agno/blob/8ac4064bca1659e2c4cc546c158adbecf67867e1/libs/agno/agno/os/job_queue.py#L410-L550">queued context and Worker resolution</a>.</p>
+            <p>If one sales session submits “update CRM” followed by “email the result,” the default <code>queue_per_session=True</code> marks the tickets for serial execution.
+              Stores supporting <code>serializes_sessions</code> claim them in acceptance order. A running or approval-paused ticket holds the session, leaving later tickets queued.
+              Different sessions can execute concurrently. The rule covers marked durable tickets; applications still coordinate direct calls and in-process fallbacks. Check <code>/config</code> for a custom store's effective capability.
+              See <a href="https://github.com/agno-agi/agno/blob/8ac4064bca1659e2c4cc546c158adbecf67867e1/libs/agno/agno/os/job_queue.py#L328-L340">submission marking</a>, <a href="https://github.com/agno-agi/agno/blob/8ac4064bca1659e2c4cc546c158adbecf67867e1/libs/agno/agno/job_queue/session.py#L1-L65">claim ordering</a>, and <a href="https://github.com/agno-agi/agno/blob/8ac4064bca1659e2c4cc546c158adbecf67867e1/libs/agno/agno/os/job_queue.py#L655-L662">store capability checks</a>.</p>
+            <pre><code class="language-text">Same session: A awaits approval → B queued, waiting_on=A
+A continues and completes → B becomes claimable
+Another session: C can execute concurrently</code></pre>
 
             <p>
               The continue route is the stronger clue. It does not merely call the model again. It dispatches by persisted run state and request body: paused runs can continue with HITL tool results, or with empty tools after an admin approval is resolved; running and error runs can resume from the last persisted state; completed runs can continue with appended messages. It also supports <code>continue_from</code>, <code>fork</code>, <code>regenerate</code>, <code>replace_original</code>, and resumable background SSE.
@@ -501,6 +513,10 @@ POST /agents/sales-assistant/runs/{run_id}/continue
               approval authority <strong>validating</strong> it, and CRM plus the business process <strong>adopting</strong> the
               change are distinct transitions.
             </p>
+
+            <p>When the same run pauses for approval again, the new record covers its newly unstamped approval tools and unresolved requirements paused alongside them.
+              Tools already carrying an <code>approval_id</code> keep their existing decisions, and repeated handling of one pause reuses its record. For example, approval for <code>update_crm</code> is followed by a separate pending approval for a later email request.
+              See <a href="https://github.com/agno-agi/agno/blob/8ac4064bca1659e2c4cc546c158adbecf67867e1/libs/agno/agno/run/approval.py#L117-L157">current-pause scope</a> and <a href="https://github.com/agno-agi/agno/blob/8ac4064bca1659e2c4cc546c158adbecf67867e1/libs/agno/agno/run/approval.py#L219-L280">creation and deduplication</a>.</p>
 
             <p>If two sales-Team members pause, one approval must not authorize another member's tool.
               The runtime first uses each tool's <code>approval_id</code>, then its owning <code>member_run_id</code>; only tools without scoped identity may fall back to run-level lookup.
