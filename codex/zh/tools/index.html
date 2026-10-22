@@ -105,7 +105,7 @@
           </section>
 
           <section class="article-body">
-            <p><strong>阅读契约。</strong>跟踪工具菜单、执行请求和结果记录，判断“可见”“已获准”与“已完成”分别在哪里成立。 本文核实于 2026-09-20，依据公开源码 <a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">固定公开源码快照</a>；不推断未公开的服务实现。</p>
+            <p><strong>阅读契约。</strong>跟踪工具菜单、执行请求和结果记录，判断“可见”“已获准”与“已完成”分别在哪里成立。 本文核实于 2026-10-22，依据公开源码 <a href="https://github.com/openai/codex/tree/2f3fb111be71d277c80bd5b96d9019748b921f5a">固定公开源码快照</a>；不推断未公开的服务实现。</p>
 
             <p>
               先从一个普通动作开始：模型想跑测试。界面上看起来像是“调用 shell 工具”，但源码里至少要回答几件事：
@@ -209,30 +209,34 @@
 
             <h2>二、工具菜单与每次模型请求一起固定</h2>
 
-            <p>每次模型请求使用一份 <code>StepContext</code>。它同时保存这一步的模型信息、设置、环境、MCP binding 和 <code>tool_router</code>。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L1746-L1840"><code>built_tools</code></a> 从这份输入准备可发现的插件建议，再调用 <code>build_tool_router</code>；<code>build_prompt</code> 把 <code>router.model_visible_specs()</code> 放进 <code>Prompt.tools</code>。</p>
+            <p>每次模型请求使用一份 <code>StepContext</code>。它同时保存这一步的模型信息、设置、环境、MCP binding 和 <code>tool_router</code>。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L1908-L2002"><code>built_tools</code></a> 从这份输入准备可发现的插件建议，再调用 <code>build_tool_router</code>；<code>build_prompt</code> 根据当前窗口使用的工具声明模式，把菜单放进 <code>Prompt.tools</code> 或交给 world state。</p>
 
-            <p>所以菜单可以随下一次 sampling 更新，不只在 turn 起点决定一次。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/parallel.rs#L42-L66"><code>ToolCallRuntime</code></a> 保留当时的 <code>Arc&lt;StepContext&gt;</code>：即使某个 call 稍后才执行，它仍使用向模型发布该工具时的配置与环境，不会临时读取另一轮菜单。</p>
+            <p>所以菜单可以随下一次 sampling 更新，不只在 turn 起点决定一次。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/parallel.rs#L44-L68"><code>ToolCallRuntime</code></a> 保留当时的 <code>Arc&lt;StepContext&gt;</code>：即使某个 call 稍后才执行，它仍使用向模型发布该工具时的配置与环境，不会临时读取另一轮菜单。</p>
 
             <p>例如模型看见 <code>exec_command</code> 后发出测试请求，运行时要保留那一步选中的执行环境。后续设置更新可以影响下一步，但不能悄悄把已排队命令送到不同环境。这是同时保存菜单与执行上下文的实际用途。</p>
 
+            <p><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/world_state.rs#L44-L69">增量工具声明</a>需要模型启用 <code>use_responses_lite</code>，且当前上下文窗口采用增量模式；新窗口再结合默认开启的 <code>incremental_tools</code> 功能判断。此时定义进入 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/world_state.rs#L168-L177"><code>TopLevelToolsState</code></a>，<code>Prompt.tools</code> 留空。已有窗口沿用历史中是否存在工具声明的事实，其他路径继续发送完整工具数组。读取请求时，要同时查看窗口历史与这个字段。</p>
+
+            <p>步骤准备还会先完成 extension 的 <code>prepare_for_step</code>，再构造 router；同一份 <code>extension_data</code> 同时用于工具与模型的 world state。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L4013-L4145">准备顺序</a>把技能目录、所选插件和 MCP binding 固定到同一步。例如执行环境刚变为 ready，后续步骤可以使用新目录，已排队的调用仍读取原步骤捕获的来源。</p>
+
             <h2>三、模型可见和运行时注册，是两张表</h2>
 
-            <p><code>ToolRouter</code> 仍然分别保存 <code>registry</code> 和 <code>model_visible_specs</code>。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/spec_plan.rs#L132-L199"><code>build_tool_router</code></a> 先创建受 allowed-tools 约束的 <code>ToolRegistry</code>，加入核心、MCP、extension 和 dynamic runtimes，再交给 <code>finalize_tool_router</code> 生成模型菜单。hosted model specs 也在最后参与组装。</p>
+            <p><code>ToolRouter</code> 仍然分别保存 <code>registry</code> 和 <code>model_visible_specs</code>。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/spec_plan.rs#L132-L211"><code>build_tool_router</code></a> 先创建受 allowed-tools 约束的 <code>ToolRegistry</code>，加入核心、MCP、extension 和 dynamic runtimes，再交给 <code>finalize_tool_router</code> 生成模型菜单。hosted model specs 也在最后参与组装。</p>
 
             <p>工具的 <code>ToolExposure</code> 决定它直接显示、延迟搜索、只用于 code mode，还是隐藏；运行时注册不等于所有调用来源都能访问。模型菜单与 code-mode 工具面分别由同一注册表派生，避免把“已有 handler”误解为“模型已经看见并获准调用”。</p>
 
-            <p>命令工具是一个容易核对的例子。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/spec_plan.rs#L1032-L1077"><code>add_shell_tools</code></a> 在 UnifiedExec 启用时注册 <code>ExecCommandHandler</code> 与 <code>WriteStdinHandler</code>；托管要求关闭 UnifiedExec 时，改为 <code>ExecCommandHandler::one_shot</code>，不暴露可恢复进程和 <code>write_stdin</code>。当前路径已经不再保留 legacy shell handler 作为 dispatch-only 兼容入口。</p>
+            <p>命令工具是一个容易核对的例子。<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/spec_plan.rs#L1235-L1267"><code>add_shell_tools</code></a> 在 UnifiedExec 启用时注册 <code>ExecCommandHandler</code> 与 <code>WriteStdinHandler</code>；托管要求关闭 UnifiedExec 时，改为 <code>ExecCommandHandler::one_shot</code>，不暴露可恢复进程和 <code>write_stdin</code>。当前路径已经不再保留 legacy shell handler 作为 dispatch-only 兼容入口。</p>
 
             <h2>四、模型返回 call 后，router 把它变成执行请求</h2>
             <p>
               模型流里出现 tool call 时，Codex 不会直接执行原始 JSON。
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/router.rs"><code>ToolRouter::build_tool_call</code></a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/router.rs"><code>ToolRouter::build_tool_call</code></a>
               先按响应类型解析：普通 <code>FunctionCall</code> 会变成带 namespace 的 <code>ToolName</code>；
               client-side 的 <code>ToolSearchCall</code> 会解析成 tool search payload；
               <code>CustomToolCall</code> 会保留 custom input。其他响应项不会变成工具调用。
             </p>
 
-            <p>router 的 <code>dispatch_tool_call_with_terminal_outcome</code> 将 call 包成 <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/context.rs#L60-L76"><code>ToolInvocation</code></a>。它包含 session、<code>step_context</code>、取消 token、diff tracker、call id、tool name、来源和 payload；handler 通过 step context 读取这次请求对应的 turn 与环境，然后由 registry 派发。</p>
+            <p>router 的 <code>dispatch_tool_call_with_state</code> 将 call 包成 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/context.rs#L70-L86"><code>ToolInvocation</code></a>。它包含 session、<code>step_context</code>、取消 token、diff tracker、call id、tool name、来源和 payload；handler 通过 step context 读取这次请求对应的 turn 与环境，然后由 registry 派发。</p>
 
             <pre><code class="language-text">形状示意：
   模型输出 function_call
@@ -257,7 +261,7 @@
               真正值得注意的是，registry 还包住了工具前后的横切逻辑。
               在执行 handler 之前，它根据工具提供的 payload 跑 pre-tool-use hooks；
               hook 可以阻止执行，也可以改写输入。通过后才进入工具启动通知和 handler 执行；部分工具自行管理启动通知。handler 结束后，
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/registry.rs">registry 会记录 telemetry，运行 post-tool-use hooks，必要时追加上下文或替换模型可见输出，再发出 lifecycle finish</a>。
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/registry.rs">registry 会记录 telemetry，运行 post-tool-use hooks，必要时追加上下文或替换模型可见输出，再发出 lifecycle finish</a>。
             </p>
 
             <p>
@@ -268,14 +272,14 @@
             <h2>六、并行和取消由工具声明与 runtime 共同决定</h2>
             <p>
               模型请求里有 <code>parallel_tool_calls</code>，但这不表示所有工具都可以同时跑。
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/parallel.rs"><code>ToolCallRuntime</code></a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/parallel.rs"><code>ToolCallRuntime</code></a>
               持有一个 <code>parallel_execution: RwLock&lt;()&gt;</code>。
               当它处理某个 call 时，会先问 router 这个工具是否支持并行。
             </p>
 
             <p>
               具体逻辑在
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/parallel.rs"><code>handle_tool_call_with_source</code></a>：
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/parallel.rs"><code>handle_tool_call_with_source</code></a>：
               支持并行的工具拿读锁，不支持并行的工具拿写锁。这样并行不由一个全局开关决定；
               每个工具 runtime 先声明能力，<code>ToolCallRuntime</code> 再据此控制锁。取消也在这里处理：如果 turn 被取消，runtime 会决定等待工具自己清理，
               或者 abort task，然后生成一个 aborted response 并通知 lifecycle。
@@ -288,19 +292,27 @@
               </p>
             </div>
 
+            <p>客户端提供的 dynamic tool 也声明了<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/handlers/dynamic.rs#L87-L90">并行能力</a>。假设 code mode 用 <code>Promise.all</code> 同时请求两个独立查询，两个请求可以先到达客户端，再分别等待各自响应；每个响应按 call id 交回对应等待者。取消时，等待通过 <code>or_cancel</code> 结束，并记录取消后的工具状态。</p>
+<pre><code class="language-text">两个独立 dynamic calls：
+  call A -> 客户端 -> 等待 A 的响应
+  call B -> 客户端 -> 等待 B 的响应（可与 A 重叠）
+客户端先回复 B，再回复 A
+  Promise.all([A, B]) -> [A 的结果, B 的结果]</code></pre>
+            <p>这个例子的<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/tests/suite/code_mode_dynamic_tools_tests.rs">集成测试</a>先等到两个请求，再逆序回复。它同时验证请求能够重叠，以及返回值仍按 <code>Promise.all</code> 的输入顺序排列。对真实副作用，仍需根据每个工具的声明与审批决定是否执行。</p>
+
             <h2>七、有副作用的工具，还要进审批和 sandbox</h2>
             <p>
               shell、apply patch 这类工具会影响外部环境，所以它们还会进入更窄的运行时关口。
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L1-L8"><code>orchestrator.rs</code> 文件头</a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs"><code>orchestrator.rs</code> 文件头</a>
               直接说明它负责 approvals、sandbox selection 和 retry semantics。
               它的主流程在
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs"><code>ToolOrchestrator::run</code></a>：
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs"><code>ToolOrchestrator::run</code></a>：
               先判断是否跳过、禁止或需要审批，再选择初次 sandbox，最后运行工具 attempt。
             </p>
 
             <p>
               如果第一次 sandboxed attempt 被拒绝，后面还有一段 retry 逻辑。
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs">源码会根据 denial、网络策略、approval policy 和工具是否允许升级来决定是否再次请求审批，并选择 retry sandbox</a>。
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs">源码会根据 denial、网络策略、approval policy 和工具是否允许升级来决定是否再次请求审批，并选择 retry sandbox</a>。
               这就是为什么“模型请求执行命令”和“命令真的执行”之间还有一段运行时判断。
             </p>
 
@@ -312,19 +324,19 @@
             <h2>八、工具结果会回到模型和历史</h2>
             <p>
               工具跑完后，结果首先要变成模型下一轮能读的 shape。
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/context.rs"><code>FunctionToolOutput</code></a>、
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/context.rs"><code>ApplyPatchToolOutput</code></a>、
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/context.rs"><code>ExecCommandToolOutput</code></a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/context.rs"><code>FunctionToolOutput</code></a>、
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/context.rs"><code>ApplyPatchToolOutput</code></a>、
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/context.rs"><code>ExecCommandToolOutput</code></a>
               都实现了 <code>to_response_item</code>，把结果转成 <code>ResponseInputItem</code>。
               对 shell 来说，输出还会包含 wall time、exit code 或 session id、token count 和截断后的输出文本。
             </p>
 
             <p>
               客户端看到的进度，则来自事件层。工具事件代码里有
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/events.rs"><code>emit_exec_command_begin</code></a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/events.rs"><code>emit_exec_command_begin</code></a>
               和 <code>ToolEmitter</code>，shell、apply patch、unified exec 会发 begin / end 或 file change 相关事件。
               生命周期扩展还会通过
-              <a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/lifecycle.rs"><code>notify_tool_start</code> / <code>notify_tool_finish</code></a>
+              <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/lifecycle.rs"><code>notify_tool_start</code> / <code>notify_tool_finish</code></a>
               通知 extension contributors。
             </p>
 
@@ -389,16 +401,16 @@
 
             <h2 id="sources">参考源码</h2>
             <ul class="source-list">
-              <li><a href="https://github.com/openai/codex/tree/5c5308fc9a9ee789049d646ef11e5400384b9c6f">openai/codex · 5c5308fc9a9e</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/step_context.rs#L27-L46">StepContext</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L1558-L1840">build_prompt / built_tools</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/spec_plan.rs#L132-L393">build_tool_router / exposure policy / finalize_tool_router</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/spec_plan.rs#L1032-L1077">add_shell_tools</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/router.rs#L73-L385">ToolRouter / dispatch</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/context.rs#L60-L180">ToolInvocation / tool output</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/registry.rs#L293-L790">registration / hooks / dispatch</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/parallel.rs#L42-L310">ToolCallRuntime</a></li>
-              <li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/tools/orchestrator.rs#L122-L465">approval / sandbox / retry</a></li>
+              <li><a href="https://github.com/openai/codex/tree/2f3fb111be71d277c80bd5b96d9019748b921f5a">openai/codex · 2f3fb111be71</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/step_context.rs#L23-L48">StepContext</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L1672-L2002">build_prompt / built_tools</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/spec_plan.rs#L132-L436">build_tool_router / exposure policy / finalize_tool_router</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/spec_plan.rs#L1235-L1267">add_shell_tools</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/router.rs#L84-L449">ToolRouter / dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/context.rs#L70-L190">ToolInvocation / tool output</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/registry.rs#L331-L896">registration / hooks / dispatch</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/parallel.rs#L44-L371">ToolCallRuntime</a></li>
+              <li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/tools/orchestrator.rs#L125-L552">approval / sandbox / retry</a></li>
             </ul>
           </section>
         </article>
