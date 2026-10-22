@@ -207,9 +207,7 @@
             <div class="note">
               <p>
                 <strong>本文依据。</strong>
-                源码引用固定到 Google ADK Python 当前公开快照
-                <code>d57c84f13baf53cfd910c2155449f8c4254e01c5</code>。本文只基于公开 README、源码和 samples，
-                不推断 Google 内部服务、托管平台或未公开控制台能力。
+                基础组件说明引用 <code>d57c84f13baf53cfd910c2155449f8c4254e01c5</code>；任务完成、循环汇合和重试重放按 <code>facd7ddafe0e23715e079e50971ad27b251e2e98</code> 核实。各段固定链接标明版本，证据来自公开源码与测试。
               </p>
             </div>
 
@@ -285,12 +283,14 @@ Runner event queue -&gt; plugin callbacks -&gt; session service -&gt; caller str
 
             <p>
               <code>FinishTaskTool</code> 很能说明 Task API 的语义：它用 task agent 的 output schema 校验结果，
-              并把 <code>finish_task</code> 的调用当作“任务完成信号”。这比“让子 agent 最后说 DONE”稳得多。
+              校验成功后的工具响应由 wrapper 提升为节点输出；校验错误返回模型继续修正。
               相关源码在
               <a href="https://github.com/google/adk-python/blob/d57c84f13baf53cfd910c2155449f8c4254e01c5/src/google/adk/agents/llm/task/_finish_task_tool.py#L72-L115">工具声明</a>
               和
               <a href="https://github.com/google/adk-python/blob/d57c84f13baf53cfd910c2155449f8c4254e01c5/src/google/adk/agents/llm/task/_finish_task_tool.py#L157-L207">执行与校验</a>。
             </p>
+
+            <p>若模型在同一轮同时调用 <code>finish_task</code> 和委派工具，wrapper 先执行委派，并把 finish 响应改成错误提示。模型取得子任务结果后需要单独调用 <code>finish_task</code>。这样退款资格检查仍会完成，终止信号才能携带有效结果。见<a href="https://github.com/google/adk-python/blob/facd7ddafe0e23715e079e50971ad27b251e2e98/src/google/adk/workflow/_llm_agent_wrapper.py#L525-L578">同轮委派与完成处理</a>。</p>
 
             <h2 id="workflow-owner">五、Workflow 怎样控制确定性 Graph</h2>
             <p>
@@ -330,6 +330,7 @@ Runner event queue -&gt; plugin callbacks -&gt; session service -&gt; caller str
               源码在
               <a href="https://github.com/google/adk-python/blob/d57c84f13baf53cfd910c2155449f8c4254e01c5/src/google/adk/workflow/_join_node.py#L32-L62"><code>JoinNode</code></a>。
             </p>
+            <p>JoinNode 处在循环里时，每次触发只消费自上次触发以来的前驱到达记录。比如订单和策略两路完成第一轮后，第二轮仍须等两路各自返回；runtime 在汇合触发时清空 <code>join_arrivals</code>，避免拿第一轮的完成状态提前放行。见<a href="https://github.com/google/adk-python/blob/facd7ddafe0e23715e079e50971ad27b251e2e98/src/google/adk/workflow/_workflow.py#L832-L888">逐轮汇合屏障</a>。</p>
 
             <div class="shape-grid">
               <section class="shape-box">
@@ -409,13 +410,11 @@ Runner event queue -&gt; plugin callbacks -&gt; session service -&gt; caller str
               <a href="https://github.com/google/adk-python/blob/d57c84f13baf53cfd910c2155449f8c4254e01c5/src/google/adk/workflow/_node_runner.py#L333-L466">事件 enrichment</a>。
             </p>
 
-            <p>
-              如果失败的是嵌套 Workflow，配置在它上面的 <code>retry_config</code> 会重试整个子流程，但不会简单重跑全部子节点。
-              已产生输出或状态变更的子节点从事件中重放；没有留下这两类记录的子节点才重新执行。
-              <a href="https://github.com/google/adk-python/blob/d57c84f13baf53cfd910c2155449f8c4254e01c5/src/google/adk/workflow/_base_node.py#L84-L95">重试配置</a>
-              与 <a href="https://github.com/google/adk-python/blob/d57c84f13baf53cfd910c2155449f8c4254e01c5/src/google/adk/workflow/_node_runner.py#L115-L198">NodeRunner 重试循环</a>
-              共同实现这个边界。因此退款工具仍需幂等：没有可重放记录，不能证明外部副作用没有发生。
-            </p>
+            <p>嵌套 Workflow 或动态子节点失败后，父节点的 <code>retry_config</code> 决定是否重试。NodeRunner 为新 attempt 创建上下文；动态子节点失败时还会回退调用计数，使同一调用位置能够找到已完成子工作。重放判断按完成、失败、等待输入及已记录的 output/route 分派：完成的动态子节点复用结果，失败子节点重新执行，未解决的输入请求继续等待。单独一条 state delta 不能决定跳过执行。见<a href="https://github.com/google/adk-python/blob/facd7ddafe0e23715e079e50971ad27b251e2e98/src/google/adk/workflow/_node_runner.py#L143-L243">attempt 与调用计数</a>和<a href="https://github.com/google/adk-python/blob/facd7ddafe0e23715e079e50971ad27b251e2e98/src/google/adk/workflow/utils/_replay_interceptor.py#L57-L190">重放条件</a>。</p>
+            <pre><code class="language-text">第一次：check_order 完成，check_policy 超时
+重试：复用 check_order 的输出，再执行 check_policy
+JoinNode：两路本次结果齐备后继续退款</code></pre>
+            <p>源码测试覆盖了已完成并行分支只执行一次，以及父节点重试时沿已记录路由继续的情况。退款工具仍需业务幂等键：外部写入与事件保存之间的崩溃，需要通过退款服务查询回执后决定后续动作。见<a href="https://github.com/google/adk-python/blob/facd7ddafe0e23715e079e50971ad27b251e2e98/tests/unittests/workflow/test_node_runner_failure.py#L1464-L1554">超时与并行重试测试</a>和<a href="https://github.com/google/adk-python/blob/facd7ddafe0e23715e079e50971ad27b251e2e98/tests/unittests/workflow/test_workflow_routes.py#L779-L820">路由重放测试</a>。</p>
 
             <h3>6.1 同一笔退款的状态到底归谁</h3>
             <p>
