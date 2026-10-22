@@ -12,13 +12,13 @@
     <p>一次模型调用只能依据当前请求里真正提供的内容。项目里“有”最新日志、某轮对话里“提过”约束、数据库里“存着”用户偏好，都不代表模型这一次看到了它们。</p>
 
     <div class="reading-contract"><p><strong>读完这篇，你应该能回答：</strong>Context 最朴素的定义是什么？一条新测试结果怎样进入下一次模型调用？为什么保存、检索和最终可见是三件事？</p></div>
-    <div class="evidence-note"><p><strong>资料说明：</strong>概念依据来自 Anthropic 与 OpenAI 的官方材料；实现案例核对了 2026 年 9 月 20 日的 Codex 公开源码，链接固定到核实版本。过滤器、TTL 和结构化 checkpoint 是本文的设计示例；下文会把它们与 Codex 已实现的历史整理、截断和压缩分开。模型窗口与服务端行为仍以目标 API 文档为准。</p></div>
+    <div class="evidence-note"><p><strong>资料说明：</strong>概念依据来自 Anthropic 与 OpenAI 的官方材料；实现案例使用 2026 年 9 月 20 日与 10 月 22 日核实的 Codex 公开源码，链接固定到对应版本；后台压缩与结果保留依据 10 月快照。过滤器、TTL 和结构化 checkpoint 是本文的设计示例；下文会把它们与 Codex 已实现的历史整理、截断和压缩分开。模型窗口与服务端行为仍以目标 API 文档为准。</p></div>
 
     <h2>一、先用“工作台”故事看懂 Context</h2>
     <h3>1.1 资料都在，为什么模型还是用了旧日志</h3>
     <p>继续看支付测试任务。系统里同时存在昨天的失败日志、刚生成的新日志、当前代码改动、完整聊天历史和项目文档。如果把所有内容都塞给模型，旧日志可能与新日志冲突，大量历史也会淹没当前问题；如果只给一句“继续修”，模型又缺少判断依据。</p>
     <p>更合适的材料包很小：任务目标、不能修改公开 API 的约束、当前 diff，以及刚运行的支付测试结果。它们足以回答眼前的问题——“这次修改是否有效，下一步该做什么？”</p>
-    <p><strong>Context engineering，就是为模型的下一步挑选、整理并更新此刻该看到的材料。</strong>这里的 Context 不只指聊天记录，而是本次模型调用实际能看到的规则、任务和证据。</p>
+    <p><strong>Context engineering，就是为模型的下一步挑选、整理并更新此刻该看到的材料。</strong>这里的 Context 包括本次模型调用实际能看到的规则、任务和证据。</p>
 
     <h3>1.2 用“资料室、候选架、工作台”建立直觉</h3>
     <p>可以把整个系统想成一间资料室。长期存储像书库，负责把可能以后有用的内容保存下来；检索像图书管理员，根据当前问题找出一批候选；Context 则是最后摆上工作台、真正交给模型的那一小包材料。</p>
@@ -29,14 +29,14 @@
     <h2>二、让正确材料进入下一步判断</h2>
     <h3>2.1 从保存到可见，要经过三次选择</h3>
     <p>先区分三个集合：<strong>durable store</strong> 保存可能以后有用的事实；<strong>candidate set</strong> 汇集检索结果、最近消息和运行时状态；<strong>final input</strong> 才是这次真正序列化进模型请求的内容。写入存储只证明第一层有这条事实，不能证明模型这一次看得见。</p>
-    <figure class="mechanism-figure"><img src="../assets/context-working-set-cover.png" alt="长期存储中的资料经过筛选，成为本次模型请求的工作集" /><figcaption>Context 是本次请求读取的一小部分资料，不是整个知识库。保存哪些内容与这次读取哪些内容需要分别设计。</figcaption></figure>
+    <figure class="mechanism-figure"><img src="../assets/context-working-set-cover.png" alt="长期存储中的资料经过筛选，成为本次模型请求的工作集" /><figcaption>Context 是本次请求从可用资料中读取的工作集。保存哪些内容与这次读取哪些内容需要分别设计。</figcaption></figure>
     <div class="table-wrap"><table><thead><tr><th>材料</th><th>适合长期保存？</th><th>适合每轮携带？</th><th>主要风险</th></tr></thead><tbody>
       <tr><td>稳定系统规则</td><td>是</td><td>通常是</td><td>多份副本漂移</td></tr><tr><td>用户目标与 done 条件</td><td>是</td><td>通常是</td><td>压缩时丢失约束</td></tr><tr><td>完整工具日志</td><td>是，便于审计</td><td>否，只带相关片段</td><td>噪声挤占证据</td></tr><tr><td>当前文件内容</td><td>可由仓库保存</td><td>按任务选择</td><td>快照过期</td></tr><tr><td>阶段性计划</td><td>可 checkpoint</td><td>当前阶段需要</td><td>旧计划阻碍新证据</td></tr><tr><td>秘密与敏感数据</td><td>按政策最小化</td><td>默认否</td><td>泄漏和权限扩大</td></tr>
     </tbody></table></div>
 
     <h3>2.2 一次 Context 是怎样装配出来的</h3>
-    <p>Anthropic 把 context engineering 概括为在 agent 每一步维护最佳 token 集合。这里的“最佳”不是相似度最高，而是能支持当前决策：相关、足够新、来源可信、与目标一致，并且值得占用预算。</p>
-    <figure class="mechanism-figure"><img src="../assets/context-assembly-pipeline.png" alt="建议的上下文装配设计：任务目标指导候选材料的过滤、排序和预算装箱，再形成模型视图；检索是候选来源之一" /><figcaption>建议的装配流程：检索只是候选来源之一，过滤、排序和预算决定最终输入。这不是 Codex 每次请求都执行的流水线。</figcaption></figure>
+    <p>Anthropic 把 context engineering 概括为在 agent 每一步维护最佳 token 集合。这里的“最佳”指能支持当前决策：相关、足够新、来源可信、与目标一致，并且值得占用预算。</p>
+    <figure class="mechanism-figure"><img src="../assets/context-assembly-pipeline.png" alt="建议的上下文装配设计：任务目标指导候选材料的过滤、排序和预算装箱，再形成模型视图；检索是候选来源之一" /><figcaption>建议的装配流程：检索只是候选来源之一，过滤、排序和预算决定最终输入。图中的通用筛选步骤属于教学设计；Codex 的实际请求路径见下文。</figcaption></figure>
     <p>先用一个建议的装配器设计继续支付测试任务。验证阶段的候选里同时有目标、旧错误日志、当前 diff、最新测试输出和完整聊天历史。装配器应先淘汰过期日志，再选择当前 diff 与最新测试输出；固定 instruction 和工具 schema 先计入输入成本，随后为输出预留空间，剩余预算才用于候选材料。</p>
     <p>在这个设计中，Harness 完成测试后产生最新 observation；若需要完整审计日志，就由运行时另行保存原文，再把退出码、关键错误和日志引用加入候选。下一次装配优先选入新结果，并明确旧错误是否已被推翻。淘汰旧日志和保存完整日志都需要代码实现，不能从“用了 Context engineering”推导出系统已经具备这些能力。</p>
     <figure class="shape-example"><pre><code class="language-python">def assemble(candidates, phase, window, fixed_input, output_reserve):
@@ -64,10 +64,10 @@ verify_candidates = [
   "trust": "local-authoritative",
   "ttl": "until-file-change"
 }</code></pre><figcaption><strong>形状级示例：</strong>Context item 不只是一段文本，还要记录来源、版本和有效期，运行时才能判断它是否仍能使用。</figcaption></figure>
-    <p><code>until-file-change</code> 不是文本自带的保证。Runtime 必须监听或比较工作区版本，在文件变化后使旧 item 失效；否则 TTL 只是一句无人执行的愿望。</p>
+    <p>要落实 <code>until-file-change</code>，Runtime 必须监听或比较工作区版本，在文件变化后使旧 item 失效。</p>
 
     <h4>2.2.3 真实实现还要保护调用与结果的配对</h4>
-    <p>Codex 给出了另一种更具体的路径：<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L512-L524">每次采样前克隆当前历史并调用 <code>for_prompt</code></a>，而不是使用上面的通用候选排序器。工具结果写入历史时，<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/history.rs#L422-L453">按截断策略处理输出负载</a>；准备请求时，再<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/history.rs#L796-L814">补齐缺失结果、移除没有对应调用的结果，并移除模型不支持的图像或音频</a>。有名字的外部工具结果可以独立存在，不应套用普通调用结果的删除规则。</p>
+    <p>Codex 在<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L541-L565">每次采样前记录当前说明的变化，再克隆历史并调用 <code>for_prompt</code></a>。工具结果写入时，<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/context_manager/history.rs#L517-L576">截断策略作用于当前模型历史中的副本，交给 rollout 的负载按传入时的内容保留</a>；准备请求时，再<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/history.rs#L796-L814">补齐缺失结果、移除没有对应调用的结果，并移除模型不支持的图像或音频</a>。有名字的外部工具结果可以独立存在，不应套用普通调用结果的删除规则。因此排查一次长测试日志时，需要分别检查rollout 中收到的负载与本次请求里的截断版本。</p>
     <p>继续看支付测试：若历史中记录了“发起测试”，却没有对应返回，模型不应把缺失理解为测试通过。<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/normalize.rs#L51-L67">普通函数调用缺结果时会补一个 <code>aborted</code> 输出</a>。这一步修复的是请求结构，并没有重新执行测试，也没有证明测试失败原因。</p>
     <figure class="shape-example"><pre><code class="language-text">历史片段：function_call(call_id="test-4")，没有对应结果
 请求片段：function_call(call_id="test-4")
@@ -84,9 +84,9 @@ verify_candidates = [
     <h2>三、进阶：让长任务可以压缩、恢复和追查</h2>
     <h3>3.1 长任务需要压缩，但不能压掉任务状态</h3>
     <p>历史持续增长并逼近可用窗口时，长任务可能需要压缩（compaction）。高质量压缩应保留目标、约束、已确认事实、已做变更、未解决问题、下一步和证据指针；可丢弃重复解释、完整低价值日志和已经被新事实推翻的猜测。摘要本身是有损变换，所以必须可追溯到原始记录。</p>
-    <figure class="mechanism-figure"><img src="../assets/context-lifecycle.png" alt="普通请求使用当前历史，必要时压缩并替换历史，恢复从持久化检查点继续" /><figcaption>普通请求与压缩是不同路径。压缩成功后替换当前历史并记录检查点；恢复读取检查点及其后的记录，不要求每轮先压缩。</figcaption></figure>
+    <figure class="mechanism-figure"><img src="../assets/context-lifecycle.png" alt="普通请求使用当前历史，必要时压缩并替换历史，恢复从持久化检查点继续" /><figcaption>图示本地摘要路径：普通请求沿当前历史继续；需要压缩时生成摘要，成功后替换历史并记录检查点。恢复读取检查点及其后的记录。后台候选路径在 3.1.3 节单独展开。</figcaption></figure>
     <h4>3.1.1 用 checkpoint schema 保护关键状态</h4>
-    <p>下面是一种形状级 schema，不是某个产品的固定字段：</p>
+    <p>下面是一种可用于应用设计的形状级 schema：</p>
     <ul><li><strong>Goal：</strong>当前任务与完成条件。</li><li><strong>Constraints：</strong>不能丢的产品、安全和用户限制。</li><li><strong>Confirmed：</strong>带来源的已验证事实。</li><li><strong>Changed：</strong>文件、外部对象和副作用记录。</li><li><strong>Open：</strong>未解决问题、失败尝试及原因。</li><li><strong>Next：</strong>下一动作以及为什么。</li></ul>
     <p>自由文本摘要适合人读，结构化 checkpoint 适合恢复与校验。二者可以同时存在：结构保证不变量，叙述解释因果。</p>
     <figure class="shape-example"><pre><code class="language-json">{
@@ -100,9 +100,20 @@ verify_candidates = [
 }</code></pre><figcaption><strong>恢复检查：</strong>下一次 run 先验证文件版本；若引用已失效就重新读取，再执行 <code>next</code>。删除 constraints、open 或 evidence_refs，会分别让系统忘记允许范围、误报完成或无法找到原始结果。</figcaption></figure>
 
     <h4>3.1.2 压缩完成后，下一次请求从哪里继续</h4>
-    <p>Codex 的<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/turn.rs#L1446-L1503">自动压缩入口</a>会按配置选择 token-budget 路径、远端压缩或本地压缩。这里跟随其中的<strong>本地摘要路径</strong>，不把它当成所有模型和提供方的统一实现。它调用模型生成摘要，然后<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact.rs#L349-L403">构造替换历史</a>；<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact.rs#L687-L718">保留的用户消息从最近向前按预算选取</a>，并按触发位置决定是否重新注入初始上下文。这不是把所有原始对话原样装回去，也不是上面六字段 checkpoint 的自动提取器。</p>
-    <p>摘要生成后还有一次明确的状态变化：<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/mod.rs#L3936-L4009"><code>replace_compacted_history</code></a>把新历史写入内存，同时将带 <code>replacement_history</code> 的 <code>Compacted</code> 记录交给持久化路径。恢复时，<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction.rs#L342-L372">先载入选中的压缩检查点，再重放其后的记录</a>。所以要保存的既是“摘要说了什么”，也是“接下来用哪一组历史继续”。</p>
-    <p>压缩本身也可能放不进窗口。本地路径遇到 <code>ContextWindowExceeded</code> 时，<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact.rs#L302-L344">在输入还有多项时移除最早历史项后重试</a>；若已无法继续缩减则返回错误，其他可重试错误则受重试次数限制。这个兜底并不能保证目标和约束永远无损，因此关键状态仍需独立检查。压缩完成事件也只表示压缩步骤结束，不表示支付测试已经通过。</p>
+    <p>Codex 的<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L1540-L1615">自动压缩入口</a>按配置选择 token-budget 重置、远端 V2 压缩或本地摘要。先跟随<strong>本地摘要路径</strong>：它调用模型生成摘要，再<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact.rs#L390-L435">构造替换历史并交给安装函数</a>；<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact.rs#L710-L789">用户文本从最近向前按预算选取，截断时同步保留对应片段的分类与来源</a>。新历史由保留文本、摘要和重新装配的初始上下文组成；上面的六字段 checkpoint 则是应用可以另行校验的设计。</p>
+    <p>摘要生成后还有一次明确的状态变化：<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L4430-L4484"><code>replace_compacted_history</code> 把替换历史写入内存，再将 <code>Compacted</code>、当前说明状态和回合上下文送入持久化路径</a>。<code>Compacted</code> 中包含 <code>replacement_history</code>，恢复时<a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction.rs#L342-L372">先载入选中的压缩检查点，再重放其后的记录</a>。所以要保存的既是“摘要说了什么”，也是“接下来用哪一组历史继续”。</p>
+    <p>压缩本身也可能放不进窗口。本地路径遇到 <code>ContextWindowExceeded</code> 时，<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact.rs#L337-L386">在输入还有多项时移除最早历史项后重试</a>；若已无法继续缩减则返回错误，其他可重试错误受次数限制。这里可能丢失早期限制，恢复后仍需检查关键状态。支付测试的通过状态必须来自测试结果。</p>
+
+    <h4>3.1.3 前台继续工作时，后台压缩怎样安全接入</h4>
+    <p>支付任务已经积累了大量调查记录，前台还要继续运行测试。如果直到窗口耗尽才开始压缩，下一步就要等待。Codex 的后台路径可以提前捕获历史快照 <code>H</code>，让远端生成压缩候选 <code>C</code>，前台同时继续追加测试结果等新记录 <code>S</code>。这个路径有<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/async_compaction.rs#L40-L80">明确启用条件</a>：开启 <code>AsyncCompaction</code>、提供方支持 V2 压缩、未启用 <code>TokenBudget</code>，已知模型窗口大小，并达到配置的上下文比例阈值；回合开始前还要等前台建立后端模型固定状态。已触及强制压缩边界时转交相应前台路径。</p>
+    <figure class="mechanism-figure"><img src="../assets/async-compaction.png" alt="条件满足后捕获历史快照并后台生成压缩候选；前台继续追加记录，候选通过校验后与新增记录接合并写入检查点，失败候选被丢弃" /><figcaption>后台工作基于捕获时的历史。候选在采样间隙或回合边界接受校验，通过后保留期间新增的记录；后台失败或候选失效时丢弃候选。图中的 H、C、S 是说明这一过程的简写。</figcaption></figure>
+    <p>启动时，运行时<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/async_compaction.rs#L83-L135">克隆历史，记录历史代数、模型、压缩兼容标识和身份代数，再提交后台任务</a>。候选就绪后，主循环在<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L659-L689">需要继续采样的间隙</a>或<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L1383-L1405">下一回合开始前</a>尝试采纳；配置允许的<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L786-L827">回合结束路径</a>也会检查候选。后台请求失败时记录调试信息并丢弃结果。</p>
+    <p>最关键的一步发生在替换之前：先检查<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact_remote_v2_installation.rs#L84-L90">当前模型与压缩兼容标识</a>，再在锁内检查<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L4359-L4388">历史代数、快照长度和身份代数</a>。期间正常追加的 <code>S</code> 会接到候选后面，得到简化形状 <code>C + S</code>；这里的 <code>C</code> 包括按捕获状态重建的初始上下文。若历史已经被替换或身份发生变化，就拒绝候选。这样，捕获快照后才返回的最新测试结果仍能留在下一次请求中。</p>
+    <p>采纳还要检查预算。新增记录很多时，<code>C + S</code> 仍可能超过限制；安装路径会<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact_remote_v2_installation.rs#L29-L69">再尝试一次前台压缩</a>。候选被拒绝时，<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L1562-L1578">只有当前阈值要求压缩才走前台回退，否则可以跳过</a>。因此后台工作主要降低等待机会，同时带来额外请求成本；失败或失效候选仍可能已经消耗模型用量。</p>
+    <p>失败处理还要看发生时点。回合开始前的压缩失败时，运行时<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L200-L228">先执行输入钩子并记录新输入，再报告错误</a>；回合结束后的普通压缩错误则<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/turn.rs#L810-L827">保留已经完成的回答</a>，中断和回合终止仍按终止处理。故障排查应分别查看新输入是否已保存、压缩是否被采纳，以及支付测试本身的结果。</p>
+    <h4>3.1.4 哪些工具结果能穿过远端压缩</h4>
+    <p>普通工具调用的详细日志可以进入压缩摘要；另有一种需要显式处理的材料：客户端直接提供的具名工具结果，例如宿主补充的一份测试报告。Codex 在开启 <a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact_remote_v2.rs#L529-L535"><code>RetainClientToolOutputs</code></a> 后，会把<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact_retained_tool_outputs.rs#L7-L20">带 <code>client_authored</code> 标记、没有 <code>call_id</code> 且有 <code>name</code> 的函数输出</a>纳入远端 V2 的保留候选。它与其他保留材料共享预算，<a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/compact_remote_v2.rs#L615-L649">从最近向前选取；整条放得下才保留，放不下就停止向更早记录回填</a>。具名只说明这种记录的形状，保留还依赖来源标记、功能开关和剩余预算。</p>
+    <p>接入 OpenAI 公开 API 时，<a href="https://developers.openai.com/api/docs/guides/compaction">独立压缩端点的返回窗口</a>包含不透明的压缩项，也可能包含保留记录；应用应把完整返回窗口传给下一次请求。上述 Codex 源码说明的是客户端如何准备、校验和安装其远端压缩结果。</p>
 
     <h3>3.2 检索命中为什么仍可能是坏 Context</h3>
     <p>Memory 是持久化机制，retrieval 是找候选的机制，context 是本次调用的可见集合。一个事实写进 memory 后，仍需要检索、过滤和预算才能进入 context；一个工具结果即使不写 memory，也可能在当前回合直接进入 context。</p>
@@ -116,8 +127,8 @@ verify_candidates = [
     <div class="table-wrap"><table><thead><tr><th>评审问题</th><th>要防的失败</th><th>首选机制</th></tr></thead><tbody>
       <tr><td>模型此刻必须知道什么？</td><td>缺关键证据</td><td>按当前决策定义 working set</td></tr><tr><td>每条事实从哪里来、还新鲜吗？</td><td>过期与错误权威</td><td>provenance、版本、TTL</td></tr><tr><td>为什么它值得占窗口？</td><td>噪声和 lost-in-the-middle</td><td>分区预算、排序、去重</td></tr><tr><td>压力下哪些不变量不能丢？</td><td>compact 后目标漂移</td><td>结构化 checkpoint</td></tr><tr><td>下一次运行怎样重新取得它？</td><td>把 session 当 memory</td><td>durable store + 可重放选择策略</td></tr>
     </tbody></table></div>
-    <p>Context engineering 的结果不是“塞得更多”，而是模型在每个决策点拿到正确的工作集。下一篇转向模型看不见却决定动作能否发生的部分：<strong>runtime harness。</strong></p>
-    <h2 id="sources">官方资料与源码</h2><ul class="source-list"><li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/history.rs#L422-L485">Codex：历史写入与请求视图</a></li><li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact.rs#L278-L403">Codex：本地压缩与替换历史</a></li><li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction.rs#L342-L372">Codex：从压缩检查点恢复</a></li><li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">Anthropic：Effective context engineering for AI agents</a></li><li><a href="https://www.anthropic.com/news/contextual-retrieval">Anthropic：Introducing Contextual Retrieval</a></li><li><a href="https://developers.openai.com/api/docs/guides/conversation-state">OpenAI：Conversation state</a></li><li><a href="https://developers.openai.com/api/docs/guides/prompt-engineering">OpenAI：Prompt engineering</a></li><li><a href="https://openai.com/index/harness-engineering/">OpenAI：Harness engineering</a></li></ul>
+    <p>Context engineering 让模型在每个决策点拿到正确的工作集。下一篇转向模型看不见却决定动作能否发生的部分：<strong>runtime harness。</strong></p>
+    <h2 id="sources">官方资料与源码</h2><ul class="source-list"><li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/async_compaction.rs#L40-L187">Codex：后台压缩候选与启用条件</a></li><li><a href="https://github.com/openai/codex/blob/2f3fb111be71d277c80bd5b96d9019748b921f5a/codex-rs/core/src/session/mod.rs#L4359-L4484">Codex：前缀校验、后缀保留与检查点</a></li><li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/context_manager/history.rs#L422-L485">Codex：历史写入与请求视图</a></li><li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/compact.rs#L278-L403">Codex：本地压缩与替换历史</a></li><li><a href="https://github.com/openai/codex/blob/5c5308fc9a9ee789049d646ef11e5400384b9c6f/codex-rs/core/src/session/rollout_reconstruction.rs#L342-L372">Codex：从压缩检查点恢复</a></li><li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">Anthropic：Effective context engineering for AI agents</a></li><li><a href="https://www.anthropic.com/news/contextual-retrieval">Anthropic：Introducing Contextual Retrieval</a></li><li><a href="https://developers.openai.com/api/docs/guides/conversation-state">OpenAI：Conversation state</a></li><li><a href="https://developers.openai.com/api/docs/guides/prompt-engineering">OpenAI：Prompt engineering</a></li><li><a href="https://openai.com/index/harness-engineering/">OpenAI：Harness engineering</a></li></ul>
     <h2>延伸阅读</h2><ul class="source-list"><li><a href="https://www.runoob.com/ai-agent/agent-context-engineering.html">菜鸟教程：Agent 上下文工程</a></li></ul>
   </section>
 </article></main></div><script src="../../assets/article.js?v=1"></script>
