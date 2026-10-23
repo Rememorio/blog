@@ -1,0 +1,794 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pi Agent 源码阅读（一）：Pi 为什么把 Coding Agent 做成可扩展的 Harness</title>
+    <meta
+      name="description"
+      content="沿 Pi 的模型循环、上下文重建、会话树和压缩，看核心怎样与内置 MCP、Codemode 及可替换扩展协作。"
+    />
+    <meta name="theme-color" content="#f5f1e8" />
+    <meta property="og:title" content="Pi Agent 源码阅读（一）：Pi 为什么把 Coding Agent 做成可扩展的 Harness" />
+    <meta
+      property="og:description"
+      content="沿 Pi 的模型循环、上下文重建、会话树和压缩，看核心怎样与内置 MCP、Codemode 及可替换扩展协作。"
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="../assets/pi-agent-harness-overview.png?v=20261023" />
+    <link rel="canonical" href="https://rememorio.github.io/blog/pi-agent/zh/overview/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/pi-agent/zh/overview/" />
+    <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/pi-agent/en/overview/" />
+    <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/pi-agent/" />
+    <link rel="stylesheet" href="../../../hermes-agent/styles.css?v=site-nav-series" />
+    <style>
+      .article-body strong {
+        color: var(--navy);
+        font-weight: 900;
+      }
+
+      .note.key-point {
+        border-color: rgba(31, 119, 123, 0.34);
+        background: rgba(31, 119, 123, 0.1);
+      }
+
+      .note.key-point strong {
+        color: var(--rose);
+      }
+
+      .shape-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin: 18px 0 22px;
+      }
+
+      .shape-box {
+        min-width: 0;
+        padding: 14px;
+        border: 1px solid rgba(24, 55, 82, 0.14);
+        border-radius: 8px;
+        background: rgba(255, 250, 240, 0.72);
+      }
+
+      .shape-box h3 {
+        margin-top: 0;
+      }
+
+      @media (max-width: 760px) {
+        .site-header .local-nav {
+          flex-wrap: wrap;
+          gap: 5px;
+          overflow-x: visible;
+          justify-content: center;
+        }
+
+        .site-header .local-nav a {
+          padding-inline: 6px;
+          font-size: 11px;
+        }
+
+        .shape-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  <link rel="stylesheet" href="../../../assets/code-highlight.css?v=1" />
+  </head>
+  <body id="top">
+    <header class="site-header">
+      <a class="brand" href="../../../zh/" aria-label="博客首页">
+        <span class="brand-mark">R</span>
+        <span>Rememorio Blog</span>
+      </a>
+      <nav class="local-nav" aria-label="文章快捷入口">
+        <a href="../">Pi Agent 系列</a>
+        <a href="../context/">下一篇</a>
+        <a href="#agent-loop">运行循环</a>
+        <a href="#session-tree">会话树</a>
+        <a href="#sources">参考源码</a>
+      </nav>
+      <nav class="site-actions" aria-label="站点操作">
+        <a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a>
+        <span class="language-switch" aria-label="语言切换">
+          <a class="active" href="./" lang="zh-CN" aria-current="page">中文</a>
+          <a href="../../en/overview/" lang="en">English</a>
+        </span>
+      </nav>
+    </header>
+
+    <div class="article-shell">
+      <aside class="toc-panel" aria-label="文章目录">
+        <div class="toc-title">目录</div>
+        <nav id="toc" class="toc-nav"></nav>
+      </aside>
+
+      <main class="article-main">
+        <article class="article-card">
+          <section class="article-hero" id="pi-agent-harness">
+            <p class="eyebrow">Pi Agent 源码阅读 · 第一篇</p>
+            <h1>Pi 为什么把 Coding Agent 做成可扩展的 Harness</h1>
+            <p class="lead">
+              给 Pi 一个“改代码并跑测试”的任务，模型会连续读文件、修改、执行命令和处理失败。
+              Pi 把支撑这段工作的核心做成 Harness：它先保证模型、工具、进度事件和会话稳定配合，
+              再让审批、规划、sub-agent 等具体工作方式通过扩展加入。
+            </p>
+            <div class="meta-line">
+              <span>主题：Pi Agent Harness</span>
+              <span>主线：pi-ai → agent-core → coding-agent</span>
+              <span>重点：loop / session tree / compaction / extensions</span>
+            </div>
+            <figure class="hero-image">
+              <img
+                src="../assets/pi-agent-harness-overview.png?v=20261023"
+                alt="Pi Agent Harness 手绘分层图：pi-ai 统一 provider，agent-core 拥有循环和事件，coding-agent 接入工具、会话与压缩，TUI、RPC、SDK 和 Extensions 共用这条运行主线"
+              />
+              <figcaption>图示聚焦本地 coding harness 的层次；Chord、telemetry 与 durable 等独立包不在这张图的范围内。</figcaption>
+            </figure>
+          </section>
+
+          <section class="article-body">
+            <div class="note key-point"><p>Pi 连续阅读的第一站：本篇跟着代码修改与测试建立运行图；<a href="../context/">下一篇</a>追踪测试留下的长日志，<a href="../codemode/">第三站</a>处理同一次测试产生的三份报告。三篇分别回答谁运行任务、怎样重建输入、怎样在工具结果进入消息前筛选数据。</p></div>
+
+<h2>一、先看一个 Coding Agent 为什么不能只调一次模型</h2>
+            <p>
+              先从一个很具体的任务开始。你让 coding agent “把配置读取改成异步，再跑测试”。它可能先读文件，
+              再修改实现，随后执行测试；测试失败后，它还要读错误、继续修复。做到这里，一个普通的
+              <code>while (tool_call)</code> 已经不够了：模型输出正在流式到终端，工具可能并行完成，
+              你可能在中途补一句“不要改公共接口”，会话还可能在两万行日志之后需要压缩。
+            </p>
+
+            <p>
+              Pi 把自己称为 <em>agent harness</em>，而不是一套预先规定好的开发流程。这里的 harness 可以理解成“运行托架”：
+              它协调模型、工具、事件和会话的运行，但不替每个团队决定应该怎样审批命令、怎样规划任务、
+              是否启用 sub-agent。核心维持运行顺序和记录一致性，工作流与隔离策略则需要另行配置。
+            </p>
+
+            <h2>二、Harness 先接住哪四件事</h2>
+            <ul>
+              <li><strong>接模型：</strong>不同 provider 的消息、工具调用和流式返回先被翻译成统一形状。</li>
+              <li><strong>跑循环：</strong>模型提出下一步，runtime 执行工具、写回结果，再决定是否继续调用模型。</li>
+              <li><strong>报进度：</strong>文本更新、工具开始、工具结束和一轮结束都成为事件，终端和 SDK 可以订阅。</li>
+              <li><strong>保会话：</strong>消息、工具结果、分支和压缩记录持续保存，进程重启后仍能重建当前工作路径。</li>
+            </ul>
+            <p>
+              权限弹窗、MCP、计划模式和 sub-agent 很重要，但它们建立在这四件事之上。Pi 的“可扩展”不是把核心做空，
+              而是先固定每种使用方式都必须保持的运行行为。
+            </p>
+
+            <h2>三、同一个改造任务怎样走完</h2>
+            <ol>
+              <li>会话装配选定的模型、文件工具、命令工具、system prompt 和已有历史。</li>
+              <li>模型先请求读取配置文件；runtime 校验并执行工具，把结果写回会话。</li>
+              <li>模型提出代码修改和测试命令；工具可以并行工作，但结果仍和原调用一一对应。</li>
+              <li>用户中途补充“不要改公共接口”，这条 steering 消息在下一次模型调用前进入。</li>
+              <li>测试失败后，模型看到错误继续修复；工具、队列与扩展续跑都处理完，外层会话才可能收尾，任务还需单独验收。</li>
+              <li>若还有 follow-up，它在当前工具与 steering 路径排空后进入；扩展也可在边界补充记录并请求继续。上下文过长时，模型改看摘要和最近记录。</li>
+              <li>所有原始记录仍留在会话树中，因此用户可以换分支、恢复或回看旧路径。</li>
+            </ol>
+            <p>
+              这七步先给出完整流程。后面的 <code>runLoop</code>、JSONL 树和 Compaction，会把每一步由哪个模块处理、必须保持什么条件说得更精确。
+            </p>
+            <div class="note warning">
+              <p>
+                <strong>先分清两棵“树”。</strong>
+                Pi 的 session tree 保存的是消息、工具结果、模型切换和摘要等会话记录；Git branch 或 worktree
+                保存的才是文件版本。执行过的 <code>edit</code>、<code>bash</code> 和外部 API 副作用不会因为
+                <code>/tree</code> 换到旧 leaf 而自动回滚。要安全试验另一条实现路径，仍需 Git worktree、sandbox、
+                可重入工具或 extension 自己的审批策略。
+              </p>
+            </div>
+
+            <div class="note key-point">
+              <p>
+                <strong>读完后你应该能回答。</strong>
+                本篇只追一个问题：Pi 的最小核心究竟拥有什么，哪些责任又被有意留给扩展？
+                读完后，你应该能从一条用户指令出发，重放模型调用、工具结果、消息插队、会话持久化、
+                分支和压缩，并说清持久会话记录与本轮模型输入为什么不是同一份东西。
+              </p>
+            </div>
+
+            <div class="note">
+              <p>
+                <strong>本文依据。</strong>
+                运行结构引用 Pi 1.0.0 发布快照 <code>a13d35a742c6ef8462812a28fbe1d8c8b7431c32</code>；摘要生成与截断恢复按 <code>be14d9732f98fcc33929cf103a92b96afaa6523e</code> 核实。每条源码链接固定到对应实现。
+                “运行托架”“持久会话记录”“本轮模型输入”是对公开代码分工的概括；
+                provider 的闭源服务行为、第三方扩展策略和容器内部实现不在本文断言范围内。
+              </p>
+            </div>
+
+            <p>先把全文压成一条运行流程：</p>
+            <pre><code class="language-text">用户：“把配置读取改成异步，再跑测试”
+  -&gt; AgentSession：装配 model、tools、system prompt、resources、SessionManager
+  -&gt; SessionManager：按当前分支、压缩与 context_edit 重建输入
+  -&gt; agent-core：prepareRequest -&gt; transformContext -&gt; convertToLlm -&gt; provider stream
+  -&gt; assistant message：文本 / thinking / toolCall
+  -&gt; tool batch：参数校验 -&gt; beforeToolCall -&gt; execute -&gt; afterToolCall
+  -&gt; AgentEvent：message_update / tool_execution_* / turn_end
+  -&gt; SessionManager：把 message、toolResult、model change 追加到 JSONL 树
+  -&gt; 下一轮：先处理 steering；没有工具和 steering 后再处理 follow-up
+  -&gt; 上下文过长：追加 CompactionEntry，模型改看 summary + recent entries
+  -&gt; /tree 换路：移动 leaf，可选写入 BranchSummaryEntry</code></pre>
+            <p>
+              这不是一段真实 TypeScript，而是后面每节要补全的状态交接。最重要的两个词是“追加”和“筛选”：
+              持久 Session 主要追加记录；模型每一轮看到的 Context，则根据当前 Leaf、Compaction 位置、上下文编辑和消息转换规则重新组装。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>同一 session 的三种视图</th>
+                    <th>怎样得到</th>
+                    <th>谁会使用</th>
+                    <th>允许丢失什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>持久会话记录</td>
+                    <td>JSONL 追加所有 entry，包括旧分支、custom entry 和 compaction record。</td>
+                    <td><code>SessionManager</code>、<code>/tree</code>、恢复与审计。</td>
+                    <td>正常运行不靠删除旧 entry 来省上下文。</td>
+                  </tr>
+                  <tr>
+                    <td>Active branch</td>
+                    <td>从当前 <code>leafId</code> 沿 <code>parentId</code> 回到 root。</td>
+                    <td>当前会话导航、fork/clone 与 context rebuild。</td>
+                    <td>其他分支仍保存在 JSONL 中，但不属于当前路径。</td>
+                  </tr>
+                  <tr>
+                    <td>本轮模型输入</td>
+                    <td>在 active branch 上应用 compaction boundary、<code>context_edit</code>、<code>transformContext</code> 和 <code>convertToLlm</code>。</td>
+                    <td>下一次 provider request。</td>
+                    <td>可以有损压缩、过滤 UI-only entry；不能破坏工具调用与结果的对应关系。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h2 id="runtime-map">四、源码里先认清四层：Pi 不是一个巨大的 Agent 类</h2>
+
+            <h3>4.1 从 provider 到终端，每层只接一类责任</h3>
+            <p>
+              这篇沿本地 coding harness 的四层来读：
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/README.md"><code>pi-ai</code>、<code>pi-agent-core</code>、<code>pi-coding-agent</code> 和 <code>pi-tui</code></a>。当前仓库还包含 Chord、telemetry 与 durable 等包；这里的四层是本文聚焦的运行路径，不是整个 monorepo 的完整目录。
+              对初学者来说，可以先不要记包名，只记住四个问题：provider 的不同消息格式谁抹平，模型与工具谁循环，
+              coding agent 的文件和会话谁管理，终端怎样消费事件。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>层</th>
+                    <th>它拥有的责任</th>
+                    <th>它不负责决定什么</th>
+                    <th>第一眼源码</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>pi-ai</code></td>
+                    <td>统一 model、provider、消息 content block、tool schema、usage 和流式 assistant event。</td>
+                    <td>不决定 coding agent 应该调用哪个工具，也不保存会话树。</td>
+                    <td><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/ai/src/models.ts"><code>Provider</code> / <code>Models</code></a></td>
+                  </tr>
+                  <tr>
+                    <td><code>pi-agent-core</code></td>
+                    <td>拥有 agent state、turn 事件、模型调用、工具批次、steering 和 follow-up 队列。</td>
+                    <td>不知道文件工具长什么样，也不知道会话落在哪个目录。</td>
+                    <td><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/README.md">message 与 event contract</a></td>
+                  </tr>
+                  <tr>
+                    <td><code>pi-coding-agent</code></td>
+                    <td>装配 read/bash/edit/write、system prompt、resources、session、compaction、extensions 和运行模式。</td>
+                    <td>不把 TUI 当成唯一入口，也不把某个 provider 写死在产品层。</td>
+                    <td><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/sdk.ts"><code>createAgentSession</code></a></td>
+                  </tr>
+                  <tr>
+                    <td><code>pi-tui</code> / modes</td>
+                    <td>把同一事件流呈现成交互终端、print/JSON、RPC，或让 SDK 嵌进别的应用。</td>
+                    <td>不重写 agent loop；界面只是 runtime 的消费者。</td>
+                    <td><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/README.md">四种运行入口</a></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              这套分层带来一个很实用的判断：Pi 的“产品”是终端 coding agent，但它的可复用核心不是终端。
+              SDK 直接创建 <code>AgentSession</code>，RPC 则把命令、响应和事件编码成逐行 JSON；
+              两者最终都复用同一条 agent 与 session 主线。
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/sdk.md">SDK contract</a>
+              和
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/rpc.md">RPC framing</a>
+              只是两种不同的外壳。
+            </p>
+
+            <p>本文的 Harness 指 coding-agent 产品及其运行分工，不是一个必须叫 AgentHarness 的类。1.0 已从 agent-core 移除旧实验性 <code>AgentHarness</code> 等接口；独立的 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/durable/README.md">pi-durable</a> 仍标为实验性，源码中的客户端／服务端实现也不属于默认发行路径。不能据此把下文的本地 JSONL 会话解释成已经迁移到 durable 服务。</p>
+
+<h3>4.2 “最小”不等于 completion adapter</h3>
+            <p>
+              如果核心只是把文本传给模型，它无法解释三件事：工具结果为什么能和原始 tool call 对上，
+              用户中途的新消息什么时候进入，进程重启后为什么能从同一分支继续。Pi 把这些都留在核心，
+              因为它们决定了运行是否可重放；至于“每次 bash 都弹确认框”还是“整个进程运行在容器里”，
+              则属于具体环境的安全策略。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <strong>Pi 的核心边界：</strong>
+                保证一次 agent run 在消息、事件、工具结果和会话记录上自洽；不替所有使用者规定工作流与安全交互。
+              </p>
+            </div>
+
+            <h2 id="agent-loop">五、一轮不是一次 completion：沿 <code>runLoop</code> 走完</h2>
+
+            <h3>5.1 模型每次只提出下一步，runtime 才拥有循环</h3>
+            <p>
+              回到“改异步并跑测试”的任务。第一次模型响应可能包含一个 <code>read</code>，
+              第二次包含 <code>edit</code> 和 <code>bash</code>，第三次才给最终回答。模型并不知道整个 while loop
+              什么时候结束；它只通过 <code>stopReason</code> 和 content blocks 交出这一步。
+            </p>
+
+            <p>正常工具路径可以按五步阅读；错误、取消与主动停止另有出口：</p>
+<ol><li>注入等待中的输入，在每次请求的 <code>prepareRequest</code> 阶段重建有效上下文。</li><li>调用 provider，流式得到完整 assistant message。</li><li>若有 tool call，完成工具批次并写回结果。</li><li>调用 <code>finishTurn</code> 决定默认调度、继续或结束，然后发出低层 <code>turn_end</code>。</li><li>处理工具后续请求、steering 与 follow-up；仍无后续请求且未要求继续时，发出低层 <code>agent_end</code>。</li></ol>
+            <p>
+              这正是
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts"><code>runLoop</code></a>
+              的内外两层循环：内层处理工具与 steering，外层让“本来已经结束的 agent”还能接住 follow-up。
+            </p>
+            <div class="note key-point">
+              <p><strong>低层 agent_end 只结束这一段循环。</strong>外层 AgentSession 还可能进行错误恢复，或通过 <code>agent_before_settle</code> 让扩展补充记录并继续。因此既不能把它直接读成整个会话已空闲，也不能读成质量通过。即使测试从 exit code 1 修复到 0，仍要检查 diff 是否改变公共接口，再由 CI 或用户接受结果。</p>
+
+            </div>
+
+            <figure class="hero-image">
+              <img
+                src="../assets/pi-agent-loop.png?v=20261023"
+                alt="Pi 工具轮次：模型请求、工具批次、结果写回和 turn_end 后进入下一轮准备，可按需压缩；steering 在下一轮前注入，follow-up 等待工具与 steering 路径排空"
+              />
+              <figcaption>图中聚焦普通工具批次与队列调度；finishTurn 的主动结束／续跑和外层会话收尾见正文。follow-up 要等工具与 steering 路径排空。</figcaption>
+            </figure>
+
+            <p>下一轮并不直接复用刚才的请求。<code>prepareNextTurn</code> 可以更新上下文、模型与 thinking 设置；每次 provider 调用前的 <code>prepareRequest</code> 又从 SessionManager 重建有效消息。coding harness 会把新工具结果计入预算，必要时先压缩。准备期间新到的 steering 也会再次检查。实现见 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts#L759">请求前上下文重建</a>。</p>
+
+
+            <p><code>finishTurn</code> 的 continue 保证还有一次模型请求；工具、steering 或 follow-up 已经带来的下一次请求可以满足它，不会额外重复一次。end 则结束当前低层 run，不再消费队列。错误和取消仍走硬退出，不能靠返回 continue 强行续跑。coding-agent 的 <code>turn_end</code> 与 <code>agent_before_settle</code> 扩展还可提交记录草稿，经预览和校验后按序落盘；详细时序见 <a href="../context/#continuation">上下文专题</a>与 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts">agent loop</a>。</p>
+
+<h3>5.2 工具可以并行完成，结果仍按原调用顺序写入</h3>
+            <p>
+              假设模型一次请求同时要读取两个互不相关的文件。Pi 默认可以并行执行工具；但“并发完成顺序”和
+              “assistant 原始 tool call 顺序”不是一回事。快的工具可以先发
+              <code>tool_execution_end</code>，最终写入 context 的 tool-result messages 仍按模型提出调用的顺序排列。
+              这样 UI 能及时更新，下一轮模型又能拿到稳定的调用—结果配对。
+            </p>
+
+            <p>
+              具体实现先逐个做参数校验和 <code>beforeToolCall</code> preflight，再把允许的调用并发执行；
+              <code>Promise.all</code> 收集后，按数组原顺序发出 tool result message。
+              如果配置 <code>toolExecution: "sequential"</code>，或任一工具声明 <code>executionMode: "sequential"</code>，整个 batch 会退回顺序执行。并行 preflight 被中断后，已准备但尚未启动的工具也会检查 abort，避免取消后继续产生副作用。
+              参见
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts"><code>executeToolCalls</code></a>。
+            </p>
+
+            <div class="shape-grid">
+              <div class="shape-box">
+                <h4>实时事件顺序</h4>
+                <pre><code class="language-text">tool A start
+tool B start
+tool B end
+tool A end</code></pre>
+                <p>适合 UI 展示真实进度。</p>
+              </div>
+              <div class="shape-box">
+            <h4>Tool Call 与结果的写入顺序</h4>
+                <pre><code class="language-text">assistant: [A, B]
+toolResult: A
+toolResult: B</code></pre>
+                <p>保持调用与结果的稳定对应。</p>
+              </div>
+            </div>
+
+            <p>
+              另一个容易忽略的失败边界是输出截断。如果 assistant message 因长度上限停止，残缺 JSON
+              有时仍可能被“尽力解析”成看似合法的参数。Pi 不执行这些调用，而是为整个批次生成错误结果，
+              让模型下一轮重新发出完整参数。
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts">截断工具调用处理</a>
+              保护的是副作用完整性，不只是 parser 成功率。
+            </p>
+
+            <h3>5.3 steering 与 follow-up 不是两个名字相似的队列</h3>
+            <p>
+              当 agent 正在跑测试时，你输入“不要改公共接口”，这是 steering：当前 assistant turn 和已经提出的工具调用会先正常结束，
+              这句话随后在下一次模型调用前进入 context。你输入“做完后再补一个 changelog”，则更像 follow-up：
+              只有当原任务已经没有工具和 steering 可处理时，它才开启下一轮。
+            </p>
+
+            <p>
+              这个边界避免了两个常见错误。第一，steering 不会把正在执行的工具凭空抹掉；
+              第二，follow-up 不会在主任务中途抢占上下文。低层 contract 在
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/types.ts"><code>getSteeringMessages</code> / <code>getFollowUpMessages</code></a>，
+              产品层又把 Enter 与 Alt+Enter 映射到两类队列。
+            </p>
+
+            <h2 id="model-view">六、AgentMessage 不是 Provider Message：先筛选和转换，再调用模型</h2>
+
+            <h3>6.1 一份运行历史里可以有模型根本不该看到的记录</h3>
+            <p>Pi 在 agent 层使用可扩展的 <code>AgentMessage</code>。coding-agent 先从会话重建消息：选当前分支和压缩范围，应用上下文编辑，再交给 agent 层转换。直接改写 <code>agent.state.messages</code> 不会持久改变下次请求，因为 prepareRequest 会重新读取会话记录。最后才执行可选 transformContext 与必须的 convertToLlm：</p>
+
+            <pre><code class="language-text">SessionManager.buildSessionProjection()
+  -&gt; prepareRequest()
+  -&gt; AgentMessage[]
+  -&gt; transformContext()   // 压缩、裁剪、注入外部上下文
+  -&gt; AgentMessage[]
+  -&gt; convertToLlm()      // 过滤 UI-only 项，转换自定义消息
+  -&gt; provider Message[]</code></pre>
+            <p>
+              这个边界写在
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts"><code>streamAssistantResponse</code></a>。
+              它意味着“会话里存在”不自动等于“下一轮发给模型”。扩展的普通 <code>CustomEntry</code>
+              可以持久化计数器却完全不进入 context；<code>CustomMessageEntry</code> 才是显式进入 model-visible view 的类型。
+            </p>
+
+            <p>工具集合本身也进入可重放的历史。每次模型请求前，<a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts"><code>declareToolChanges</code></a> 比较历史已声明的工具与当前可执行工具，把差异写成 system message 的 <code>toolsAdded</code> / <code>toolsRemoved</code>。例如扩展撤下 <code>bash</code> 后，后续请求看到撤下记录，而不是继续相信旧工具目录；仅仅修改内存中的工具数组不足以解释这一变化。</p>
+
+            <p>长日志写入会话后，后续请求可以通过持久的 <code>context_edit</code> 或请求时转换缩短内容。两者的保存位置与恢复行为在<a href="../context/#request">下一篇的请求重建流程</a>中展开；这里先保留“会话记录 → 本次消息 → provider 请求”这条分工。</p>
+
+<h3>6.2 provider 差异停在 <code>pi-ai</code>，上层只看统一事件</h3>
+            <p>
+              Anthropic、OpenAI Responses、OpenAI-compatible chat、Google 等 provider 的 wire shape 不一样，
+              但 agent loop 消费的是统一的 <code>AssistantMessageEventStream</code>。流开始时先把 partial assistant message
+              放进当前 context；text、thinking、tool-call delta 持续替换这条 partial；done/error 到来后再落成 final message。
+              对上层来说，provider 变了，<code>message_start → message_update → message_end</code> 的生命周期不变。
+            </p>
+
+            <p>
+              <code>pi-ai</code> 让工具循环与 provider payload 解耦，并作为独立包供其他应用复用。
+              coding agent 还可以通过 extension 注册新 provider 或覆盖 base URL。
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/extensions/types.ts"><code>registerProvider</code></a>
+              是产品层重新接入 provider 的扩展点。
+            </p>
+
+            <h3>6.3 每次请求还可以选择不同的实际模型</h3>
+<p>实验性的 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/virtual-models.md">virtual models</a> 让用户选择一个虚拟模型，由扩展在请求时选定实际 provider、model 和 thinking。会话保留虚拟选择，assistant 记录实际执行模型；路由状态可沿分支保存。若实际模型上下文窗口较小，runtime 会按该模型检查压缩。切换模型可能影响缓存复用与消息兼容性，所以“能够路由”不能直接推出成本或质量更好；应比较同一任务的实际结果和用量。</p>
+
+<h2 id="session-tree">七、会话不是聊天数组：JSONL 记录为什么要长成树</h2>
+
+            <h3>7.1 <code>id + parentId + leaf</code> 把“回到过去”变成移动指针</h3>
+            <p>
+              线性聊天数组遇到 <code>/tree</code> 会很尴尬：用户回到第十轮重写问题，后面的旧回答是删除、复制到新文件，
+              还是继续混在数组里？Pi 选择 append-only tree。每条 entry 都有 <code>id</code> 和
+              <code>parentId</code>，<code>leafId</code> 表示当前所在位置；从 leaf 沿 parent 一直走回 root，
+              就得到当前有效分支。
+            </p>
+
+            <pre><code class="language-json">{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"改成异步"}}
+{"type":"message","id":"m2","parentId":"m1","message":{"role":"assistant","content":[...]}}
+{"type":"message","id":"m3","parentId":"m2","message":{"role":"toolResult",...}}
+{"type":"message","id":"b1","parentId":"m1","message":{"role":"user","content":"保留同步兼容层"}}</code></pre>
+            <p>
+              这是简化后的 shape，不是完整 session 文件。<code>m3</code> 与 <code>b1</code> 是从不同位置继续的两条路；
+              旧记录没有被改写。<code>SessionManager.branch()</code> 只是把 leaf 移到较早 entry，
+              下一次 append 自然成为它的新 child。
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/session-manager.ts">分支与 tree 构造</a>
+              直接体现了这条 invariant。
+            </p>
+
+            <h3>7.2 <code>/tree</code>、<code>/fork</code>、<code>/clone</code> 解决的是三种不同问题</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>操作</th>
+                    <th>记录怎么变</th>
+                    <th>适合的场景</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>/tree</code></td>
+                    <td>留在同一个 JSONL，移动 leaf；可选把离开的分支总结到新位置。</td>
+                    <td>在同一任务里试另一种实现，同时保留两条路径。</td>
+                  </tr>
+                  <tr>
+                    <td><code>/fork</code></td>
+                    <td>把选定 active path 复制成新的 session 文件，并把旧 user prompt 放回编辑器。</td>
+                    <td>从过去的问题开始一个独立实验。</td>
+                  </tr>
+                  <tr>
+                    <td><code>/clone</code></td>
+                    <td>复制当前 active path 到新 session，编辑器为空。</td>
+                    <td>保留当前上下文，但把后续工作拆成另一份会话。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              <code>/tree</code> 还有一层容易读反的行为：如果用户选择总结离开的旧分支，
+              <code>navigateTree()</code> 先找到旧 leaf 与目标路径的 common ancestor，收集离开路径上的 entries；
+              summary 生成后，不是挂在旧 leaf 后面，而是作为 <code>BranchSummaryEntry</code> 追加到新的导航位置。
+              这样未来从新分支继续时，模型能知道“另一条路试过什么”，却不必把整条旧分支重新塞进 context。
+              参见
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts"><code>navigateTree</code></a>。
+            </p>
+
+            <h2 id="compaction">八、Compaction 缩短本轮模型输入，不删除原始记录</h2>
+
+            <h3>8.1 触发以后，先找到不会拆散 Tool Call 与结果的位置</h3>
+            <p>当 context token 超过 <code>contextWindow - reserveTokens</code>，或用户主动执行 <code>/compact</code>，Pi 先重建当前有效输入，再从其中向前选择保留范围。已经应用的 context_edit 会影响摘要材料和长度估算；原始长日志不会仅因为还在 JSONL 中就重新进入摘要。<code>keepRecentTokens</code> 尽量保留近期内容，但切点不能落在 tool result 上，避免留下孤儿结果。</p>
+
+
+            <p>切点必须兼顾消息角色和完整 turn。若一个 turn 自己已经超出保留预算，可以单独总结早期 turn prefix；若尾部工具结果很大，则连同前面的 assistant tool call 一起保留。<code>keepRecentTokens</code> 是近似预算。当前 preparation 使用 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/compaction.ts#L802">findProjectedCutPoint</a>，根据每条 entry 实际贡献的消息选择范围，同时处理不贡献模型内容的记录。</p>
+
+
+            <h3>8.2 Summary 是 model context 的检查点协议</h3>
+            <p>默认 summary path 依次做四件事：</p>
+            <ol>
+              <li>从已应用编辑的有效消息中取摘要材料，再把自定义消息转换并序列化成带角色标签的文本。</li>
+              <li>截短过大的 tool result，避免 summary request 自己再次撑爆 context。</li>
+              <li>要求模型只输出 Goal、Constraints、Progress、Decisions、Next Steps、Critical Context，不继续原对话。</li>
+              <li>额外累计 read/write/edit 的文件清单，作为结构化标记附在 summary 后面。</li>
+            </ol>
+            <p>
+              这些步骤分别由
+              <a href="https://github.com/earendil-works/pi/blob/be14d9732f98fcc33929cf103a92b96afaa6523e/packages/coding-agent/src/core/compaction/utils.ts"><code>serializeConversation</code></a>
+              和
+              <a href="https://github.com/earendil-works/pi/blob/be14d9732f98fcc33929cf103a92b96afaa6523e/packages/coding-agent/src/core/compaction/compaction.ts"><code>generateSummaryWithUsage</code></a>
+              实现。这样 summary 的目标不是写一段好看的回顾，而是给另一个模型留下可继续推理的文本检查点。
+              它只恢复本轮模型输入，不恢复工作区文件、后台进程、工具内部状态或已经发生的外部副作用。
+            </p>
+
+            <p>摘要请求的输入、输出与安装检查，集中在<a href="../context/#summary-request">下一篇的摘要请求协议</a>中；本篇继续看摘要怎样成为会话记录。</p>
+
+
+            <h3>8.3 写入新的 Entry，再重建下一轮模型输入</h3>
+            <p>Summary 成功后，AgentSession 追加 <code>CompactionEntry { summary, firstKeptEntryId, tokensBefore, details }</code>，再通过 <code>buildSessionProjection()</code> 刷新状态。旧消息仍在 JSONL。新的输入包含压缩时的 system 检查点、最新摘要、保留范围内有效消息与之后的新记录；内容编辑仍参与重建。下面省略无关元数据：</p>
+
+
+            <pre><code class="language-text">persistent JSONL:
+M1 -&gt; A1 -&gt; T1 -&gt; M2 -&gt; A2 -&gt; T2 -&gt; C1
+
+C1 = {
+  type: "compaction",
+  summary: "...",
+  firstKeptEntryId: "M2",
+  tokensBefore: 48210,
+  systemMessage: { role: "system", content: "...", ... }
+}
+
+下一轮 model-visible view:
+[systemCheckpoint(C1), compactionSummary(C1), M2, A2, T2]</code></pre>
+            <p>
+              这也是 Pi 与“直接把旧数组替换成摘要”的关键差别。后者一旦摘要漏掉细节，原始记录就已经消失；
+              Pi 的 Compaction 会有损地缩短模型输入，但原始历史仍可通过 <code>/tree</code> 查看。
+              写入与重建发生在
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts"><code>AgentSession.compact</code></a>，
+              投影规则在
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/session-manager.ts"><code>buildContextEntries</code></a>。
+            </p>
+
+            <figure class="hero-image">
+              <img
+                src="../assets/pi-session-tree-compaction.png?v=20261023"
+                alt="Pi 会话树与压缩手绘图：JSONL 账本保留分支，摘要通过有效性检查后追加 CompactionEntry，失败摘要停止，模型读取摘要与近期历史"
+              />
+              <figcaption>默认摘要路径先检查失败、截断和工具调用，再追加 CompactionEntry；图中的验收是运行时有效性检查，不保证摘要保留了每个语义细节。</figcaption>
+            </figure>
+
+            <h3>8.4 自动恢复与再次压缩分别有自己的停止条件</h3>
+            <p>
+              自动压缩区分“主动腾空间”和“中断后恢复”。threshold 跨过预算就压缩，不重跑已经完成的回答；overflow 既可能来自上下文溢出，也可能来自可恢复的长度截断。失败或截断的 assistant message 会从重试输入中移除，但仍留在会话历史里，随后最多执行一次压缩并重试。若回答已正常完成，只压缩而不重跑。无 provider usage 时还可以按消息大小估计，压缩前的陈旧 usage 则不能触发刚压完后的第二次压缩。
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts"><code>_checkCompaction</code></a> 选择恢复原因；<a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts"><code>_runAutoCompaction</code></a> 执行并安装结果。等待中的 steering/follow-up 在压缩后仍可继续处理。
+            </p>
+
+            <p>再次压缩从当前重建结果出发：旧摘要与上次保留的尾部已经在这份结果中，新摘要再吸收后来进展，不需要重新把所有原始记录拉回来。输入被 context_edit 或 compaction 改过以后，较早 assistant 的 usage 已不能代表当前长度；<code>estimateProjectedContextTokens</code> 会按有效消息重新估算。失败 assistant 的省略也用持久 context_edit 表达。<a href="https://github.com/earendil-works/pi/blob/be14d9732f98fcc33929cf103a92b96afaa6523e/packages/coding-agent/src/core/agent-session.ts#L1238-L1281">恢复时</a>，runtime 从当前有效输入找出该 assistant 的 toolCallId，以及下一条 assistant 之前的配对结果，一起写入省略记录；这让当前 run 与恢复后的下一次请求都维持调用和结果的配对。见 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/compaction.ts#L872">prepareCompaction</a>与 <a href="../context/#compaction">上下文专题</a>。</p>
+
+
+            <h2 id="extensions">九、Extension 可以介入哪些运行步骤</h2>
+
+            <h3>9.1 内置能力也通过扩展进入产品</h3>
+<p>在 v1.0.0，MCP、codemode 和 tool_search 已是内置扩展。MCP 负责接入服务与发现工具；codemode 让模型用 JavaScript 组合调用并过滤结果；tool_search 把选中的工具声明加载到后续请求。它们增加了默认产品能力，却不需要把全部行为塞进低层 agent-core。入口和结果流详见 <a href="../codemode/">Codemode 与 MCP 专题</a>。</p>
+<p>Extension 可以注册工具、命令、provider 与 MCP 服务，也能处理模型请求、工具执行和会话事件。turn_end 与 agent_before_settle 还允许返回追加记录和续跑草稿。计划流程、子 Agent 编排和权限交互仍可由扩展选择；产品默认能力与核心循环由不同层次实现。</p>
+<div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>想增加的能力</th>
+                    <th>介入哪个运行步骤</th>
+                    <th>必须保护的 invariant</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>危险命令确认</td>
+                    <td><code>tool_call</code> / <code>beforeToolCall</code></td>
+                    <td>被拒绝的调用要变成明确 tool result，不能静默消失。</td>
+                  </tr>
+                  <tr>
+                    <td>自定义 compaction</td>
+                    <td><code>session_before_compact</code></td>
+                    <td>仍要提供 summary、first kept entry 和 token boundary，恢复路径不能断。</td>
+                  </tr>
+                  <tr>
+                    <td>plan mode / sub-agent</td>
+                    <td>custom tool、message、entry、command、event</td>
+                    <td>子流程的结果最终仍通过 agent message 与 session record 回到主线。</td>
+                  </tr>
+                  <tr>
+                    <td>MCP 与脚本工具编排</td>
+                    <td>内置 MCP、codemode、tool_search；可由扩展替换。</td>
+                    <td>嵌套调用仍经工具 hook，发现与声明沿明确规则变化。</td>
+                  </tr>
+                  <tr>
+                    <td>新 provider</td>
+                    <td><code>registerProvider</code> / custom stream</td>
+                    <td>上层仍消费统一 assistant message event。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>9.2 Skills 是按需说明书，Extensions 是可执行 runtime code</h3>
+            <p>
+              两者也不能混在一起。Skill 以 <code>SKILL.md</code> 表达说明、步骤和资源，
+              默认把 name/description 放进 system prompt，模型需要时再读取正文；Extension 则是运行在 Pi 进程里的 TypeScript，
+              可以直接注册工具、修改事件或写 session state。
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/skills.ts">skill metadata validation</a>
+              与
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/skills.ts"><code>formatSkillsForPrompt</code></a>
+              说明前者是渐进披露；后者拥有完整代码权限。
+            </p>
+
+            <p>一个 Pi Package 可以同时带 extension、skill、prompt 和 theme。扩展在宿主进程中执行代码，skill 则可能指引模型调用有副作用的工具，因此不能根据包的外观判断可信程度。<a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/security.md">安全文档</a> 要求加载前审查扩展和包；可扩展性带来的代码权限需要由部署环境约束。</p>
+
+
+            <h2 id="security">十、Project trust 不是 sandbox，hook 也不是默认权限系统</h2>
+
+            <h3>10.1 启动时信任项目，与每次工具调用是否允许，是两道门</h3>
+            <p>Project trust 控制项目 settings、MCP 配置、extensions、skills、prompts、themes 与 system-prompt 文件等受保护资源是否加载。默认需要信任决定，但已有决定、命令行参数和扩展可以改变交互。它防止项目悄悄加载可执行扩展，不限制会话启动后工具的操作权限。<a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/security.md">Security 文档</a> 还列出两个例外：project sessionDir 在信任判断前读取；AGENTS.override.md、AGENTS.md 和 CLAUDE.md 等上下文文件，除非禁用 context loading，否则不受该信任决定阻止。</p>
+
+
+            <p>
+              <code>beforeToolCall</code> 与 extension 的 <code>tool_call</code> 事件确实可以阻止执行；
+              coding-agent 也把 extension hook 接进 agent-core 的 preflight。
+              但默认发行版没有像 AgentScope 那样内置一套 allow/deny/ask 权限策略。
+              没有自定义 gate 时，read、write、edit、bash 继承启动 Pi 的用户与进程权限。
+            </p>
+
+            <h3>10.2 真正隔离要落到进程或工具执行环境</h3>
+            <p>
+              Pi 给出的三种模式很诚实：整个进程放进 Docker；整个进程进入 OpenShell 这类 policy-controlled sandbox；
+              或让 Pi 与 provider auth 留在宿主机，通过 Gondolin extension 把 built-in tools 和 <code>!</code> 命令路由到 micro-VM。
+              这三种方案隔离的对象不同，尤其第三种只会自动接管被覆盖的工具，其他 Extension Tool 仍可能在宿主机运行。
+              <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/containerization.md">containerization 选择表</a>
+              正是在提醒这个边界。
+            </p>
+
+            <div class="note key-point">
+              <p>
+                <strong>不要把可插拔 gate 当成已启用的安全策略。</strong>
+                Pi 提供拦截关口，但默认权限边界仍是操作系统用户；project trust 只管理项目资源是否加载。
+              </p>
+            </div>
+
+            <h2 id="decision">十一、Pi 适合什么：用责任表，而不是功能清单做判断</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>工程压力</th>
+                    <th>Pi 核心接住什么</th>
+                    <th>仍需你决定什么</th>
+                    <th>失败边界</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>多 provider coding agent</td>
+                    <td>统一流式消息、tool call、usage、thinking 和 error contract。</td>
+                    <td>模型选择、认证来源、代理与 provider 扩展。</td>
+                    <td>自定义 provider 必须维持统一 stream contract。</td>
+                  </tr>
+                  <tr>
+                    <td>长时间工具任务</td>
+                    <td>事件、并发工具批次、steering/follow-up、abort 与 retry 接点。</td>
+                    <td>哪些工具并行、哪些副作用要审批。</td>
+                    <td>默认没有逐次权限弹窗。</td>
+                  </tr>
+                  <tr>
+                    <td>可恢复的探索过程</td>
+                    <td>append-only JSONL tree、leaf、fork/clone、branch summary。</td>
+                    <td>何时换分支，是否总结离开的路径。</td>
+                    <td>summary 有损，但原始账本仍在。</td>
+                  </tr>
+                  <tr>
+                    <td>上下文窗口压力</td>
+                    <td>上下文编辑、按有效消息选择切点、CompactionEntry 与恢复。</td>
+                    <td>预算、模型、自定义 summary 策略。</td>
+                    <td>错误切点会拆散 tool call/result，因此被显式禁止。</td>
+                  </tr>
+                  <tr>
+                    <td>团队自定义工作流</td>
+                    <td>Extensions、Skills、packages、SDK/RPC 接入面。</td>
+                    <td>plan、sub-agent、MCP 暴露与认证、权限及 sandbox 策略。</td>
+                    <td>扩展代码与 skill 进入同一信任边界，必须审查。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>Pi 把模型接入、运行循环和会话管理做成可嵌入的包，再通过扩展组织具体工作方式。它的设计取舍是<strong>让核心职责保持清楚，让应用能替换审批、规划和协作策略</strong>。这些策略进入产品后，仍需由应用验证权限、恢复和外部副作用。需要横向比较这些职责时，可以参照<a href="../../../agent-framework/zh/overview/">Agent 框架总览</a>。</p>
+
+            <p>现在回到这次代码修改：测试已经执行，长日志也写入了会话。<a href="../context/">下一篇沿这份日志继续</a>，把它记为 <code>T1</code>，检查原文怎样保留、当前分支怎样选择内容，以及重启后如何重建相同的下一轮输入。</p>
+
+            <h2 id="sources">参考源码与文档</h2>
+            <ul>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/README.md">Pi Agent Harness README</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/agent-loop.ts"><code>pi-agent-core</code> agent loop</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/agent/src/types.ts"><code>AgentLoopConfig</code> 与 tool hooks</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts"><code>AgentSession</code></a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/session-manager.ts"><code>SessionManager</code></a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/compaction.ts">Compaction implementation</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/compaction/branch-summarization.ts">Branch summarization implementation</a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/extensions/types.ts"><code>ExtensionAPI</code></a></li>
+              <li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/security.md">Pi Security</a></li>
+            </ul>
+          </section>
+        </article>
+      </main>
+    </div>
+
+    <script src="../../../assets/table-labels.js"></script>
+    <script>
+      (() => {
+        const article = document.querySelector(".article-body");
+        const toc = document.querySelector("#toc");
+        if (!article || !toc) return;
+        const headings = [...article.querySelectorAll("h2, h3, h4")];
+        const slugCounts = new Map();
+        const slugify = (text) => {
+          const raw = text
+            .trim()
+            .toLowerCase()
+            .replace(/<[^>]+>/g, "")
+            .replace(/["'“”‘’]/g, "")
+            .replace(/[^\p{Script=Han}\p{Letter}\p{Number}]+/gu, "-")
+            .replace(/^-+|-+$/g, "");
+          const base = raw || "section";
+          const count = slugCounts.get(base) || 0;
+          slugCounts.set(base, count + 1);
+          return count ? base + "-" + (count + 1) : base;
+        };
+        const root = document.createElement("ol");
+        root.className = "toc-list";
+        const stack = [{ level: 2, list: root }];
+        headings.forEach((heading) => {
+          if (!heading.id) heading.id = slugify(heading.textContent || "");
+          const level = Number(heading.tagName.slice(1));
+          while (stack.length && level < stack[stack.length - 1].level) stack.pop();
+          if (level > stack[stack.length - 1].level) {
+            const parent = stack[stack.length - 1].list.lastElementChild;
+            const child = document.createElement("ol");
+            child.className = "toc-sublist";
+            if (parent) parent.appendChild(child);
+            stack.push({ level, list: child });
+          }
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = "#" + heading.id;
+          link.textContent = heading.textContent || "";
+          link.className = "toc-link toc-level-" + level;
+          item.appendChild(link);
+          stack[stack.length - 1].list.appendChild(item);
+        });
+        toc.appendChild(root);
+      })();
+    </script>
+  <script defer src="../../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+  <script defer src="../../../assets/code-highlight.js?v=1"></script>
+  </body>
+</html>
