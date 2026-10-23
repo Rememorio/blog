@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Jev: From Probabilities to Program Decisions | Rememorio Blog</title>
+  <meta name="description" content="Use one bug report to understand typed judgments, probability distributions, and confidence. Then trace retention, shortening, and deletion through fast-jev-compaction." />
+  <meta name="theme-color" content="#f5f1e8" />
+  <meta property="og:title" content="Jev: From Probabilities to Program Decisions" />
+  <meta property="og:description" content="Use one bug report to understand typed judgments, probability distributions, and confidence. Then trace retention, shortening, and deletion through fast-jev-compaction." />
+  <meta property="og:type" content="article" />
+  <meta property="og:image" content="https://rememorio.github.io/blog/jev-compaction/en/assets/cover.png" />
+  <meta property="og:image:alt" content="Evidence and questions enter Jev; its probabilities enter program rules that select retained context" />
+  <meta property="og:url" content="https://rememorio.github.io/blog/jev-compaction/en/" />
+  <link rel="canonical" href="https://rememorio.github.io/blog/jev-compaction/en/" />
+  <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/jev-compaction/zh/" />
+  <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/jev-compaction/en/" />
+  <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/jev-compaction/" />
+  <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  <link rel="stylesheet" href="../../hermes-agent/styles.css?v=site-nav-scroll" />
+  <link rel="stylesheet" href="../../ai-engineering/assets/series.css?v=figure-ratio" />
+  <link rel="stylesheet" href="../../assets/code-highlight.css?v=1" />
+  <link rel="stylesheet" href="../article.css?v=1" />
+</head>
+<body id="top">
+  <header class="site-header">
+    <a class="brand" href="../../en/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+    <nav class="local-nav" aria-label="Article navigation"><a href="../../ai-engineering/en/agent-decisions/">Related: Agent decisions</a><a href="#sources">Sources</a></nav>
+    <nav class="site-actions" aria-label="Site actions"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="Switch language"><a href="../zh/" lang="zh-CN">中文</a><a class="active" aria-current="page" href="./" lang="en">English</a></span></nav>
+  </header>
+  <div class="article-shell">
+    <aside class="toc-panel"><div class="toc-title">Contents</div><nav id="toc" class="toc-nav" aria-label="Contents"></nav></aside>
+    <main class="article-main"><article class="article-card">
+      <section class="article-hero">
+        <p class="eyebrow">Standalone article · Jev and context management</p>
+        <h1>Jev: From Probabilities to Program Decisions</h1><p class="article-subtitle">Noul, Choice, Score, and context compaction</p>
+        <p class="lead">Use one bug report to understand typed judgments, probability distributions, and confidence. Then trace retention, shortening, and deletion through fast-jev-compaction.</p>
+        <div class="meta-line"><span>Judgments, probabilities, and action rules</span><span>Source: fast-jev-compaction · e3f262a</span><span>Updated: 2026-10-23</span></div>
+        <figure class="hero-image"><img fetchpriority="high" decoding="async" width="1672" height="941" src="assets/cover.png" alt="Evidence and questions enter Jev; its probabilities enter program rules that select retained context" /><figcaption>Jev supplies judgments; code selects actions. The overview shows all three interfaces. The actual fast-jev-compaction path uses Noul.</figcaption></figure>
+      </section>
+      <section class="article-body">
+<p>A checkout page occasionally times out. Refreshing lets the customer finish, and the order service has found no duplicate orders. The report is ready, but the application still has decisions to make: does it contain reproducible steps, who should investigate, and how severe is the impact? Each decision requires understanding text, and each has a defined answer space.</p>
+<p><a href="https://docs.typesafe.ai/introduction">Jev</a> exposes these small judgments through a model API. An application supplies evidence and questions, receives typed answers with probabilities, and uses code to choose an action. That division of work makes <a href="https://github.com/tamaratran/fast-jev-compaction">fast-jev-compaction</a> an interesting example: it asks Jev which tool records still matter in a growing agent conversation, then edits the history according to those answers.</p>
+<div class="reading-contract"><p><strong>Reading route:</strong> use one bug report to understand Noul, Choice, and Score; calculate probabilities, confidence, and thresholds; then follow a tool record through state construction, batched judgments, history reconstruction, and fallback. The final question is practical: how do we decide whether the saved context is worth the lost information?</p></div>
+<p class="evidence-note">API definitions were checked against TypeSafe documentation on October 23, 2026. Plugin behavior follows the public source snapshot pinned in the links. The bug report, numerical examples, and evaluation plan are teaching examples; the probabilities shown here were not obtained from live inference. Training discussion is limited to the objectives and contracts published by TypeSafe.</p>
+
+<h2 id="questions">1. Define the judgments before calling the model</h2>
+<h3 id="state">1.1 One record can support several questions</h3>
+<p>The application needs the symptom, the available evidence, and the facts still missing. We will carry this record through the first three sections:</p>
+<pre><code class="language-text">Symptom: mobile checkout occasionally times out.
+Steps: open the cart and select checkout; roughly one in ten attempts times out.
+Workaround: refresh and try again.
+Checked: the order service has found no duplicate orders.
+Missing: correlated client and server logs from a failed attempt.</code></pre>
+<p>This material becomes the request's <a href="https://docs.typesafe.ai/concepts/state"><code>state</code></a>, supplied as a string, object, or array. The <code>questions</code> describe what to judge about it. Separating evidence from questions lets the same record support several judgments, and lets us compare revised criteria against unchanged examples.</p>
+<p>Every question has an application-defined ID, and the answer returns under that ID. According to the documentation, IDs are used for matching requests to responses and are not sent to the model. The complete judgment belongs in <code>instructions</code>. Naming an ID <code>has_reproduction_steps</code> while asking only “check this” leaves the intended condition out of the actual question.</p>
+<figure class="mechanism-figure"><img loading="lazy" decoding="async" width="1672" height="941" src="assets/primitives.png" alt="One bug report supplies a Noul proposition, Choice categories, and ordered Score levels" /><figcaption>Each primitive defines an answer space: a proposition, named categories, or ordered levels. Define the judgment before choosing its type.</figcaption></figure>
+
+<h3 id="noul">1.2 Noul: the probability that a proposition is true</h3>
+<p>Start with a small question: “Does the report provide a concrete sequence of actions to reproduce the issue?” A <a href="https://docs.typesafe.ai/primitives/noul">Noul</a> returns a number <code>p</code>, the probability of yes. An illustrative value of <code>0.92</code> leaves probability <code>0.08</code> for no. Together they describe the binary distribution.</p>
+<pre><code class="language-json">{
+  "type": "noul",
+  "instructions": "Does the report provide a concrete sequence of reproduction steps?",
+  "criteria": {
+    "true": "Gives a specific sequence of actions that triggers the issue.",
+    "false": "Describes symptoms without a specific sequence of actions."
+  }
+}</code></pre>
+<p>Noul's optional <code>criteria</code> clarify what counts as a reproduction sequence. The report's “one in ten” describes observed failure frequency. The model's <code>0.92</code> describes its judgment that the report contains steps. To measure the failure rate, count execution outcomes; use this question to assess the text's description of the procedure.</p>
+<p>A value near <code>0.5</code> puts similar probability on both answers. The application can send a middle range for further investigation, or choose a single threshold based on the cost of mistakes. A Noul response carries <code>noul</code> alone, without a separate <code>confidence</code> field.</p>
+
+<h3 id="choice">1.3 Choice: distribute probability across named alternatives</h3>
+<p>Next, decide who should investigate. Frontend, backend, and further investigation are unordered alternatives, so they fit <a href="https://docs.typesafe.ai/primitives/choice">Choice</a>. The application supplies names and descriptions in <code>criteria</code>. The response includes the highest-probability option and the full distribution.</p>
+<pre><code class="language-json">{
+  "type": "choice",
+  "instructions": "Who should investigate next, given the available evidence?",
+  "criteria": {
+    "frontend": "The evidence locates the problem in the client.",
+    "backend": "The evidence locates the problem in the server.",
+    "investigate": "The evidence is insufficient to locate it; gather more."
+  }
+}</code></pre>
+<p>Suppose the distribution is <code>frontend: 0.15</code>, <code>backend: 0.10</code>, and <code>investigate: 0.75</code>. Then <code>choice</code> is <code>investigate</code>, and the application can schedule collection of correlated logs. An explicit investigation option gives incomplete evidence a useful destination. Offering only frontend and backend requires all probability to be allocated to those two candidates.</p>
+<p>Option names and descriptions define the answer space. Changing a category's meaning, or adding a category, changes the classification task. Record the rule version with the answer so that a later investigation can explain why the same report reached a different team.</p>
+
+<h3 id="score">1.4 Score: express a judgment along ordered levels</h3>
+<p>For impact, define three levels: cosmetic, degraded functionality with a workaround, and blocked core functionality without a workaround. <a href="https://docs.typesafe.ai/primitives/score">Score</a> defines these through an ordered <code>criteria</code> array, indexed from <code>0</code>. The model assigns probability to each level; <code>score</code> is the weighted mean of their indices.</p>
+<pre><code class="language-json">{
+  "type": "score",
+  "instructions": "How much functional impact does the report describe?",
+  "criteria": [
+    "Cosmetic issue; functionality works.",
+    "Degraded functionality with a usable workaround.",
+    "Core functionality blocked with no usable workaround."
+  ]
+}</code></pre>
+<p>For illustrative probabilities <code>(0, 0.8, 0.2)</code>, <code>score = 0×0 + 1×0.8 + 2×0.2 = 1.2</code>. The judgment leans toward level 1 while retaining some probability on level 2. The numeric spacing comes from array positions. Monetary damage or downtime in minutes requires the corresponding facts and calculation rules.</p>
+<p>Levels should follow one dimension. “High impact,” “easy to fix,” and “urgent customer” describe three dimensions; ask separate questions and define priority in application code. A clear rubric gives both the returned numbers and subsequent actions a stable meaning.</p>
+
+<h2 id="probabilities">2. Read probabilities, scores, and confidence separately</h2>
+<h3 id="choice-confidence">2.1 Recompute Choice confidence from the distribution</h3>
+<p>A Choice's <code>probabilities</code> retain the alternatives, and <code>choice</code> selects the largest one. The <a href="https://docs.typesafe.ai/confidence#choice">documented confidence formula</a> normalizes how far that largest probability sits above an even split:</p>
+<pre><code class="language-text">n = number of options; p_max = largest probability
+confidence = (p_max - 1/n) / (1 - 1/n)
+
+Three options, largest probability 0.75:
+confidence = (0.75 - 1/3) / (1 - 1/3) = 0.625</code></pre>
+<p>We now have three values that can be inspected separately: the option <code>investigate</code>, its probability <code>0.75</code>, and confidence <code>0.625</code>. Confidence is calculated from the existing distribution. With two options and the same largest probability of <code>0.75</code>, the formula gives <code>0.5</code>; adding options therefore calls for a fresh check of application thresholds.</p>
+<p>Only the largest probability and option count enter this formula. Distributions <code>(0.6, 0.3, 0.1)</code> and <code>(0.6, 0.2, 0.2)</code> both yield confidence <code>0.4</code>. An application concerned with the lead over the runner-up can compute that gap from the full distribution. The useful statistic depends on the error the program needs to prevent.</p>
+
+<h3 id="score-confidence">2.2 Preserve where Score probability is located</h3>
+<p>Consider two distributions over levels 0, 1, and 2. A is <code>(0, 1, 0)</code>; B is <code>(0.5, 0, 0.5)</code>. Both have mean <code>1</code>. A places all probability on moderate impact, while B splits it between opposite ends. Saving only the mean discards that difference.</p>
+<figure class="mechanism-figure"><img loading="lazy" decoding="async" width="1672" height="941" src="assets/distributions.png" alt="Two distributions both have score 1; the central point mass has confidence 1 and the split extremes have confidence 0" /><figcaption>Both A and B have score = 1, but express different judgments. The full distribution distinguishes moderate impact from ambiguity between extremes. Confidence follows the official formula.</figcaption></figure>
+<p><a href="https://docs.typesafe.ai/confidence#score">Score confidence</a> considers distance from the most likely level, penalizing probability further away more strongly. The documented formula gives A confidence <code>1</code> and B confidence <code>0</code>. Our earlier bug example, <code>(0, 0.8, 0.2)</code>, yields <code>score = 1.2</code> and <code>confidence = 0.7</code>.</p>
+<details><summary>Calculate Score confidence from a distribution</summary>
+<pre><code class="language-text">n = number of levels; i = level index; p_i = level probability
+m = most likely level
+D = Σ p_i × |i - m|
+U = (1/n) × Σ |i - (n - 1)/2|
+confidence = max(0, 1 - D/U)
+
+Three-level distribution (0, 0.8, 0.2):
+m = 1; D = 0.2; U = 2/3
+confidence = 1 - 0.2/(2/3) = 0.7</code></pre>
+<p>D measures average distance from the most likely level. U supplies a distance scale for an even distribution. An application may also read the probability of a particular high-impact level directly, keeping the full distribution for later inspection.</p></details>
+
+<h3 id="calibration">2.3 Check calibration against observed outcomes</h3>
+<p>Collect predictions for “contains reproduction steps,” group those near <code>0.8</code>, and check them against independent labels. If roughly eight out of ten really contain steps, the predictions show calibration in that group. <a href="https://proceedings.mlr.press/v70/guo17a.html">Calibration research</a> studies this correspondence between predicted probabilities and empirical frequency. Record sample counts too: eight positives among ten reports and eight hundred among a thousand have different statistical stability.</p>
+<p>TypeSafe calls its training objective <a href="https://docs.typesafe.ai/introduction/machine-learning-primer">RLCD</a>, reinforcement learning for calibrated decisions. An integration can directly inspect question types, output distributions, and derived formulas. It must also measure errors under its own language, input lengths, and task distribution. The official <a href="https://docs.typesafe.ai/concepts/state">State documentation</a> notes a primarily English training language and lower accuracy in other languages. Include Chinese tasks when evaluating a Chinese application.</p>
+
+<h3 id="thresholds">2.4 Thresholds express the application's error costs</h3>
+<p>To connect this to context pruning, let <code>p</code> be the probability that a tool result still needs to be kept. Consider a simplified decision model: an unnecessary retention costs C_extra; deleting useful information costs C_loss; correct decisions have zero cost. Expected loss from keeping is <code>(1−p)×C_extra</code>; expected loss from deleting is <code>p×C_loss</code>.</p>
+<pre><code class="language-text">Choose retention when:
+p ≥ C_extra / (C_extra + C_loss)
+
+Illustrative costs: unnecessary retention = 1, harmful deletion = 19
+Retention threshold = 1 / 20 = 0.05</code></pre>
+<p>Asymmetric losses can justify a threshold far from <code>0.5</code>. Real systems also have budgets, reread latency, and dependencies between records. Define those costs, then choose thresholds using held-out examples. The plugin below uses a default of <code>0.5</code>; that is its implementation choice.</p>
+
+<h2 id="api">3. Put several judgments into one API call</h2>
+<h3 id="request">3.1 State, questions, and answers form one round trip</h3>
+<p>The bug workflow has four steps: assemble the report; ask about reproduction steps, ownership, and impact; receive the answers; then schedule investigation or assignment in code. This teaching request preserves the actual field structure of <code>POST /v1/systemone</code>:</p>
+<pre><code class="language-json">{
+  "model": "jev-1.13.0",
+  "state": {
+    "symptom": "Mobile checkout sometimes times out; refreshing allows completion.",
+    "steps": "Open cart, select checkout; roughly one in ten attempts times out.",
+    "evidence": "No duplicate orders found; correlated failure logs are missing."
+  },
+  "questions": {
+    "repro": {
+      "type": "noul",
+      "instructions": "Does the report provide a specific sequence of reproduction steps?"
+    },
+    "owner": {
+      "type": "choice",
+      "instructions": "Who should investigate next, given the available evidence?",
+      "criteria": {
+        "frontend": "Evidence locates the problem in the client.",
+        "backend": "Evidence locates the problem in the server.",
+        "investigate": "Evidence is insufficient; gather more."
+      }
+    },
+    "impact": {
+      "type": "score",
+      "instructions": "How much functional impact does the report describe?",
+      "criteria": ["Cosmetic issue.", "Degraded but a workaround exists.", "Core blocked, no workaround."]
+    }
+  }
+}</code></pre>
+<p>The illustrative response below omits surrounding fields such as <code>usage</code>. Score's <code>legend</code> maps each level index back to its description.</p>
+<pre><code class="language-json">{
+  "answers": {
+    "repro": { "type": "noul", "noul": 0.92 },
+    "owner": {
+      "type": "choice",
+      "choice": "investigate",
+      "probabilities": { "frontend": 0.15, "backend": 0.10, "investigate": 0.75 },
+      "confidence": 0.625
+    },
+    "impact": {
+      "type": "score",
+      "score": 1.2,
+      "probabilities": { "0": 0, "1": 0.8, "2": 0.2 },
+      "legend": { "0": "Cosmetic issue.", "1": "Degraded but a workaround exists.", "2": "Core blocked, no workaround." },
+      "confidence": 0.7
+    }
+  }
+}</code></pre>
+<p>On <code>investigate</code>, the application can create a log-collection task and keep the impact judgment for prioritization. The answer about reproduction steps describes the report. Actually confirming reproduction still requires executing those steps and recording the outcome.</p>
+
+<h3 id="batching-contract">3.2 Shared evidence, application-managed dependencies</h3>
+<p>The <a href="https://docs.typesafe.ai/patterns/fan-out">batching contract</a> says each question independently reads the shared state and is evaluated in parallel. An application can ask speculative questions together, then ignore irrelevant answers. A question that requires newly obtained information from an earlier answer needs a subsequent request.</p>
+<p>This fits screening tool history: each candidate can be judged against the current task. The caller still needs to check that all answer IDs arrived, values are finite and within range, and the request succeeded. Interface shape, semantic accuracy, and runtime failure handling belong to distinct parts of the integration.</p>
+
+<h2 id="compaction">4. How fast-jev chooses tool history to retain</h2>
+<h3 id="trigger">4.1 From fixing a test to triggering compaction</h3>
+<p>Follow a coding agent that reads a file, runs a failing test, edits a parser, reruns the tests, and starts a changelog entry. Its history contains old file contents, failure logs, edit arguments, and the latest successful output. <strong>Which evidence should remain for the next step?</strong> becomes a bounded judgment.</p>
+<p>The plugin receives session messages in a <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/hooks/fast-jev.ts#L258-L310"><code>session.compact</code> hook</a>. Manual and host-triggered compaction can reach that entry point. The plugin also checks context usage after <code>turn.complete</code> and requests compaction at a configurable percentage, defaulting to <code>60%</code>. Claude Code continues to own the ordinary conversation loop.</p>
+<p>The integration depends on early function hooks, and the repository includes a <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/hooks/README.md">Claude Code 2.1.274 interface reference</a>. Deployment on another release requires checking the corresponding host interface. The npm library can also run in another host through <code>compact(messages, asker, options)</code>.</p>
+
+<h3 id="pairing">4.2 Pair calls with results and protect recent records</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/state.ts#L49-L94"><code>collectToolCalls</code></a> pairs calls and results by <code>tool_use_id</code>, then assigns a short scoring ID such as <code>t12</code>. A call without a result is excluded from pruning candidates. If either end of a pair is in the first message or the latest six messages by default, the entire pair is pinned.</p>
+<p>Protection follows message positions; six messages may cover only a few user turns. Pinned calls receive a retention decision directly. The remaining K pairs produce <code>2K</code> questions: whether the call still matters, and whether its full result must remain.</p>
+
+<h3 id="judging-view">4.3 Inspect what Jev actually receives</h3>
+<p>The judging input differs from the original conversation. <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/state.ts#L105-L170"><code>historyEntries</code></a> keeps roles, ordinary text, and call descriptions, replacing each tool-result body with status and character count. Here is a teaching example of the same read in both representations:</p>
+<pre><code class="language-text">Original conversation result:
+tool_use_id: toolu_12
+text: a complete parser source file, including the function about to be edited
+
+Call visible to Jev:
+id: t12
+tool: Read
+input: {"file_path":"src/parser.ts"}
+result: ok, 4213 chars (omitted)</code></pre>
+<figure class="mechanism-figure"><img loading="lazy" decoding="async" width="1672" height="941" src="assets/judging-view.png" alt="An original conversation is fitted into Jev state with call paths, result status and length, while result bodies are omitted" /><figcaption>Preparing the judging input precedes pruning. The figure summarizes state construction and fitState: full results still exist in the conversation while Jev sees selected evidence.</figcaption></figure>
+<p>The default task description takes the latest three eligible user texts, capped at 500 characters each; callers may supply an explicit <code>goal</code>. <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/state.ts#L174-L302"><code>fitState</code></a> then fits the judging material into an estimated budget. Tool arguments initially have a 1,000-character cap; further stages reduce it to 200 and 60, abridge long text, collapse old text, reduce old calls to short lines, remove old messages without calls, and finally merge adjacent old call-only records. Failure to fit throws.</p>
+<p>Two consequences follow directly. A logged <code>full</code> stage already omits result bodies and caps argument length. Also, ordinary text preserved in the final output may have been shortened in the judging input. Evidence found only inside an omitted result cannot contribute to this judgment; Jev must rely on arguments and surrounding conversation.</p>
+<p>A boundary case can be checked without inference: construct two histories that differ only in tool-result text, while keeping its length, error flag, arguments, and other messages identical. The state builder produces the same judging material. A crucial clue unique to one result is unavailable to the model. Finer discrimination requires changing the visible material first, for example by including selected head and tail snippets or recoverable references.</p>
+
+<h3 id="two-nouls">4.4 Ask two Nouls for each candidate pair</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L55-L67"><code>questionsFor</code></a> constructs only <code>type: 'noul'</code> questions. The <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/types.ts#L144-L187">type declarations</a> include Choice and Score too; neither is used by this compaction path.</p>
+<div class="table-wrap"><table><thead><tr><th>Question</th><th>Meaning in the source</th><th>Stored as</th></tr></thead><tbody>
+<tr><td><code>call_t12</code></td><td>Knowing this call was made, with its arguments, still matters to the next step.</td><td><code>keepCall</code></td></tr>
+<tr><td><code>result_t12</code></td><td>The full result is still needed verbatim, and rerunning the tool would not suffice.</td><td><code>keepResult</code></td></tr>
+</tbody></table></div>
+<p>The second question combines continued need with an inability to replace the result by rerunning. A file about to be edited can be useful and also easy to reread, so the extra condition affects the answer. Probability belongs to the complete proposition actually asked. Measuring whether retention saves future work would require a different question and a fresh evaluation of deletions.</p>
+<p>The two questions let code preserve evidence of what was invoked while shortening a long result. A Choice could instead define three action options, but that changes the meaning of the answer: the current numbers describe separate propositions, while a three-way choice distributes probability across actions. Changing types calls for reevaluation.</p>
+
+<h3 id="request-budget">4.5 Batch within the budget and await every answer</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L69-L98"><code>batchCalls</code></a> subtracts estimated state and envelope cost, then packs questions into the remaining space. If even one pair cannot fit, it throws. Default budgets are 25,000 estimated tokens for state and 30,000 for a request, using the repository's heuristic estimator. Every batch repeats the same fitted state. <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L257-L309"><code>compact</code></a> awaits them concurrently with <code>Promise.all</code> and merges their answers.</p>
+<p>For many candidates, input cost is approximately <code>B×S + Q</code>: B batches, state length S, and total question length Q. Repeated state consumes input tokens and can contribute to rate limits. This path has no explicit concurrency cap, and a failed batch fails the compaction attempt.</p>
+<p>These numbers are the plugin's client-side budgets. At the time of checking, the <a href="https://docs.typesafe.ai/models#context-length">official model documentation</a> lists default limits of 64k per request and 32k per question. The former counts state plus all questions; the latter counts state plus one question. Raising client budgets requires satisfying both limits and checking estimator error and accuracy on longer input.</p>
+
+<h2 id="rebuild">5. Turn two probabilities into the next history</h2>
+<h3 id="decision">5.1 Code selects one of three edits</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L101-L115"><code>decideCall</code></a> compares the numbers in a fixed order: protect pinned calls, check full-result retention, then check call retention. This excerpt preserves the control flow while omitting result metadata:</p>
+<pre><code class="language-typescript">if (call.pinned) return 'keep';
+if (answer.keepResult &gt;= keepThreshold) return 'keep';
+if (answer.keepCall &gt;= keepThreshold) return 'drop_result';
+return 'drop_call';</code></pre>
+<figure class="mechanism-figure"><img loading="lazy" decoding="async" width="1672" height="941" src="assets/decisions.png" alt="Two probabilities, keepCall and keepResult, enter a threshold rule with separate keep, drop_result, and drop_call outcomes" /><figcaption>Three alternatives for unpinned calls. Retain the pair when keepResult meets the threshold; otherwise keepCall selects shortening or pair removal. Dashed pages indicate removed records.</figcaption></figure>
+<p>The default threshold is <code>0.5</code>. For example, <code>keepCall = 0.82</code> and <code>keepResult = 0.21</code> retain the call and enter the result-shortening branch. A result probability above threshold retains the whole pair even when the call probability is low, preserving the call needed to interpret that result. Values near the threshold enter these branches directly; there is no separate uncertainty band that defers deletion.</p>
+
+<h3 id="apply">5.2 What reconstruction preserves</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L135-L227"><code>applyDecisions</code></a> returns untouched messages as their original objects. A long output entering <code>drop_result</code> keeps its first 300 characters by default, followed by an omission count and a rerun note. Outputs no longer than <code>300 + 120</code> characters remain unchanged. Consequently, counts of truncation decisions can exceed the number of results that actually became shorter.</p>
+<p><code>drop_call</code> removes both the call and its paired result. A message left with no text, calls, or results disappears too. Ordinary user and assistant text stays in order. Suppose an assistant said “the file is updated,” followed by an edit call and successful result. Removing that pair can leave the next model call with the report and without its execution evidence. Evaluate whether the supporting evidence remains recoverable.</p>
+<pre><code class="language-text">Before pruning:
+assistant: The parser is updated.
+tool_use: Edit(src/parser.ts, ...)
+tool_result: Update succeeded.
+
+After drop_call:
+assistant: The parser is updated.</code></pre>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/hooks/fast-jev.ts#L123-L159"><code>toSessionMessages</code></a> maps the result back to the host. Unchanged messages preserve their object and handle; rebuilt messages omit the original handle so the host adopts edited content. The library returns a new message array, while the host installs and persists compaction results. This source path provides no result store that the model can query by ID to recover deleted outputs.</p>
+
+<h3 id="fallback">5.3 Accept the edit after enough characters are removed</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L228-L244"><code>reductionRatio</code></a> measures the reduction in character count across ordinary text, serialized arguments, and tool results. Below the default minimum of 25%, the hook invokes <code>next(event)</code> to delegate to the host's original compaction logic. Missing credentials, state-fitting failures, failed requests, and missing answers also enter the fallback path.</p>
+<p>Once the reduction meets the threshold, the hook returns the pruned messages and logs decision and request counts. Acceptance checks size; it does not execute the remaining task. Text-heavy histories also have a reduction floor: deleting every eligible tool record may still leave too many characters.</p>
+<p>Response validation has a specific scope. <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/request.ts#L39-L80"><code>parseJevResponse</code> and <code>noulAnswer</code></a> check HTTP status, JSON, the answers object, and required finite numeric values. This snapshot does not explicitly reject noul values below 0 or above 1. An integration should enforce the API range and provide request deadlines, cancellation, and bounded retries.</p>
+
+<h2 id="evaluation">6. Decide whether this pruning strategy is useful</h2>
+<h3 id="observed-risks">6.1 Turn public reports into testable cases</h3>
+<p>The author of <a href="https://github.com/tamaratran/fast-jev-compaction/issues/56">issue #56</a> reports that default thresholds removed all 141 candidates in one session replay, with large retention changes after adjusting the threshold. <a href="https://github.com/tamaratran/fast-jev-compaction/issues/65">Issue #65</a> records repeated fabricated completion reports without tool calls after a compaction. These reports supply input characteristics and failure symptoms for replication; controlled comparisons are needed to establish the cause of each run.</p>
+<p>The source identifies concrete risks: a shared threshold for two propositions, hidden result bodies, and assistant narration surviving removal of tool records. Experiments can change question wording, visible result snippets, and deletion markers one at a time, then observe whether subsequent task behavior improves. This isolates which layer needs a correction.</p>
+
+<h3 id="benchmark">6.2 Resume each strategy from the same checkpoint</h3>
+<p>A useful comparison has four paths: full history when it fits, fixed-window masking of old outputs, generative summaries, and Jev-guided pruning. <a href="https://arxiv.org/abs/2508.21433">The Complexity Trap</a> compares simple observation masking and summaries in software-engineering tasks and helps motivate a simple baseline. The extra judgment cost should be assessed alongside that baseline's outcomes.</p>
+<p>Freeze the history checkpoint, file state, and continuation task before comparing strategies. Use recorded results or restorable environments for changing external tools; otherwise, a fresh query that happens to receive newer information mixes environment changes into the compression comparison. Repeat runs to observe model variation, and separate threshold-tuning examples from final acceptance examples.</p>
+<div class="table-wrap"><table><thead><tr><th>Measure</th><th>Record</th><th>Question answered</th></tr></thead><tbody>
+<tr><td>Task results and constraints</td><td>Shared acceptance tests, protected edit scope, correctness</td><td>Can the task still be completed correctly?</td></tr>
+<tr><td>Critical facts</td><td>Visibility or recovery of exact errors, paths, constraints, edits, and execution evidence</td><td>Was necessary evidence removed?</td></tr>
+<tr><td>Recovery work and latency</td><td>Extra file reads, test reruns, external queries, total elapsed time</td><td>How much work did shorter input create?</td></tr>
+<tr><td>Total cost</td><td>Jev input, continuation input and output, cache usage, tool cost</td><td>Is the complete workflow cheaper?</td></tr>
+<tr><td>Failures and recovery</td><td>Fallbacks, timeouts, repeated compaction, unreplayable results</td><td>Can long tasks continue reliably?</td></tr>
+</tbody></table></div>
+<p>Record the requested model, returned version, question text, and thresholds; <code>jev-latest</code> is a moving alias. Reduction is a process metric. Adoption depends on task quality, total cost, and recoverability. Editing the historical sequence can also change the prefix sent to the continuation model. Measure actual cache usage alongside character savings.</p>
+
+<h3 id="rules">6.3 Carry the design into other applications</h3>
+<p>Jev offers a clear software interface: evidence goes in; bounded answers and probabilities come out. Noul fits a proposition, Choice fits named alternatives, and Score fits ordered levels. Distributions preserve ambiguity, confidence supplies a reproducible summary, and business rules turn judgments into actions.</p>
+<p>fast-jev-compaction places that interface at a concrete point in an agent runtime: two Nouls per tool pair, followed by retention, shortening, or deletion in code. The transferable design order is <strong>choose what the judge can see, define the proposition behind each probability, specify action rules, then validate the task after the action</strong>. Together, those steps give a numerical judgment a dependable role in software.</p>
+
+<h2 id="sources">Sources and further reading</h2>
+<ul class="source-list">
+<li><a href="https://docs.typesafe.ai/primitives">TypeSafe question types and composition</a>; <a href="https://docs.typesafe.ai/primitives/noul">Noul</a>; <a href="https://docs.typesafe.ai/primitives/choice">Choice</a>; <a href="https://docs.typesafe.ai/primitives/score">Score</a>.</li>
+<li><a href="https://docs.typesafe.ai/confidence">Confidence definitions and formulas</a>; <a href="https://docs.typesafe.ai/models">model versions and context limits</a>.</li>
+<li><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts">fast-jev-compaction questions, decisions, and reconstruction</a>; <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/state.ts">state construction</a>; <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/hooks/fast-jev.ts">host integration</a>.</li>
+<li><a href="https://proceedings.mlr.press/v70/guo17a.html">On Calibration of Modern Neural Networks</a>; <a href="https://arxiv.org/abs/2508.21433">The Complexity Trap</a>.</li>
+<li>Continue with <a href="../../ai-engineering/en/agent-decisions/">How Agents Decide What to Do Next</a> for workflow composition; <a href="../../claude-code/en/context-management/">Claude Code context management</a> for the broader compaction path; and <a href="../../deepseek-harness/en/compaction-reconstruction/">DeepSeek Harness compaction and request reconstruction</a> for durable records and model requests.</li>
+</ul>
+
+      </section>
+    </article></main>
+  </div>
+  <script src="../../ai-engineering/assets/article.js?v=1"></script>
+  <script defer src="../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+  <script defer src="../../assets/code-highlight.js?v=1"></script>
+</body>
+</html>

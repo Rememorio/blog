@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Jev 如何把概率变成程序决策 | Rememorio Blog</title>
+  <meta name="description" content="从一份故障记录读懂三种判断、完整分布与 confidence，再沿 fast-jev-compaction 源码追踪哪些工具历史被保留、截短或删除。" />
+  <meta name="theme-color" content="#f5f1e8" />
+  <meta property="og:title" content="Jev 如何把概率变成程序决策" />
+  <meta property="og:description" content="从一份故障记录读懂三种判断、完整分布与 confidence，再沿 fast-jev-compaction 源码追踪哪些工具历史被保留、截短或删除。" />
+  <meta property="og:type" content="article" />
+  <meta property="og:image" content="https://rememorio.github.io/blog/jev-compaction/zh/assets/cover.png" />
+  <meta property="og:image:alt" content="材料与问题进入 Jev，返回的概率交给程序规则，再形成保留的上下文" />
+  <meta property="og:url" content="https://rememorio.github.io/blog/jev-compaction/zh/" />
+  <link rel="canonical" href="https://rememorio.github.io/blog/jev-compaction/zh/" />
+  <link rel="alternate" hreflang="zh-CN" href="https://rememorio.github.io/blog/jev-compaction/zh/" />
+  <link rel="alternate" hreflang="en" href="https://rememorio.github.io/blog/jev-compaction/en/" />
+  <link rel="alternate" hreflang="x-default" href="https://rememorio.github.io/blog/jev-compaction/" />
+  <link rel="icon" type="image/png" href="https://rememorio.github.io/blog/Eyjafjalla.png" />
+  <link rel="stylesheet" href="../../hermes-agent/styles.css?v=site-nav-scroll" />
+  <link rel="stylesheet" href="../../ai-engineering/assets/series.css?v=figure-ratio" />
+  <link rel="stylesheet" href="../../assets/code-highlight.css?v=1" />
+  <link rel="stylesheet" href="../article.css?v=1" />
+</head>
+<body id="top">
+  <header class="site-header">
+    <a class="brand" href="../../zh/"><span class="brand-mark">R</span><span>Rememorio Blog</span></a>
+    <nav class="local-nav" aria-label="文章导航"><a href="../../ai-engineering/zh/agent-decisions/">延伸阅读：Agent 决策</a><a href="#sources">资料与源码</a></nav>
+    <nav class="site-actions" aria-label="站点操作"><a class="site-action" href="https://github.com/Rememorio/blog">GitHub</a><span class="language-switch" aria-label="切换语言"><a class="active" aria-current="page" href="./" lang="zh-CN">中文</a><a href="../en/" lang="en">English</a></span></nav>
+  </header>
+  <div class="article-shell">
+    <aside class="toc-panel"><div class="toc-title">目录</div><nav id="toc" class="toc-nav" aria-label="目录"></nav></aside>
+    <main class="article-main"><article class="article-card">
+      <section class="article-hero">
+        <p class="eyebrow">独立文章 · Jev 与上下文管理</p>
+        <h1>Jev 如何把概率变成程序决策</h1><p class="article-subtitle">从 Noul、Choice、Score 到上下文裁剪</p>
+        <p class="lead">从一份故障记录读懂三种判断、完整分布与 confidence，再沿 fast-jev-compaction 源码追踪哪些工具历史被保留、截短或删除。</p>
+        <div class="meta-line"><span>主题：判断、概率与动作规则</span><span>源码：fast-jev-compaction · e3f262a</span><span>更新：2026-10-23</span></div>
+        <figure class="hero-image"><img fetchpriority="high" decoding="async" width="1672" height="941" src="assets/cover.png" alt="材料与问题进入 Jev，返回的概率交给程序规则，再形成保留的上下文" /><figcaption>Jev 提供判断，程序选择动作。图中展示三类接口；fast-jev-compaction 的实际裁剪路径使用 Noul。</figcaption></figure>
+      </section>
+      <section class="article-body">
+<p>一个结算页面偶尔超时，刷新后可以成功，订单服务也没有发现重复订单。故障记录已经收齐，程序接下来有几件事要决定：这份记录是否包含复现步骤？该交给前端、后端，还是继续收集材料？影响属于哪个等级？三个问题都需要读懂文字，各自的答案范围却很清楚。</p>
+<p><a href="https://docs.typesafe.ai/introduction">Jev</a> 把这种小判断做成了可调用的模型接口：应用提供材料和问题，模型返回带类型的答案与概率，代码据此选择动作。理解这套分工以后，就能读懂 <a href="https://github.com/tamaratran/fast-jev-compaction">fast-jev-compaction</a> 的尝试：面对越积越长的 Agent 历史，让 Jev 判断哪些工具调用仍值得保留，再由程序裁剪历史。</p>
+<div class="reading-contract"><p><strong>阅读路线：</strong>先用同一份故障记录解释 Noul、Choice 与 Score，再算清概率、confidence 和阈值；随后跟着一条工具调用走完状态构造、批量判断、历史重建与回退。最后回答一个工程问题：怎样确认省下的上下文值得付出信息丢失的代价？</p></div>
+<p class="evidence-note">接口定义按 2026 年 10 月 23 日的 TypeSafe 官方文档核对；插件行为以文中固定链接的公开源码为准。故障记录、数值样例和评估方案为教学设计，概率示例没有调用在线模型。模型训练部分只采用官方公布的目标与接口说明。</p>
+
+<h2 id="questions">一、先把要判断的事情拆清楚</h2>
+<h3 id="state">1.1 一份材料，可以回答多个小问题</h3>
+<p>把这条故障记录展开，程序需要保留发生了什么、已有证据和仍然缺少什么。我们用下面这份材料贯穿前三节：</p>
+<pre><code class="language-text">问题：移动端结算页面偶尔超时。
+复现：打开购物车，点击结算，约十次中有一次等待超时。
+绕行：刷新后重试可以完成。
+已查：订单服务没有发现重复订单。
+待查：尚未取得发生超时时的前后端关联日志。</code></pre>
+<p>这些材料组成请求中的 <a href="https://docs.typesafe.ai/concepts/state"><code>state</code></a>；应用可以把它写成字符串、对象或数组。<code>questions</code> 则描述对这份材料要作出的判断。把事实与问题分开，有两个实际好处：同一份材料可以回答多种问题，修改判断标准时也能继续用原样本比较结果。</p>
+<p>每个问题都有应用指定的 ID，响应再按这个 ID 返回答案。官方文档说明，问题 ID 用于请求与响应配对，模型不读取它；判断依据要写进 <code>instructions</code>。例如只把 ID 命名为 <code>has_reproduction_steps</code>，却把问题写成“检查一下”，就遗漏了真正需要模型判断的条件。</p>
+<figure class="mechanism-figure"><img loading="lazy" decoding="async" width="1672" height="941" src="assets/primitives.png" alt="同一份故障记录分别进入 Noul 真假命题、Choice 候选类别和 Score 有序等级" /><figcaption>三种类型分别定义答案空间：一个命题、几个类别、一组有序等级。先明确要判断什么，再选择接口。</figcaption></figure>
+
+<h3 id="noul">1.2 Noul：这个命题有多大可能为真</h3>
+<p>先问最小的问题：“这份报告是否给出了可以照着操作的复现步骤？”<a href="https://docs.typesafe.ai/primitives/noul">Noul</a> 的答案是一个数 <code>p</code>，表示“是”的概率。若示意答案为 <code>0.92</code>，那么“否”的概率就是 <code>0.08</code>；两者合起来覆盖这个二元问题。</p>
+<pre><code class="language-json">{
+  "type": "noul",
+  "instructions": "报告是否给出了可以照着操作的复现步骤？",
+  "criteria": {
+    "true": "提供了触发问题的具体操作顺序。",
+    "false": "只描述症状，没有具体操作顺序。"
+  }
+}</code></pre>
+<p><code>criteria</code> 在 Noul 中可选，这里用它明确“复现步骤”的标准。记录里的“十次中有一次”是故障发生频率；返回的 <code>0.92</code> 则是模型对“报告包含步骤”的判断。两种数值描述不同的对象。需要故障发生率时，应统计执行结果；需要判断文字是否给出了操作顺序时，才使用这个问题。</p>
+<p>靠近 <code>0.5</code> 的值表示两种答案接近均分。应用可以把中间区间送去补查，也可以因误判代价不同而选择单侧阈值。Noul 响应只需要 <code>noul</code> 这一个数，没有单独的 <code>confidence</code> 字段。</p>
+
+<h3 id="choice">1.3 Choice：把概率分配给明确的候选项</h3>
+<p>接着判断该把故障交给谁。前端、后端和继续排查是三个没有高低顺序的选项，适合 <a href="https://docs.typesafe.ai/primitives/choice">Choice</a>。应用在 <code>criteria</code> 中提供候选名称及说明，模型返回概率最大的选项，以及完整分布。</p>
+<pre><code class="language-json">{
+  "type": "choice",
+  "instructions": "按已有证据判断下一步由谁调查。",
+  "criteria": {
+    "frontend": "已有证据把问题定位到客户端。",
+    "backend": "已有证据把问题定位到服务端。",
+    "investigate": "现有证据还不足以定位，需要补查。"
+  }
+}</code></pre>
+<p>假设响应分布为 <code>frontend: 0.15</code>、<code>backend: 0.10</code>、<code>investigate: 0.75</code>，则 <code>choice</code> 为 <code>investigate</code>。程序可以安排采集关联日志。显式提供“继续排查”，给材料不足的输入留出了合理位置；只列前后端两项，就要求模型把所有概率分配给这两个候选。</p>
+<p>候选名称与说明共同定义答案空间。修改一个类别的含义，或者加入新类别，都会改变这次判断的任务。分类结果与规则版本应一起记录，方便以后解释为何同一条报告走向了不同处理人。</p>
+
+<h3 id="score">1.4 Score：沿一组有序等级表达判断</h3>
+<p>最后判断影响程度。我们把等级定义为：外观问题、功能受损但可以绕行、核心功能阻塞且没有绕行。<a href="https://docs.typesafe.ai/primitives/score">Score</a> 用有序的 <code>criteria</code> 数组定义这些等级，编号从 <code>0</code> 开始。模型为每个等级给出概率，<code>score</code> 是等级编号的加权平均。</p>
+<pre><code class="language-json">{
+  "type": "score",
+  "instructions": "报告描述的功能影响属于什么程度？",
+  "criteria": [
+    "外观问题，功能可正常使用。",
+    "功能受损，但存在可用的绕行方法。",
+    "核心功能阻塞，且没有可用的绕行方法。"
+  ]
+}</code></pre>
+<p>若三个等级的示意概率为 <code>(0, 0.8, 0.2)</code>，则 <code>score = 0×0 + 1×0.8 + 2×0.2 = 1.2</code>。这个数表示判断偏向等级 1，同时留有等级 2 的可能。等级之间的数字间隔由数组位置确定；需要按金额、停机分钟数定损时，应使用对应事实和计算规则。</p>
+<p>等级应沿同一维度排列。“影响大、容易修、客户着急”涉及三个维度，适合分别提问，再由应用定义排序。一个清楚的等级表，能让低分、高分与后续动作都具有可解释的含义。</p>
+
+<h2 id="probabilities">二、概率、分数与 confidence 怎样读</h2>
+<h3 id="choice-confidence">2.1 Choice 的 confidence 可以从分布重算</h3>
+<p>Choice 的 <code>probabilities</code> 保留每个选项的可能性，<code>choice</code> 选出其中最大者。<a href="https://docs.typesafe.ai/confidence#choice">官方 confidence 公式</a>再把最大概率相对均匀分布的位置归一化：</p>
+<pre><code class="language-text">n = 选项数，p_max = 最大概率
+confidence = (p_max - 1/n) / (1 - 1/n)
+
+三个选项，最大概率 0.75：
+confidence = (0.75 - 1/3) / (1 - 1/3) = 0.625</code></pre>
+<p>这给出了三个可独立检查的值：选项为 <code>investigate</code>，其概率为 <code>0.75</code>，confidence 为 <code>0.625</code>。后者由已有分布计算。两个选项中最大概率同为 <code>0.75</code> 时，公式得到 <code>0.5</code>；因此增加候选项以后，应重新检查应用阈值。</p>
+<p>公式只使用最大概率和选项数。例如 <code>(0.6, 0.3, 0.1)</code> 与 <code>(0.6, 0.2, 0.2)</code> 的 confidence 都是 <code>0.4</code>。若业务关心第一名与第二名之间的差距，保留完整分布就可以另算差值。采用哪一个统计量，取决于程序要防止什么错误。</p>
+
+<h3 id="score-confidence">2.2 Score 还要保留“概率落在哪里”</h3>
+<p>看两个由等级 0、1、2 组成的假设分布：A 为 <code>(0, 1, 0)</code>，B 为 <code>(0.5, 0, 0.5)</code>。两者的平均分都是 <code>1</code>。A 的判断全部集中在中等影响；B 则在两端分配概率。若程序只保存平均分，就丢掉了这项区别。</p>
+<figure class="mechanism-figure"><img loading="lazy" decoding="async" width="1672" height="941" src="assets/distributions.png" alt="两组概率分布平均分都为 1，集中于中间等级的 confidence 为 1，分散于两端的为 0" /><figcaption>A 与 B 都有 score = 1，却表达不同判断。保留完整分布，程序才能区分中等影响与两端歧义；confidence 按官方公式计算。</figcaption></figure>
+<p><a href="https://docs.typesafe.ai/confidence#score">Score 的 confidence</a>会考虑概率与最可能等级之间的距离。距离越远，惩罚越大。按官方公式，上图 A 的 confidence 为 <code>1</code>，B 为 <code>0</code>。前面故障示例的 <code>(0, 0.8, 0.2)</code> 得到 <code>score = 1.2</code>、<code>confidence = 0.7</code>。</p>
+<details><summary>展开计算：Score 怎样把分布压成 confidence</summary>
+<pre><code class="language-text">n = 等级数；i = 等级编号；p_i = 等级概率
+m = 最可能等级
+D = Σ p_i × |i - m|
+U = (1/n) × Σ |i - (n - 1)/2|
+confidence = max(0, 1 - D/U)
+
+三等级分布 (0, 0.8, 0.2)：
+m = 1，D = 0.2，U = 2/3
+confidence = 1 - 0.2/(2/3) = 0.7</code></pre>
+<p>这里的 D 衡量围绕最可能等级的平均距离，U 提供均匀分布的距离尺度。对于特定动作，应用也可以直接读取高影响等级的概率。例如是否立即升级故障，可以单独检查等级 2，而把完整分布留给后续审计。</p></details>
+
+<h3 id="calibration">2.3 校准要用实际结果检验</h3>
+<p>如果收集足够多“包含复现步骤”的预测，把概率接近 <code>0.8</code> 的报告分成一组，再由独立标注核对，约八成确实包含步骤，这组预测才体现了校准。<a href="https://proceedings.mlr.press/v70/guo17a.html">概率校准研究</a>关注预测概率与真实频率的对应关系。分组时还应记录样本量：十条样本里的八条，和一千条里的八百条，具有不同的统计稳定性。</p>
+<p>TypeSafe 将自己的训练目标称为 <a href="https://docs.typesafe.ai/introduction/machine-learning-primer">RLCD</a>，即针对校准决策进行强化学习。工程接入可以直接核对的部分包括问题类型、返回分布和派生公式；在具体业务里，还需要用自己的语言、材料长度和任务分布测量误判。官方 <a href="https://docs.typesafe.ai/concepts/state">State 文档</a>也提示，模型主要以英语训练，其他语言的准确率需要单独关注。中文任务应进入评估样本。</p>
+
+<h3 id="thresholds">2.4 阈值表达应用愿意承担的代价</h3>
+<p>提前连接到上下文裁剪：设 <code>p</code> 表示“这条结果仍需要保留”的概率。为了说明阈值如何产生，做一个简化决策模型：误留一条无用结果的代价为 C_extra，误删一条有用结果的代价为 C_loss，正确决策代价记为零。则保留的期望损失为 <code>(1−p)×C_extra</code>，删除为 <code>p×C_loss</code>。</p>
+<pre><code class="language-text">选择保留的条件：
+p ≥ C_extra / (C_extra + C_loss)
+
+教学假设：误留代价 1，误删代价 19
+保留阈值 = 1 / 20 = 0.05</code></pre>
+<p>这个算例说明，损失不对称时，合理阈值可以远离 <code>0.5</code>。实际系统还会受到预算、重读延迟和多条记录之间依赖的影响；要先定义错误代价，再在独立样本上选择阈值。后文插件默认使用 <code>0.5</code>，这是它的实现选择。</p>
+
+<h2 id="api">三、把多个判断放进一次调用</h2>
+<h3 id="request">3.1 state、questions、answers 构成一次往返</h3>
+<p>故障分流的调用可以按四步执行：整理报告；分别提出复现、负责人和影响等级三个问题；接收三个答案；由代码安排补查或分派。下面是保留实际字段的教学请求，发送入口为 <code>POST /v1/systemone</code>：</p>
+<pre><code class="language-json">{
+  "model": "jev-1.13.0",
+  "state": {
+    "symptom": "移动端结算偶发超时，刷新后可完成。",
+    "steps": "打开购物车，点击结算，约十次中一次超时。",
+    "evidence": "未发现重复订单，缺少超时时的关联日志。"
+  },
+  "questions": {
+    "repro": {
+      "type": "noul",
+      "instructions": "报告是否提供具体的复现操作顺序？"
+    },
+    "owner": {
+      "type": "choice",
+      "instructions": "按已有证据判断下一步由谁调查。",
+      "criteria": {
+        "frontend": "证据定位到客户端。",
+        "backend": "证据定位到服务端。",
+        "investigate": "证据不足，需要补查。"
+      }
+    },
+    "impact": {
+      "type": "score",
+      "instructions": "报告描述的功能影响属于什么程度？",
+      "criteria": ["外观问题。", "功能受损但可绕行。", "核心功能阻塞且无绕行。"]
+    }
+  }
+}</code></pre>
+<p>示意响应如下。为突出答案，省略了 <code>usage</code> 等外围字段；Score 的 <code>legend</code> 保存等级编号与说明的映射。</p>
+<pre><code class="language-json">{
+  "answers": {
+    "repro": { "type": "noul", "noul": 0.92 },
+    "owner": {
+      "type": "choice",
+      "choice": "investigate",
+      "probabilities": { "frontend": 0.15, "backend": 0.10, "investigate": 0.75 },
+      "confidence": 0.625
+    },
+    "impact": {
+      "type": "score",
+      "score": 1.2,
+      "probabilities": { "0": 0, "1": 0.8, "2": 0.2 },
+      "legend": { "0": "外观问题。", "1": "功能受损但可绕行。", "2": "核心功能阻塞且无绕行。" },
+      "confidence": 0.7
+    }
+  }
+}</code></pre>
+<p>应用读到“继续排查”后，可以创建补充日志的待办，并保留影响等级供排队使用。即使另一个答案认为存在复现步骤，也仍需执行复现、记录输出，才能确认故障确实重现。</p>
+
+<h3 id="batching-contract">3.2 多问题共享材料，依赖关系由程序安排</h3>
+<p>按<a href="https://docs.typesafe.ai/patterns/fan-out">官方批量提问说明</a>，同一请求里的问题各自读取共享 state，并行求值。可以先把可能用到的问题一起问完，再由代码忽略不适用的答案。若一个问题必须读取另一个答案中新得到的信息，就需要下一次请求。</p>
+<p>这个能力适合批量筛选工具历史：每条候选记录都可以针对当前任务提问。对应用而言，需要检查响应 ID 是否齐全、数值是否有限且在合法区间内、请求是否成功。格式保证、语义准确性、运行时错误处理分别由接口、模型效果和调用代码承担。</p>
+
+<h2 id="compaction">四、fast-jev 怎样选择要留下的工具历史</h2>
+<h3 id="trigger">4.1 从修复测试到触发压缩</h3>
+<p>现在跟随一个编码 Agent：它读取文件、运行失败测试、修改解析器、重新测试，最后准备补充变更说明。历史里保存了旧文件内容、失败日志、编辑参数和最新成功输出。<strong>下一步需要保留哪些证据</strong>，成为一次限定判断。</p>
+<p>插件在 <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/hooks/fast-jev.ts#L258-L310"><code>session.compact</code> hook</a> 中接收会话消息。手动或宿主自动压缩可以进入这个入口；它另在 <code>turn.complete</code> 后读取上下文用量，达到配置比例时请求压缩，默认比例为 <code>60%</code>。这里触发的是一次压缩过程，普通聊天循环仍由 Claude Code 运行。</p>
+<p>项目依赖早期 function hooks，并随仓库提供了 <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/hooks/README.md">Claude Code 2.1.274 的接口说明</a>。把插件部署到其他发行版前，需要核对宿主是否提供同一接口。npm 库本身也可以通过 <code>compact(messages, asker, options)</code> 在其他宿主中使用。</p>
+
+<h3 id="pairing">4.2 配对调用与结果，保护近期记录</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/state.ts#L49-L94"><code>collectToolCalls</code></a> 通过 <code>tool_use_id</code> 把调用与结果配成一组，再赋予本次判断使用的短 ID，例如 <code>t12</code>。没有结果的调用不会成为裁剪候选。调用或结果任一端位于第一条消息、或者最近默认六条消息时，整组受到保护。</p>
+<p>这保护的是消息位置，六条消息可能只覆盖少量用户轮次。被保护的调用直接得到保留决定；剩余 K 组调用会产生 <code>2K</code> 个问题。每组都需要检查“调用还重要吗”和“完整结果还必须留着吗”。</p>
+
+<h3 id="judging-view">4.3 先看清 Jev 实际收到的材料</h3>
+<p>评分阶段读取的材料与原始会话有明显差别。<a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/state.ts#L105-L170"><code>historyEntries</code></a> 保留角色、普通文本和调用描述，把工具结果正文替换成状态及字符数。下面是同一次读取在两个位置上的教学形状：</p>
+<pre><code class="language-text">原始会话中的结果：
+tool_use_id: toolu_12
+text: 一整份解析器源码，包含当前待修改函数
+
+Jev 看到的调用：
+id: t12
+tool: Read
+input: {"file_path":"src/parser.ts"}
+result: ok, 4213 chars (omitted)</code></pre>
+<figure class="mechanism-figure"><img loading="lazy" decoding="async" width="1672" height="941" src="assets/judging-view.png" alt="原始会话经 fitState 整理，Jev state 保留调用路径、结果状态及字符数，省略结果正文" /><figcaption>判断输入的整理发生在裁剪之前。图示概括状态构造与 fitState：原始结果仍在会话中，Jev 此时只看到经过筛选的材料。</figcaption></figure>
+<p>默认任务描述来自最近三条符合条件的用户文本，每条最多截取 500 个字符；调用方也可以显式传入 <code>goal</code>。<a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/state.ts#L174-L302"><code>fitState</code></a> 再把材料压进估算预算：最初工具参数最多 1000 字符；超限后依次降到 200、60 字符，再压缩长文本、折叠旧文本、把旧调用改成短行、移除没有调用的旧消息，最后合并相邻旧调用记录。仍然超限就抛错。</p>
+<p>这里有两个直接后果。首先，日志中的 <code>full</code> 阶段已经省略了结果正文，并限制了参数长度。其次，普通文本在最终输出中受到保留，也可能在判断输入中被缩短。若关键依据只存在于被省略的结果里，Jev 就只能借助调用参数及周边对话作出判断。</p>
+<p>可以构造一个无需调用模型就能检查的边界：两份历史只有工具结果正文不同，长度、错误标志、参数和其他消息都相同。那么状态构造器给 Jev 的材料相同。正文中独有的关键线索没有进入这次判断，模型无法利用它。需要更细判断时，应用必须先改变可见材料，例如提供经过选择的头尾片段或可恢复引用。</p>
+
+<h3 id="two-nouls">4.4 每组调用提出两个 Noul 问题</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L55-L67"><code>questionsFor</code></a> 实际只构造 <code>type: 'noul'</code>。尽管 <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/types.ts#L144-L187">类型文件</a> 同时声明了 Choice 与 Score，压缩路径没有使用它们。</p>
+<div class="table-wrap"><table><thead><tr><th>问题</th><th>源码中的含义</th><th>程序保存为</th></tr></thead><tbody>
+<tr><td><code>call_t12</code></td><td>知道做过这次调用及其参数，对助手下一步仍然重要。</td><td><code>keepCall</code></td></tr>
+<tr><td><code>result_t12</code></td><td>仍需要完整结果原文，而且重新执行工具无法替代。</td><td><code>keepResult</code></td></tr>
+</tbody></table></div>
+<p>第二问同时包含“仍需要”和“无法用重跑替代”。一份马上要编辑的文件可能很有用，但确实能重新读取，因此这项条件会影响返回值。概率对应的是写在问题里的整个命题。若希望衡量“保留能否节省后续工作”，就需要重新定义问题，再评估其删除效果。</p>
+<p>两个问题拆开后，程序可以保留“执行过什么”的线索，同时丢掉很长的输出。若改成 Choice，也可以设计三个动作选项，但它会改变答案含义：目前的两个数字分别对应两个命题，三选一接口则会在三个动作之间分配概率。切换类型需要重新评测。</p>
+
+<h3 id="request-budget">4.5 按请求预算分批，等待全部回答</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L69-L98"><code>batchCalls</code></a> 先扣除状态与请求外围的估算成本，再装入问题；放不下一组问题就抛错。默认状态预算为 25,000，单次请求预算为 30,000，token 数来自仓库的启发式估算器。每一批都带上同一份已整理状态，<a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L257-L309"><code>compact</code></a> 用 <code>Promise.all</code> 并发等待，再合并回答。</p>
+<p>这使候选很多时的输入成本接近 <code>B×S + Q</code>：B 为批次数，S 为状态长度，Q 为全部问题长度。重复发送状态会消耗输入 token，也可能触发限流。源码这条路径没有显式的并发上限，任何一批失败都会使本次压缩失败。</p>
+<p>这些数值是插件的客户端预算。核对时<a href="https://docs.typesafe.ai/models#context-length">官方模型文档</a>列出默认 64k 的每请求上限与 32k 的每问题上限：前者计算 state 加全部问题，后者计算 state 加单个问题。调大客户端参数时需要同时满足这两种条件，并重新检查估算误差与长输入准确率。</p>
+
+<h2 id="rebuild">五、从两个概率到下一轮历史</h2>
+<h3 id="decision">5.1 三种动作由代码决定</h3>
+<p>拿到两个数字后，<a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L101-L115"><code>decideCall</code></a> 按固定顺序比较阈值：先保护近期调用，再判断完整结果是否保留，最后判断调用本身是否保留。下面保留了源码控制流，省略返回对象中的统计字段。</p>
+<pre><code class="language-typescript">if (call.pinned) return 'keep';
+if (answer.keepResult &gt;= keepThreshold) return 'keep';
+if (answer.keepCall &gt;= keepThreshold) return 'drop_result';
+return 'drop_call';</code></pre>
+<figure class="mechanism-figure"><img loading="lazy" decoding="async" width="1672" height="941" src="assets/decisions.png" alt="keepCall 和 keepResult 两个概率进入阈值规则，分别指向保留、截短结果和删除整组的三个分支" /><figcaption>非保护调用的三种可选结果。keepResult 达标时保留整组；否则由 keepCall 决定截短结果或删除整组。虚线纸张表示移除的记录。</figcaption></figure>
+<p>默认阈值为 <code>0.5</code>。例如 <code>keepCall = 0.82</code>、<code>keepResult = 0.21</code> 时，调用被保留，结果进入截短分支；即使调用概率较低，只要结果概率达到阈值，整组也会保留，以免留下缺少调用的结果。接近阈值的值会直接进入对应分支，这里没有另设“不确定，暂缓删除”的区间。</p>
+
+<h3 id="apply">5.2 重建时保留哪些内容</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L135-L227"><code>applyDecisions</code></a> 对未触及的消息返回原对象。进入 <code>drop_result</code> 的长输出默认保留前 300 字符，再附上省略数量和重跑提示；原本不超过 <code>300 + 120</code> 字符的输出会原样保留。因此，“进入截短分支”的统计次数可以大于“实际变短”的结果数。</p>
+<p><code>drop_call</code> 会同时移除调用与配对结果；没有文本、调用或结果的消息随之移除。用户和助手的普通文本按原顺序保留。假设助手原先说“文件已经修改”，紧接着有编辑调用和成功结果：删除这组工具记录后，下一轮仍可能读到这句报告，而读不到原来的执行证据。压缩后的叙述需要连同证据是否可恢复一起评估。</p>
+<pre><code class="language-text">裁剪前：
+assistant: 已修改解析器。
+tool_use: Edit(src/parser.ts, ...)
+tool_result: 更新成功。
+
+drop_call 后：
+assistant: 已修改解析器。</code></pre>
+<p>插件通过 <a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/hooks/fast-jev.ts#L123-L159"><code>toSessionMessages</code></a> 把结果交还宿主。未改变的消息保留原对象与 handle；重建消息不携带原 handle，让宿主采用编辑后的内容。库负责返回新的消息数组，宿主负责压缩结果的安装与会话持久化。这条源码路径没有提供供模型按 ID 取回被删结果的存储服务。</p>
+
+<h3 id="fallback">5.3 字符减少达到门槛，才采用裁剪结果</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts#L228-L244"><code>reductionRatio</code></a> 计算前后字符数量的减少比例，计入普通文本、序列化参数和工具结果。默认减少不足 25% 时，hook 调用 <code>next(event)</code>，交给宿主原来的压缩逻辑。缺少密钥、状态无法装入预算、请求失败或缺少答案等异常，也进入这个回退路径。</p>
+<p>字符减少达到门槛后，hook 返回裁剪后的 messages，并记录动作数量与请求数。这个接受条件检查体积，没有运行压缩后的任务。普通文本占比很高的历史还会存在一个压缩下限：即使所有候选工具记录都删掉，也可能无法减少足够字符。</p>
+<p>响应检查也有具体范围：<a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/request.ts#L39-L80"><code>parseJevResponse</code> 与 <code>noulAnswer</code></a> 检查 HTTP 状态、JSON、answers 及所需有限数值；该快照没有显式拒绝小于 0 或大于 1 的 noul。自行接入时，应补齐接口范围校验，并为请求设置超时、取消和有限重试策略。</p>
+
+<h2 id="evaluation">六、怎样判断这种裁剪值得采用</h2>
+<h3 id="observed-risks">6.1 把公开反馈变成可验证的案例</h3>
+<p><a href="https://github.com/tamaratran/fast-jev-compaction/issues/56">issue #56</a> 的提交者报告，在一个含 141 个候选调用的会话回放中，默认阈值删除了所有候选；调整阈值后，保留比例大幅变化。<a href="https://github.com/tamaratran/fast-jev-compaction/issues/65">issue #65</a> 记录了一次压缩后出现连续无工具调用的虚假完成报告。这两项反馈提供了值得复测的输入特征与失败现象，单次运行的原因仍需对照实验确认。</p>
+<p>源码能直接解释相关风险来自哪里：两个命题共用阈值、结果正文不可见、普通叙述在工具记录被删除后继续保留。复测时可以分别改变问题措辞、结果可见片段和删除标记，每次只改变一个因素，观察后续任务是否恢复。这样的实验才有助于决定修正哪一层。</p>
+
+<h3 id="benchmark">6.2 从同一个检查点继续任务</h3>
+<p>一个实用的比较包含四条路径：预算允许时保留完整历史、固定窗口遮蔽旧输出、生成式摘要、Jev 选择性裁剪。<a href="https://arxiv.org/abs/2508.21433">The Complexity Trap</a> 已在软件工程任务中比较过简单 observation masking 与摘要，可作为选择基线的依据。Jev 的附加判断成本，需要与简单规则的效果一起比较。</p>
+<p>实验先冻结历史检查点、文件状态和后续任务，再让各路径继续同一工作。可变外部工具应使用记录的结果或可恢复环境；否则某一路重新查询时碰巧得到更新数据，会把环境变化混进压缩效果。重复运行以观察模型波动，并把调阈值的样本与最终验收样本分开。</p>
+<div class="table-wrap"><table><thead><tr><th>观察项</th><th>怎样记录</th><th>回答的问题</th></tr></thead><tbody>
+<tr><td>任务结果与约束</td><td>统一验收测试、禁止修改范围、结果正确性</td><td>裁剪后能否继续把事情做对</td></tr>
+<tr><td>关键事实保留</td><td>错误原文、路径、约束、编辑与执行证据的可见或恢复情况</td><td>删掉的是冗余还是必要材料</td></tr>
+<tr><td>补取次数与延迟</td><td>额外读文件、重跑测试、外部查询及整段任务耗时</td><td>节省输入后增加了多少工作</td></tr>
+<tr><td>总成本</td><td>Jev 输入、后续模型输入输出、缓存读写与工具成本</td><td>整体是否更省</td></tr>
+<tr><td>异常与恢复</td><td>失败回退、超时、重复压缩、不可重放结果的处理</td><td>长任务能否稳定接续</td></tr>
+</tbody></table></div>
+<p>记录请求模型、实际返回版本、问题文本和阈值；<code>jev-latest</code> 是会移动的别名。压缩率可以作为过程指标，最终是否采用则由任务质量、总成本与可恢复性共同决定。历史序列发生编辑时，后续模型请求的前缀也可能改变；评估应纳入实际缓存用量，避免只计算少发了多少字符。</p>
+
+<h3 id="rules">6.3 把这套设计迁移到其他应用</h3>
+<p>Jev 给软件提供了一个清楚的接口：材料进入，有限答案与概率出来。Noul 适合一个命题，Choice 适合候选类别，Score 适合有序等级；分布保留歧义，confidence 提供可重算的摘要，业务规则把判断变成动作。</p>
+<p>fast-jev-compaction 把这套接口落到了一个具体位置：每组工具记录对应两个 Noul，再由代码完成保留、截短和删除。这个例子最值得带走的设计顺序是：<strong>先决定判断者能看到什么，再定义概率对应的命题，随后制定动作规则，最后验证动作以后的任务结果。</strong>四步连起来，才能把一次看似明确的小数变成可依赖的程序行为。</p>
+
+<h2 id="sources">资料与延伸阅读</h2>
+<ul class="source-list">
+<li><a href="https://docs.typesafe.ai/primitives">TypeSafe：问题类型与组合</a>；<a href="https://docs.typesafe.ai/primitives/noul">Noul</a>；<a href="https://docs.typesafe.ai/primitives/choice">Choice</a>；<a href="https://docs.typesafe.ai/primitives/score">Score</a>。</li>
+<li><a href="https://docs.typesafe.ai/confidence">Confidence 的定义与计算公式</a>；<a href="https://docs.typesafe.ai/models">模型版本与上下文限制</a>。</li>
+<li><a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/compact.ts">fast-jev-compaction：问题、决策与重建</a>；<a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/src/state.ts">状态构造</a>；<a href="https://github.com/tamaratran/fast-jev-compaction/blob/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0/hooks/fast-jev.ts">宿主接入</a>。</li>
+<li><a href="https://proceedings.mlr.press/v70/guo17a.html">On Calibration of Modern Neural Networks</a>；<a href="https://arxiv.org/abs/2508.21433">The Complexity Trap</a>。</li>
+<li>继续阅读：<a href="../../ai-engineering/zh/agent-decisions/">Agent 怎样决定下一步</a>，查看 Jev 与工作流分工；<a href="../../claude-code/zh/context-management/">Claude Code 上下文管理</a>，查看完整压缩路径；<a href="../../deepseek-harness/zh/compaction-reconstruction/">DeepSeek Harness 压缩与请求重建</a>，查看持久记录与模型请求的关系。</li>
+</ul>
+
+      </section>
+    </article></main>
+  </div>
+  <script src="../../ai-engineering/assets/article.js?v=1"></script>
+  <script defer src="../../assets/vendor/highlightjs/highlight.min.js?v=11.11.1"></script>
+  <script defer src="../../assets/code-highlight.js?v=1"></script>
+</body>
+</html>
