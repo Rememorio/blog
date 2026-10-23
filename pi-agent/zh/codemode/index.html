@@ -88,11 +88,11 @@
           <div class="meta-line"><span>Pi 工具专题</span><span>发现 → 执行 → 筛选</span><span>Codemode / MCP / Tool calls</span></div>
           <figure class="hero-image"><img src="../assets/pi-codemode-workshop.png" alt="模型提交 JavaScript，由 QuickJS 调用外部文件和 MCP 工具并筛选数据，只有选出的脚本输出返回下一轮模型。" fetchpriority="high" /></figure>
         </section>
-        <section class="article-body"><div class="note key-point"><p>承接<a href="../context/">上一章</a>的配置修改与测试任务，长日志 <code>T1</code> 已经保存并可按需缩短。现在继续读取同一次测试的三份报告，只把失败用例交给模型。本篇追踪脚本在哪里执行、工具怎样发现、结果怎样返回，以及失败后哪些状态仍然留下。</p></div>
-<p>本文依据 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/CHANGELOG.md">Pi 1.0.0</a> 的公开实现。Codemode、tool search 和 MCP 在 0.99 已进入内置扩展，1.0 又调整了工具说明、后台连接与模型调用能力。下文沿用这条 CLI 路径，并按 <a href="https://github.com/earendil-works/pi/tree/be14d9732f98fcc33929cf103a92b96afaa6523e">后续源码快照</a>更新 worker 调度、输出限制和图像返回；SDK 需要显式装配相应扩展。文中示例用于解释数据流，不代表测得的延迟、费用或任务成功率。</p>
+        <section class="article-body"><div class="note key-point"><p>Pi 在终端中调用模型和工具完成代码任务。沿着<a href="../context/">上一篇</a>的配置改造，测试长日志 <code>T1</code> 已保存在会话中，后续模型输入可以使用它的短摘要。现在继续读取同次测试的三份报告，只把失败用例交给模型。本篇追踪脚本怎样调用工具、筛选结果，以及失败后哪些状态会留下。</p></div>
+<p>本文依据 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/CHANGELOG.md">Pi 1.0.0</a> 的终端产品实现，并按 <a href="https://github.com/earendil-works/pi/tree/be14d9732f98fcc33929cf103a92b96afaa6523e">后续源码快照</a>核对脚本执行、输出限制和图像返回。下面用同一次测试的报告说明数据流。</p>
 <h2 id="one-task">一、让脚本先读报告，模型只看需要判断的部分</h2>
 <p>这次测试还生成了三份 JSON 报告。每份都有几百条通过记录，只有少量失败。模型可以逐个调用 read，再从长输出里找失败；但这个任务的大部分工作只是解析 JSON、过滤数组和合并字段。把这些中间数据全部放进对话，会消耗模型输入，也会增加遗漏关键错误的机会。</p>
-<p>Codemode 让模型先写一段 JavaScript。脚本读取报告、筛选结果，再显式输出小摘要。模型仍决定该做什么、怎样解释失败；机械的数据处理交给脚本完成。工具调用照常产生真实效果，只是原始返回值先到脚本，而不是自动成为下一轮模型消息。</p>
+<p>Codemode 是 Pi 提供的一个工具，工具名为 <code>codemode</code>。模型通过工具调用提交 JavaScript，Pi 执行脚本，再把选定输出作为这次工具调用的结果交回模型。在下面的例子里，<code>tools.read()</code> 请求 Pi 读取文件，脚本解析 JSON 并筛选失败用例，<code>text()</code> 输出筛选结果。模型随后根据这些结果判断如何修复。</p>
 <pre><code class="language-javascript">const paths = [&quot;reports/unit.json&quot;, &quot;reports/api.json&quot;, &quot;reports/ui.json&quot;];
 const reports = await Promise.all(paths.map(async (path) =&gt; {
   const raw = await tools.read({ path });
@@ -105,10 +105,11 @@ const reports = await Promise.all(paths.map(async (path) =&gt; {
   };
 }));
 text(reports);</code></pre>
-<p>这个例子假定报告结构为 tests 数组，且文件足够小，read 返回可直接解析的完整 JSON。它没有创造一个绕过工具限制的文件接口；如果 read 返回截断提示、文件不存在或格式不符，脚本仍会失败。三次读取可以并发发出，但宿主的工具调度策略仍会影响实际执行顺序。</p>
+<p>这个例子假定报告结构为 tests 数组，且文件足够小，read 返回可直接解析的完整 JSON。如果 read 返回截断提示、文件不存在或格式不符，脚本会失败。三份报告互不依赖，可以并发请求读取；实际执行顺序仍受 Pi 的工具调度配置影响。</p>
 <p>输入给 <code>codemode</code> 的是原始 JavaScript 源码，运行时把它当作异步函数体执行，因而可使用顶层 await。<code>text()</code>、<code>image()</code> 和顶层 return 决定模型最终收到什么；只计算出一个局部变量不会自动把它加入输出。具体接口见 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/codemode.md">Codemode 文档</a>。</p>
 <h2 id="discovery">二、工具很多时，先发现，再决定怎样调用</h2>
-<p>把读取报告换成查询测试平台，数据可能来自 MCP 服务。一个服务可以提供几十甚至几百个工具。若每次请求都附上所有参数说明，即使任务只用两个查询接口，也要反复携带整本手册。Pi 因此把“知道有这个服务”和“拿到某个工具的调用声明”分开。</p>
+<p>如果报告存放在测试平台，Pi 可以通过 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/mcp.md">MCP（Model Context Protocol）</a> 查询。MCP 是连接外部工具服务的协议，让 Pi 向另一个进程或远端服务询问“有哪些工具”，并发送参数调用它们。测试平台可提供查询运行、列出失败用例等工具；Codemode 则用脚本组合这些调用并处理结果。</p>
+<p>模型要正确调用工具，先要知道名称、用途和参数格式，这些信息合称<strong>工具声明</strong>。获取声明叫<strong>发现</strong>；发送参数并取得结果是执行。一个服务可能有数百个工具，把全部声明附在每次模型请求里会占用大量输入。Pi 用不同的<strong>暴露方式（exposure）</strong>决定声明何时进入请求、工具通过什么入口调用：</p>
 <p>默认 MCP 工具使用 codemode exposure：模型先看到服务简介，脚本再搜索工具并读取声明。另一个入口 tool_search 会把匹配工具加载为后续请求里的直接工具。二者解决的是说明何时进入上下文；发现本身不执行查询，也不代表获得了额外权限。</p>
 <figure class="hero-image"><img src="../assets/pi-codemode-discovery.png" alt="MCP 工具目录经过按需发现，分别供 codemode 脚本读取声明或由 tool_search 加载到下一次模型请求；初始请求只带服务简介。" loading="lazy" decoding="async" /><figcaption>图中只展开两种间接入口。codemode 与 deferred 工具可经由任一间接入口访问；direct 与 hidden 的行为见下表。</figcaption></figure>
 <pre><code class="language-javascript">const matches = await searchTools(&quot;failed test runs&quot;, { namespace: &quot;mcp__tests&quot; });
@@ -121,10 +122,10 @@ if (matches[0]) text(await describeTool(matches[0].name));</code></pre>
 <p>Pi 在会话启动时后台连接 MCP 服务。第一次提示只为有 direct 工具的服务等待最多 10 秒，因为这些声明需要进入这次请求。其他服务等到实际发现或调用时再等待：脚本明确命名某个 MCP 服务时等待对应服务；搜索全部工具、读取 ALL_TOOLS 或使用 tool_search 时则等待全部服务。</p>
 <p>默认间接工具不进入 codemode 的工具说明，因此新服务连上来不会让这份说明不断变长。服务简介发生变化时，Pi 在提示开始时把新 mcp_servers 内容追加进对话。这样能减少对较早内容的改写；缓存是否命中仍由实际请求、provider 规则和缓存寿命决定，不能从“追加”直接推出命中率。</p>
 <h3>2.2 内置扩展的默认值与 SDK 的装配是两件事</h3>
-<p>CLI 的 MCP 扩展会在 codemode 服务连接后自动启用 codemode，deferred 服务则启用 tool_search；不使用 MCP 时也可在 defaultTools 中加入 <code>+codemode</code>。<code>codemode.mode: "on"</code> 保留已声明工具，<code>"only"</code> 才把它们从直接声明移到脚本入口。<a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/sdk.md">SDK 文档</a> 明确说明 SDK 会话不自动加载内置扩展，需要通过资源加载器加入对应工厂。不能把 CLI 的自动装配当成底层 Agent 默认行为。</p>
+<p>Codemode、tool_search 和 MCP 在 0.99 进入内置扩展，1.0 又调整了声明、后台连接和模型调用。终端命令行入口（CLI）的 MCP 扩展会在 codemode 服务连接后自动启用 codemode，deferred 服务则启用 tool_search；不使用 MCP 时也可在 defaultTools 中加入 <code>+codemode</code>。<code>codemode.mode: "on"</code> 保留已声明工具，<code>"only"</code> 才把它们从直接声明移到脚本入口。<a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/sdk.md">SDK 文档</a> 明确说明 SDK 会话不自动加载内置扩展，需要通过资源加载器加入对应工厂。不能把 CLI 的自动装配当成底层 Agent 默认行为。</p>
 <h2 id="execution">三、脚本通过同一条工具执行路径影响外部世界</h2>
-<p>模型生成的脚本在独立 QuickJS worker 中运行。每次调用建立新的 VM；没有 Node API、文件系统、网络或定时器，脚本访问外部世界要通过 tools 或 models。这个安排限制了脚本直接操作宿主的能力，也让宿主能明确记录它请求了哪些操作。</p>
-<p>在 coding-agent 中，tools 调用经由 <code>ctx.executeTool()</code> 进入 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts#L702">AgentSession 的嵌套工具执行</a>。参数验证、执行前后的扩展处理与普通工具调用使用同一条路径；子调用携带 <code>parentToolCallId</code>，可以关联到外层 codemode。脚本只是增加一个调用组织层，没有把工具变成不受宿主管理的函数。</p>
+<p>Pi 用轻量 JavaScript 引擎 <strong>QuickJS</strong> 执行模型提交的脚本，并把执行放在独立的 worker 中。每次调用创建新的虚拟机（VM），局部变量在这次调用结束后释放。下文的<strong>宿主</strong>指接收脚本请求并执行实际工具的 Pi 程序。脚本环境没有 Node API，也不能直接访问文件系统、网络或定时器；外部操作要通过 <code>tools</code> 或 <code>models</code> 请求宿主。</p>
+<p>脚本中的 <code>tools.read()</code> 等调用发生在外层 codemode 调用内部，称为嵌套工具调用。在 coding-agent 中，它们经由 <code>ctx.executeTool()</code> 进入 <a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts#L702">AgentSession 的嵌套工具执行</a>。参数验证、执行前后的扩展处理与普通工具调用使用同一条路径；子调用携带 <code>parentToolCallId</code>，可以关联到外层 codemode。脚本只是增加一个调用组织层，没有把工具变成不受宿主管理的函数。</p>
 <pre><code class="language-text">模型发出 codemode 调用
   → QuickJS 执行 JavaScript
     → tools.&lt;name&gt;(args) 请求宿主
@@ -153,13 +154,13 @@ text(results.map((result, index) =&gt; {
 <p>大输出也有两道不同限制。直接展示的 MCP 文本超过 20 KB 时会截去中间并保存完整临时文件；codemode 能先拿到完整 MCP 结果再过滤。脚本自身的最终输出默认限制为 10,000 个估算 token，超出后保留头尾并提供完整文本文件。bash 在脚本里也有自己的 1 MiB 输出上限。VM 有 256 MB 内存。除此之外，运行时按累计输出限制资源：文本与 base64 图像合计超过 16,777,216 个字符，或 <code>text()</code>、<code>image()</code>、console 调用超过 100,000 次时，脚本失败。前面的 10,000-token 设置控制最终展示，这两项硬限制控制脚本积累输出的上限。见<a href="https://github.com/earendil-works/pi/blob/be14d9732f98fcc33929cf103a92b96afaa6523e/packages/coding-agent/docs/codemode.md#L8-L19">输出规则</a>。</p>
 <p>输出保持明确的条目结构：多个文本项带 <code>==&gt; text N/M &lt;==</code> 分隔标记，console 调用集中放在末尾的 <code>&lt;console_output&gt;</code> 中。<code>image()</code> 同时把图像保存到临时文件，返回值在图片前列出路径，后续工具可以复制这份文件。若配置 <code>// @options:</code>，它必须出现在源码第一行；放在后面会在执行前报错。上述行为见<a href="https://github.com/earendil-works/pi/blob/be14d9732f98fcc33929cf103a92b96afaa6523e/packages/coding-agent/docs/codemode.md#L8-L29">脚本输入与输出约定</a>。</p>
 <h2 id="state">五、脚本失败后，哪些状态会留下</h2>
-<p>假设脚本先把修复建议写入文件，再用 store 保存本次报告的游标，最后解析另一份报告时抛错。读者最容易误以为这是一笔原子事务：脚本失败，所以前面的写入都取消。Pi 并没有给工具副作用提供这样的回滚。</p>
+<p>假设脚本先把修复建议写入文件，再用 <code>store</code> 暂存本次报告的游标，最后解析另一份报告时抛错。已经完成的文件写入会保留；本次 store 修改只有在整个脚本成功后才写入会话。一次失败因此可能同时留下外部效果和未提交的小状态。</p>
 <figure class="hero-image"><img src="../assets/pi-codemode-effects.png" alt="工具已完成的文件写入在脚本失败后仍保留；store 暂存的修改只有脚本成功才写入 codemode-store，会在失败时不提交。" loading="lazy" decoding="async" /><figcaption>两个目的地有不同提交规则：外部工具效果已经发生，脚本的会话小状态仍等待成功。取消仍在执行的调用，也不能撤销已经完成的写入。</figcaption></figure>
 <p><code>store(key, value)</code> 暂存小型 JSON 值，<code>load(key)</code> 读取脚本当前的小状态：初始值来自当前分支之前的成功写入，同一脚本里的 store 也会立即更新可读值。<a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/extensions/codemode/execute.ts">executeCodemode</a> 仅在脚本成功后追加 <code>codemode-store</code> custom entry；恢复会话时沿分支从根重放这些写入。失败脚本不会提交它本轮的 store 修改，但会保留此前已输出的部分内容，并报告脚本错误。</p>
 <p>这适合保留游标、ID 或摘要。单个值最多 262,144 个 JSON 字符，总量最多 1,048,576 个字符，不能拿来存图像数据。换分支后只看到该路径上的值；外部文件和远端系统却不会跟着会话树自动回到旧版本。需要跨系统一致性时，仍要设计幂等操作、显式检查点或补偿步骤。</p>
 <p>脚本结束时，未等待的 Promise 会丢弃，还在执行的工具调用会收到取消信号。若启动写操作后立即 return，不能把“脚本已结束”当成“写入已确认”。需要的结果必须 await；取消是否及时生效取决于工具自身，已经完成的副作用不会因此消失。</p>
 <h2 id="models">六、分类与图像模型把哪些工作带进脚本</h2>
-<p>同一条数据处理路径也可调用非聊天模型。例如，把失败反馈交给分类器标注类别，或根据筛选后的结果生成一张图。脚本通过 models 查询目录并使用会话凭据运行 classifier 与 image 模型；聊天模型虽然可列出，但不能从脚本运行。因此这不是默认启动另一个能自由对话的子 Agent。</p>
+<p>同一条数据处理路径也可调用分类和图像模型。例如，把失败反馈交给分类器标注类别，或根据筛选结果生成图片。脚本通过 <code>models</code> 查询目录，并使用会话凭据运行 classifier 与 image 模型；聊天模型可列出，但当前接口不支持从脚本运行。</p>
 <p><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/codemode.md">模型调用约定</a> 要求检查 <code>stopReason</code> 和 <code>errorMessage</code>：provider 错误会作为结果返回，不一定抛异常。同一脚本最多同时运行四个分类或图像调用，额外请求排队；用量计入 codemode 结果和会话费用。图像必须用 <code>image(block)</code> 输出，打印 base64 文本只会制造巨大且不可读的上下文。</p>
 <p>支持图像输入的分类器还能一起判断截图与结构化状态。<code>tools.read({ path: "screenshot.png" })</code> 返回的图像块可直接放进 <code>ClassifierContext.images</code>；调用前检查模型的 <code>input</code> 是否包含 <code>"image"</code>，仅支持文本的分类器会返回错误结果。测试报告里可以保留失败名称，同时附上对应截图，供分类器判断布局问题。见<a href="https://github.com/earendil-works/pi/blob/be14d9732f98fcc33929cf103a92b96afaa6523e/packages/coding-agent/docs/codemode.md#L165-L186">图像分类示例</a>。</p>
 <p>分类器提供的是模型判断。若它决定哪些失败会被隐藏、哪些报告可以归档，就需要保留未确认项并验证误分类，而不能把结构化字段当作可靠性证明。Codemode 改变了中间工作在哪里完成；判断是否正确，仍需任务自己的验证标准。</p>
@@ -167,7 +168,8 @@ text(results.map((result, index) =&gt; {
 <div class="table-wrap"><table><thead><tr><th>任务形状</th><th>优先选择</th><th>需要保留的性质</th></tr></thead><tbody><tr><td data-label="任务形状">单次调用，结果很短</td><td data-label="优先选择">直接工具调用。</td><td data-label="需要保留的性质">让错误和结果清楚可见。</td></tr><tr><td data-label="任务形状">多份独立报告，需要过滤或合并</td><td data-label="优先选择">codemode 组织读取和确定性处理。</td><td data-label="需要保留的性质">每份数据的成功／失败状态与来源。</td></tr><tr><td data-label="任务形状">工具数量很多，调用方式暂不确定</td><td data-label="优先选择">先发现工具，再选择直接调用或脚本。</td><td data-label="需要保留的性质">真实参数声明和当前可用性。</td></tr><tr><td data-label="任务形状">历史已经很长，后续不需要原文</td><td data-label="优先选择">会话 ContextEdit 或 compaction。</td><td data-label="需要保留的性质">原始记录、分支语义和恢复一致性。</td></tr><tr><td data-label="任务形状">涉及多个外部写入</td><td data-label="优先选择">按依赖顺序执行，设计幂等与检查点。</td><td data-label="需要保留的性质">不能用脚本成功标志替代副作用核对。</td></tr></tbody></table></div>
 <p>要评价这套设计是否有收益，可以对同一批报告比较两种执行路径：最终答案是否一致，遗漏了多少失败，发给模型的输入和输出各有多少，完整等待时间是多少，工具失败能否被正确解释，恢复后游标是否仍然对应已完成的工作。脚本把长结果缩短只是第一步；缩短后仍能做对事情，才值得保留这次改造。</p>
 <p>与前一篇连起来看，Pi 给出了两个不同的处理时机：Codemode 在工具结果进入模型之前筛选，ContextEdit 在历史已经写入之后改变未来输入。二者都把“保留什么证据”和“给模型看什么”变成显式决定，也都要求单独核对已经发生的外部效果。</p>
-<p>Pi 的三篇路线到这里连起来了：运行循环执行任务，会话记录支持后续输入重建，Codemode 在工具返回与模型读取之间处理数据。需要继续比较产品层的权限与恢复时，可阅读 Agent 框架系列中的<a href="../../../agent-framework/zh/agentscope-runtime/">AgentScope</a>，看权限询问、暂停恢复与多用户服务怎样接到一次回复上。</p>
+<p>回到最初的配置改造：Pi 的循环先完成文件读取、修改和测试，会话保存日志并为后续请求重建输入，Codemode 汇总三份报告中的失败用例。模型据此继续修复后，还要重跑相关测试，并核对公共接口是否保持兼容。沿着这条完整路径，才能判断任务是否完成、下一次恢复时又应从哪里继续。</p>
+<p>进一步比较权限询问、暂停恢复和多用户服务，可阅读 Agent 框架系列的<a href="../../../agent-framework/zh/agentscope-runtime/">AgentScope</a>。</p>
 <h2 id="sources">参考源码与文档</h2>
 <ul><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/codemode.md">Codemode：脚本、输出、状态与模型调用</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/mcp.md">MCP：发现、暴露方式、连接与资源</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/extensions/codemode/execute.ts">Codemode 执行与返回值转换</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/extensions/codemode/tool.ts">工具声明与内联预算</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/src/core/agent-session.ts">AgentSession：嵌套工具执行</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/codemode/README.md">QuickJS sandbox 的独立包说明</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/sdk.md">SDK 的显式装配</a></li><li><a href="https://github.com/earendil-works/pi/blob/a13d35a742c6ef8462812a28fbe1d8c8b7431c32/packages/coding-agent/docs/security.md">安全与项目信任</a></li></ul></section>
       </article></main>
